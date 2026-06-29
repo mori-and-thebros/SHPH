@@ -73,6 +73,29 @@ increment of the Optional/Research hardening track.
 - 5 new keystore regression tests (roundtrip, 0600 perms, leaky-file refusal,
   oversized-file rejection, no leftover temp files). `shph-core` 27 -> 32.
 
+## [Hardening] — Transport DoS hardening + dead-code cleanup (2026-06-30)
+
+Third increment of the Optional/Research hardening track (`shph-transport`).
+
+### Security
+- **Per-peer connection-rate limiting:** the TCP accept entry path now enforces
+  a per-source-IP cap (`MAX_CONNECTS_PER_PEER_PER_WINDOW` = 8 per 10s) before
+  any handshake work. This complements the per-loop `TCP_HANDSHAKE_ATTEMPTS`
+  bound (which only covers a single accept loop) so one host cannot flood the
+  entry path across repeated sessions.
+- **Anti-slowloris hello read:** `read_tcp_hello` now reads in 1 KiB chunks into
+  a single bounded buffer instead of one syscall per byte, with the same
+  `MAX_HELLO_BYTES` cap. A dribbling peer can no longer amplify per-byte cost or
+  hold the connection open beyond the cap.
+
+### Changed
+- Removed the orphaned, never-compiled root `src/crypto.rs` and `src/error.rs`
+  (not part of any workspace crate; the live code is `shph-core/src/`).
+
+### Tests
+- 3 new `PeerRateLimiter` regression tests (under-cap allow, per-IP-not-port
+  keying, distinct-IP isolation). `shph-transport` 1 -> 4 unit tests.
+
 Gates referenced below: `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace` (0 failed), `cargo build --workspace --locked`.

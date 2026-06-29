@@ -28,6 +28,15 @@ const QUIC_HANDSHAKE_ATTEMPTS: usize = 3;
 /// the effort an unauthenticated attacker can force on the entry path.
 const TCP_HANDSHAKE_ATTEMPTS: usize = 5;
 
+/// Per-source connection-rate limiting for the unauthenticated TCP entry path.
+/// A single peer address may open at most `MAX_CONNECTS_PER_PEER_PER_WINDOW`
+/// inbound handshakes within `PEER_RATE_WINDOW`. Beyond that, further connects
+/// from that source are rejected before any handshake work is done, so one host
+/// cannot flood the entry path across sessions (the attempt bound above only
+/// covers a single accept loop).
+const PEER_RATE_WINDOW: Duration = Duration::from_secs(10);
+const MAX_CONNECTS_PER_PEER_PER_WINDOW: usize = 8;
+
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
     Tcp,
@@ -610,6 +619,52 @@ pub fn tcp_connect_and_handshake(
     Ok((stream, state))
 }
 
+/// Per-peer-address connection-rate limiter for the unauthenticated entry path.
+///
+/// Tracks recent accepted-connect timestamps per peer IP. A peer that has
+/// already opened `MAX_CONNECTS_PER_PEER_PER_WINDOW` connections within the
+/// rolling `PEER_RATE_WINDOW` is rejected (its stale entries are pruned first)
+/// before any handshake work is performed. This complements the per-loop
+/// `TCP_HANDSHAKE_ATTEMPTS` bound, which only governs a single accept loop.
+struct PeerRateLimiter {
+    window: Duration,
+    max: usize,
+    // peer IP string -> list of recent connect instants (unsorted append-only;
+    // pruned lazily on each check).
+    seen: std::collections::HashMap<String, Vec<Instant>>,
+}
+
+impl PeerRateLimiter {
+    fn new() -> Self {
+        Self {
+            window: PEER_RATE_WINDOW,
+            max: MAX_CONNECTS_PER_PEER_PER_WINDOW,
+            seen: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record a connect from `addr` and return `Ok(())` if it is within the
+    /// rate limit, or `Err` if the peer has exceeded it. The check prunes
+    /// entries older than the window before counting.
+    fn check_and_record(&mut self, addr: SocketAddr) -> std::result::Result<(), ShphError> {
+        let key = addr.ip().to_string();
+        let now = Instant::now();
+        let cutoff = now - self.window;
+        let entries = self.seen.entry(key).or_default();
+        entries.retain(|t| *t > cutoff);
+        if entries.len() >= self.max {
+            return Err(ShphError::Transport(format!(
+                "peer {} exceeded connection rate limit ({} per {:?})",
+                addr.ip(),
+                self.max,
+                self.window
+            )));
+        }
+        entries.push(now);
+        Ok(())
+    }
+}
+
 pub fn tcp_accept_and_handshake(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
@@ -621,10 +676,22 @@ pub fn tcp_accept_and_handshake(
     // closed. Genuine listener failures and timeouts propagate immediately so
     // an attacker cannot exhaust the attempt budget with a slow/blocked socket.
     let mut last_err: Option<ShphError> = None;
+    let mut rate_limiter = PeerRateLimiter::new();
     for _ in 0..TCP_HANDSHAKE_ATTEMPTS {
         let (mut stream, peer_addr) = listener
             .accept()
             .map_err(|e| ShphError::Transport(e.to_string()))?;
+
+        // Per-source rate limit BEFORE any handshake work: a single host that
+        // is hammering the entry path is dropped immediately, so it cannot
+        // exhaust the attempt budget or burn CPU on hello parsing across
+        // repeated sessions.
+        if let Err(err) = rate_limiter.check_and_record(peer_addr) {
+            last_err = Some(err);
+            drop(stream);
+            continue;
+        }
+
         apply_timeout(&stream, timeout_secs)?;
 
         match read_tcp_hello(&mut stream) {
@@ -666,31 +733,53 @@ fn write_tcp_hello(stream: &mut TcpStream, hello: &Hello) -> Result<()> {
 }
 
 fn read_tcp_hello(stream: &mut TcpStream) -> Result<Hello> {
-    let mut line = Vec::with_capacity(512);
+    // Read the newline-terminated hello in chunks into a single bounded buffer
+    // rather than one syscall per byte. The buffer is capped at
+    // `MAX_HELLO_BYTES` (+1 to detect overshoot), so a slowloris-style peer
+    // cannot hold the connection open with dribbled single bytes beyond the
+    // cap, and the cost per peer is O(1) reads instead of O(len) reads.
+    let mut buf = Vec::with_capacity(512);
+    let mut chunk = [0u8; 1024];
     loop {
-        let mut byte = [0u8; 1];
-        let read = stream.read(&mut byte).map_err(map_io_error)?;
+        let read = stream.read(&mut chunk).map_err(map_io_error)?;
         if read == 0 {
-            return if line.is_empty() {
+            return if buf.is_empty() {
                 Err(ShphError::ConnectionClosed)
             } else {
                 Err(ShphError::Protocol("truncated hello".into()))
             };
         }
-        if byte[0] == b'\n' {
-            break;
-        }
-        if line.len() >= MAX_HELLO_BYTES {
+        // Look for the newline within this chunk and append up to (and
+        // including) it; anything after the newline is ignored (the hello is a
+        // single line).
+        let nl = chunk[..read].iter().position(|&b| b == b'\n');
+        let take = match nl {
+            Some(i) => &chunk[..=i],
+            None => &chunk[..read],
+        };
+        // Enforce the cap including any data already buffered.
+        if buf.len() + take.len() > MAX_HELLO_BYTES + 1 {
             return Err(ShphError::Protocol("hello exceeds size limit".into()));
         }
-        line.push(byte[0]);
+        buf.extend_from_slice(take);
+        if nl.is_some() {
+            break;
+        }
     }
-    if line.last() == Some(&b'\r') {
-        line.pop();
+    // Strip the trailing newline (and a CR if present).
+    while buf
+        .last()
+        .map(|&b| b == b'\n' || b == b'\r')
+        .unwrap_or(false)
+    {
+        buf.pop();
+    }
+    if buf.len() > MAX_HELLO_BYTES {
+        return Err(ShphError::Protocol("hello exceeds size limit".into()));
     }
 
     let hello_line =
-        std::str::from_utf8(&line).map_err(|_| ShphError::Protocol("hello not utf8".into()))?;
+        std::str::from_utf8(&buf).map_err(|_| ShphError::Protocol("hello not utf8".into()))?;
     let hello = serde_json::from_str::<Hello>(hello_line)
         .map_err(|e| ShphError::Protocol(e.to_string()))?;
     Ok(hello)
@@ -1573,7 +1662,8 @@ fn collect_shph_files(root: &Path, out: &mut Vec<(PathBuf, DataMuleEnvelope)>) -
 
 #[cfg(test)]
 mod tests {
-    use super::TransportMode;
+    use super::{PeerRateLimiter, TransportMode, MAX_CONNECTS_PER_PEER_PER_WINDOW};
+    use std::net::SocketAddr;
 
     #[test]
     fn transport_mode_parses_supported_values() {
@@ -1582,5 +1672,53 @@ mod tests {
         assert!(TransportMode::parse("offline-mesh").is_ok());
         assert!(TransportMode::parse("data_mule").is_ok());
         assert!(TransportMode::parse("bad").is_err());
+    }
+
+    #[test]
+    fn peer_rate_limiter_allows_under_cap() {
+        let mut rl = PeerRateLimiter::new();
+        let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        for _ in 0..MAX_CONNECTS_PER_PEER_PER_WINDOW {
+            assert!(
+                rl.check_and_record(addr).is_ok(),
+                "under-cap connects allowed"
+            );
+        }
+        // One over the cap is rejected.
+        assert!(
+            rl.check_and_record(addr).is_err(),
+            "over-cap connect from same peer must be rejected"
+        );
+    }
+
+    #[test]
+    fn peer_rate_limiter_keys_by_ip_not_port() {
+        let mut rl = PeerRateLimiter::new();
+        // Same IP, different ports: share the budget.
+        for port in 0..MAX_CONNECTS_PER_PEER_PER_WINDOW {
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            assert!(rl.check_and_record(addr).is_ok());
+        }
+        let over: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        assert!(
+            rl.check_and_record(over).is_err(),
+            "rate limit is per-IP, so a new port on a capped IP is still rejected"
+        );
+    }
+
+    #[test]
+    fn peer_rate_limiter_isolates_distinct_ips() {
+        let mut rl = PeerRateLimiter::new();
+        // Exhausting one IP must not affect a different IP.
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        for _ in 0..MAX_CONNECTS_PER_PEER_PER_WINDOW {
+            rl.check_and_record(a).unwrap();
+        }
+        assert!(rl.check_and_record(a).is_err());
+        let b: SocketAddr = "10.0.0.2:1".parse().unwrap();
+        assert!(
+            rl.check_and_record(b).is_ok(),
+            "a distinct IP has its own budget"
+        );
     }
 }

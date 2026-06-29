@@ -72,7 +72,7 @@ these until the corresponding roadmap phase ships and is independently reviewed:
 | Passive eavesdropper on the wire | Mitigated: AEAD-encrypted data plane. |
 | Replay of a captured data frame | Mitigated: receiver-side sliding-window nonce anti-replay (fail-closed); send-side nonce-limit guard prevents nonce reuse. |
 | Tampered/truncated frames | Mitigated: AEAD authentication + length bounds + fail-closed decode. |
-| Unauthenticated handshake flood (resource exhaustion) | Partially mitigated: bounded accept loop + handshake timeouts; not a full DoS defense. |
+| Unauthenticated handshake flood (resource exhaustion) | Mitigated: bounded accept loop + handshake timeouts + per-source-IP connection rate limiting; not a full DoS defense against a distributed flood. |
 | Active MITM | Mitigated by identity-key signature verification and peer fingerprint pinning. |
 | Endpoint compromise / key theft | Out of scope: no HSM/TPM binding yet. |
 | Traffic-analysis / DPI | Out of scope: no fingerprint parity yet. |
