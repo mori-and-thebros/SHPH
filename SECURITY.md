@@ -39,7 +39,8 @@ OSS validation only.**
   HKDF session-key derivation.
 - ChaCha20-Poly1305 AEAD framing on the TCP data plane.
 - AEAD nonce anti-replay: the receiver rejects replayed or out-of-order counter
-  nonces (fail-closed).
+  nonces via a sliding bitmap window (fail-closed); the send counter also stops
+  at the AEAD nonce limit to make nonce reuse impossible.
 - Bounded handshake attempts on the TCP accept path (drops malformed/early-
   closing/wrong-key peers, fails closed).
 - Fail-closed IO: EOF/broken-pipe/timeout/errors terminate the session rather
@@ -66,7 +67,7 @@ these until the corresponding roadmap phase ships and is independently reviewed:
 | Threat | Status |
 | ------ | ------ |
 | Passive eavesdropper on the wire | Mitigated: AEAD-encrypted data plane. |
-| Replay of a captured data frame | Mitigated: receiver-side nonce anti-replay (fail-closed). |
+| Replay of a captured data frame | Mitigated: receiver-side sliding-window nonce anti-replay (fail-closed); send-side nonce-limit guard prevents nonce reuse. |
 | Tampered/truncated frames | Mitigated: AEAD authentication + length bounds + fail-closed decode. |
 | Unauthenticated handshake flood (resource exhaustion) | Partially mitigated: bounded accept loop + handshake timeouts; not a full DoS defense. |
 | Active MITM | Mitigated by identity-key signature verification and peer fingerprint pinning. |

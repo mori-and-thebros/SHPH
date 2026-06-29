@@ -43,7 +43,7 @@ independently reviewed. Marketing or implying any of these is a policy violation
 | Threat | Covered? | Mechanism |
 | ------ | -------- | --------- |
 | Passive wire eavesdropping | Yes | AEAD-encrypted data plane |
-| Frame replay | Yes | Receiver nonce anti-replay (fail-closed) |
+| Frame replay | Yes | Receiver sliding-window nonce anti-replay (fail-closed) + send-side nonce-limit guard |
 | Tampered/truncated frames | Yes | AEAD auth + length bounds + fail-closed decode |
 | Active MITM | Yes | Identity-key signature + peer fingerprint pinning |
 | Handshake flood | Partial | Bounded accept loop + handshake timeouts (not full DoS defense) |

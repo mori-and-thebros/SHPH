@@ -106,11 +106,37 @@ impl IdentityKeyPair {
         hasher.update(peer_public_raw);
         hasher.update(transcript);
         let expected = hasher.finalize();
-        if provided.as_slice() != expected.as_slice() {
+        if !constant_time_eq(provided.as_slice(), expected.as_slice()) {
             return Err(ShphError::Handshake("signature verification failed".into()));
         }
         Ok(())
     }
+}
+
+/// Constant-time equality check for secret/credential comparisons.
+///
+/// Returns `true` iff `a` and `b` are the same length and have identical bytes.
+/// The comparison runs in time independent of where (or whether) the first
+/// difference occurs, so it does not leak how much of a signature, digest, or
+/// fingerprint matched. Unequal lengths are reported as not-equal while still
+/// scanning to avoid a length-based timing oracle on the shorter input.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        // Still walk the longer input to avoid leaking the length relationship
+        // through early return; the result is fixed (mismatch).
+        let longest = if a.len() > b.len() { a } else { b };
+        let mut sink = 0u8;
+        for &byte in longest {
+            sink |= byte;
+        }
+        let _ = sink;
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl zeroize::Zeroize for IdentityKeyPair {
@@ -140,6 +166,12 @@ pub fn hkdf_sha256(input_key: &[u8], info: &[&[u8]], output_len: usize) -> Resul
     Ok(output)
 }
 
+/// Maximum AEAD counter nonce before the session MUST rekey. ChaCha20-Poly1305
+/// is safe for 2^32 messages under a single key; SHPH stops at one less than
+/// that to make nonce reuse via counter overflow impossible. Hitting this cap
+/// fails closed rather than wrapping the counter back to a reused nonce.
+pub const AEAD_NONCE_LIMIT: u64 = (1u64 << 32) - 1;
+
 /// ChaCha20-Poly1305 cipher for session encryption.
 pub struct SendCipher {
     key: [u8; 32],
@@ -153,6 +185,15 @@ impl SendCipher {
 
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         use chacha20poly1305::ChaCha20Poly1305;
+
+        // Fail closed before nonce reuse: once the counter reaches the limit,
+        // refuse to encrypt further. The caller must establish a new session
+        // (new key) rather than letting the 64-bit counter wrap.
+        if self.nonce >= AEAD_NONCE_LIMIT {
+            return Err(ShphError::Crypto(
+                "AEAD nonce limit reached; rekey required to avoid nonce reuse".into(),
+            ));
+        }
 
         let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
             .map_err(|e| ShphError::Crypto(e.to_string()))?;
@@ -231,35 +272,120 @@ fn nonce_counter(nonce_bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(buf))
 }
 
-/// Replay window for inbound messages.
+/// Sliding anti-replay window over the 64-bit counter nonce space.
+///
+/// Tracks the highest nonce seen plus a bitmap of the last `size` nonces below
+/// it. A nonce is rejected if it equals a previously-seen nonce, or if it falls
+/// below the bottom of the window (too old to distinguish from a replay
+/// safely). This replaces an earlier implementation that cleared the whole set
+/// when it filled, which dropped all protection across the clear boundary (a
+/// previously-seen nonce became acceptable again after the clear).
 pub struct ReplayWindow {
-    window: std::collections::HashSet<u64>,
+    /// Highest accepted nonce so far (None until the first valid nonce).
+    highest: Option<u64>,
+    /// Bitmap of accepted nonces within the window below `highest`. Bit `i`
+    /// (counting down from the top) is set when nonce `highest - 1 - i` has
+    /// been seen.
+    bits: Vec<u64>,
+    /// Window width in nonce units (a multiple of 64).
     size: usize,
 }
 
 impl ReplayWindow {
     pub fn new(size: usize) -> Self {
+        // At least one word (64 nonces) so the window is non-trivial and the
+        // word math is sound.
+        let size = size.max(64);
+        let words = size.div_ceil(64);
         Self {
-            window: std::collections::HashSet::new(),
-            size,
+            highest: None,
+            bits: vec![0u64; words],
+            size: words * 64,
         }
     }
 
+    /// Record `nonce` if it is fresh; return `true` if accepted, `false` if it
+    /// is a replay or falls below the window (too old to track safely).
     pub fn check_and_insert(&mut self, nonce: u64) -> bool {
-        if self.window.contains(&nonce) {
-            return false;
+        match self.highest {
+            None => {
+                self.highest = Some(nonce);
+                true
+            }
+            Some(highest) => {
+                if nonce > highest {
+                    // Advance the window. First record the previous highest as
+                    // seen (offset 0 == the nonce just below the new highest is
+                    // the old highest), then shift the bitmap down by the gap.
+                    // A gap larger than the window simply resets the bitmap.
+                    let gap = nonce - highest;
+                    if gap >= self.size as u64 {
+                        self.bits.iter_mut().for_each(|w| *w = 0);
+                    } else {
+                        self.shift_down(gap as usize);
+                        // After shifting, bit index (gap-1) corresponds to the
+                        // old highest; mark it seen so it cannot be replayed.
+                        let bit_index = (gap - 1) as usize;
+                        let word = bit_index / 64;
+                        let mask = 1u64 << (bit_index % 64);
+                        self.bits[word] |= mask;
+                    }
+                    self.highest = Some(nonce);
+                    true
+                } else {
+                    // Within or below the window. Reject if stale (at/below
+                    // the window bottom) or already seen.
+                    let offset = highest - nonce;
+                    if offset == 0 || offset > self.size as u64 {
+                        return false;
+                    }
+                    let bit_index = (offset - 1) as usize;
+                    let word = bit_index / 64;
+                    let mask = 1u64 << (bit_index % 64);
+                    if self.bits[word] & mask != 0 {
+                        return false;
+                    }
+                    self.bits[word] |= mask;
+                    true
+                }
+            }
         }
-        self.window.insert(nonce);
-        if self.window.len() > self.size {
-            self.window.clear();
+    }
+
+    /// Shift the bitmap down by `gap` positions, dropping the lowest `gap`
+    /// nonces (they fall out of the window). Requires `gap < size`.
+    fn shift_down(&mut self, gap: usize) {
+        let word_shift = gap / 64;
+        let bit_shift = gap % 64;
+        let words = self.bits.len();
+        let mut out = vec![0u64; words];
+        if bit_shift == 0 {
+            for i in 0..words {
+                if i + word_shift < words {
+                    out[i + word_shift] = self.bits[i];
+                }
+            }
+        } else {
+            for i in 0..words {
+                let lo = self.bits[i] << bit_shift;
+                if i + word_shift < words {
+                    out[i + word_shift] |= lo;
+                }
+                let hi = self.bits[i] >> (64 - bit_shift);
+                if i + word_shift + 1 < words {
+                    out[i + word_shift + 1] |= hi;
+                }
+            }
         }
-        true
+        self.bits = out;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{nonce_counter, ReceiveCipher, SendCipher};
+    use super::{
+        constant_time_eq, nonce_counter, ReceiveCipher, ReplayWindow, SendCipher, AEAD_NONCE_LIMIT,
+    };
 
     #[test]
     fn send_and_receive_roundtrip_succeeds() {
@@ -339,5 +465,93 @@ mod tests {
     #[test]
     fn nonce_counter_rejects_short_input() {
         assert!(nonce_counter(&[0u8; 4]).is_err());
+    }
+
+    // --- Crypto-hardening regression tests ---
+
+    #[test]
+    fn replay_window_accepts_monotonic_nonces() {
+        let mut w = ReplayWindow::new(128);
+        assert!(w.check_and_insert(1));
+        assert!(w.check_and_insert(2));
+        assert!(w.check_and_insert(1_000_000));
+    }
+
+    #[test]
+    fn replay_window_rejects_exact_replay_within_window() {
+        let mut w = ReplayWindow::new(128);
+        w.check_and_insert(10);
+        w.check_and_insert(20);
+        // 10 is below the current highest (20) and within the window, and
+        // already seen -> rejected.
+        assert!(!w.check_and_insert(10), "replayed nonce must be rejected");
+        // A fresh nonce just below the highest, not yet seen, is accepted.
+        assert!(
+            w.check_and_insert(15),
+            "fresh in-window nonce must be accepted"
+        );
+    }
+
+    #[test]
+    fn replay_window_rejects_replay_after_many_advances() {
+        // Regression for the old clear-on-full bug: after the window advanced
+        // well past an old nonce, replaying that old nonce must STILL be
+        // rejected (it is below the window bottom, too old to be safe).
+        let mut w = ReplayWindow::new(128);
+        let old = 5;
+        w.check_and_insert(old);
+        // Advance far beyond the window width.
+        for n in (old + 1)..(old + 1 + 10_000) {
+            assert!(w.check_and_insert(n));
+        }
+        assert!(
+            !w.check_and_insert(old),
+            "old nonce below window must be rejected even after many advances"
+        );
+    }
+
+    #[test]
+    fn replay_window_rejects_zero_offset_duplicate_at_highest() {
+        let mut w = ReplayWindow::new(128);
+        w.check_and_insert(42);
+        // Equal to highest -> duplicate, rejected.
+        assert!(!w.check_and_insert(42));
+    }
+
+    #[test]
+    fn send_cipher_fails_closed_at_nonce_limit() {
+        let mut sender = SendCipher::new([0x77u8; 32]);
+        // Fast-forward the counter to the limit.
+        sender.nonce = AEAD_NONCE_LIMIT;
+        let res = sender.encrypt(b"one-too-many");
+        assert!(
+            res.is_err(),
+            "encrypt must fail closed at the nonce limit to prevent nonce reuse"
+        );
+    }
+
+    #[test]
+    fn send_cipher_encrypts_just_below_limit() {
+        let mut sender = SendCipher::new([0x88u8; 32]);
+        sender.nonce = AEAD_NONCE_LIMIT - 1;
+        // The last allowed encryption (nonce = LIMIT-1) must succeed; the next
+        // would hit the guard.
+        assert!(sender.encrypt(b"last-one").is_ok());
+        assert!(sender.encrypt(b"overflow").is_err());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_semantics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_prefix() {
+        // A matching prefix must not be reported as equal.
+        assert!(!constant_time_eq(b"signature-v1", b"signature-v2"));
     }
 }

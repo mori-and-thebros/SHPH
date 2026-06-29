@@ -27,6 +27,31 @@ the phase-gated funding roadmap in `ROADMAP_OSS_AND_DELIVERY.md`.
   never invoked by SHPH). 2 transitive warnings (`paste`, `lru`) accepted and
   documented; both isolated to the optional TUI.
 
+## [Hardening] — Crypto data-plane hardening (2026-06-30)
+
+Concrete security hardening of `shph-core/src/crypto.rs`, each with a
+regression test. This is the first increment of the post-funding hardening
+track (Optional/Research), not a funding-gate phase.
+
+### Security
+- **Anti-replay window correctness:** `ReplayWindow` was a `HashSet` that
+  cleared the whole set when it filled, dropping protection across the clear
+  boundary (a previously-seen nonce became acceptable again). Replaced with a
+  proper sliding bitmap window over the 64-bit counter space; the previous
+  highest nonce is recorded as seen on every advance, so it cannot be replayed.
+- **Nonce-reuse prevention:** `SendCipher` now fails closed at `AEAD_NONCE_LIMIT`
+  (`2^32 - 1`) instead of letting the 64-bit counter wrap and reuse nonce 0
+  (which would catastrophically break ChaCha20-Poly1305). The session must
+  rekey rather than overflow.
+- **Timing-safe verification:** handshake signature comparison now uses a
+  constant-time equality check (`constant_time_eq`) instead of `!=`, removing a
+  timing oracle on how much of the signature digest matched.
+
+### Tests
+- 8 new regression tests in `shph-core` (replay-window boundary, replay after
+  many advances, nonce-limit fail-closed, constant-time eq semantics/prefix).
+- `shph-core` unit tests: 19 -> 27.
+
 Gates referenced below: `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace` (0 failed), `cargo build --workspace --locked`.
