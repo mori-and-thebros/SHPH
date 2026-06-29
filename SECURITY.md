@@ -45,6 +45,9 @@ OSS validation only.**
   closing/wrong-key peers, fails closed).
 - Fail-closed IO: EOF/broken-pipe/timeout/errors terminate the session rather
   than corrupting state.
+- Secret-at-rest hygiene: the keystore (private identity key) is written
+  owner-only (mode 0600 on Unix) via an atomic temp+rename, and loading refuses
+  a group/other-accessible key file rather than silently using a leaked key.
 - Atomic control-plane apply with preflight validation and best-effort rollback.
 - Graceful SIGINT/SIGTERM shutdown on Unix.
 

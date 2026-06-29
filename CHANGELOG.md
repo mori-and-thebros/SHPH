@@ -52,6 +52,27 @@ track (Optional/Research), not a funding-gate phase.
   many advances, nonce-limit fail-closed, constant-time eq semantics/prefix).
 - `shph-core` unit tests: 19 -> 27.
 
+## [Hardening] — Keystore secret hygiene (2026-06-30)
+
+Hardening of `shph-core/src/keystore.rs` (private identity-key storage). Second
+increment of the Optional/Research hardening track.
+
+### Security
+- **Private-key file permissions:** the keystore (holding the X25519 private
+  key) is now written with mode `0600` on Unix (owner-only) instead of the
+  process-umask default (often world-readable `0644`).
+- **Leaky-file refusal:** `load` now rejects a keystore that is group/other
+  accessible, failing closed rather than silently using a leaked key.
+- **Bounded load:** keystore load is capped at 1 MiB (`MAX_KEYSTORE_BYTES`) and
+  enforces UTF-8, so a hostile/giant file cannot force a large allocation.
+- **Atomic save:** the keystore is written to a temp file beside the target,
+  fsynced, then renamed into place — a crash mid-write can no longer leave a
+  truncated/corrupt key file.
+
+### Tests
+- 5 new keystore regression tests (roundtrip, 0600 perms, leaky-file refusal,
+  oversized-file rejection, no leftover temp files). `shph-core` 27 -> 32.
+
 Gates referenced below: `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace` (0 failed), `cargo build --workspace --locked`.
