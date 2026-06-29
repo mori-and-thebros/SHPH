@@ -80,18 +80,19 @@ The manifest is the human-readable counterpart to the git tag. Until the tree
 tag is the authoritative artifact. Current latest:
 
 ```text
-Checkpoint : checkpoint-phaseA-1.0.0  (Phase A complete + Phase B.1)
-Status     : Phase A COMPLETE (5/5); Phase B.1 COMPLETE
+Checkpoint : checkpoint-phaseB-1.0.0  (Phase A + Phase B complete)  [LATEST]
+Status     : Phase A COMPLETE (5/5); Phase B (B.1+B.2) COMPLETE
 Date (UTC) : 2026-06-29
-Tag        : checkpoint-phaseA-1.0.0  (annotated)
-Points at  : the commit this manifest lives in (git rev-parse checkpoint-phaseA-1.0.0)
-Prior base : e0a5949 (initial Phase A + B.1 commit)
+Tag        : checkpoint-phaseB-1.0.0  (annotated)
+Points at  : the commit this manifest lives in (git rev-parse checkpoint-phaseB-1.0.0)
 Trees      : /home/mori/SHPH_working_copy  (canonical Linux)
             D:\FUNDING NEEDED\snap-shroud-rs  (Windows mirror)
 Parity     : verified via scripts/sync_mirror.sh --verify
-Gates      : fmt clean · clippy clean (0 warnings) · test 0 failed · build --locked OK
-Evidence   : docs/evidence/GATE_EVIDENCE.md
+Gates      : fmt clean · clippy clean (0 warnings) · test 0 failed · build --locked OK · cargo audit 0 vulns
+Evidence   : docs/evidence/GATE_EVIDENCE.md, docs/evidence/CARGO_AUDIT.txt
 Demo       : scripts/demo.sh all (happy / bad-cidr / unreachable)
+
+Prior checkpoint: checkpoint-phaseA-1.0.0  (Phase A + B.1; base commit e0a5949)
 ```
 
 Update this manifest block in place at every checkpoint.
