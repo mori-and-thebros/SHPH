@@ -13,4 +13,4 @@ path = "src/main.rs"
 shph-config = { path = "../shph-config" }
 shph-core = { path = "../shph-core" }
 crossterm = "0.27"
-ratatui = "0.27"
+ratatui = "0.28"

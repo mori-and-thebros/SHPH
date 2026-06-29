@@ -310,5 +310,54 @@ Validation commands executed and passing in this environment:
 ## Phase B.1 — COMPLETE
 
 All four B.1 tasks and evidence items are satisfied in the working copy.
-Remaining: B.2 (Stability Before Feature Expansion) is the next locked phase
-per `ROADMAP_OSS_AND_DELIVERY.md`.
+
+### Phase B.2 — Stability Before Feature Expansion (Complete)
+
+**Status:** Complete (2026-06-29)
+
+#### Tasks
+
+1. Freeze API changes during validation window.
+2. Add bug bounty-safe report template and triage SLA.
+3. Resolve high-impact/low-effort CVE-risk issues identified by scanners.
+
+#### Completion Evidence (2026-06-29)
+
+1. **API freeze:** `docs/API_STABILITY.md` defines the three public-API tiers
+   (CLI, config schema, library crates), SemVer `0.x` posture, and the rules
+   that hold during a validation window — no breaking CLI/config changes,
+   library breaks only with CHANGELOG rationale, security fixes override.
+2. **Bug-bounty template + triage SLA:** `docs/SECURITY_REPORTING.md` ships a
+   structured redactable report template (with safe-sharing rule) and a
+   severity-based triage rubric (Critical/High/Medium/Low) with ack/fix SLAs,
+   complementing `SECURITY.md`'s 5-day/90-day disclosure window.
+3. **Scanner-driven fixes:** `cargo-audit` run against 178 dependencies.
+   - Fixed the one direct finding: `anyhow 1.0.102 -> 1.0.103`
+     (RUSTSEC-2026-0190 unsound `downcast_mut`, never called by SHPH).
+   - Accepted 2 transitive warnings (`paste`, `lru`) isolated to the optional
+     TUI via `ratatui`; both documented in `docs/SUPPLY_CHAIN_SCAN.md`.
+   - Bumped `ratatui 0.27 -> 0.28.1`; fixed the deprecated `frame.size()` ->
+     `frame.area()` it introduced.
+   - `cargo audit` wired into CI (`.github/workflows/ci.yml`, non-blocking).
+   - Captured output in `docs/evidence/CARGO_AUDIT.txt`.
+
+#### Exit Criteria Check
+
+- API changes frozen during validation window (policy documented): yes.
+- Bug bounty-safe report template + triage SLA: yes.
+- High-impact/low-effort scanner issues resolved: yes (direct dep fixed;
+  transitive findings triaged + documented; result 0 vulnerabilities).
+
+Validation commands executed and passing in this environment:
+- `cargo fmt --all -- --check` (clean)
+- `cargo clippy --workspace --all-targets -- -D warnings` (clean)
+- `cargo test --workspace` (0 failed)
+- `cargo audit` (0 vulnerabilities; 2 accepted transitive warnings)
+- `cargo build --workspace --locked` (OK)
+
+---
+
+## Phase B.2 — COMPLETE
+
+All three B.2 tasks and evidence items are satisfied. With B.1 and B.2 done,
+**Phase B (Funding Validation & Audit Preparation) is COMPLETE.**

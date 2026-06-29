@@ -4,6 +4,29 @@ All notable changes to SHPH are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) principles, adapted to
 the phase-gated funding roadmap in `ROADMAP_OSS_AND_DELIVERY.md`.
 
+## [Phase B.2] — Stability Before Feature Expansion (2026-06-29)
+
+### Added
+- `docs/API_STABILITY.md` — public-API tiers (CLI / config / library), SemVer
+  posture, and validation-window freeze rules.
+- `docs/SECURITY_REPORTING.md` — bug-bounty-safe redactable report template +
+  severity-based triage SLA (complements `SECURITY.md`).
+- `docs/SUPPLY_CHAIN_SCAN.md` — `cargo-audit` scanner procedure + advisory triage.
+- `docs/evidence/CARGO_AUDIT.txt` — captured advisory-scan output.
+- `cargo audit` job in `.github/workflows/ci.yml` (non-blocking, periodic).
+
+### Changed
+- `anyhow` bumped `1.0.102 -> 1.0.103` (RUSTSEC-2026-0190, direct dep).
+- `ratatui` bumped `0.27 -> 0.28.1` in `shph-tui` (transitive advisory hygiene).
+
+### Fixed
+- `shph-tui/src/main.rs`: deprecated `frame.size()` -> `frame.area()` (ratatui 0.28).
+
+### Security
+- Resolved the one direct scanner finding (`anyhow` unsound `downcast_mut`,
+  never invoked by SHPH). 2 transitive warnings (`paste`, `lru`) accepted and
+  documented; both isolated to the optional TUI.
+
 Gates referenced below: `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace` (0 failed), `cargo build --workspace --locked`.

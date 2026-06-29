@@ -31,7 +31,11 @@ This repository is an active prototype-to-production hardening effort with stric
   `scripts/capture_evidence.sh` (writes `docs/evidence/GATE_EVIDENCE.md`),
   `docs/RELEASE_PROCEDURE.md`, `docs/LEGAL_COMPLIANCE.md`, `CHANGELOG.md`.
   The tree is now a git repository; the first checkpoint tag
-  `checkpoint-phaseA-1.0.0` (commit `e0a5949`) closes Phase A + Phase B.1.
+  `checkpoint-phaseA-1.0.0` closes Phase A + Phase B.1.
+- Phase B.2 (Stability Before Feature Expansion): **Complete**. Added
+  `docs/API_STABILITY.md`, `docs/SECURITY_REPORTING.md`, `docs/SUPPLY_CHAIN_SCAN.md`;
+  fixed the direct `anyhow` scanner finding (1.0.102->1.0.103), bumped
+  `ratatui` 0.27->0.28.1, wired `cargo audit` into CI. **Phase B is COMPLETE.**
 - Completed improvements are present in both trees; do not revert test skip guards unless host policy is confirmed and safe.
 
 ## Next engineer starting points

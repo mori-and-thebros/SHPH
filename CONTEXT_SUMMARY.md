@@ -63,10 +63,18 @@
   here); Windows target not `cargo check`-able in this sandbox.
 - This sandbox sometimes denies loopback; transport tests have skip-guards.
 
-## Next: Phase B.2 — Stability Before Feature Expansion
-- Locked; awaits sign-off. Phase B.1 (External Review Readiness) is COMPLETE.
-- B.2 scope: freeze API changes during validation, bug-bounty-safe report
-  template + triage SLA, resolve high-impact/low-effort scanner-flagged issues.
+## Phase B.2 completion (2026-06-29) — Stability Before Feature Expansion
+- `docs/API_STABILITY.md`: API tiers + validation-window freeze rules.
+- `docs/SECURITY_REPORTING.md`: bug-bounty-safe report template + triage SLA.
+- `docs/SUPPLY_CHAIN_SCAN.md` + `docs/evidence/CARGO_AUDIT.txt`: cargo-audit
+  scan of 178 deps -> 0 vulnerabilities; direct `anyhow` finding fixed
+  (1.0.102->1.0.103), 2 transitive warnings (`paste`,`lru`) accepted (optional TUI).
+- `ratatui` 0.27->0.28.1; `frame.size()`->`frame.area()`; `cargo audit` in CI.
+
+## Next
+- **Phase B is COMPLETE (B.1 + B.2).** Next roadmap item is the Optional /
+  Research Track (transport fingerprint shaping, QUIC hardening) — explicitly
+  NOT part of mandatory funding readiness.
 
 ## Phase B.1 completion (2026-06-29) — External Review Readiness
 - `scripts/demo.sh`: reproducible loopback demos (happy / bad-cidr / unreachable).

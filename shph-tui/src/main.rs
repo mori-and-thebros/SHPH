@@ -70,7 +70,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
             Constraint::Min(8),
             Constraint::Length(3),
         ])
-        .split(frame.size());
+        .split(frame.area());
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled("SHPH TUI", Style::default().fg(Color::Cyan)),

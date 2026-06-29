@@ -72,3 +72,18 @@ jobs:
         run: cargo build -p shph-cli
       - name: smoke (requires CAP_NET_ADMIN; may be skipped by host policy)
         run: SHPH_TUN_NATIVE=1 cargo test -p shph-tun
+
+  # Periodic supply-chain advisory scan (Phase B.2). Non-blocking by default:
+  # continue-on-error so a fresh advisory does not fail the build/test matrix.
+  # Remove continue-on-error once a zero-warning baseline is enforced.
+  audit:
+    name: cargo audit (advisory scan)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit
