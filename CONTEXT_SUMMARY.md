@@ -74,7 +74,8 @@
   `docs/evidence/GATE_EVIDENCE.md` with summed totals (fmt clean, clippy 0
   warnings, test 0 failed, `--locked` build OK).
 - `docs/RELEASE_PROCEDURE.md`: funding-checkpoint tagging procedure + manifest
-  (caveat: tree not yet a git repository, so no git tag yet).
+  Tree is now a git repository; checkpoint tag `checkpoint-phaseA-1.0.0`
+  (commit `e0a5949`) is cut.
 - `docs/LEGAL_COMPLIANCE.md`: OSS artifact legal/compliance checklist.
 - `CHANGELOG.md`: phase-anchored changelog.
 - README doc index, `docs/FUNDING_SPRINT_BOARD.md`, `agents.md` updated.

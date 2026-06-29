@@ -5,7 +5,8 @@
 #   - Linux working copy: /home/mori/SHPH_working_copy   (this WSL home)
 #   - Windows mirror:     D:\FUNDING NEEDED\snap-shroud-rs  (mounted at /mnt/d)
 #
-# Neither is a git repo yet, so this uses rsync to produce a true mirror.
+# Both trees are git repositories; .git/ is mirrored so tag/history/HEAD
+# are identical on both sides (a true mirror).
 #
 # Usage:
 #   scripts/sync_mirror.sh                 # auto-detect side, mirror source<->dest
@@ -23,9 +24,9 @@ LINUX_DIR="/home/mori/SHPH_working_copy"
 WINDOWS_MIRROR="/mnt/d/FUNDING NEEDED/snap-shroud-rs"
 
 # Paths never mirrored: build output, lockfile (platform-specific), local-only dirs.
+# NOTE: .git/ IS mirrored so both trees share tag/history/HEAD (true mirror).
 EXCLUDES=(
   --exclude='target/'
-  --exclude='.git/'
   --exclude='Cargo.lock'
   --exclude='THE WORKING ONE/'
   --exclude='.agents/'

@@ -30,9 +30,8 @@ This repository is an active prototype-to-production hardening effort with stric
 - Phase B.1 (External Review Readiness): **Complete**. Added `scripts/demo.sh`,
   `scripts/capture_evidence.sh` (writes `docs/evidence/GATE_EVIDENCE.md`),
   `docs/RELEASE_PROCEDURE.md`, `docs/LEGAL_COMPLIANCE.md`, `CHANGELOG.md`.
-  Caveat: the tree is **not yet a git repository**, so funding-checkpoint git
-  tags cannot be created yet — the manifest in `docs/RELEASE_PROCEDURE.md`
-  stands in for a tag.
+  The tree is now a git repository; the first checkpoint tag
+  `checkpoint-phaseA-1.0.0` (commit `e0a5949`) closes Phase A + Phase B.1.
 - Completed improvements are present in both trees; do not revert test skip guards unless host policy is confirmed and safe.
 
 ## Next engineer starting points
@@ -42,8 +41,9 @@ This repository is an active prototype-to-production hardening effort with stric
    there to confirm parity.
 2. Re-run `./scripts/capture_evidence.sh` after any change so
    `docs/evidence/GATE_EVIDENCE.md` stays current.
-3. Once the tree is placed under git, cut the `checkpoint-phaseA-1.0.0` tag per
-   `docs/RELEASE_PROCEDURE.md` (the manifest currently stands in for the tag).
+3. The first checkpoint `checkpoint-phaseA-1.0.0` (commit `e0a5949`) is cut.
+   Future checkpoints: refresh evidence + changelog, then
+   `git tag -a checkpoint-phaseX-Y.Y.Z` per `docs/RELEASE_PROCEDURE.md`.
 4. Wire Windows graceful shutdown (`SetConsoleCtrlHandler` via `windows-sys`) - the
    tracked A.2 follow-up; needs the Windows toolchain to verify.
 5. Next roadmap phase is **B.2 (Stability Before Feature Expansion)** — still locked

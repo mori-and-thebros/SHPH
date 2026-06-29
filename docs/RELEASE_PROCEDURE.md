@@ -39,11 +39,10 @@ authoritative tags.** Each checkpoint tag carries the roadmap phase it closes.
 
 ## 3. Cutting a checkpoint (procedure)
 
-> **Environment caveat:** This project tree is **not yet a git repository**
-> (`git rev-parse` fails in the current working copy). The steps below are the
-> canonical procedure to run once the tree is under git. Until then, the
-> funding-checkpoint manifest (section 4) stands in for a tag and must be
-> committed alongside the checkpoint.
+> **Note:** This project tree is now a git repository. The first checkpoint
+> tag `checkpoint-phaseA-1.0.0` (commit `e0a5949`) closes Phase A + Phase B.1.
+> Future checkpoints follow the procedure below; the manifest in section 4 is
+> the human-readable counterpart to each tag.
 
 1. **Verify gates.** From the workspace root run, in order:
    ```bash
@@ -78,19 +77,20 @@ authoritative tags.** Each checkpoint tag carries the roadmap phase it closes.
 ## 4. Funding-checkpoint manifest
 
 The manifest is the human-readable counterpart to the git tag. Until the tree
-is under git, the manifest is the authoritative artifact. Current latest:
+tag is the authoritative artifact. Current latest:
 
 ```text
-Checkpoint : checkpoint-phaseA-1.0.0  (end of Phase A)
-Status     : Phase A COMPLETE (5/5); Phase B.1 IN PROGRESS
+Checkpoint : checkpoint-phaseA-1.0.0  (Phase A complete + Phase B.1)
+Status     : Phase A COMPLETE (5/5); Phase B.1 COMPLETE
 Date (UTC) : 2026-06-29
+Commit     : e0a594951e7365783564ba4e9063284d4536fdf3  (short: e0a5949)
+Tag        : checkpoint-phaseA-1.0.0  (annotated)
 Trees      : /home/mori/SHPH_working_copy  (canonical Linux)
             D:\FUNDING NEEDED\snap-shroud-rs  (Windows mirror)
 Parity     : verified via scripts/sync_mirror.sh --verify
 Gates      : fmt clean · clippy clean (0 warnings) · test 0 failed · build --locked OK
 Evidence   : docs/evidence/GATE_EVIDENCE.md
 Demo       : scripts/demo.sh all (happy / bad-cidr / unreachable)
-Git tag    : PENDING — tree is not yet a git repository; see section 3 caveat
 ```
 
 Update this manifest block in place at every checkpoint.
