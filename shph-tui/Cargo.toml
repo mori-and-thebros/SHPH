@@ -1,0 +1,16 @@
+[package]
+name = "shph-tui"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Optional terminal UI for SHPH operations"
+
+[[bin]]
+name = "shph-tui"
+path = "src/main.rs"
+
+[dependencies]
+shph-config = { path = "../shph-config" }
+shph-core = { path = "../shph-core" }
+crossterm = "0.27"
+ratatui = "0.27"

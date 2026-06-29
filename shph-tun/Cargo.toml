@@ -1,0 +1,10 @@
+[package]
+name = "shph-tun"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "TUN device abstraction for SHPH"
+
+[dependencies]
+shph-core = { path = "../shph-core" }
+libc = { workspace = true }

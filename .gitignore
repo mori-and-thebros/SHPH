@@ -1,0 +1,17 @@
+# Build artifacts
+/target/
+**/target/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Stray working dirs (kept locally, not versioned)
+/THE WORKING ONE/
+
+# Per-agent local state
+.agents/
+.codex/
+.gapcode/

@@ -1,0 +1,11 @@
+[package]
+name = "shph-transport"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Transport abstraction interfaces for SHPH"
+
+[dependencies]
+shph-core = { path = "../shph-core" }
+serde_json = { workspace = true }
+base64 = { workspace = true }
