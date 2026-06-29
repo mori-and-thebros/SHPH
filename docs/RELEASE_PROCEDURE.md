@@ -83,8 +83,9 @@ tag is the authoritative artifact. Current latest:
 Checkpoint : checkpoint-phaseA-1.0.0  (Phase A complete + Phase B.1)
 Status     : Phase A COMPLETE (5/5); Phase B.1 COMPLETE
 Date (UTC) : 2026-06-29
-Commit     : e0a594951e7365783564ba4e9063284d4536fdf3  (short: e0a5949)
 Tag        : checkpoint-phaseA-1.0.0  (annotated)
+Points at  : the commit this manifest lives in (git rev-parse checkpoint-phaseA-1.0.0)
+Prior base : e0a5949 (initial Phase A + B.1 commit)
 Trees      : /home/mori/SHPH_working_copy  (canonical Linux)
             D:\FUNDING NEEDED\snap-shroud-rs  (Windows mirror)
 Parity     : verified via scripts/sync_mirror.sh --verify
