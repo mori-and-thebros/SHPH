@@ -8,9 +8,8 @@ review).
 
 ## 1. Current versioning
 
-- Workspace version: `0.2.0` (see root `Cargo.toml`). Released at tag
-  `v0.2.0`; the first versioned release line. Prior `0.1.0` was never tagged
-  as a release (only as funding checkpoints).
+- Workspace version: `0.3.0` (see root `Cargo.toml`). `v0.3.0` made the
+  handshake signature a real Ed25519 signature (breaking protocol bump `shph/3`).
 - SHPH is **pre-1.0.** Per SemVer, `0.x.y` changes may break the API in any
   `0.minor` bump. This document narrows that freedom during validation windows.
 

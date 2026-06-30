@@ -1,32 +1,35 @@
 # Changelog
 
-## [0.2.0] — First versioned release: security hardening (2026-06-30)
+## [0.3.0] — Real Ed25519 handshake authentication (BREAKING, 2026-06-30)
 
-`v0.2.0` is the first SemVer release line. It bundles the three Optional/Research
-hardening increments (previously tagged `hardening-1/2/3`) on top of the
-Phase A + Phase B funding-readiness baseline. See `docs/HARDENING.md` for the
-full summary and threat-table impact.
+### Security (critical fix)
+- **The handshake "signature" was not a real signature.** `sign_handshake`
+  computed `SHA256(public-key || transcript)` and verify compared that hash — a
+  digest of purely public data with no private-key operation. Anyone could forge
+  a valid `sig`, so the handshake had **no authentication / no MITM resistance**.
+- Replaced with a **real Ed25519 detached signature** via `ring`. Each identity
+  now carries an independent Ed25519 keypair (in addition to the X25519 DH key).
+  The signature binds the X25519 identity key, the Ed25519 signing key, the
+  ephemeral key, the nonce, and the timestamp, so the keys cannot be swapped by
+  a MITM. Only the holder of the peer's Ed25519 private key can complete the
+  handshake.
 
-### Security
-- Crypto data-plane: sliding anti-replay window, AEAD nonce-limit reuse guard,
-  constant-time signature verification (`shph-core/src/crypto.rs`).
-- Keystore secret hygiene: owner-only (0600) perms, leaky-file refusal, bounded
-  + atomic save (`shph-core/src/keystore.rs`).
-- Transport DoS: per-source-IP connection rate limiting, anti-slowloris chunked
-  hello read (`shph-transport/src/lib.rs`).
+### Breaking changes
+- Protocol tag bumped `shph/2` -> `shph/3`; `Hello` gains a `sign_pub_b64`
+  field. Old and new peers are not wire-compatible.
+- Keystore gains a persisted Ed25519 signing seed (`sign_seed_b64`); pre-0.3
+  keystores load with a fallback signing key and should be re-`init`ed.
 
 ### Changed
-- Workspace version `0.1.0` -> `0.2.0` (all crates inherit via `{ workspace = true }`).
-- `anyhow` 1.0.102 -> 1.0.103, `ratatui` 0.27 -> 0.28.1 (scanner-driven).
-- Removed orphaned, never-compiled root `src/crypto.rs` + `src/error.rs`.
+- Workspace version `0.2.0` -> `0.3.0`.
+- `SECURITY.md` corrected: the "Ed25519-style handshake signatures" claim is now
+  genuinely true (previously aspirational), and the MITM threat row reflects the
+  real public-key signature.
 
 ### Tests
-- +16 regression tests across the three increments.
-  `shph-core` 19 -> 32; `shph-transport` 1 -> 4.
-
-### Tags
-- `v0.2.0` (this release). Prior milestones: `checkpoint-phaseA-1.0.0`,
-  `checkpoint-phaseB-1.0.0`, `hardening-1`, `hardening-2`, `hardening-3`.
+- +4 handshake authentication regression tests: real sig verifies; forged
+  impersonation rejected; tampered signature bytes rejected; swapped signing key
+  rejected. `handshake_flow` 2 -> 6.
 
 All notable changes to SHPH are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) principles, adapted to

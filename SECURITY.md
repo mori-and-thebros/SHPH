@@ -35,8 +35,9 @@ OSS validation only.**
 
 ### What works today
 
-- X25519 identity keys, Ed25519-style handshake signatures, transcript-bound
-  HKDF session-key derivation.
+- X25519 identity keys for DH **plus** a separate Ed25519 key that produces a
+  real detached signature over the handshake transcript (identity + signing key
+  + ephemeral + nonce + timestamp), transcript-bound HKDF session-key derivation.
 - ChaCha20-Poly1305 AEAD framing on the TCP data plane.
 - AEAD nonce anti-replay: the receiver rejects replayed or out-of-order counter
   nonces via a sliding bitmap window (fail-closed); the send counter also stops
@@ -73,7 +74,7 @@ these until the corresponding roadmap phase ships and is independently reviewed:
 | Replay of a captured data frame | Mitigated: receiver-side sliding-window nonce anti-replay (fail-closed); send-side nonce-limit guard prevents nonce reuse. |
 | Tampered/truncated frames | Mitigated: AEAD authentication + length bounds + fail-closed decode. |
 | Unauthenticated handshake flood (resource exhaustion) | Mitigated: bounded accept loop + handshake timeouts + per-source-IP connection rate limiting; not a full DoS defense against a distributed flood. |
-| Active MITM | Mitigated by identity-key signature verification and peer fingerprint pinning. |
+| Active MITM | Mitigated by Ed25519 transcript signature verification + peer fingerprint pinning (only the holder of the peer's Ed25519 private key can complete the handshake). |
 | Endpoint compromise / key theft | Out of scope: no HSM/TPM binding yet. |
 | Traffic-analysis / DPI | Out of scope: no fingerprint parity yet. |
 | Host privilege escalation via control-plane apply | Mitigated by dry-run default, preflight validation, and OS privilege requirements. |

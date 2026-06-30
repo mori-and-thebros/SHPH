@@ -32,6 +32,11 @@ pub struct KeyStoreConfig {
 struct StoredKeyStore {
     identity_private_b64: String,
     identity_public_b64: String,
+    /// Ed25519 signing seed. Absent in pre-v0.3 keystores; on load it falls
+    /// back to the X25519 DH seed, so an upgraded old identity can still verify
+    /// peers but should be re-`init`ed to obtain a distinct signing key.
+    #[serde(default)]
+    sign_seed_b64: Option<String>,
     contacts: HashMap<String, Contact>,
     config: KeyStoreConfig,
 }
@@ -74,6 +79,7 @@ impl KeyStore {
         let stored = StoredKeyStore {
             identity_private_b64: self.identity.private_key_b64(),
             identity_public_b64: self.identity.public_key_b64(),
+            sign_seed_b64: Some(self.identity.signing_seed_b64()),
             contacts: self.contacts.clone(),
             config: self.config.clone(),
         };
@@ -110,10 +116,25 @@ impl KeyStore {
         if config.password.is_none() {
             config.password = password.map(ToOwned::to_owned);
         }
-        let identity = IdentityKeyPair::from_base64(
-            &stored.identity_private_b64,
-            Some(&stored.identity_public_b64),
-        )?;
+        let identity = match &stored.sign_seed_b64 {
+            Some(seed_b64) => {
+                let dh_seed = base64_decode_32(&stored.identity_private_b64, "identity private")?;
+                let sign_seed = base64_decode_32(seed_b64, "signing seed")?;
+                let id = IdentityKeyPair::from_seeds(dh_seed, sign_seed);
+                // Verify the stored X25519 public key matches.
+                let stored_pub = base64_decode_32(&stored.identity_public_b64, "identity public")?;
+                if id.public_key_bytes() != stored_pub {
+                    return Err(ShphError::Crypto(
+                        "public key does not match private key".into(),
+                    ));
+                }
+                id
+            }
+            None => IdentityKeyPair::from_base64(
+                &stored.identity_private_b64,
+                Some(&stored.identity_public_b64),
+            )?,
+        };
         Ok(Self {
             identity,
             contacts: stored.contacts,
@@ -212,6 +233,16 @@ fn assert_secret_file_perms(path: &Path) -> Result<()> {
         let _ = path;
     }
     Ok(())
+}
+
+/// Decode a base64 string into exactly 32 bytes.
+fn base64_decode_32(b64: &str, label: &str) -> Result<[u8; 32]> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|_| ShphError::Crypto(format!("invalid {label} base64")))?;
+    raw.try_into()
+        .map_err(|_| ShphError::Crypto(format!("{label} must be 32 bytes")))
 }
 
 pub fn compute_fingerprint_hex(public_key_raw: &[u8]) -> String {

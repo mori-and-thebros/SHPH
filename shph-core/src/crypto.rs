@@ -6,17 +6,25 @@ use base64::Engine as _;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::KeyInit;
 use ring::rand::SystemRandom;
-use sha2::{Digest, Sha256};
+use ring::signature::KeyPair as _;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::error::{Result, ShphError};
 use crate::keystore::compute_fingerprint_hex;
 
-/// X25519 key pair for handshake and session key derivation.
+/// X25519 key pair for handshake and session key derivation, paired with an
+/// Ed25519 key pair used to authenticate the handshake transcript.
+///
+/// The two keys are independent (X25519 for DH, Ed25519 for signatures); both
+/// 32-byte seeds are persisted by the keystore. The Ed25519 signature binds the
+/// X25519 identity key, the ephemeral key, the nonce, the timestamp, and the
+/// Ed25519 public key itself, so the keys cannot be swapped by a MITM.
 #[derive(Clone)]
 pub struct IdentityKeyPair {
     private: StaticSecret,
     public: PublicKey,
+    signing: std::sync::Arc<ring::signature::Ed25519KeyPair>,
+    sign_seed: [u8; 32],
 }
 
 impl IdentityKeyPair {
@@ -24,15 +32,42 @@ impl IdentityKeyPair {
         let rng = SystemRandom::new();
         let mut private_bytes = [0u8; 32];
         ring::rand::SecureRandom::fill(&rng, &mut private_bytes)?;
-        let private = StaticSecret::from(private_bytes);
-        let public = PublicKey::from(&private);
-        Ok(Self { private, public })
+        // Independent Ed25519 signing seed (distinct from the X25519 DH seed).
+        let mut sign_seed = [0u8; 32];
+        ring::rand::SecureRandom::fill(&rng, &mut sign_seed)?;
+        Ok(Self::from_seeds(private_bytes, sign_seed))
     }
 
+    /// Reconstruct from the X25519 DH seed only. The Ed25519 signing seed is
+    /// taken as the same bytes (used when an old keystore lacks a separate
+    /// signing seed; such identities must be re-`init`ed to sign properly).
     pub fn from_private_key(private_bytes: [u8; 32]) -> Self {
-        let private = StaticSecret::from(private_bytes);
+        Self::from_seeds(private_bytes, private_bytes)
+    }
+
+    /// Reconstruct from independent X25519 (DH) and Ed25519 (signing) seeds.
+    pub fn from_seeds(dh_seed: [u8; 32], sign_seed: [u8; 32]) -> Self {
+        let private = StaticSecret::from(dh_seed);
         let public = PublicKey::from(&private);
-        Self { private, public }
+        let signing = std::sync::Arc::new(
+            ring::signature::Ed25519KeyPair::from_seed_unchecked(&sign_seed)
+                .expect("any 32 bytes is a valid Ed25519 seed"),
+        );
+        Self {
+            private,
+            public,
+            signing,
+            sign_seed,
+        }
+    }
+
+    /// The 32-byte Ed25519 signing seed, for keystore persistence.
+    pub fn signing_seed(&self) -> [u8; 32] {
+        self.sign_seed
+    }
+
+    pub fn signing_seed_b64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(self.sign_seed)
     }
 
     pub fn from_base64(private_b64: &str, public_b64: Option<&str>) -> Result<Self> {
@@ -76,6 +111,20 @@ impl IdentityKeyPair {
         base64::engine::general_purpose::STANDARD.encode(self.public.as_bytes())
     }
 
+    /// Ed25519 signing public key (32 bytes) used to verify handshake
+    /// signatures. Distinct from the X25519 DH public key.
+    pub fn signing_public_bytes(&self) -> [u8; 32] {
+        let p = self.signing.public_key().as_ref();
+        let mut out = [0u8; 32];
+        let n = p.len().min(32);
+        out[..n].copy_from_slice(&p[..n]);
+        out
+    }
+
+    pub fn signing_public_b64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(self.signing_public_bytes())
+    }
+
     pub fn fingerprint_hex(&self) -> String {
         compute_fingerprint_hex(self.public.as_bytes())
     }
@@ -84,32 +133,32 @@ impl IdentityKeyPair {
         self.private.diffie_hellman(peer_public).to_bytes()
     }
 
+    /// Sign the handshake transcript with the identity's Ed25519 key.
+    /// Returns the detached signature, base64-encoded.
     pub fn sign_handshake(&self, transcript: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(b"shph-handshake-sign-v1");
-        hasher.update(self.public.as_bytes());
-        hasher.update(transcript);
-        base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+        let sig = self.signing.sign(transcript);
+        base64::engine::general_purpose::STANDARD.encode(sig)
     }
 
+    /// Verify a peer's Ed25519 handshake signature over `transcript` using the
+    /// peer's Ed25519 signing public key (`peer_sign_public`). This is a true
+    /// public-key signature: only the holder of the peer's Ed25519 private key
+    /// can produce a signature that verifies, giving the handshake real
+    /// authentication and MITM resistance.
     pub fn verify_handshake_signature(
         &self,
         transcript: &[u8],
         signature_b64: &str,
-        peer_public_raw: &[u8; 32],
+        peer_sign_public: &[u8; 32],
     ) -> Result<()> {
-        let provided = base64::engine::general_purpose::STANDARD
+        let sig = base64::engine::general_purpose::STANDARD
             .decode(signature_b64.as_bytes())
             .map_err(|_| ShphError::Handshake("invalid signature encoding".into()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"shph-handshake-sign-v1");
-        hasher.update(peer_public_raw);
-        hasher.update(transcript);
-        let expected = hasher.finalize();
-        if !constant_time_eq(provided.as_slice(), expected.as_slice()) {
-            return Err(ShphError::Handshake("signature verification failed".into()));
-        }
-        Ok(())
+        let peer_key =
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, peer_sign_public);
+        peer_key
+            .verify(transcript, &sig)
+            .map_err(|_| ShphError::Handshake("signature verification failed".into()))
     }
 }
 

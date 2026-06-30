@@ -10,13 +10,16 @@ use crate::crypto::{hkdf_sha256, IdentityKeyPair, SessionKeys};
 use crate::error::{Result, ShphError};
 use crate::keystore::compute_fingerprint_hex;
 
-const HANDSHAKE_VERSION: u8 = 2;
-const PROTOCOL_TAG: &str = "shph/2";
+const HANDSHAKE_VERSION: u8 = 3;
+const PROTOCOL_TAG: &str = "shph/3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub proto: String,
     pub identity_pub_b64: String,
+    /// Ed25519 signing public key (base64). Bound into the signed payload so a
+    /// MITM cannot swap it for a different signing key.
+    pub sign_pub_b64: String,
     pub ephemeral_pub_b64: String,
     pub nonce_b64: String,
     pub timestamp_secs: u64,
@@ -60,9 +63,11 @@ pub fn build_hello(local_identity: &IdentityKeyPair) -> Result<HandshakeMaterial
         .map_err(|_| ShphError::Handshake("system clock before unix epoch".into()))?
         .as_secs();
 
+    let sign_pub = local_identity.signing_public_bytes();
     let mut signed_payload = Vec::new();
     signed_payload.extend_from_slice(PROTOCOL_TAG.as_bytes());
     signed_payload.extend_from_slice(local_identity.public().as_bytes());
+    signed_payload.extend_from_slice(&sign_pub);
     signed_payload.extend_from_slice(local_ephemeral.public().as_bytes());
     signed_payload.extend_from_slice(&local_nonce);
     signed_payload.extend_from_slice(&timestamp_secs.to_be_bytes());
@@ -72,6 +77,7 @@ pub fn build_hello(local_identity: &IdentityKeyPair) -> Result<HandshakeMaterial
         proto: PROTOCOL_TAG.to_string(),
         identity_pub_b64: base64::engine::general_purpose::STANDARD
             .encode(local_identity.public().as_bytes()),
+        sign_pub_b64: base64::engine::general_purpose::STANDARD.encode(sign_pub),
         ephemeral_pub_b64: base64::engine::general_purpose::STANDARD
             .encode(local_ephemeral.public().as_bytes()),
         nonce_b64: base64::engine::general_purpose::STANDARD.encode(local_nonce),
@@ -109,16 +115,18 @@ pub fn verify_and_derive(
         return Err(ShphError::Handshake("peer timestamp out of window".into()));
     }
 
+    let peer_sign_public = decode_32(&peer_hello.sign_pub_b64, "peer signing key")?;
     let mut signed_payload = Vec::new();
     signed_payload.extend_from_slice(PROTOCOL_TAG.as_bytes());
     signed_payload.extend_from_slice(&peer_identity_raw);
+    signed_payload.extend_from_slice(&peer_sign_public);
     signed_payload.extend_from_slice(&peer_ephemeral_raw);
     signed_payload.extend_from_slice(&peer_nonce);
     signed_payload.extend_from_slice(&peer_hello.timestamp_secs.to_be_bytes());
     local_identity.verify_handshake_signature(
         &signed_payload,
         &peer_hello.sig,
-        &peer_identity_raw,
+        &peer_sign_public,
     )?;
 
     let peer_ephemeral = PublicKey::from(peer_ephemeral_raw);
