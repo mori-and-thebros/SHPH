@@ -161,6 +161,7 @@ Additional docs:
 - `docs/API_STABILITY.md` (public-API tiers + validation-window freeze rules)
 - `docs/SECURITY_REPORTING.md` (bug-bounty report template + triage SLA)
 - `docs/SUPPLY_CHAIN_SCAN.md` (cargo-audit scanner + advisory triage)
+- `docs/HARDENING.md` (post-funding security-hardening summary + threat impact)
 - `docs/evidence/CARGO_AUDIT.txt` (regenerable advisory-scan output)
 - `CHANGELOG.md` (phase-anchored changelog)
 - `SECURITY.md` (vulnerability reporting, threat model, non-claims matrix)

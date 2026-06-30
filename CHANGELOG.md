@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.2.0] — First versioned release: security hardening (2026-06-30)
+
+`v0.2.0` is the first SemVer release line. It bundles the three Optional/Research
+hardening increments (previously tagged `hardening-1/2/3`) on top of the
+Phase A + Phase B funding-readiness baseline. See `docs/HARDENING.md` for the
+full summary and threat-table impact.
+
+### Security
+- Crypto data-plane: sliding anti-replay window, AEAD nonce-limit reuse guard,
+  constant-time signature verification (`shph-core/src/crypto.rs`).
+- Keystore secret hygiene: owner-only (0600) perms, leaky-file refusal, bounded
+  + atomic save (`shph-core/src/keystore.rs`).
+- Transport DoS: per-source-IP connection rate limiting, anti-slowloris chunked
+  hello read (`shph-transport/src/lib.rs`).
+
+### Changed
+- Workspace version `0.1.0` -> `0.2.0` (all crates inherit via `{ workspace = true }`).
+- `anyhow` 1.0.102 -> 1.0.103, `ratatui` 0.27 -> 0.28.1 (scanner-driven).
+- Removed orphaned, never-compiled root `src/crypto.rs` + `src/error.rs`.
+
+### Tests
+- +16 regression tests across the three increments.
+  `shph-core` 19 -> 32; `shph-transport` 1 -> 4.
+
+### Tags
+- `v0.2.0` (this release). Prior milestones: `checkpoint-phaseA-1.0.0`,
+  `checkpoint-phaseB-1.0.0`, `hardening-1`, `hardening-2`, `hardening-3`.
+
 All notable changes to SHPH are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) principles, adapted to
 the phase-gated funding roadmap in `ROADMAP_OSS_AND_DELIVERY.md`.

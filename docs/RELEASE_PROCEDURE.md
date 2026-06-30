@@ -34,8 +34,11 @@ checkpoint-phaseB-1.0.0      # end of Phase B (B.1–B.2), funding validation
 vX.Y.Z                       # semantic-version point releases once a release line is live
 ```
 
-Until a versioned release line is established, **funding checkpoints are the
-authoritative tags.** Each checkpoint tag carries the roadmap phase it closes.
+A versioned release line is now live: **`v0.2.0`** is the first versioned
+release (the prior `0.1.0` was only captured via funding checkpoints). Going
+forward, SemVer releases (`vX.Y.Z`) are the authoritative tags; funding
+checkpoints remain as roadmap-anchored milestones. Each checkpoint tag carries
+the roadmap phase it closes.
 
 ## 3. Cutting a checkpoint (procedure)
 
