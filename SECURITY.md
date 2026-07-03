@@ -38,6 +38,13 @@ OSS validation only.**
 - X25519 identity keys for DH **plus** a separate Ed25519 key that produces a
   real detached signature over the handshake transcript (identity + signing key
   + ephemeral + nonce + timestamp), transcript-bound HKDF session-key derivation.
+- **Hybrid post-quantum key exchange (ML-KEM-768, FIPS-203)** layered on X25519:
+  every handshake additionally performs an ML-KEM encapsulation/decapsulation
+  and the session key is derived from **both** the ECDH and the ML-KEM shared
+  secrets, so recorded traffic stays confidential against a future quantum
+  adversary that breaks ECDH ("harvest now, decrypt later"). The PQ public key
+  is bound into the signed transcript and derivation fails closed if the PQ
+  shared secret is absent, blocking a silent classical downgrade.
 - ChaCha20-Poly1305 AEAD framing on the TCP data plane.
 - AEAD nonce anti-replay: the receiver rejects replayed or out-of-order counter
   nonces via a sliding bitmap window (fail-closed); the send counter also stops
@@ -58,11 +65,15 @@ This is the **non-claims matrix** — SHPH must **not** be marketed as providing
 these until the corresponding roadmap phase ships and is independently reviewed:
 
 - Browser/TLS/QUIC fingerprint parity or DPI evasion.
-- Full QUIC hardening; the QUIC path is an experimental UDP shim.
+- Full production QUIC: the QUIC path is an experimental UDP shim. It now has
+  post-handshake source-address binding, per-IP rate limiting, and truncation
+  guards (v0.4.0), but it is **not** a conformant or congestion-controlled QUIC
+  implementation and remains opt-in/experimental; TCP is the stable default.
 - Hostile-network / adversarial anti-observation posture.
 - Constant-time guarantees beyond what the underlying crates provide.
-- Production key management (HSM/PKCS#11/YubiKey/TPM), PQC, Shamir quorum, and
-  ratchet audit (planned, not defaults).
+- Production key management (HSM/PKCS#11/YubiKey/TPM), Shamir quorum, and
+  ratchet audit (planned, not defaults). Hybrid PQ key exchange **is** shipped
+  (v0.4.0); hardware-backed key storage is still out of scope.
 - Side-channel resistance audits of the full stack.
 - Windows graceful Ctrl+C teardown (tracked follow-up; Unix-only today).
 
@@ -75,6 +86,7 @@ these until the corresponding roadmap phase ships and is independently reviewed:
 | Tampered/truncated frames | Mitigated: AEAD authentication + length bounds + fail-closed decode. |
 | Unauthenticated handshake flood (resource exhaustion) | Mitigated: bounded accept loop + handshake timeouts + per-source-IP connection rate limiting; not a full DoS defense against a distributed flood. |
 | Active MITM | Mitigated by Ed25519 transcript signature verification + peer fingerprint pinning (only the holder of the peer's Ed25519 private key can complete the handshake). |
+| Harvest-now-decrypt-later (recorded traffic broken by a future quantum adversary) | Mitigated (v0.4.0): hybrid ML-KEM-768 + X25519 key derivation means breaking ECDH alone is insufficient to recover the session key. Note: this protects confidentiality of recorded sessions, not against an active quantum adversary that also defeats the classical authentication. |
 | Endpoint compromise / key theft | Out of scope: no HSM/TPM binding yet. |
 | Traffic-analysis / DPI | Out of scope: no fingerprint parity yet. |
 | Host privilege escalation via control-plane apply | Mitigated by dry-run default, preflight validation, and OS privilege requirements. |

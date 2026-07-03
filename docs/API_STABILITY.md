@@ -8,8 +8,10 @@ review).
 
 ## 1. Current versioning
 
-- Workspace version: `0.3.0` (see root `Cargo.toml`). `v0.3.0` made the
-  handshake signature a real Ed25519 signature (breaking protocol bump `shph/3`).
+- Workspace version: `0.4.0` (see root `Cargo.toml`). `v0.4.0` added hybrid
+  post-quantum key exchange (ML-KEM-768) to the handshake (breaking protocol bump
+  `shph/4`). `v0.3.0` made the handshake signature a real Ed25519 signature
+  (protocol bump `shph/3`).
 - SHPH is **pre-1.0.** Per SemVer, `0.x.y` changes may break the API in any
   `0.minor` bump. This document narrows that freedom during validation windows.
 

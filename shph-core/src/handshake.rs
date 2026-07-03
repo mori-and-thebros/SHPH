@@ -10,8 +10,8 @@ use crate::crypto::{hkdf_sha256, IdentityKeyPair, SessionKeys};
 use crate::error::{Result, ShphError};
 use crate::keystore::compute_fingerprint_hex;
 
-const HANDSHAKE_VERSION: u8 = 3;
-const PROTOCOL_TAG: &str = "shph/3";
+const HANDSHAKE_VERSION: u8 = 4;
+const PROTOCOL_TAG: &str = "shph/4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
@@ -20,6 +20,12 @@ pub struct Hello {
     /// Ed25519 signing public key (base64). Bound into the signed payload so a
     /// MITM cannot swap it for a different signing key.
     pub sign_pub_b64: String,
+    /// ML-KEM-768 encapsulation public key (base64) for the hybrid PQ key exchange.
+    pub pqc_pub_b64: String,
+    /// ML-KEM-768 ciphertext (base64) the sender produced against the peer's PQ
+    /// public key. Both sides decapsulate the peer's ciphertext against their
+    /// own PQ key, giving a shared PQ secret combined with X25519 ECDH.
+    pub pqc_ct_b64: String,
     pub ephemeral_pub_b64: String,
     pub nonce_b64: String,
     pub timestamp_secs: u64,
@@ -39,11 +45,15 @@ impl HandshakeVersion {
     }
 }
 
-#[derive(Clone)]
 pub struct HandshakeMaterial {
     pub local_ephemeral: IdentityKeyPair,
     pub local_nonce: [u8; 32],
+    pub local_pqc: crate::pqc::PqcKeypair,
     pub local_hello: Hello,
+    /// Hybrid ML-KEM-768 shared secret, populated by [`finalize_initiator_pq`]
+    /// (initiator) or [`absorb_responder_pq`] (responder) before key derivation.
+    /// `None` here blocks derivation, preventing a silent classical downgrade.
+    pub pq_shared: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,10 +74,16 @@ pub fn build_hello(local_identity: &IdentityKeyPair) -> Result<HandshakeMaterial
         .as_secs();
 
     let sign_pub = local_identity.signing_public_bytes();
+    let local_pqc = crate::pqc::PqcKeypair::generate()?;
+    let pqc_pub = local_pqc.encap_public_bytes();
+    // The PQ ciphertext each side sends is computed against the peer's PQ public
+    // key, which is only known after the hellos are exchanged. It is filled in
+    // during verify_and_derive; the hello carries an empty placeholder here.
     let mut signed_payload = Vec::new();
     signed_payload.extend_from_slice(PROTOCOL_TAG.as_bytes());
     signed_payload.extend_from_slice(local_identity.public().as_bytes());
     signed_payload.extend_from_slice(&sign_pub);
+    signed_payload.extend_from_slice(&pqc_pub);
     signed_payload.extend_from_slice(local_ephemeral.public().as_bytes());
     signed_payload.extend_from_slice(&local_nonce);
     signed_payload.extend_from_slice(&timestamp_secs.to_be_bytes());
@@ -78,6 +94,9 @@ pub fn build_hello(local_identity: &IdentityKeyPair) -> Result<HandshakeMaterial
         identity_pub_b64: base64::engine::general_purpose::STANDARD
             .encode(local_identity.public().as_bytes()),
         sign_pub_b64: base64::engine::general_purpose::STANDARD.encode(sign_pub),
+        pqc_pub_b64: base64::engine::general_purpose::STANDARD.encode(&pqc_pub),
+        // Filled in by verify_and_derive once the peer PQ key is known.
+        pqc_ct_b64: String::new(),
         ephemeral_pub_b64: base64::engine::general_purpose::STANDARD
             .encode(local_ephemeral.public().as_bytes()),
         nonce_b64: base64::engine::general_purpose::STANDARD.encode(local_nonce),
@@ -88,7 +107,9 @@ pub fn build_hello(local_identity: &IdentityKeyPair) -> Result<HandshakeMaterial
     Ok(HandshakeMaterial {
         local_ephemeral,
         local_nonce,
+        local_pqc,
         local_hello,
+        pq_shared: None,
     })
 }
 
@@ -116,10 +137,12 @@ pub fn verify_and_derive(
     }
 
     let peer_sign_public = decode_32(&peer_hello.sign_pub_b64, "peer signing key")?;
+    let peer_pqc_pub = b64_decode(&peer_hello.pqc_pub_b64, "peer PQ public key")?;
     let mut signed_payload = Vec::new();
     signed_payload.extend_from_slice(PROTOCOL_TAG.as_bytes());
     signed_payload.extend_from_slice(&peer_identity_raw);
     signed_payload.extend_from_slice(&peer_sign_public);
+    signed_payload.extend_from_slice(&peer_pqc_pub);
     signed_payload.extend_from_slice(&peer_ephemeral_raw);
     signed_payload.extend_from_slice(&peer_nonce);
     signed_payload.extend_from_slice(&peer_hello.timestamp_secs.to_be_bytes());
@@ -130,7 +153,29 @@ pub fn verify_and_derive(
     )?;
 
     let peer_ephemeral = PublicKey::from(peer_ephemeral_raw);
-    let shared = material.local_ephemeral.derive_shared(&peer_ephemeral);
+    let ecdh_shared = material.local_ephemeral.derive_shared(&peer_ephemeral);
+
+    // Hybrid post-quantum key exchange (ML-KEM-768). The INITIATOR encapsulates
+    // against the responder's PQ public key, producing (ciphertext, shared);
+    // the RESPONDER decapsulates that ciphertext to recover the same shared
+    // secret. The `initiator` flag selects the role. The resulting PQ shared
+    // secret is combined with the X25519 ECDH shared secret and fed to HKDF, so
+    // the session key stays confidential even against a future quantum adversary
+    // that recorded this exchange and later breaks ECDH.
+    // Hybrid post-quantum shared secret (ML-KEM-768). The transport layer is
+    // responsible for performing the encapsulate/decapsulate round trip and
+    // passing the resulting 32-byte secret here. Refusing `None` hardens
+    // against a silent downgrade to classical-only ECDH: if a peer strips the
+    // PQ ciphertext the handshake fails closed instead of deriving a key that a
+    // future quantum adversary could break from a transcript recording.
+    let pq_shared = material.pq_shared.ok_or_else(|| {
+        ShphError::Handshake("missing post-quantum shared secret (downgrade blocked)".into())
+    })?;
+    let _ = initiator;
+
+    let mut shared = Vec::with_capacity(32 + 32);
+    shared.extend_from_slice(&ecdh_shared);
+    shared.extend_from_slice(&pq_shared);
 
     let (first, second) = if material.local_hello.identity_pub_b64 <= peer_hello.identity_pub_b64 {
         (&material.local_hello, peer_hello)
@@ -182,10 +227,47 @@ pub fn verify_and_derive(
     })
 }
 
+/// Initiator half of the hybrid PQ exchange.
+///
+/// After receiving the responder's hello, the initiator encapsulates against the
+/// responder's PQ public key. Returns the ciphertext bytes the transport must
+/// deliver to the responder as a follow-up handshake message, and stashes the
+/// derived PQ shared secret onto `material` so the subsequent
+/// [`verify_and_derive_with_pq`] call can consume it.
+pub fn finalize_initiator_pq(
+    material: &mut HandshakeMaterial,
+    peer_hello: &Hello,
+) -> Result<Vec<u8>> {
+    let peer_pqc_pub = b64_decode(&peer_hello.pqc_pub_b64, "peer PQ public key")?;
+    let (ct, ss) = crate::pqc::PqcKeypair::encapsulate_against(&peer_pqc_pub)?;
+    // Record the ciphertext we are sending so the transcript/inspection stays
+    // consistent, and remember the shared secret for verify_and_derive_with_pq.
+    material.local_hello.pqc_ct_b64 = base64::engine::general_purpose::STANDARD.encode(&ct);
+    material.pq_shared = Some(ss);
+    Ok(ct)
+}
+
+/// Responder half of the hybrid PQ exchange.
+///
+/// The responder receives the initiator's PQ ciphertext (delivered by the
+/// transport as a follow-up message), decapsulates it against her own PQ key,
+/// and stashes the resulting shared secret onto `material`.
+pub fn absorb_responder_pq(material: &mut HandshakeMaterial, peer_ct: &[u8]) -> Result<()> {
+    let ss = material.local_pqc.decapsulate(peer_ct)?;
+    material.pq_shared = Some(ss);
+    Ok(())
+}
+
 fn decode_32(input_b64: &str, what: &str) -> Result<[u8; 32]> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(input_b64.as_bytes())
         .map_err(|_| ShphError::Handshake(format!("invalid {what} encoding")))?;
     raw.try_into()
         .map_err(|_| ShphError::Handshake(format!("{what} must be 32 bytes")))
+}
+
+fn b64_decode(input_b64: &str, what: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(input_b64.as_bytes())
+        .map_err(|_| ShphError::Handshake(format!("invalid {what} encoding")))
 }

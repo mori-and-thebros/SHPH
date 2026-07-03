@@ -6,9 +6,9 @@
 use base64::Engine as _;
 use shph_core::roadmap::{data_mule_inbox_path, offline_session_id};
 use shph_core::{
-    build_hello, verify_and_derive, DataMuleConfig, DataMuleEnvelope, HandshakeState, Hello,
-    IdentityKeyPair, OfflineMeshConfig, OfflineMeshEnvelope, ReceiveCipher, Result, SendCipher,
-    ShphError,
+    absorb_responder_pq, build_hello, finalize_initiator_pq, verify_and_derive, DataMuleConfig,
+    DataMuleEnvelope, HandshakeState, Hello, IdentityKeyPair, OfflineMeshConfig,
+    OfflineMeshEnvelope, ReceiveCipher, Result, SendCipher, ShphError, ML_KEM_768_CIPHERTEXT_BYTES,
 };
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -216,6 +216,9 @@ pub fn offline_mesh_connect_and_handshake(
     let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
 
+    let mut material = material;
+    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+    writer.send_payload(&ct)?;
     verify_and_derive(local_identity, &material, &peer_hello, true)
 }
 
@@ -235,6 +238,9 @@ pub fn offline_mesh_accept_and_handshake(
     let local_hello =
         serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?;
     writer.send_payload(&local_hello)?;
+    let ct_payload = reader.receive_payload(timeout)?;
+    let mut material = material;
+    absorb_responder_pq(&mut material, &ct_payload)?;
     verify_and_derive(local_identity, &material, &peer_hello, false)
 }
 
@@ -255,6 +261,9 @@ pub fn offline_mesh_connect_secure_session(
     let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
 
+    let mut material = material;
+    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+    writer.send_payload(&ct)?;
     let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
     let session = SecureSession {
         inner: SecureSessionInner::OfflineMesh(OfflineMeshSession::new(
@@ -283,6 +292,9 @@ pub fn offline_mesh_accept_secure_session(
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
+    let ct_payload = reader.receive_payload(timeout)?;
+    let mut material = material;
+    absorb_responder_pq(&mut material, &ct_payload)?;
 
     let state = verify_and_derive(local_identity, &material, &peer_hello, false)?;
     let session = SecureSession {
@@ -313,6 +325,9 @@ pub fn data_mule_connect_and_handshake(
     let peer_payload = reader.receive_payload(timeout)?;
     let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
+    let mut material = material;
+    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+    writer.send_payload(&ct)?;
     verify_and_derive(local_identity, &material, &peer_hello, true)
 }
 
@@ -334,6 +349,9 @@ pub fn data_mule_accept_and_handshake(
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
+    let ct_payload = reader.receive_payload(timeout)?;
+    let mut material = material;
+    absorb_responder_pq(&mut material, &ct_payload)?;
     verify_and_derive(local_identity, &material, &peer_hello, false)
 }
 
@@ -355,6 +373,9 @@ pub fn data_mule_connect_secure_session(
     let peer_payload = reader.receive_payload(timeout)?;
     let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
+    let mut material = material;
+    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+    writer.send_payload(&ct)?;
     let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
 
     let session = SecureSession {
@@ -387,6 +408,9 @@ pub fn data_mule_accept_secure_session(
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
+    let ct_payload = reader.receive_payload(timeout)?;
+    let mut material = material;
+    absorb_responder_pq(&mut material, &ct_payload)?;
 
     let state = verify_and_derive(local_identity, &material, &peer_hello, false)?;
 
@@ -583,9 +607,13 @@ pub fn tcp_handshake_client(
 ) -> Result<HandshakeState> {
     let mut stream = TcpStream::connect(peer).map_err(|e| ShphError::Transport(e.to_string()))?;
     apply_timeout(&stream, timeout_secs)?;
-    let material = build_hello(local_identity)?;
+    let mut material = build_hello(local_identity)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
     let peer_hello = read_tcp_hello(&mut stream)?;
+    // Initiator: encapsulate against the responder's PQ public key and deliver
+    // the ciphertext as a bounded follow-up message before deriving keys.
+    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+    write_tcp_pq_ct(&mut stream, &ct)?;
     verify_and_derive(local_identity, &material, &peer_hello, true)
 }
 
@@ -600,8 +628,11 @@ pub fn tcp_handshake_server(
         .map_err(|e| ShphError::Transport(e.to_string()))?;
     apply_timeout(&stream, timeout_secs)?;
     let peer_hello = read_tcp_hello(&mut stream)?;
-    let material = build_hello(local_identity)?;
+    let mut material = build_hello(local_identity)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
+    // Responder: read the initiator's PQ ciphertext and decapsulate it.
+    let ct = read_tcp_pq_ct(&mut stream)?;
+    absorb_responder_pq(&mut material, &ct)?;
     verify_and_derive(local_identity, &material, &peer_hello, false)
 }
 
@@ -612,9 +643,11 @@ pub fn tcp_connect_and_handshake(
 ) -> Result<(TcpStream, HandshakeState)> {
     let mut stream = TcpStream::connect(peer).map_err(|e| ShphError::Transport(e.to_string()))?;
     apply_timeout(&stream, timeout_secs)?;
-    let material = build_hello(local_identity)?;
+    let mut material = build_hello(local_identity)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
     let peer_hello = read_tcp_hello(&mut stream)?;
+    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+    write_tcp_pq_ct(&mut stream, &ct)?;
     let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
     Ok((stream, state))
 }
@@ -696,8 +729,20 @@ pub fn tcp_accept_and_handshake(
 
         match read_tcp_hello(&mut stream) {
             Ok(peer_hello) => {
-                let material = build_hello(local_identity)?;
+                let mut material = build_hello(local_identity)?;
                 write_tcp_hello(&mut stream, &material.local_hello)?;
+                let ct = match read_tcp_pq_ct(&mut stream) {
+                    Ok(ct) => ct,
+                    Err(ShphError::ConnectionClosed) | Err(ShphError::Protocol(_)) => {
+                        last_err = Some(ShphError::ConnectionClosed);
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+                if absorb_responder_pq(&mut material, &ct).is_err() {
+                    last_err = Some(ShphError::Handshake("pq decapsulation failed".into()));
+                    continue;
+                }
                 match verify_and_derive(local_identity, &material, &peer_hello, false) {
                     Ok(state) => return Ok((stream, state)),
                     Err(err) => {
@@ -783,6 +828,56 @@ fn read_tcp_hello(stream: &mut TcpStream) -> Result<Hello> {
     let hello = serde_json::from_str::<Hello>(hello_line)
         .map_err(|e| ShphError::Protocol(e.to_string()))?;
     Ok(hello)
+}
+
+/// Write the initiator's ML-KEM ciphertext to the stream as a length-prefixed,
+/// size-bounded frame so the responder can read exactly the expected bytes.
+fn write_tcp_pq_ct(stream: &mut TcpStream, ct: &[u8]) -> Result<()> {
+    if ct.len() != ML_KEM_768_CIPHERTEXT_BYTES {
+        return Err(ShphError::Protocol(format!(
+            "pq ciphertext size mismatch: expected {}, got {}",
+            ML_KEM_768_CIPHERTEXT_BYTES,
+            ct.len()
+        )));
+    }
+    write_tcp_all_or_closed(stream, &(ct.len() as u32).to_be_bytes())?;
+    write_tcp_all_or_closed(stream, ct)?;
+    stream.flush().map_err(map_io_error)?;
+    Ok(())
+}
+
+/// Read the initiator's ML-KEM ciphertext frame. The 4-byte length prefix must
+/// announce exactly `ML_KEM_768_CIPHERTEXT_BYTES`; anything else is rejected
+/// before any allocation, and the read is capped so a malicious peer cannot
+/// stream an unbounded payload into the handshake.
+fn read_tcp_pq_ct(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    read_exact_or_closed(stream, &mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len != ML_KEM_768_CIPHERTEXT_BYTES {
+        return Err(ShphError::Protocol(format!(
+            "pq ciphertext length mismatch: expected {}, got {}",
+            ML_KEM_768_CIPHERTEXT_BYTES, len
+        )));
+    }
+    let mut ct = vec![0u8; len];
+    read_exact_or_closed(stream, &mut ct)?;
+    Ok(ct)
+}
+
+/// Read exactly `buf.len()` bytes or fail closed on early EOF. Used for the
+/// fixed-size PQ ciphertext frame where a short read means a truncated/attacking
+/// peer.
+fn read_exact_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = stream.read(&mut buf[filled..]).map_err(map_io_error)?;
+        if n == 0 {
+            return Err(ShphError::ConnectionClosed);
+        }
+        filled += n;
+    }
+    Ok(())
 }
 
 fn apply_timeout(stream: &TcpStream, timeout_secs: u64) -> Result<()> {
@@ -917,6 +1012,9 @@ pub fn quic_handshake_client(
             write_and_wait_quic_hello(&socket, peer_addr, &material.local_hello, &mut buf);
         match peer_hello {
             Ok((peer_hello, addr)) if addr == peer_addr => {
+                let mut material = material;
+                let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+                write_quic_pq_ct(&socket, peer_addr, &ct)?;
                 let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
                 return Ok((socket, peer_addr, state));
             }
@@ -948,6 +1046,10 @@ pub fn quic_handshake_server(
     let material = build_hello(local_identity)?;
     let mut line = vec![0u8; MAX_QUIC_HELLO_BYTES];
     let mut peer_hello = None;
+    // Per-source rate limit, mirroring the TCP accept path: a single host that
+    // floods the UDP entry path is dropped before its hello is parsed, so it
+    // cannot exhaust the handshake loop budget or burn CPU on deserialization.
+    let mut rate_limiter = PeerRateLimiter::new();
 
     let start = Instant::now();
     let deadline = Duration::from_secs(timeout_secs.max(1));
@@ -955,6 +1057,9 @@ pub fn quic_handshake_server(
     while start.elapsed() < deadline {
         match read_quic_hello(&socket, &mut line) {
             Ok((hello, peer_addr)) => {
+                if rate_limiter.check_and_record(peer_addr).is_err() {
+                    continue;
+                }
                 peer_hello = Some((hello, peer_addr));
                 break;
             }
@@ -966,6 +1071,9 @@ pub fn quic_handshake_server(
     let (peer_hello, peer_addr) = peer_hello.ok_or(ShphError::Timeout)?;
 
     write_tcp_hello_to_peer(&socket, peer_addr, &material.local_hello)?;
+    let mut material = material;
+    let ct = read_quic_pq_ct(&socket, peer_addr)?;
+    absorb_responder_pq(&mut material, &ct)?;
     let state = verify_and_derive(local_identity, &material, &peer_hello, false)?;
     Ok((socket, peer_addr, state))
 }
@@ -1009,6 +1117,15 @@ fn write_and_wait_quic_hello(
 
 fn read_quic_hello(socket: &UdpSocket, buf: &mut [u8]) -> Result<(Hello, SocketAddr)> {
     let (len, peer_addr) = socket.recv_from(buf).map_err(map_io_error)?;
+    // If the datagram exactly filled the buffer it may have been truncated by
+    // the kernel (recv_from never reports the true on-wire size). A legitimate
+    // hello is strictly smaller than the cap, so a full buffer is treated as an
+    // oversized/rejected hello to prevent parsing a truncated message.
+    if len == buf.len() {
+        return Err(ShphError::Protocol(
+            "quic hello may be truncated (fills receive buffer)".into(),
+        ));
+    }
     decode_quic_hello(len, &buf[..len], peer_addr)
 }
 
@@ -1036,6 +1153,37 @@ fn write_tcp_hello_to_peer(socket: &UdpSocket, peer_addr: SocketAddr, hello: &He
         .map(|_| ())
 }
 
+/// Send the initiator's PQ ciphertext as a single bounded UDP datagram.
+fn write_quic_pq_ct(socket: &UdpSocket, peer_addr: SocketAddr, ct: &[u8]) -> Result<()> {
+    if ct.len() != ML_KEM_768_CIPHERTEXT_BYTES {
+        return Err(ShphError::Protocol(format!(
+            "pq ciphertext size mismatch: expected {}, got {}",
+            ML_KEM_768_CIPHERTEXT_BYTES,
+            ct.len()
+        )));
+    }
+    socket.send_to(ct, peer_addr).map_err(map_io_error)?;
+    Ok(())
+}
+
+/// Receive the initiator's PQ ciphertext datagram from the expected peer.
+fn read_quic_pq_ct(socket: &UdpSocket, expected_peer: SocketAddr) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; ML_KEM_768_CIPHERTEXT_BYTES];
+    let (len, addr) = socket.recv_from(&mut buf).map_err(map_io_error)?;
+    if addr != expected_peer {
+        return Err(ShphError::Protocol(
+            "peer address mismatch during pq ciphertext".into(),
+        ));
+    }
+    if len != ML_KEM_768_CIPHERTEXT_BYTES {
+        return Err(ShphError::Protocol(format!(
+            "pq ciphertext datagram length mismatch: expected {}, got {}",
+            ML_KEM_768_CIPHERTEXT_BYTES, len
+        )));
+    }
+    Ok(buf)
+}
+
 pub struct ExperimentalQuicSession {
     socket: UdpSocket,
     peer: SocketAddr,
@@ -1051,6 +1199,7 @@ pub struct ExperimentalQuicSender {
 
 pub struct ExperimentalQuicReceiver {
     socket: UdpSocket,
+    peer: SocketAddr,
     recv_cipher: ReceiveCipher,
 }
 
@@ -1069,20 +1218,22 @@ impl ExperimentalQuicSession {
     }
 
     pub fn recv_frame(&mut self) -> Result<Vec<u8>> {
-        read_encrypted_quic_frame(&self.socket, &mut self.recv_cipher)
+        read_encrypted_quic_frame(&self.socket, &mut self.recv_cipher, self.peer)
     }
 
     pub fn into_split(self) -> Result<(ExperimentalQuicSender, ExperimentalQuicReceiver)> {
         let recv_socket = self.socket.try_clone().map_err(map_io_error)?;
         let send_socket = self.socket;
+        let peer = self.peer;
         Ok((
             ExperimentalQuicSender {
                 socket: send_socket,
-                peer: self.peer,
+                peer,
                 send_cipher: self.send_cipher,
             },
             ExperimentalQuicReceiver {
                 socket: recv_socket,
+                peer,
                 recv_cipher: self.recv_cipher,
             },
         ))
@@ -1097,7 +1248,7 @@ impl ExperimentalQuicSender {
 
 impl ExperimentalQuicReceiver {
     pub fn recv_frame(&mut self) -> Result<Vec<u8>> {
-        read_encrypted_quic_frame(&self.socket, &mut self.recv_cipher)
+        read_encrypted_quic_frame(&self.socket, &mut self.recv_cipher, self.peer)
     }
 }
 
@@ -1156,9 +1307,23 @@ fn write_encrypted_quic_frame(
         .map(|_| ())
 }
 
-fn read_encrypted_quic_frame(socket: &UdpSocket, cipher: &mut ReceiveCipher) -> Result<Vec<u8>> {
+fn read_encrypted_quic_frame(
+    socket: &UdpSocket,
+    cipher: &mut ReceiveCipher,
+    expected_peer: SocketAddr,
+) -> Result<Vec<u8>> {
+    // Source-address binding: after the handshake authenticates a peer address,
+    // every data-frame datagram must arrive from that same address. Without this
+    // check an off-path attacker could inject forged ciphertext datagrams,
+    // forcing expensive AEAD-decrypt work and disrupting the authenticated
+    // stream. Rejecting foreign sources closes the injection/amplification path.
     let mut packet = vec![0u8; MAX_QUIC_HELLO_BYTES];
-    let (len, _) = socket.recv_from(&mut packet).map_err(map_io_error)?;
+    let (len, addr) = socket.recv_from(&mut packet).map_err(map_io_error)?;
+    if addr != expected_peer {
+        return Err(ShphError::Protocol(
+            "quic data frame from unexpected peer address".into(),
+        ));
+    }
     if len < 4 {
         return Err(ShphError::Protocol("invalid QUIC frame length".into()));
     }
@@ -1719,6 +1884,57 @@ mod tests {
         assert!(
             rl.check_and_record(b).is_ok(),
             "a distinct IP has its own budget"
+        );
+    }
+
+    #[test]
+    fn quic_frame_rejects_foreign_source() {
+        // Post-handshake source binding: after a QUIC handshake authenticates a
+        // peer address, a data-frame datagram arriving from any other address
+        // must be rejected before AEAD decryption. This closes an off-path
+        // injection/amplification surface where an attacker could force
+        // expensive decrypt work or disrupt the authenticated stream.
+        use shph_core::IdentityKeyPair;
+        use std::net::UdpSocket;
+        use std::thread;
+
+        let server_id = IdentityKeyPair::generate().unwrap();
+        let client_id = IdentityKeyPair::generate().unwrap();
+        // Reserve a real loopback port, then release it so the server can bind.
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        // Run the server (accept) on the main thread so its bound socket is the
+        // injection target; the client connects from a background thread.
+        let client_id2 = client_id.clone();
+        let peer = server_addr.to_string();
+        let client_handle = thread::spawn(move || {
+            super::connect_secure_session(&peer, &client_id2, 5, super::TransportMode::Quic)
+        });
+        let (mut server_sess, _state) = super::accept_secure_session(
+            &server_addr.to_string(),
+            &server_id,
+            5,
+            super::TransportMode::Quic,
+        )
+        .expect("server handshake");
+        client_handle.join().unwrap().expect("client handshake");
+
+        // An unauthenticated second socket injects a well-formed-looking frame
+        // datagram from a foreign port into the server's bound socket. The
+        // server session is bound to the authenticated client peer; the
+        // injection arrives from a different source address.
+        let injector = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&4u32.to_be_bytes());
+        forged.extend_from_slice(&[0u8; 4]); // bogus ciphertext body
+        injector.send_to(&forged, server_addr).unwrap();
+
+        let res = server_sess.recv_frame();
+        assert!(
+            matches!(res, Err(shph_core::ShphError::Protocol(_))),
+            "foreign-source QUIC frame must be rejected, got {res:?}"
         );
     }
 }

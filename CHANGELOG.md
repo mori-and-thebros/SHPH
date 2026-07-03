@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.4.0] — Hybrid post-quantum key exchange + QUIC shim hardening (BREAKING, 2026-07-02)
+
+### Security (hybrid PQECDH)
+- **Hybrid post-quantum key exchange (ML-KEM-768) is now layered on X25519.**
+  Each handshake performs a full ML-KEM-768 encapsulation/decapsulation in
+  addition to the classical X25519 ECDH. The session key is derived from
+  **both** the ECDH shared secret **and** the ML-KEM shared secret via HKDF, so
+  recorded traffic remains confidential even against a future quantum adversary
+  that breaks ECDH ("harvest now, decrypt later").
+- **Downgrade resistance.** `verify_and_derive` fails closed if the PQ shared
+  secret is absent: a peer that strips the PQ ciphertext can never silently
+  negotiate a classical-only key. The PQ public key is bound into the signed
+  handshake transcript, so it cannot be swapped by a MITM.
+- New `shph-core/src/pqc.rs` module (`PqcKeypair`, `encapsulate_against`,
+  `decapsulate`) wrapping RustCrypto `ml-kem` (FIPS-203).
+
+### Breaking changes
+- Protocol tag bumped `shph/3` -> `shph/4`; `Hello` gains `pqc_pub_b64` and
+  `pqc_ct_b64` fields. Old and new peers are not wire-compatible.
+- The handshake now exchanges a small follow-up ML-KEM ciphertext message after
+  the hello round-trip (one extra bounded frame/datagram/payload per handshake).
+- `HandshakeMaterial` gained a `pq_shared` field and is no longer `Clone`
+  (ML-KEM decapsulation keys are not cloneable).
+
+### Hardening (QUIC/UDP shim)
+- **Post-handshake source-address binding.** QUIC data-frame datagrams are now
+  rejected unless they arrive from the address authenticated during the
+  handshake, closing an off-path injection/amplification surface.
+- **Per-IP rate limiting on the QUIC accept path** (parity with TCP), so a single
+  host cannot exhaust the handshake budget by flooding UDP hellos.
+- **Datagram truncation guard:** a hello that fills the receive buffer is
+  rejected instead of being parsed as a truncated message.
+- PQ ciphertext frames are length-prefixed and size-bounded to exactly
+  `ML_KEM_768_CIPHERTEXT_BYTES`; oversized or short reads fail closed.
+
+### Tests
+- Hybrid roundtrip, downgrade-blocked, corrupted-ciphertext-breaks-agreement,
+  and classical-only-cannot-derive regression tests in `handshake_flow.rs`.
+- QUIC foreign-source rejection regression test in `shph-transport`.
+
+### Out of scope (documented, not implemented)
+HSM/TPM/YubiKey key binding, browser/DPI/TLS fingerprint shaping, and offline
+mesh adversarial posture remain explicitly out of scope — they require hardware
+or substantial design work and are tracked in `docs/RISK_MATRIX.md`.
+
 ## [0.3.0] — Real Ed25519 handshake authentication (BREAKING, 2026-06-30)
 
 ### Security (critical fix)

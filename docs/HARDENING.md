@@ -77,6 +77,44 @@ distinct-IP isolation). `shph-transport` 1 -> 4.
 | Handshake-flood from one host | Per-loop bound only | + per-IP rate limit |
 | Slowloris per-byte hello cost | 1 syscall/byte | Chunked bounded read |
 
+## Increment 4 — Hybrid post-quantum exchange + QUIC shim hardening (v0.4.0)
+
+Files: `shph-core/src/pqc.rs` (new), `shph-core/src/handshake.rs`,
+`shph-transport/src/lib.rs`.
+
+- **Hybrid PQECDH (ML-KEM-768).** The handshake now performs a full ML-KEM-768
+  encapsulation/decapsulation alongside X25519 ECDH; the session key is HKDF-
+  derived from both shared secrets, so a future quantum adversary that breaks
+  ECDH cannot decrypt recorded sessions ("harvest now, decrypt later").
+- **Downgrade resistance.** `HandshakeMaterial.pq_shared` is `None` until the
+  PQ round-trip completes; `verify_and_derive` fails closed on `None`, so a peer
+  that strips the PQ ciphertext can never silently negotiate classical-only.
+- **PQ key binding.** The ML-KEM public key is included in the Ed25519-signed
+  transcript, so a MITM cannot swap it.
+- **Bounded PQ transport.** The ML-KEM ciphertext is exchanged as a size-bounded
+  follow-up frame (TCP: length-prefixed exactly `ML_KEM_768_CIPHERTEXT_BYTES`;
+  UDP: a single fixed-size datagram; offline/data-mule: a bounded payload).
+- **QUIC source-address binding.** Post-handshake data-frame datagrams are
+  rejected unless they arrive from the authenticated peer address, closing an
+  off-path injection/amplification surface.
+- **QUIC per-IP rate limiting** (parity with TCP accept path).
+- **QUIC datagram truncation guard** — a hello filling the receive buffer is
+  rejected rather than parsed as a truncated message.
+
+Tests: 4 new PQ regression tests (hybrid roundtrip, downgrade-blocked, corrupted
+ciphertext breaks agreement, classical-only cannot derive) + 1 QUIC
+foreign-source rejection test.
+
+## Threat-table impact (increment 4)
+
+| Threat | Before | After |
+| ------ | ------ | ----- |
+| Harvest-now-decrypt-later (future quantum breaks ECDH) | Vulnerable | Hybrid ML-KEM-768 mitigates |
+| Silent classical downgrade (PQ stripped) | N/A | Fails closed |
+| Off-path QUIC frame injection | Accepted from any source | Source-address bound |
+| QUIC handshake flood from one host | No per-IP limit | Per-IP rate limited |
+| Truncated UDP hello parsing | Possible | Rejected |
+
 ## What this is NOT
 
 These are hardening of the existing design, not new anti-observation
