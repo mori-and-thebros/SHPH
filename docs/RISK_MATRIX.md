@@ -19,7 +19,7 @@ Severity legend:
 | Windows graceful Ctrl+C teardown not signal-driven | Medium | Tracked | Default termination; stdin loop still checks shutdown flag | `windows-sys` `SetConsoleCtrlHandler` (A.2 follow-up) |
 | QUIC path is an experimental UDP shim, not production QUIC | High | Partially hardened (v0.4.0) | TCP is the stable default; QUIC is opt-in with source-address binding, per-IP rate limiting, truncation guards | Conformant/congestion-controlled QUIC in later phase |
 | Native TUN requires `CAP_NET_ADMIN`/root | Medium | By design | Stub backend for dev flow; native behind `SHPH_TUN_NATIVE=1` | Privilege-separation in ops phase |
-| No dependency advisory automation in CI yet | Low | Tracked | Manual `cargo audit` before release (see REPRODUCIBILITY.md) | Add `cargo audit` step once release cadence exists |
+| No dependency advisory automation in CI yet | Low | **Present (non-blocking)** | `cargo audit` runs as a CI job in `.github/workflows/ci.yml` (Phase B.2); 0 vulns, 2 accepted transitive advisories | Promote `audit` job to blocking (`continue-on-error: false`) once advisory policy for the 2 accepted warnings is finalized |
 | Live control-plane apply needs host privileges/tools | Medium | By design | `dry_run=true` default; preflight validation; rollback guard | Ops hardening phase |
 
 ## Shipped security capabilities (v0.4.0)

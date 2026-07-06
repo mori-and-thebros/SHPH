@@ -16,14 +16,14 @@ This is the single source of truth for "how far along is SHPH?"
 
 **Phase A burn-down: 5 / 5 complete (100%).**
 
-## Phase B — Funding Validation & Audit Preparation (not started)
+## Phase B — Funding Validation & Audit Preparation (complete)
 
-| Phase | Title | Status | Notes |
-| ----- | ----- | ------ | ----- |
-| B.1 | External Review Readiness | Not started | Reproducible demo scripts, failure-mode walk-throughs |
+| Phase | Title | Status | Evidence (run to verify) |
+| ----- | ----- | ------ | ------------------------ |
+| B.1 | External Review Readiness | **Complete** | `docs/FUNDERS.md`, reproducible demo scripts, `docs/REPRODUCIBILITY.md` |
+| B.2 | API Stability & Supply-Chain Scan | **Complete** | `docs/API_STABILITY.md`, `docs/SECURITY_REPORTING.md`, `docs/SUPPLY_CHAIN_SCAN.md`; `cargo audit` clean (0 vulns, 2 accepted advisories) |
 
-(Phase B scope lives in `ROADMAP_OSS_AND_DELIVERY.md`; do not start until Phase
-A is fully signed off.)
+**Phase B burn-down: 2 / 2 complete (100%).** Tagged at `checkpoint-phaseB-1.0.0`.
 
 ## Measurable quality signals (reproducible)
 
@@ -31,8 +31,9 @@ These numbers regenerate from a clean checkout. Run the command to verify.
 
 | Signal | Value | Reproduce |
 | ------ | ----- | --------- |
-| Workspace tests passing | **52 passed, 0 failed** | `cargo test --workspace` |
-| Core security/crypto unit tests | 19 | `cargo test -p shph-core` |
+| Workspace tests passing | **79 passed, 0 failed** | `cargo test --workspace` |
+| Core security/crypto tests | 44 (35 unit + 9 integration) | `cargo test -p shph-core` |
+| Transport tests | 5 | `cargo test -p shph-transport` |
 | CLI unit + integration tests | 27 (19 unit + 8 integration) | `cargo test -p shph-cli` |
 | Lint cleanliness | 0 warnings (warnings = errors) | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Format cleanliness | clean | `cargo fmt --all -- --check` |
