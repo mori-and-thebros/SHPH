@@ -137,7 +137,7 @@ Keep these as explicit optional features, not part of mandatory funding readines
 - HSM/PKCS#11 offload
 - YubiKey / PIV binding
 - TPM key sealing
-- Hybrid PQC session upgrade (ML-KEM/Kyber-style)
+- ~~Hybrid PQC session upgrade (ML-KEM/Kyber-style)~~ — **shipped in v0.4.0** (ML-KEM-768 + X25519); see `docs/HARDENING.md` increment 4.
 - Shamir M-of-N unwrapping workflows
 - Ratchet audit export for compliance
 

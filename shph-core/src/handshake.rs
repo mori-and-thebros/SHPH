@@ -200,16 +200,19 @@ pub fn verify_and_derive(
         [b"responder".as_slice(), b"initiator".as_slice()]
     };
 
-    let send_key_raw = hkdf_sha256(
+    // Wrap HKDF outputs in `Zeroizing` so the raw key material is wiped when
+    // these bindings go out of scope, rather than lingering in freed heap
+    // memory until the page is reused.
+    let send_key_raw = zeroize::Zeroizing::new(hkdf_sha256(
         &shared,
         &[b"shph-session-v1", &transcript_hash, direction[0]],
         32,
-    )?;
-    let recv_key_raw = hkdf_sha256(
+    )?);
+    let recv_key_raw = zeroize::Zeroizing::new(hkdf_sha256(
         &shared,
         &[b"shph-session-v1", &transcript_hash, direction[1]],
         32,
-    )?;
+    )?);
     let mut send_key = [0u8; 32];
     let mut recv_key = [0u8; 32];
     send_key.copy_from_slice(&send_key_raw[..32]);

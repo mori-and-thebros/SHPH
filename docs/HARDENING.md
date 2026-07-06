@@ -115,6 +115,46 @@ foreign-source rejection test.
 | QUIC handshake flood from one host | No per-IP limit | Per-IP rate limited |
 | Truncated UDP hello parsing | Possible | Rejected |
 
+## Increment 5 — Secret-material zeroization on drop (`hardening-5`)
+
+Files: `shph-core/src/crypto.rs`, `shph-core/src/handshake.rs`.
+
+- **Session AEAD keys wiped on drop.** `SendCipher` and `ReceiveCipher` hold the
+  32-byte ChaCha20-Poly1305 session key in plain heap memory. Previously it
+  survived until the allocator reused the page; now both implement `Drop` to
+  `zeroize` the key the instant the cipher is discarded. This closes core-dump,
+  swap, and memory-disclosure exposure of *live traffic keys* after a session
+  ends.
+- **`SessionKeys` derived from `ZeroizeOnDrop`.** The `send_key` / `recv_key`
+  arrays are now zeroized on drop via the `zeroize` derive (nonces are skipped —
+  they are not secret).
+- **Identity signing-seed hygiene.** `IdentityKeyPair.sign_seed` (the raw 32-byte
+  Ed25519 seed) is now wiped in both `Zeroize` and `Drop`. The X25519
+  `StaticSecret` already self-zeroizes; the raw Ed25519 seed previously did not.
+- **HKDF intermediate zeroization.** The raw 32-byte HKDF outputs in
+  `verify_and_derive` are wrapped in `Zeroizing<Vec<u8>>` so the key material is
+  wiped once it has been copied into the session keys, rather than lingering in
+  a freed heap buffer.
+
+This is a defense-in-depth / secret-hygiene hardening: it does not change any
+wire format or public API, so it is non-breaking. The `zeroize` crate (with the
+`derive` feature) was already a direct `shph-core` dependency, so no new
+dependency was introduced.
+
+Tests: 4 new regression tests proving the key bytes are wiped after drop
+(`send_cipher_zeroizes_key_on_drop`, `receive_cipher_zeroizes_key_on_drop`,
+`session_keys_zeroizes_on_drop`, `identity_keypair_zeroizes_sign_seed_on_drop`).
+`shph-core` unit tests 35 -> 39.
+
+## Threat-table impact (increment 5)
+
+| Threat | Before | After |
+| ------ | ------ | ----- |
+| Session AEAD key recoverable from freed memory / core dump | Yes (plain bytes) | Zeroized on drop |
+| `SessionKeys` retained after session end | Yes | Zeroized on drop |
+| Ed25519 signing seed retained after identity drop | Yes (raw array) | Zeroized on drop |
+| HKDF raw output retained in heap | Yes | `Zeroizing` wiped after copy |
+
 ## What this is NOT
 
 These are hardening of the existing design, not new anti-observation

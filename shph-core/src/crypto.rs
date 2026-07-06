@@ -8,6 +8,7 @@ use chacha20poly1305::KeyInit;
 use ring::rand::SystemRandom;
 use ring::signature::KeyPair as _;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 use crate::error::{Result, ShphError};
 use crate::keystore::compute_fingerprint_hex;
@@ -191,16 +192,32 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 impl zeroize::Zeroize for IdentityKeyPair {
     fn zeroize(&mut self) {
         self.private = StaticSecret::from([0u8; 32]);
+        self.sign_seed.zeroize();
+    }
+}
+
+impl Drop for IdentityKeyPair {
+    fn drop(&mut self) {
+        // The X25519 `StaticSecret` zeroizes itself on drop; the raw Ed25519
+        // signing seed is a plain array we must wipe explicitly so it does not
+        // persist in freed heap memory after the identity is discarded.
+        self.sign_seed.zeroize();
     }
 }
 
 /// Session keys derived from shared secret.
-#[derive(Debug, Clone)]
+///
+/// The symmetric session keys are zeroized on drop so they do not linger in
+/// heap memory after the session ends (mitigating core-dump / swap / memory-
+/// disclosure exposure of live traffic keys).
+#[derive(Debug, Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct SessionKeys {
+    #[zeroize(skip)]
+    pub send_nonce: u64,
+    #[zeroize(skip)]
+    pub recv_nonce: u64,
     pub send_key: [u8; 32],
     pub recv_key: [u8; 32],
-    pub send_nonce: u64,
-    pub recv_nonce: u64,
 }
 
 pub fn hkdf_sha256(input_key: &[u8], info: &[&[u8]], output_len: usize) -> Result<Vec<u8>> {
@@ -225,6 +242,12 @@ pub const AEAD_NONCE_LIMIT: u64 = (1u64 << 32) - 1;
 pub struct SendCipher {
     key: [u8; 32],
     nonce: u64,
+}
+
+impl Drop for SendCipher {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 impl SendCipher {
@@ -263,6 +286,12 @@ impl SendCipher {
 pub struct ReceiveCipher {
     key: [u8; 32],
     last_nonce: Option<u64>,
+}
+
+impl Drop for ReceiveCipher {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 impl ReceiveCipher {
@@ -433,7 +462,8 @@ impl ReplayWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        constant_time_eq, nonce_counter, ReceiveCipher, ReplayWindow, SendCipher, AEAD_NONCE_LIMIT,
+        constant_time_eq, nonce_counter, IdentityKeyPair, ReceiveCipher, ReplayWindow, SendCipher,
+        SessionKeys, AEAD_NONCE_LIMIT,
     };
 
     #[test]
@@ -602,5 +632,64 @@ mod tests {
     fn constant_time_eq_rejects_prefix() {
         // A matching prefix must not be reported as equal.
         assert!(!constant_time_eq(b"signature-v1", b"signature-v2"));
+    }
+
+    #[test]
+    fn send_cipher_zeroizes_key_on_drop() {
+        // Wrap in ManuallyDrop so we control when Drop runs, then read the key
+        // field directly (tests are in-module, so private fields are visible).
+        use std::mem::ManuallyDrop;
+        use std::ptr;
+        let mut cipher = ManuallyDrop::new(SendCipher::new([0xABu8; 32]));
+        assert_eq!(cipher.key, [0xABu8; 32]);
+        // Run Drop in place on the contained value.
+        unsafe { ptr::drop_in_place(&mut *cipher) };
+        assert_eq!(cipher.key, [0u8; 32]);
+        // Drop already ran; forget so it does not run a second time.
+        let _inner = ManuallyDrop::into_inner(cipher);
+        std::mem::forget(_inner);
+    }
+
+    #[test]
+    fn receive_cipher_zeroizes_key_on_drop() {
+        use std::mem::ManuallyDrop;
+        use std::ptr;
+        let mut cipher = ManuallyDrop::new(ReceiveCipher::new([0xCDu8; 32]));
+        assert_eq!(cipher.key, [0xCDu8; 32]);
+        unsafe { ptr::drop_in_place(&mut *cipher) };
+        assert_eq!(cipher.key, [0u8; 32]);
+        let _inner = ManuallyDrop::into_inner(cipher);
+        std::mem::forget(_inner);
+    }
+
+    #[test]
+    fn session_keys_zeroizes_on_drop() {
+        use std::mem::ManuallyDrop;
+        use std::ptr;
+        let mut sk = ManuallyDrop::new(SessionKeys {
+            send_key: [0x11u8; 32],
+            recv_key: [0x22u8; 32],
+            send_nonce: 7,
+            recv_nonce: 3,
+        });
+        assert_eq!(sk.send_key, [0x11u8; 32]);
+        unsafe { ptr::drop_in_place(&mut *sk) };
+        assert_eq!(sk.send_key, [0u8; 32]);
+        assert_eq!(sk.recv_key, [0u8; 32]);
+        let _inner = ManuallyDrop::into_inner(sk);
+        std::mem::forget(_inner);
+    }
+
+    #[test]
+    fn identity_keypair_zeroizes_sign_seed_on_drop() {
+        use std::mem::ManuallyDrop;
+        use std::ptr;
+        let seed = [0xFEu8; 32];
+        let mut id = ManuallyDrop::new(IdentityKeyPair::from_private_key(seed));
+        assert_eq!(id.sign_seed, [0xFEu8; 32]);
+        unsafe { ptr::drop_in_place(&mut *id) };
+        assert_eq!(id.sign_seed, [0u8; 32]);
+        let _inner = ManuallyDrop::into_inner(id);
+        std::mem::forget(_inner);
     }
 }

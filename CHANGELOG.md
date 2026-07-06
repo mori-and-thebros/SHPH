@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased] — hardening-5: secret-material zeroization on drop (non-breaking, 2026-07-06)
+
+### Security (secret hygiene)
+- **Session AEAD keys are now zeroized on drop.** `SendCipher` and
+  `ReceiveCipher` implement `Drop` to wipe the 32-byte ChaCha20-Poly1305 session
+  key, so live traffic keys no longer persist in heap memory after a session
+  ends. This mitigates core-dump, swap, and memory-disclosure recovery of
+  session keys.
+- **`SessionKeys` derives `ZeroizeOnDrop`** — `send_key` / `recv_key` are wiped
+  on drop (nonces are non-secret and skipped).
+- **Ed25519 signing-seed hygiene** — `IdentityKeyPair.sign_seed` is now wiped in
+  both `Zeroize` and `Drop` (the X25519 `StaticSecret` already self-zeroizes).
+- **HKDF intermediates zeroized** — the raw 32-byte HKDF outputs in
+  `verify_and_derive` are wrapped in `Zeroizing<Vec<u8>>` and wiped once copied
+  into the session keys.
+
+### Non-breaking
+- No wire-format, protocol-tag, or public-API change. The `zeroize` crate was
+  already a direct dependency of `shph-core`; no new dependency added.
+
+### Tests
+- 4 new regression tests for zeroize-on-drop (`SendCipher`, `ReceiveCipher`,
+  `SessionKeys`, `IdentityKeyPair`). Workspace tests 79 -> 83 (0 failed).
+
 ## [0.4.0] — Hybrid post-quantum key exchange + QUIC shim hardening (BREAKING, 2026-07-02)
 
 ### Security (hybrid PQECDH)

@@ -31,8 +31,8 @@ These numbers regenerate from a clean checkout. Run the command to verify.
 
 | Signal | Value | Reproduce |
 | ------ | ----- | --------- |
-| Workspace tests passing | **79 passed, 0 failed** | `cargo test --workspace` |
-| Core security/crypto tests | 44 (35 unit + 9 integration) | `cargo test -p shph-core` |
+| Workspace tests passing | **83 passed, 0 failed** | `cargo test --workspace` |
+| Core security/crypto tests | 48 (39 unit + 9 integration) | `cargo test -p shph-core` |
 | Transport tests | 5 | `cargo test -p shph-transport` |
 | CLI unit + integration tests | 27 (19 unit + 8 integration) | `cargo test -p shph-cli` |
 | Lint cleanliness | 0 warnings (warnings = errors) | `cargo clippy --workspace --all-targets -- -D warnings` |

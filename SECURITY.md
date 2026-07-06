@@ -56,6 +56,10 @@ OSS validation only.**
 - Secret-at-rest hygiene: the keystore (private identity key) is written
   owner-only (mode 0600 on Unix) via an atomic temp+rename, and loading refuses
   a group/other-accessible key file rather than silently using a leaked key.
+- In-memory secret hygiene: session AEAD keys (`SendCipher` / `ReceiveCipher`),
+  derived `SessionKeys`, the Ed25519 signing seed, and HKDF intermediates are
+  `zeroize`d on drop so live key material does not linger in freed heap memory
+  after a session ends (`hardening-5`).
 - Atomic control-plane apply with preflight validation and best-effort rollback.
 - Graceful SIGINT/SIGTERM shutdown on Unix.
 
