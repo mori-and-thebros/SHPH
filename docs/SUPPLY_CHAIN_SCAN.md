@@ -23,7 +23,7 @@ to avoid adding a build-time dependency).
 
 ## 3. Triage (as of checkpoint-phaseB-1.0.0)
 
-Scanned **178 crate dependencies**. Result: **0 vulnerabilities**, 2
+Scanned **200 crate dependencies**. Result: **0 vulnerabilities**, 2
 advisory **warnings**, both transitive and isolated to the optional TUI.
 
 | Advisory | Crate | Severity | Path | Disposition |
@@ -50,6 +50,6 @@ rather than a funding blocker.
 ## 5. Follow-ups (tracked, non-blocking)
 
 1. Watch for a `ratatui` release that drops `paste` / `lru`; bump when available.
-2. Add `cargo audit` as a **periodic** (non-blocking) CI job once a CI runner
-   with network access is available (see `.github/workflows/ci.yml` audit step).
+2. Keep the CI advisory job blocking. It explicitly ignores only the two
+   accepted TUI advisories above; new warnings or vulnerabilities fail CI.
 3. Consider `cargo-deny` for license + ban-list enforcement at a later phase.

@@ -11,7 +11,7 @@ Make SHPH a **funding-ready, open-source VPN** with:
 
 Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claims, and optional experimental transports.
 
-## Current State (as of 2026-06-24)
+## Current State (as of 2026-07-10)
 
 ### What is already built
 
@@ -22,16 +22,28 @@ Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claim
 - Linux native TUN flow behind `SHPH_TUN_NATIVE=1`.
 - Reconnect policy with runtime backoff for session mode.
 - Config schema and peer/config workflows.
-- Initial control-plane design for routes/DNS with dry-run validation.
+- Control-plane routes/DNS apply, reconcile, undo, and persistent rollback state.
 - CLI and docs baseline in place.
+- Roadmap validation, Shamir split/recovery, and ratchet-audit export primitives
+  are available behind explicit CLI commands.
 
-### What is currently blocked from “funding-grade” status
+### Mandatory-track status
 
-- Windows control-plane parity is partial (apply/rollback coverage is uneven).
-- Live control operations still have incomplete operational hardening and evidence.
-- No formal CI/CD policy or release checklist.
-- No externally visible security/process docs.
-- No explicit deployment profiles (safe default vs hardened).
+The mandatory funding track is complete for the documented controlled-lab scope:
+Linux gates, the mirrored source tree, control-plane lifecycle tests, security
+regressions, release/process documents, and evidence artifacts are maintained.
+This does not make SHPH a production VPN or establish hostile-network,
+anti-censorship, or conformant-QUIC claims.
+
+Remaining work is explicitly optional or deployment-specific:
+
+- Native Windows route/DNS execution still requires operator validation on a
+  privileged Windows host; native Windows TUN now fails explicitly until a
+  signed Wintun runtime is provisioned and integrated.
+- Production QUIC, effective anti-observation shaping, and hardware-backed
+  identity providers remain unimplemented.
+- A lab-grade password-encrypted keystore path now exists; production key
+  management remains unimplemented.
 
 ---
 
@@ -140,6 +152,19 @@ Keep these as explicit optional features, not part of mandatory funding readines
 - ~~Hybrid PQC session upgrade (ML-KEM/Kyber-style)~~ — **shipped in v0.4.0** (ML-KEM-768 + X25519); see `docs/HARDENING.md` increment 4.
 - Shamir M-of-N unwrapping workflows
 - Ratchet audit export for compliance
+
+### Optional-track implementation status
+
+- Configuration validation and safe CLI primitives exist for offline-mesh,
+  data-mule, Shamir, and ratchet-audit workflows.
+- Offline-mesh and data-mule prototypes now have bounded scans, quarantine,
+  deferred acknowledgement, and documented copy/replication workflows for
+  controlled labs.
+- Hardware identity provider entries fail closed with an explicit unavailable
+  backend error.
+- These primitives are not represented as production hardware integrations,
+  production QUIC, or effective anti-observation traffic shaping. The
+  Shroud-cell path is lab-only and opt-in.
 
 ---
 

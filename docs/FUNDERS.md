@@ -30,11 +30,13 @@ This list is binding for any funder-facing or marketing material:
 - **Not** a DPI/TLS/QUIC fingerprint-parity or anti-observation tool (planned,
   not shipped).
 - **Not** a full QUIC stack (the QUIC path is an experimental UDP shim).
-- **Not** a key-management/HSM/TPM/YubiKey/PQC/Shamir solution (planned, not
-  defaults).
+- **Not** a key-management/HSM/TPM/YubiKey/Shamir solution; hybrid PQ key
+  exchange is shipped, while hardware-backed key storage and quorum sharing
+  remain planned.
 - **Not** audited for constant-time or side-channel resistance beyond what its
   dependency crates provide.
-- **Not** Windows-feature-complete for graceful teardown (Unix-only today).
+- **Not** fully service-manager integrated; Unix signals and Windows console
+  control events are handled, while native Windows verification remains.
 
 See `docs/RISK_MATRIX.md` for the severity-rated version of this list.
 
@@ -46,15 +48,16 @@ See `docs/RISK_MATRIX.md` for the severity-rated version of this list.
 | Authenticated TCP handshake (transcript-bound keys) | done | `cargo test -p shph-core --test handshake_flow` |
 | Encrypted framed data plane (ChaCha20-Poly1305) | done | `cargo test -p shph-cli --test cli_tcp_data_plane` |
 | Anti-replay on the data plane (fail-closed) | done | `cargo test -p shph-core crypto::tests::replayed_frame_is_rejected_fail_closed` |
-| Graceful SIGINT/SIGTERM shutdown (Unix) | done | `docs/TESTING.md` (Phase A.1 evidence) |
-| Atomic control-plane apply + rollback | done | `cargo test -p shph-cli --test cli_control_plane` |
+| Graceful process shutdown | done | `docs/TESTING.md` and `shph-cli/src/shutdown.rs` |
+| Atomic control-plane apply + rollback | done | `cargo test -p shph-cli --test cli_control_plane`; multi-DNS regression in `shph-cli` unit tests |
 | CI template (Linux + Windows) | done | `.github/workflows/ci.yml` |
 | Reproducible, locked builds | done | `cargo build --locked` + `docs/REPRODUCIBILITY.md` |
 | DPI/fingerprint evasion | not done | `docs/RISK_MATRIX.md` |
 | Production anti-observation posture | not done | `docs/RISK_MATRIX.md` |
 
-Test totals (as of last validation): **52 passed, 0 failed** across the
-workspace. Re-run `cargo test --workspace` to reproduce.
+Test totals are regenerated in `docs/evidence/GATE_EVIDENCE.md`; the `0 passed`
+lines at the end are empty doc-test suites, not failed or skipped
+unit/integration tests. Re-run `cargo test --workspace` to reproduce.
 
 ## How funders verify claims
 
@@ -70,6 +73,8 @@ workspace. Re-run `cargo test --workspace` to reproduce.
 
 ## Related funder documents
 
+- `docs/CRYPTO_FUNDING_BOOTSTRAP.md` — small crypto-only campaign draft,
+  milestones, custody boundaries, and operator checklist.
 - `docs/RISK_MATRIX.md` — current limits and explicit exclusions (severity-rated).
 - `docs/MILESTONE_SCORECARD.md` — measurable phase scorecard + roadmap burn-down.
 - `docs/SUPPORT_AND_MAINTENANCE.md` — support model and maintenance plan.

@@ -19,7 +19,16 @@ pub struct ShroudProfile {
 
 impl ShroudProfile {
     pub const fn payload_capacity(&self) -> usize {
-        self.cell_size - 5
+        self.cell_size.saturating_sub(5)
+    }
+
+    pub const fn is_valid(&self) -> bool {
+        self.cell_size >= 64
+            && self.cell_size <= 16 * 1024
+            && self.max_payload_chunk > 0
+            && self.max_payload_chunk <= self.payload_capacity()
+            && !self.send_interval.is_zero()
+            && !self.chaff_interval.is_zero()
     }
 }
 
@@ -50,6 +59,16 @@ pub const BULK: ShroudProfile = ShroudProfile {
     chaff_interval: Duration::from_millis(500),
     max_payload_chunk: 3072,
     deterministic_padding: true,
+    adaptive_chunking: true,
+};
+
+pub const RANDOMIZED_LAB: ShroudProfile = ShroudProfile {
+    name: "randomized-lab",
+    cell_size: 1024,
+    send_interval: Duration::from_millis(25),
+    chaff_interval: Duration::from_millis(250),
+    max_payload_chunk: 768,
+    deterministic_padding: false,
     adaptive_chunking: true,
 };
 
@@ -135,9 +154,44 @@ pub const MIMICRY_LAB: StealthProfile = StealthProfile {
 };
 
 pub fn profiles() -> &'static [ShroudProfile] {
-    &[BALANCED, LOW_LATENCY, BULK]
+    &[BALANCED, LOW_LATENCY, BULK, RANDOMIZED_LAB]
 }
 
 pub fn stealth_profiles() -> &'static [StealthProfile] {
     &[STEADY, CAMOUFLAGE, MIMICRY_LAB]
+}
+
+pub fn shroud_profile_by_name(name: &str) -> Option<ShroudProfile> {
+    profiles()
+        .iter()
+        .copied()
+        .find(|profile| profile.name == name)
+}
+
+pub fn stealth_profile_by_name(name: &str) -> Option<StealthProfile> {
+    stealth_profiles()
+        .iter()
+        .copied()
+        .find(|profile| profile.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shroud_profile_by_name, ShroudProfile, BALANCED};
+
+    #[test]
+    fn randomized_lab_profile_is_available_and_valid() {
+        let profile = shroud_profile_by_name("randomized-lab").expect("profile");
+        assert!(profile.is_valid());
+        assert!(!profile.deterministic_padding);
+    }
+
+    #[test]
+    fn profile_validation_rejects_invalid_payload_chunk() {
+        let invalid = ShroudProfile {
+            max_payload_chunk: 0,
+            ..BALANCED
+        };
+        assert!(!invalid.is_valid());
+    }
 }

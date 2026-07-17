@@ -27,6 +27,16 @@ dry_run = true
     *before* any host mutation. If any single entry is invalid, the whole apply
     is rejected and nothing is changed.
 
+## Commands
+
+- `shph apply` validates and applies configured routes/DNS. Live applies persist
+  the exact applied state beside the config as `<config>.control-plane.json`.
+- `shph reconcile` removes recorded state, then applies the current
+  configuration. It is safe to repeat.
+- `shph undo` removes recorded routes/DNS and deletes the state file.
+- `shph down` invokes `undo` before exiting.
+- `shph status` reports whether persisted control-plane state is present.
+
 ## Current Command Backends
 
 - Linux:
@@ -56,11 +66,9 @@ dry_run = true
 - **Interface requirement:** a non-empty interface name is required to apply
   the control plane; an empty/blank name is rejected.
 
-## Windows Graceful Shutdown
+## Graceful Shutdown
 
-- Unix installs SIGINT/SIGTERM handlers (Phase A.1).
-- Windows graceful shutdown via `SetConsoleCtrlHandler` is a tracked follow-up:
-  it is a Win32 API not exposed by the `libc` crate, and wiring it requires a
-  `windows-sys` dependency compiled and verified on the Windows toolchain.
-- Until then, the Windows connect loop relies on default Ctrl+C termination but
-  still checks the shutdown flag between stdin lines.
+- Unix installs SIGINT/SIGTERM handlers.
+- Windows installs a `SetConsoleCtrlHandler` callback for Ctrl+C, Ctrl+Break,
+  console close, logoff, and system shutdown events.
+- Session loops poll the shared shutdown flag and perform normal cleanup.

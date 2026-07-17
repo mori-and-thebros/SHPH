@@ -54,25 +54,23 @@ Validation commands executed and passing in this environment:
 
 Phase A.1 is complete only when **all four tasks and all evidence items** are fully satisfied and test logs are mirrored across working and Windows copies.
 
-> All four tasks and evidence items are satisfied in the working copy. Windows
-> mirror sync is the remaining operator action (see Sync Notes below).
+> All four tasks and evidence items are satisfied in the working copy. Run the
+> supported mirror sync and verification commands below after each change.
 
 #### Sync Notes
 
 - Primary working copy: `/home/mori/SHPH_working_copy`
 - Windows mirror: `D:\FUNDING NEEDED\snap-shroud-rs`
-- The Linux agent has no mount/access to the Windows `D:\` drive; the operator
-  must copy the changed source and docs to the mirror. Changed files for this
-  phase: `Cargo.toml`, `shph-cli/Cargo.toml`, `shph-tun/Cargo.toml`,
-  `shph-cli/src/main.rs`, `shph-cli/src/shutdown.rs` (new),
-  `shph-cli/tests/cli_up_session_mode.rs`, `docs/TESTING.md`,
-  `docs/FUNDING_SPRINT_BOARD.md`, `CONTEXT_SUMMARY.md`.
+- The Windows mirror is mounted at `/mnt/d/FUNDING NEEDED/snap-shroud-rs` in
+  the supported WSL workflow. Run `./scripts/sync_mirror.sh --to-windows`
+  followed by `./scripts/sync_mirror.sh --verify`.
 
 ## Later Phases
 
-### Phase A.2 — Control-Plane Reliability (Next)
+### Phase A.2 — Control-Plane Reliability (Complete)
 
-**Status:** Complete (2026-06-24)
+**Status:** Complete, with persistent lifecycle commands and multi-DNS
+hardening (2026-07-15)
 
 #### Tasks
 
@@ -92,15 +90,21 @@ Phase A.1 is complete only when **all four tasks and all evidence items** are fu
    generic `Internal` message.
 3. `ControlPlaneGuard::cleanup` rolls back DNS then routes, collecting all
    errors rather than aborting on the first, maximizing partial rollback.
-4. Windows graceful-shutdown via `SetConsoleCtrlHandler` is **not** wired: it is
-   a Win32 API absent from the `libc` crate, and adding `windows-sys` requires
-   compiling/verifying on the Windows toolchain (tracked follow-up). Unix
-   SIGINT/SIGTERM parity from A.1 remains in place.
+4. Windows graceful-shutdown via `SetConsoleCtrlHandler` is wired through
+   `windows-sys`; the Windows mirror still needs native-toolchain validation.
+   Unix SIGINT/SIGTERM parity from A.1 remains in place.
+5. Persistent `apply`, `reconcile`, `undo`, and `down` lifecycle commands now
+   record exact live-applied state beside the config and are covered by
+   `cli_control_plane`.
+6. Multi-server DNS application preserves all configured servers: Linux emits
+   one `resolvectl dns` command, while Windows emits primary and secondary
+   `netsh` commands per address family. Partial application retains rollback
+   state before command execution.
 
 Validation commands executed and passing in this environment:
 - `cargo fmt --all` (clean)
 - `cargo clippy --workspace --all-targets -- -D warnings` (clean)
-- `cargo test --workspace` (36 passed, 0 failed)
+- `cargo test --workspace` (exact totals recorded in `docs/evidence/GATE_EVIDENCE.md`)
 
 New/changed unit tests: `control_plane_plan_preflight_validates_all_before_apply`,
 `control_plane_plan_normalizes_dns_and_routes`, `control_plane_plan_requires_interface_name`,

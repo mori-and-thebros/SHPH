@@ -16,10 +16,10 @@ Severity legend:
 
 | Risk / Limit | Severity | Status | Mitigation today | Plan |
 | ------------ | -------- | ------ | ---------------- | ---- |
-| Windows graceful Ctrl+C teardown not signal-driven | Medium | Tracked | Default termination; stdin loop still checks shutdown flag | `windows-sys` `SetConsoleCtrlHandler` (A.2 follow-up) |
-| QUIC path is an experimental UDP shim, not production QUIC | High | Partially hardened (v0.4.0) | TCP is the stable default; QUIC is opt-in with source-address binding, per-IP rate limiting, truncation guards | Conformant/congestion-controlled QUIC in later phase |
-| Native TUN requires `CAP_NET_ADMIN`/root | Medium | By design | Stub backend for dev flow; native behind `SHPH_TUN_NATIVE=1` | Privilege-separation in ops phase |
-| No dependency advisory automation in CI yet | Low | **Present (non-blocking)** | `cargo audit` runs as a CI job in `.github/workflows/ci.yml` (Phase B.2); 0 vulns, 2 accepted transitive advisories | Promote `audit` job to blocking (`continue-on-error: false`) once advisory policy for the 2 accepted warnings is finalized |
+| QUIC path is an experimental UDP shim, not production QUIC | High | Partially hardened (v0.4.0) | TCP is the stable default; QUIC is opt-in with source binding, bounded peer state, malformed-datagram budgets, strict frame lengths, and capped idle timeout | Loss recovery, congestion control, stream multiplexing, and conformant QUIC in later phase |
+| Native TUN accepts malformed or oversized IP packets | High | Hardened in working tree | 65,535-byte cap plus IPv4/IPv6 length validation at both TUN directions | Privilege separation and broader packet-policy controls in ops phase |
+| Native TUN requires `CAP_NET_ADMIN`/root | Medium | By design | Linux native backend is opt-in; Windows native mode refuses unsafe stub fallback until Wintun integration is provisioned | Privilege-separation and signed Wintun runtime integration |
+| Dependency advisory automation | Low | **Present and blocking** | `cargo audit` runs in `.github/workflows/ci.yml`; only two documented TUI advisories are ignored | Revisit the allowlist when `ratatui` drops the affected transitive crates |
 | Live control-plane apply needs host privileges/tools | Medium | By design | `dry_run=true` default; preflight validation; rollback guard | Ops hardening phase |
 
 ## Shipped security capabilities (v0.4.0)
@@ -40,8 +40,8 @@ independently reviewed. Marketing or implying any of these is a policy violation
 | ------------------- | ------------------------------- | ------------ | ------------ |
 | Censorship-resistant / anti-observation transport | Critical | No fingerprint parity or adversarial posture | Later phases |
 | DPI / TLS / QUIC fingerprint evasion | Critical | Not implemented | Later phases |
-| Production key management (HSM/PKCS#11/YubiKey/TPM) | High | Planned, not a default | Roadmap (optional) |
-| Shamir quorum key sharing | Medium | Planned, not a default | Roadmap (optional) |
+| Production key management (HSM/PKCS#11/YubiKey/TPM) | High | Not implemented; providers fail closed | Roadmap (optional) |
+| Shamir quorum key sharing | Medium | Safe CLI primitive, not a production KMS | Split/recover validates bounded shares; no hardware custody |
 | Constant-time / side-channel audit of the full stack | High | Relies on dependency crates' guarantees | Security audit phase |
 | Anti-DoS / resource-exhaustion guarantees | High | Only bounded handshake attempts + timeouts | Hardening phase |
 | Mobile/embedded platform support | Low | Not targeted | Not planned |
@@ -51,9 +51,9 @@ independently reviewed. Marketing or implying any of these is a policy violation
 | Threat | Covered? | Mechanism |
 | ------ | -------- | --------- |
 | Passive wire eavesdropping | Yes | AEAD-encrypted data plane |
-| Frame replay | Yes | Receiver sliding-window nonce anti-replay (fail-closed) + send-side nonce-limit guard |
+| Frame replay | Yes | TCP strict monotonic anti-replay; experimental UDP/QUIC sliding-window anti-replay (fail-closed) + send-side nonce-limit guard |
 | Tampered/truncated frames | Yes | AEAD auth + length bounds + fail-closed decode |
-| Active MITM | Yes | Identity-key signature + peer fingerprint pinning |
+| Active MITM | Yes | Identity-key signature + mandatory CLI-enforced configured peer fingerprint pinning |
 | Handshake flood | Partial | Bounded accept loop + handshake timeouts (not full DoS defense) |
 | Endpoint/key compromise | No | No HSM/TPM binding yet |
 | Traffic analysis / DPI | No | No fingerprint parity yet |

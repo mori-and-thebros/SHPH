@@ -12,13 +12,21 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn parse(addr: &str) -> Result<Self, String> {
-        let parts: Vec<&str> = addr.split(':').collect();
-        if parts.len() != 2 {
+        let (host, port_text) = if let Some(stripped) = addr.strip_prefix('[') {
+            let (host, port) = stripped
+                .split_once("]:")
+                .ok_or_else(|| format!("invalid endpoint: {}", addr))?;
+            (host, port)
+        } else {
+            addr.rsplit_once(':')
+                .ok_or_else(|| format!("invalid endpoint: {}", addr))?
+        };
+        let port = port_text.parse::<u16>().map_err(|e| e.to_string())?;
+        if host.trim().is_empty() || port == 0 {
             return Err(format!("invalid endpoint: {}", addr));
         }
-        let port = parts[1].parse::<u16>().map_err(|e| e.to_string())?;
         Ok(Self {
-            host: parts[0].to_string(),
+            host: host.to_string(),
             port,
         })
     }
@@ -28,7 +36,11 @@ impl Endpoint {
     /// Returns an error for malformed hosts (e.g. bad IPv6 literals, invalid
     /// characters) rather than panicking via `.unwrap()`.
     pub fn to_socket_addr_result(&self) -> std::result::Result<std::net::SocketAddr, String> {
-        let candidate = format!("{}:{}", self.host, self.port);
+        let candidate = if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        };
         candidate
             .to_socket_addrs()
             .map_err(|e| format!("invalid endpoint {candidate}: {e}"))?
@@ -87,6 +99,8 @@ mod tests {
         assert!(Endpoint::parse("host:notaport").is_err());
         let ep = Endpoint::parse("127.0.0.1:7000").expect("valid");
         assert_eq!(ep.port, 7000);
+        let ipv6 = Endpoint::parse("[::1]:7000").expect("valid IPv6 endpoint");
+        assert_eq!(ipv6.host, "::1");
     }
 
     #[test]

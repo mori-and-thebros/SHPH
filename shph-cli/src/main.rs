@@ -4,25 +4,28 @@ mod shutdown;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use shph_config::{Config, ControlPlaneConfig, PeerConfig, SessionRole};
 use shph_core::{
-    build_hello,
+    append_ratchet_audit_event, build_hello, compute_fingerprint_hex, read_ratchet_audit_events,
+    recover_secret_from_shares,
     roadmap::{DataMuleConfig, OfflineMeshConfig, RoadmapConfig},
-    verify_and_derive, Contact, Endpoint, HandshakeState, KeyStore, KeyStoreConfig,
-    MetricsCollector, Result, ShphError,
+    split_secret, validate_identity_provider, validate_roadmap, verify_and_derive, Contact,
+    Endpoint, HandshakeState, KeyStore, KeyStoreConfig, MetricsCollector, Result, ShamirShare,
+    ShphError,
 };
 use shph_transport::{
-    accept_secure_session, connect_secure_session, data_mule_accept_and_handshake,
+    accept_secure_session_lab, connect_secure_session_lab, data_mule_accept_and_handshake,
     data_mule_accept_secure_session, data_mule_connect_and_handshake,
     data_mule_connect_secure_session, offline_mesh_accept_and_handshake,
     offline_mesh_accept_secure_session, offline_mesh_connect_and_handshake,
     offline_mesh_connect_secure_session, quic_handshake_client, quic_handshake_server,
-    tcp_handshake_client, tcp_handshake_server, SecureReceiver, SecureSender, SecureSession,
-    TransportMode,
+    tcp_handshake_client, tcp_handshake_server, QuicLabConfig, SecureReceiver, SecureSender,
+    SecureSession, TransportMode,
 };
-use shph_tun::TunDevice;
-use std::io;
+use shph_tun::{TunDevice, TUN_READ_BUFFER_BYTES};
+use std::fs;
+use std::io::{self, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
@@ -32,6 +35,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
+
+const MAX_STDIN_LINE_BYTES: usize = 64 * 1024;
+const MAX_SHAMIR_SECRET_BYTES: u64 = 64 * 1024;
 
 fn phase_a1_now_ms() -> Result<u64> {
     Ok(SystemTime::now()
@@ -41,7 +48,7 @@ fn phase_a1_now_ms() -> Result<u64> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "shph")]
+#[command(name = "shph", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SHPH_BUILD_ID"), ")"))]
 #[command(
     about = "SHPH (Shroud-Phantom): Layer 3 VPN with stealth/shroud features",
     long_about = None
@@ -78,10 +85,20 @@ enum Commands {
     },
     /// Bring down the VPN tunnel
     Down,
+    /// Apply configured routes and DNS
+    Apply,
+    /// Reconcile configured routes and DNS
+    Reconcile,
+    /// Undo previously applied routes and DNS
+    Undo,
     /// Show VPN status
     Status,
     /// Show peer fingerprint
     ShowFingerprint,
+    /// Show the local identity public key
+    ShowPublicKey,
+    /// Show the local Ed25519 handshake-signing public key
+    ShowSigningPublicKey,
     /// List configured peers
     ListPeers,
     /// Add a new peer
@@ -90,9 +107,40 @@ enum Commands {
         host: String,
         port: u16,
         pubkey: String,
+        /// Ed25519 signing public key (base64, 32-byte raw)
+        #[arg(long)]
+        sign_pubkey: String,
     },
     /// Show configuration
     ShowConfig,
+    /// Validate optional roadmap adapters and trust configuration
+    ValidateRoadmap,
+    /// Split a secret into configured Shamir shares
+    ShamirSplit {
+        /// Read the secret from a protected file. Use "-" for stdin.
+        #[arg(
+            long,
+            conflicts_with = "secret_stdin",
+            required_unless_present = "secret_stdin"
+        )]
+        secret_file: Option<PathBuf>,
+        /// Read the secret bytes from stdin.
+        #[arg(long, conflicts_with = "secret_file")]
+        secret_stdin: bool,
+        /// Directory where owner-only share files are written.
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    /// Recover a secret from Shamir share JSON files
+    ShamirRecover {
+        #[arg(required = true)]
+        shares: Vec<PathBuf>,
+        /// Owner-only output file for the recovered secret.
+        #[arg(long)]
+        output_file: PathBuf,
+    },
+    /// Export ratchet audit journal as JSON
+    RatchetAuditExport,
     /// Perform local handshake simulation against a peer pubkey
     HandshakeSim {
         /// Peer identity public key (base64, 32-byte raw)
@@ -163,25 +211,56 @@ fn main() -> Result<()> {
             let path = config.unwrap_or(config_path);
             let config = load_config(&path)?;
             let mode = resolve_transport_mode(transport.as_deref(), config.roadmap.as_ref())?;
+            let path_keystore = keystore_path_from_config(&path);
             handle_up(
                 &path,
-                &keystore_path,
+                &path_keystore,
                 &config,
                 mode,
                 config.roadmap.as_ref(),
             )?
         }
-        Commands::Down => handle_down()?,
+        Commands::Down => handle_down(&config_path)?,
+        Commands::Apply => handle_control_plane_apply(&config_path)?,
+        Commands::Reconcile => handle_control_plane_reconcile(&config_path)?,
+        Commands::Undo => handle_control_plane_undo(&config_path)?,
         Commands::Status => handle_status(&config_path, &keystore_path)?,
         Commands::ShowFingerprint => handle_show_fingerprint(&keystore_path)?,
+        Commands::ShowPublicKey => handle_show_public_key(&keystore_path)?,
+        Commands::ShowSigningPublicKey => handle_show_signing_public_key(&keystore_path)?,
         Commands::ListPeers => handle_list_peers(&config_path)?,
         Commands::AddPeer {
             alias,
             host,
             port,
             pubkey,
-        } => handle_add_peer(&config_path, &keystore_path, alias, host, port, pubkey)?,
+            sign_pubkey,
+        } => handle_add_peer(
+            &config_path,
+            &keystore_path,
+            alias,
+            host,
+            port,
+            pubkey,
+            sign_pubkey,
+        )?,
         Commands::ShowConfig => handle_show_config(&config_path)?,
+        Commands::ValidateRoadmap => handle_validate_roadmap(&config_path)?,
+        Commands::ShamirSplit {
+            secret_file,
+            secret_stdin,
+            output_dir,
+        } => handle_shamir_split(
+            &config_path,
+            secret_file.as_deref(),
+            secret_stdin,
+            &output_dir,
+        )?,
+        Commands::ShamirRecover {
+            shares,
+            output_file,
+        } => handle_shamir_recover(&config_path, &shares, &output_file)?,
+        Commands::RatchetAuditExport => handle_ratchet_audit_export(&config_path)?,
         Commands::HandshakeSim { peer_pubkey_b64 } => {
             handle_handshake_sim(&keystore_path, &peer_pubkey_b64)?
         }
@@ -272,12 +351,13 @@ fn handle_init(config_path: &Path, keystore_path: &Path, force_new: bool) -> Res
 }
 
 fn handle_up(
-    _config_path: &Path,
+    config_path: &Path,
     keystore_path: &Path,
     config: &Config,
     transport: TransportMode,
     _roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
+    validate_config_roadmap(config)?;
     let tun = TunDevice::open(&config.interface_name)?;
     println!("SHPH up");
     println!("  Interface: {}", tun.name());
@@ -286,6 +366,28 @@ fn handle_up(
     print_control_plane_status(config);
     let mut control_guard = apply_control_plane(config, tun.name())?;
     let interface_name = tun.name().to_string();
+    let control_state_recorded = !control_guard.dry_run
+        && (!control_guard.added_routes.is_empty()
+            || !control_guard.applied_dns_servers.is_empty());
+    if control_state_recorded {
+        if let Err(err) = save_control_plane_state(
+            config_path,
+            &state_from_guard(&interface_name, &control_guard),
+        ) {
+            let cleanup_result = control_guard.cleanup();
+            return match cleanup_result {
+                Ok(()) => Err(err),
+                Err(clean_err) => Err(ShphError::Internal(format!(
+                    "control-plane state save error: {err}; rollback error: {clean_err}"
+                ))),
+            };
+        }
+    }
+    // Drop the probe handle before the session loops open the same-named TUN
+    // interface again; keeping both open causes ioctl(TUNSETIFF) to fail with
+    // EBUSY ("Device or resource busy") since the kernel ties interface state
+    // to the already-open fd.
+    drop(tun);
     let session_result = if let Some(session) = &config.session {
         let timeout_secs = session.timeout_secs.unwrap_or(5);
         let reconnect_enabled = session
@@ -385,6 +487,9 @@ fn handle_up(
     match session_result {
         Ok(()) => {
             control_guard.cleanup()?;
+            if control_state_recorded {
+                remove_control_plane_state(config_path)?;
+            }
             Ok(())
         }
         Err(err) => {
@@ -394,13 +499,17 @@ fn handle_up(
                     "session error: {err}; control-plane cleanup error: {clean_err}"
                 )));
             }
+            if control_state_recorded {
+                remove_control_plane_state(config_path)?;
+            }
             Err(err)
         }
     }
 }
 
-fn handle_down() -> Result<()> {
+fn handle_down(config_path: &Path) -> Result<()> {
     println!("SHPH down");
+    handle_control_plane_undo(config_path)?;
     Ok(())
 }
 
@@ -412,6 +521,7 @@ fn handle_status(config_path: &Path, keystore_path: &Path) -> Result<()> {
     } else {
         0
     };
+    let control_state = control_plane_state_path(config_path);
     println!("SHPH Status");
     println!(
         "  Config: {}",
@@ -427,12 +537,200 @@ fn handle_status(config_path: &Path, keystore_path: &Path) -> Result<()> {
     );
     println!("  Tunnel: inactive");
     println!("  Peers: {peer_count}");
+    println!(
+        "  Control plane: {}",
+        if control_state.exists() {
+            "active state recorded"
+        } else {
+            "inactive"
+        }
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedControlPlaneState {
+    interface_name: String,
+    routes: Vec<String>,
+    dns_servers: Vec<String>,
+}
+
+fn control_plane_state_path(config_path: &Path) -> PathBuf {
+    let mut state_path = config_path.to_path_buf();
+    state_path.set_extension("control-plane.json");
+    state_path
+}
+
+fn load_control_plane_state(config_path: &Path) -> Result<PersistedControlPlaneState> {
+    let state_path = control_plane_state_path(config_path);
+    let contents = fs::read_to_string(&state_path).map_err(ShphError::Io)?;
+    serde_json::from_str(&contents).map_err(ShphError::Serialization)
+}
+
+fn save_control_plane_state(config_path: &Path, state: &PersistedControlPlaneState) -> Result<()> {
+    let state_path = control_plane_state_path(config_path);
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent).map_err(ShphError::Io)?;
+    }
+    let contents = serde_json::to_vec_pretty(state)?;
+    let mut temp_path = state_path.clone();
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ShphError::Internal("system clock before unix epoch".into()))?
+        .as_nanos();
+    temp_path.set_extension(format!(
+        "control-plane.json.tmp.{}.{}",
+        std::process::id(),
+        suffix
+    ));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(ShphError::Io)?;
+    restrict_state_file_perms(&temp_path)?;
+    use std::io::Write as _;
+    if let Err(err) = file.write_all(&contents).map_err(ShphError::Io) {
+        drop(file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    if let Err(err) = file.sync_all().map_err(ShphError::Io) {
+        drop(file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    drop(file);
+    if let Err(err) = fs::rename(&temp_path, &state_path).map_err(ShphError::Io) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn remove_control_plane_state(config_path: &Path) -> Result<()> {
+    let state_path = control_plane_state_path(config_path);
+    match fs::remove_file(state_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ShphError::Io(err)),
+    }
+}
+
+fn restrict_state_file_perms(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(ShphError::Io)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn state_from_guard(interface_name: &str, guard: &ControlPlaneGuard) -> PersistedControlPlaneState {
+    PersistedControlPlaneState {
+        interface_name: interface_name.to_string(),
+        routes: guard.added_routes.clone(),
+        dns_servers: guard.applied_dns_servers.clone(),
+    }
+}
+
+fn guard_from_state(state: &PersistedControlPlaneState) -> ControlPlaneGuard {
+    ControlPlaneGuard {
+        added_routes: state.routes.clone(),
+        applied_dns_servers: state.dns_servers.clone(),
+        dns_interface_name: (!state.dns_servers.is_empty()).then(|| state.interface_name.clone()),
+        dry_run: false,
+    }
+}
+
+fn handle_control_plane_apply(config_path: &Path) -> Result<()> {
+    let config = load_config(config_path)?;
+    let Some(control) = &config.control_plane else {
+        println!("Control plane: no configuration");
+        return Ok(());
+    };
+    let interface_name = config.interface_name.trim();
+    if interface_name.is_empty() {
+        return Err(ShphError::InvalidArgument(
+            "interface name required for control-plane apply".into(),
+        ));
+    }
+    let plan = build_control_plane_plan(control, interface_name)?;
+    let desired = PersistedControlPlaneState {
+        interface_name: interface_name.to_string(),
+        routes: plan.routes.clone(),
+        dns_servers: plan.dns_servers.clone(),
+    };
+
+    let state_path = control_plane_state_path(config_path);
+    if state_path.exists() {
+        let existing = load_control_plane_state(config_path)?;
+        if existing == desired {
+            println!("Control plane: already reconciled");
+            return Ok(());
+        }
+        return Err(ShphError::Config(
+            "recorded control-plane state differs; run reconcile".into(),
+        ));
+    }
+
+    let guard = apply_control_plane(&config, interface_name)?;
+    if control.dry_run.unwrap_or(true) {
+        return Ok(());
+    }
+    save_control_plane_state(config_path, &state_from_guard(interface_name, &guard))?;
+    println!(
+        "Control plane: applied routes={} dns={}",
+        desired.routes.len(),
+        desired.dns_servers.len()
+    );
+    Ok(())
+}
+
+fn handle_control_plane_reconcile(config_path: &Path) -> Result<()> {
+    if control_plane_state_path(config_path).exists() {
+        let state = load_control_plane_state(config_path)?;
+        let mut guard = guard_from_state(&state);
+        guard.cleanup()?;
+        remove_control_plane_state(config_path)?;
+        println!("Control plane: previous state undone");
+    }
+    handle_control_plane_apply(config_path)
+}
+
+fn handle_control_plane_undo(config_path: &Path) -> Result<()> {
+    let state_path = control_plane_state_path(config_path);
+    if !state_path.exists() {
+        println!("Control plane: no applied state");
+        return Ok(());
+    }
+    let state = load_control_plane_state(config_path)?;
+    let mut guard = guard_from_state(&state);
+    guard.cleanup()?;
+    remove_control_plane_state(config_path)?;
+    println!("Control plane: undone");
     Ok(())
 }
 
 fn handle_show_fingerprint(keystore_path: &Path) -> Result<()> {
     let keystore = KeyStore::load(keystore_path, None)?;
     println!("{}", keystore.fingerprint_hex());
+    Ok(())
+}
+
+fn handle_show_public_key(keystore_path: &Path) -> Result<()> {
+    let keystore = KeyStore::load(keystore_path, None)?;
+    println!("{}", keystore.public_key_b64());
+    Ok(())
+}
+
+fn handle_show_signing_public_key(keystore_path: &Path) -> Result<()> {
+    let keystore = KeyStore::load(keystore_path, None)?;
+    println!("{}", keystore.identity.signing_public_b64());
     Ok(())
 }
 
@@ -455,6 +753,7 @@ fn handle_add_peer(
     host: String,
     port: u16,
     pubkey_b64: String,
+    sign_pubkey_b64: String,
 ) -> Result<()> {
     if alias.trim().is_empty() {
         return Err(ShphError::InvalidArgument("alias cannot be empty".into()));
@@ -463,6 +762,7 @@ fn handle_add_peer(
         return Err(ShphError::InvalidArgument("port must be > 0".into()));
     }
     validate_pubkey_b64(&pubkey_b64)?;
+    validate_pubkey_b64_named(&sign_pubkey_b64, "sign_pubkey")?;
 
     let mut config = if config_path.exists() {
         load_config(config_path)?
@@ -476,11 +776,12 @@ fn handle_add_peer(
         ));
     }
 
-    let endpoint = format!("{host}:{port}");
+    let endpoint = format_endpoint(&host, port);
     config.peers.push(PeerConfig {
         alias: alias.clone(),
         endpoint: endpoint.clone(),
         pubkey: pubkey_b64.clone(),
+        sign_pubkey: Some(sign_pubkey_b64.clone()),
     });
     save_config(&config, config_path)?;
 
@@ -493,6 +794,7 @@ fn handle_add_peer(
         alias: alias.clone(),
         endpoint: Endpoint { host, port },
         pubkey_b64,
+        sign_pubkey_b64: Some(sign_pubkey_b64),
     });
     keystore.save(keystore_path)?;
 
@@ -504,6 +806,248 @@ fn handle_show_config(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
     let rendered = toml::to_string_pretty(&config).map_err(|e| ShphError::Config(e.to_string()))?;
     println!("{rendered}");
+    Ok(())
+}
+
+fn handle_validate_roadmap(config_path: &Path) -> Result<()> {
+    let config = load_config(config_path)?;
+    if config.roadmap.is_none() {
+        println!("Roadmap: no optional configuration");
+        return Ok(());
+    }
+    validate_config_roadmap(&config)?;
+    let roadmap = config.roadmap.as_ref().expect("checked above");
+    println!("Roadmap: valid");
+    println!("  Transport: {:?}", roadmap.transport);
+    println!("  Identity provider: {:?}", roadmap.identity);
+    println!("  Shamir enabled: {}", roadmap.shamir.enabled);
+    println!(
+        "  Ratchet audit journal: {}",
+        roadmap.ratchet_audit.journal_path
+    );
+    Ok(())
+}
+
+fn configured_roadmap(config_path: &Path) -> Result<RoadmapConfig> {
+    let config = load_config(config_path)?;
+    let roadmap = config
+        .roadmap
+        .ok_or_else(|| ShphError::Config("roadmap configuration is required".into()))?;
+    validate_roadmap(&roadmap)?;
+    validate_identity_provider(&roadmap.identity)?;
+    Ok(roadmap)
+}
+
+fn validate_config_roadmap(config: &Config) -> Result<()> {
+    if let Some(roadmap) = config.roadmap.as_ref() {
+        validate_roadmap(roadmap)?;
+        validate_identity_provider(&roadmap.identity)?;
+    }
+    if let Some(stealth) = &config.stealth {
+        if !shph_core::stealth_profiles()
+            .iter()
+            .any(|profile| profile.name == stealth.profile)
+        {
+            return Err(ShphError::Config(format!(
+                "unknown stealth profile: {}",
+                stealth.profile
+            )));
+        }
+        if !shph_core::profiles()
+            .iter()
+            .any(|profile| profile.name == stealth.shroud_profile)
+        {
+            return Err(ShphError::Config(format!(
+                "unknown shroud profile: {}",
+                stealth.shroud_profile
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn handle_shamir_split(
+    config_path: &Path,
+    secret_file: Option<&Path>,
+    secret_stdin: bool,
+    output_dir: &Path,
+) -> Result<()> {
+    let roadmap = configured_roadmap(config_path)?;
+    if !roadmap.shamir.enabled {
+        return Err(ShphError::Config(
+            "Shamir is disabled in roadmap configuration".into(),
+        ));
+    }
+    let mut secret = read_shamir_secret(secret_file, secret_stdin)?;
+    if secret.is_empty() {
+        return Err(ShphError::InvalidArgument("secret cannot be empty".into()));
+    }
+    let shares = split_secret(&secret, &roadmap.shamir)?;
+    write_shamir_shares(output_dir, &shares)?;
+    secret.zeroize();
+    println!(
+        "Wrote {} Shamir share files to {}",
+        shares.len(),
+        output_dir.display()
+    );
+    Ok(())
+}
+
+fn handle_shamir_recover(config_path: &Path, paths: &[PathBuf], output_file: &Path) -> Result<()> {
+    let roadmap = configured_roadmap(config_path)?;
+    if !roadmap.shamir.enabled {
+        return Err(ShphError::Config(
+            "Shamir is disabled in roadmap configuration".into(),
+        ));
+    }
+    if paths.is_empty() {
+        return Err(ShphError::InvalidArgument(
+            "at least one share file is required".into(),
+        ));
+    }
+    let mut shares = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = fs::read(path).map_err(ShphError::Io)?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.is_array() {
+            let file_shares: Vec<ShamirShare> = serde_json::from_value(value)?;
+            shares.extend(file_shares);
+        } else {
+            shares.push(serde_json::from_value(value)?);
+        }
+    }
+    let mut recovered = recover_secret_from_shares(&shares, &roadmap.shamir)?;
+    write_owner_only_file(output_file, &recovered)?;
+    recovered.zeroize();
+    println!("Wrote recovered secret to {}", output_file.display());
+    Ok(())
+}
+
+fn read_shamir_secret(
+    path: Option<&Path>,
+    from_stdin: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let mut file = if from_stdin || path.is_some_and(|value| value == Path::new("-")) {
+        None
+    } else {
+        Some(open_secret_input(path.ok_or_else(|| {
+            ShphError::InvalidArgument("secret file is required".into())
+        })?)?)
+    };
+    let mut bytes = Vec::new();
+    if let Some(file) = file.as_mut() {
+        let length = file.metadata()?.len();
+        if length > MAX_SHAMIR_SECRET_BYTES {
+            return Err(ShphError::InvalidArgument(
+                "Shamir secret file exceeds the 64 KiB safety limit".into(),
+            ));
+        }
+        file.take(MAX_SHAMIR_SECRET_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+    } else {
+        io::stdin()
+            .take(MAX_SHAMIR_SECRET_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+    }
+    if bytes.len() as u64 > MAX_SHAMIR_SECRET_BYTES {
+        return Err(ShphError::InvalidArgument(
+            "Shamir secret exceeds the 64 KiB safety limit".into(),
+        ));
+    }
+    Ok(zeroize::Zeroizing::new(bytes))
+}
+
+fn open_secret_input(path: &Path) -> Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(ShphError::Io)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::open(path).map_err(ShphError::Io)
+    }
+}
+
+fn write_shamir_shares(output_dir: &Path, shares: &[ShamirShare]) -> Result<()> {
+    fs::create_dir_all(output_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(output_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    for (offset, share) in shares.iter().enumerate() {
+        let path = output_dir.join(format!("share-{:03}.json", offset + 1));
+        let data = serde_json::to_vec_pretty(share)?;
+        write_owner_only_file(&path, &data)?;
+    }
+    Ok(())
+}
+
+fn write_owner_only_file(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("secret");
+    let temp = parent.join(format!(
+        ".{filename}.tmp.{}.{}",
+        std::process::id(),
+        phase_a1_now_ms()?
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
+    }
+    if let Err(error) = (|| -> Result<()> {
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)?;
+        Ok(())
+    })() {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn append_handshake_audit(
+    roadmap: Option<&RoadmapConfig>,
+    local_identity: &shph_core::IdentityKeyPair,
+    peer: &str,
+    state: &HandshakeState,
+    role: &str,
+    transport: TransportMode,
+) -> Result<()> {
+    if let Some(roadmap) = roadmap {
+        append_ratchet_audit_event(
+            &roadmap.ratchet_audit,
+            compute_fingerprint_hex(&local_identity.public_key_bytes()),
+            state.peer_fingerprint_hex.clone(),
+            state.transcript_hash_hex.clone(),
+            role,
+            transport_mode_to_str(transport),
+        )?;
+        println!("  Ratchet audit: recorded peer {peer}");
+    }
+    Ok(())
+}
+
+fn handle_ratchet_audit_export(config_path: &Path) -> Result<()> {
+    let roadmap = configured_roadmap(config_path)?;
+    let records = read_ratchet_audit_events(&roadmap.ratchet_audit)?;
+    println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
 }
 
@@ -544,6 +1088,10 @@ fn handle_listen(
     transport: Option<String>,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
+    if let Some(roadmap) = roadmap {
+        validate_roadmap(roadmap)?;
+        validate_identity_provider(&roadmap.identity)?;
+    }
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let state = match mode {
@@ -562,6 +1110,8 @@ fn handle_listen(
             data_mule_accept_and_handshake(&cfg, &keystore.identity, timeout_secs)?
         }
     };
+    enforce_peer_policy(keystore_path, bind, &state, false)?;
+    append_handshake_audit(roadmap, &keystore.identity, bind, &state, "listen", mode)?;
     print_handshake_state("listen", bind, &state);
     Ok(())
 }
@@ -573,6 +1123,10 @@ fn handle_connect(
     transport: Option<String>,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
+    if let Some(roadmap) = roadmap {
+        validate_roadmap(roadmap)?;
+        validate_identity_provider(&roadmap.identity)?;
+    }
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let state = match mode {
@@ -591,6 +1145,8 @@ fn handle_connect(
             data_mule_connect_and_handshake(&cfg, &keystore.identity, peer, timeout_secs)?
         }
     };
+    enforce_peer_policy(keystore_path, peer, &state, true)?;
+    append_handshake_audit(roadmap, &keystore.identity, peer, &state, "connect", mode)?;
     print_handshake_state("connect", peer, &state);
     Ok(())
 }
@@ -603,6 +1159,10 @@ fn handle_send_once(
     transport: Option<String>,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
+    if let Some(roadmap) = roadmap {
+        validate_roadmap(roadmap)?;
+        validate_identity_provider(&roadmap.identity)?;
+    }
     let start_ms = phase_a1_now_ms()?;
     let session_id = format!("send-once-{peer}-{start_ms}");
     let metrics = MetricsCollector::new();
@@ -610,14 +1170,15 @@ fn handle_send_once(
     println!("  Session start: {start_ms}ms");
     println!("  Initial metrics: {:?}", metrics.snapshot());
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
+    let lab = quic_lab_config()?;
     let (mut session, state) = match mode {
         TransportMode::Tcp => {
             let keystore = KeyStore::load(keystore_path, None)?;
-            connect_secure_session(peer, &keystore.identity, timeout_secs, mode)?
+            connect_secure_session_lab(peer, &keystore.identity, timeout_secs, mode, lab)?
         }
         TransportMode::Quic => {
             let keystore = KeyStore::load(keystore_path, None)?;
-            connect_secure_session(peer, &keystore.identity, timeout_secs, mode)?
+            connect_secure_session_lab(peer, &keystore.identity, timeout_secs, mode, lab)?
         }
         TransportMode::OfflineMesh => {
             let keystore = KeyStore::load(keystore_path, None)?;
@@ -630,6 +1191,9 @@ fn handle_send_once(
             data_mule_connect_secure_session(&cfg, &keystore.identity, peer, timeout_secs)?
         }
     };
+    enforce_peer_policy(keystore_path, peer, &state, true)?;
+    let keystore = KeyStore::load(keystore_path, None)?;
+    append_handshake_audit(roadmap, &keystore.identity, peer, &state, "send", mode)?;
     session.send_frame(text.as_bytes())?;
     metrics.inc_bytes_sent(text.len());
     print_handshake_state("send-once", peer, &state);
@@ -647,6 +1211,10 @@ fn handle_recv_once(
     transport: Option<String>,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
+    if let Some(roadmap) = roadmap {
+        validate_roadmap(roadmap)?;
+        validate_identity_provider(&roadmap.identity)?;
+    }
     let start_ms = phase_a1_now_ms()?;
     let session_id = format!("recv-once-{bind}-{start_ms}");
     let metrics = MetricsCollector::new();
@@ -654,14 +1222,15 @@ fn handle_recv_once(
     println!("  Session start: {start_ms}ms");
     println!("  Initial metrics: {:?}", metrics.snapshot());
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
+    let lab = quic_lab_config()?;
     let (mut session, state) = match mode {
         TransportMode::Tcp => {
             let keystore = KeyStore::load(keystore_path, None)?;
-            accept_secure_session(bind, &keystore.identity, timeout_secs, mode)?
+            accept_secure_session_lab(bind, &keystore.identity, timeout_secs, mode, lab)?
         }
         TransportMode::Quic => {
             let keystore = KeyStore::load(keystore_path, None)?;
-            accept_secure_session(bind, &keystore.identity, timeout_secs, mode)?
+            accept_secure_session_lab(bind, &keystore.identity, timeout_secs, mode, lab)?
         }
         TransportMode::OfflineMesh => {
             let keystore = KeyStore::load(keystore_path, None)?;
@@ -674,6 +1243,9 @@ fn handle_recv_once(
             data_mule_accept_secure_session(&cfg, &keystore.identity, timeout_secs)?
         }
     };
+    enforce_peer_policy(keystore_path, bind, &state, false)?;
+    let keystore = KeyStore::load(keystore_path, None)?;
+    append_handshake_audit(roadmap, &keystore.identity, bind, &state, "recv", mode)?;
     let payload = session.recv_frame()?;
     metrics.inc_bytes_recv(payload.len());
     let plaintext = String::from_utf8(payload)
@@ -694,6 +1266,7 @@ fn to_peer_configs(keystore: &KeyStore) -> Vec<PeerConfig> {
             alias: contact.alias.clone(),
             endpoint: format!("{}:{}", contact.endpoint.host, contact.endpoint.port),
             pubkey: contact.pubkey_b64.clone(),
+            sign_pubkey: contact.sign_pubkey_b64.clone(),
         })
         .collect()
 }
@@ -706,13 +1279,17 @@ fn keystore_path_from_config(config_path: &Path) -> PathBuf {
 }
 
 fn validate_pubkey_b64(input: &str) -> Result<()> {
+    validate_pubkey_b64_named(input, "pubkey")
+}
+
+fn validate_pubkey_b64_named(input: &str, label: &str) -> Result<()> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(input.as_bytes())
-        .map_err(|_| ShphError::InvalidArgument("pubkey must be base64".into()))?;
+        .map_err(|_| ShphError::InvalidArgument(format!("{label} must be base64")))?;
     if raw.len() != 32 {
-        return Err(ShphError::InvalidArgument(
-            "pubkey must decode to 32 bytes".into(),
-        ));
+        return Err(ShphError::InvalidArgument(format!(
+            "{label} must decode to 32 bytes"
+        )));
     }
     Ok(())
 }
@@ -751,6 +1328,20 @@ fn resolve_transport_from_roadmap(cfg: &RoadmapConfig) -> Result<TransportMode> 
     }
 }
 
+fn quic_lab_config() -> Result<QuicLabConfig> {
+    let Some(name) = std::env::var("SHPH_SHROUD_PROFILE").ok() else {
+        return Ok(QuicLabConfig::default());
+    };
+    let profile = shph_core::shroud_profile_by_name(&name).ok_or_else(|| {
+        ShphError::Config(format!(
+            "unknown SHPH_SHROUD_PROFILE '{name}'; expected balanced, low-latency, bulk, or randomized-lab"
+        ))
+    })?;
+    Ok(QuicLabConfig {
+        shroud_profile: Some(profile),
+    })
+}
+
 fn roadmap_offline_mesh_config(roadmap: Option<&RoadmapConfig>) -> Result<OfflineMeshConfig> {
     roadmap
         .ok_or_else(|| {
@@ -785,6 +1376,77 @@ fn save_config(config: &Config, config_path: &Path) -> Result<()> {
     config
         .save(config_path)
         .map_err(|e| ShphError::Config(e.to_string()))
+}
+
+fn format_endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn enforce_peer_policy(
+    keystore_path: &Path,
+    endpoint: &str,
+    state: &HandshakeState,
+    outbound: bool,
+) -> Result<()> {
+    let keystore = KeyStore::load(keystore_path, None)?;
+    let peers = if outbound {
+        let matching: Vec<_> = keystore
+            .contacts
+            .iter()
+            .filter(|(_, peer)| {
+                let configured = format_endpoint(&peer.endpoint.host, peer.endpoint.port);
+                configured == endpoint
+            })
+            .map(|(_, peer)| peer)
+            .collect();
+        if matching.is_empty() {
+            return Err(ShphError::Auth(format!(
+                "peer endpoint is not configured: {endpoint}"
+            )));
+        }
+        matching
+    } else if keystore.contacts.is_empty() {
+        return Err(ShphError::Auth(
+            "no peers are pinned; add the expected peer before starting a session".into(),
+        ));
+    } else {
+        keystore.contacts.values().collect()
+    };
+
+    if peers.iter().any(|peer| {
+        let signing_key_matches = peer
+            .sign_pubkey_b64
+            .as_deref()
+            .and_then(|expected| {
+                let expected = base64::engine::general_purpose::STANDARD
+                    .decode(expected.as_bytes())
+                    .ok()?;
+                let actual = base64::engine::general_purpose::STANDARD
+                    .decode(state.peer_signing_pubkey_b64.as_bytes())
+                    .ok()?;
+                Some(expected.len() == 32 && expected == actual)
+            })
+            .unwrap_or(false);
+        base64::engine::general_purpose::STANDARD
+            .decode(peer.pubkey_b64.as_bytes())
+            .ok()
+            .filter(|raw| raw.len() == 32)
+            .map(|raw| {
+                compute_fingerprint_hex(&raw) == state.peer_fingerprint_hex && signing_key_matches
+            })
+            .unwrap_or(false)
+    }) {
+        Ok(())
+    } else {
+        Err(ShphError::Auth(format!(
+            "peer identity {} is not pinned in configuration",
+            state.peer_fingerprint_hex
+        )))
+    }
 }
 
 fn print_handshake_state(role: &str, endpoint: &str, state: &HandshakeState) {
@@ -836,13 +1498,15 @@ fn apply_control_plane(config: &Config, interface_name: &str) -> Result<ControlP
         }
 
         if plan.apply_dns {
-            for server in &plan.dns_servers {
-                if dry_run {
+            if dry_run {
+                for server in &plan.dns_servers {
                     println!("  [dry-run] dns add {server}");
-                } else {
-                    apply_dns_server(server, interface_name)?;
-                    guard.applied_dns_servers.push(server.clone());
-                    guard.dns_interface_name = Some(interface_name.to_string());
+                }
+            } else {
+                guard.applied_dns_servers = plan.dns_servers.clone();
+                guard.dns_interface_name = Some(interface_name.to_string());
+                apply_dns_servers(&plan.dns_servers, interface_name)?;
+                for server in &plan.dns_servers {
                     println!("  dns add {server}");
                 }
             }
@@ -987,9 +1651,89 @@ fn delete_route(cidr: &str) -> Result<()> {
     run_shell_command(&command)
 }
 
-fn apply_dns_server(server: &str, interface_name: &str) -> Result<()> {
-    let command = build_dns_apply_command(server, interface_name)?;
-    run_shell_command(&command)
+fn apply_dns_servers(servers: &[String], interface_name: &str) -> Result<()> {
+    if servers.is_empty() {
+        return Ok(());
+    }
+    let commands = build_dns_apply_commands(servers, interface_name)?;
+    for command in commands {
+        run_shell_command(&command)?;
+    }
+    Ok(())
+}
+
+fn build_dns_apply_commands(servers: &[String], interface_name: &str) -> Result<Vec<Vec<String>>> {
+    if servers.is_empty() {
+        return Ok(Vec::new());
+    }
+    for server in servers {
+        server
+            .parse::<IpAddr>()
+            .map_err(|_| ShphError::Config(format!("invalid DNS server IP: {server}")))?;
+    }
+
+    if cfg!(target_os = "linux") {
+        return Ok(vec![{
+            let mut command = vec![
+                "resolvectl".to_string(),
+                "dns".to_string(),
+                interface_name.to_string(),
+            ];
+            command.extend(servers.iter().cloned());
+            command
+        }]);
+    }
+
+    if cfg!(target_os = "windows") {
+        let mut commands = Vec::with_capacity(servers.len());
+        for family in ["ipv4", "ipv6"] {
+            let family_servers: Vec<&String> = servers
+                .iter()
+                .filter(|server| {
+                    (server.contains(':') && family == "ipv6")
+                        || (!server.contains(':') && family == "ipv4")
+                })
+                .collect();
+            for (index, server) in family_servers.iter().enumerate() {
+                if index == 0 {
+                    commands.push(vec![
+                        "netsh".to_string(),
+                        "interface".to_string(),
+                        family.to_string(),
+                        "set".to_string(),
+                        "dns".to_string(),
+                        format!("name={interface_name}"),
+                        "static".to_string(),
+                        (*server).clone(),
+                    ]);
+                } else {
+                    commands.push(vec![
+                        "netsh".to_string(),
+                        "interface".to_string(),
+                        family.to_string(),
+                        "add".to_string(),
+                        "dnsserver".to_string(),
+                        format!("name={interface_name}"),
+                        format!("address={}", server),
+                        format!("index={}", index + 1),
+                    ]);
+                }
+            }
+        }
+        return Ok(commands);
+    }
+
+    Err(ShphError::Unsupported(
+        "DNS apply unsupported on this platform".into(),
+    ))
+}
+
+#[cfg(test)]
+fn build_dns_apply_command(server: &str, interface_name: &str) -> Result<Vec<String>> {
+    build_dns_apply_commands(&[server.to_string()], interface_name)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ShphError::Internal("DNS command builder returned no command".into()))
 }
 
 fn restore_dns(interface_name: Option<&str>) -> Result<()> {
@@ -1080,36 +1824,6 @@ fn build_route_delete_command(cidr: &str) -> Result<Vec<String>> {
     } else {
         Err(ShphError::Unsupported(
             "route delete unsupported on this platform".into(),
-        ))
-    }
-}
-
-fn build_dns_apply_command(server: &str, interface_name: &str) -> Result<Vec<String>> {
-    let _addr = server
-        .parse::<IpAddr>()
-        .map_err(|_| ShphError::Config(format!("invalid DNS server IP: {server}")))?;
-    if cfg!(target_os = "linux") {
-        Ok(vec![
-            "resolvectl".to_string(),
-            "dns".to_string(),
-            interface_name.to_string(),
-            server.to_string(),
-        ])
-    } else if cfg!(target_os = "windows") {
-        let family = if server.contains(':') { "ipv6" } else { "ipv4" };
-        Ok(vec![
-            "netsh".to_string(),
-            "interface".to_string(),
-            family.to_string(),
-            "set".to_string(),
-            "dns".to_string(),
-            format!("name={interface_name}"),
-            "static".to_string(),
-            server.to_string(),
-        ])
-    } else {
-        Err(ShphError::Unsupported(
-            "DNS apply unsupported on this platform".into(),
         ))
     }
 }
@@ -1239,9 +1953,10 @@ fn run_listen_loop(
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
+    let lab = quic_lab_config()?;
     let (mut session, state) = match mode {
         TransportMode::Tcp | TransportMode::Quic => {
-            accept_secure_session(bind, &keystore.identity, timeout_secs, mode)?
+            accept_secure_session_lab(bind, &keystore.identity, timeout_secs, mode, lab)?
         }
         TransportMode::OfflineMesh => {
             let cfg = roadmap_offline_mesh_config(roadmap)?;
@@ -1252,6 +1967,15 @@ fn run_listen_loop(
             data_mule_accept_secure_session(&cfg, &keystore.identity, timeout_secs)?
         }
     };
+    enforce_peer_policy(keystore_path, bind, &state, false)?;
+    append_handshake_audit(
+        roadmap,
+        &keystore.identity,
+        bind,
+        &state,
+        "listen-loop",
+        mode,
+    )?;
     print_handshake_state("listen-loop", bind, &state);
     let session_id = format!("listen-{bind}-{start_ms}");
     let metrics = MetricsCollector::new();
@@ -1308,9 +2032,10 @@ fn run_connect_loop(
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
+    let lab = quic_lab_config()?;
     let (mut session, state) = match mode {
         TransportMode::Tcp | TransportMode::Quic => {
-            connect_secure_session(peer, &keystore.identity, timeout_secs, mode)?
+            connect_secure_session_lab(peer, &keystore.identity, timeout_secs, mode, lab)?
         }
         TransportMode::OfflineMesh => {
             let cfg = roadmap_offline_mesh_config(roadmap)?;
@@ -1321,6 +2046,15 @@ fn run_connect_loop(
             data_mule_connect_secure_session(&cfg, &keystore.identity, peer, timeout_secs)?
         }
     };
+    enforce_peer_policy(keystore_path, peer, &state, true)?;
+    append_handshake_audit(
+        roadmap,
+        &keystore.identity,
+        peer,
+        &state,
+        "connect-loop",
+        mode,
+    )?;
     print_handshake_state("connect-loop", peer, &state);
     let session_id = format!("connect-{peer}-{start_ms}");
     let metrics = MetricsCollector::new();
@@ -1357,12 +2091,13 @@ fn stream_stdin_lines(session: &mut SecureSession, metrics: &MetricsCollector) -
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut line = String::new();
+    let mut pending = Vec::new();
     loop {
         if shutdown::shutdown_requested() {
             break;
         }
         line.clear();
-        let got_line = read_stdin_line(&mut reader, &mut line)?;
+        let got_line = read_stdin_line(&mut reader, &mut line, &mut pending)?;
         if !got_line {
             break;
         }
@@ -1378,24 +2113,55 @@ fn stream_stdin_lines(session: &mut SecureSession, metrics: &MetricsCollector) -
 /// shutdown request or EOF. On unix the underlying read is poll-driven with a
 /// short timeout so signals are observed without busy-waiting.
 #[cfg(unix)]
-fn read_stdin_line(reader: &mut io::StdinLock<'_>, line: &mut String) -> Result<bool> {
-    read_stdin_line_unix(reader, line)
+fn read_stdin_line(
+    reader: &mut io::StdinLock<'_>,
+    line: &mut String,
+    pending: &mut Vec<u8>,
+) -> Result<bool> {
+    read_stdin_line_unix(reader, line, pending)
 }
 
 #[cfg(not(unix))]
-fn read_stdin_line(reader: &mut io::StdinLock<'_>, line: &mut String) -> Result<bool> {
+fn read_stdin_line(
+    reader: &mut io::StdinLock<'_>,
+    line: &mut String,
+    _pending: &mut Vec<u8>,
+) -> Result<bool> {
     use std::io::BufRead;
     let n = reader.read_line(line).map_err(ShphError::Io)?;
+    if line.len() > MAX_STDIN_LINE_BYTES {
+        return Err(ShphError::Protocol(
+            "stdin line exceeds the 64 KiB safety limit".into(),
+        ));
+    }
     Ok(n > 0)
 }
 
 #[cfg(unix)]
-fn read_stdin_line_unix(reader: &mut io::StdinLock<'_>, line: &mut String) -> Result<bool> {
+fn read_stdin_line_unix(
+    reader: &mut io::StdinLock<'_>,
+    line: &mut String,
+    pending: &mut Vec<u8>,
+) -> Result<bool> {
     use std::os::fd::AsRawFd;
     let fd = reader.as_raw_fd();
     loop {
         if shutdown::shutdown_requested() {
             return Ok(false);
+        }
+        if let Some(newline) = pending.iter().position(|&byte| byte == b'\n') {
+            let mut bytes: Vec<u8> = pending.drain(..=newline).collect();
+            while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+                bytes.pop();
+            }
+            *line = String::from_utf8(bytes)
+                .map_err(|_| ShphError::InvalidArgument("stdin line is not valid UTF-8".into()))?;
+            return Ok(true);
+        }
+        if pending.len() > MAX_STDIN_LINE_BYTES {
+            return Err(ShphError::Protocol(
+                "stdin line exceeds the 64 KiB safety limit".into(),
+            ));
         }
         // Poll stdin for up to 200ms, then re-check the shutdown flag.
         let mut pfd = libc::pollfd {
@@ -1434,16 +2200,25 @@ fn read_stdin_line_unix(reader: &mut io::StdinLock<'_>, line: &mut String) -> Re
                 return Err(ShphError::Io(err));
             }
             let data = &buf[..n as usize];
-            if let Some(nl) = data.iter().position(|&b| b == b'\n') {
-                line.push_str(std::str::from_utf8(&data[..nl]).unwrap_or(""));
-                return Ok(true);
-            } else {
-                line.push_str(std::str::from_utf8(data).unwrap_or(""));
-                continue;
+            if pending.len().saturating_add(data.len()) > MAX_STDIN_LINE_BYTES {
+                return Err(ShphError::Protocol(
+                    "stdin line exceeds the 64 KiB safety limit".into(),
+                ));
             }
+            pending.extend_from_slice(data);
+            continue;
         }
         if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
-            return Ok(false);
+            if pending.is_empty() {
+                return Ok(false);
+            }
+            let mut bytes = std::mem::take(pending);
+            while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+                bytes.pop();
+            }
+            *line = String::from_utf8(bytes)
+                .map_err(|_| ShphError::InvalidArgument("stdin line is not valid UTF-8".into()))?;
+            return Ok(true);
         }
     }
 }
@@ -1493,7 +2268,7 @@ fn tun_to_transport_loop(
     shutdown: Arc<AtomicBool>,
     metrics: MetricsCollector,
 ) -> Result<()> {
-    let mut packet = vec![0u8; 65535];
+    let mut packet = vec![0u8; TUN_READ_BUFFER_BYTES];
     while !shutdown.load(Ordering::Relaxed) && !shutdown::shutdown_requested() {
         match tun.recv_packet(&mut packet) {
             Ok(0) => thread::sleep(Duration::from_millis(5)),
@@ -1501,12 +2276,23 @@ fn tun_to_transport_loop(
                 sender.send_frame(&packet[..n])?;
                 metrics.inc_bytes_sent(n);
             }
-            Err(ShphError::Timeout) => thread::sleep(Duration::from_millis(5)),
+            Err(ShphError::Timeout) => {
+                metrics.inc_timeout();
+                thread::sleep(Duration::from_millis(5))
+            }
             Err(ShphError::Unsupported(_)) => break,
             Err(ShphError::ConnectionClosed) => break,
+            Err(ShphError::Tun(message)) => {
+                if message.contains("exceeds") {
+                    metrics.inc_oversized_packet();
+                } else {
+                    metrics.inc_malformed_packet();
+                }
+                continue;
+            }
             Err(err) => {
                 shutdown.store(true, Ordering::Relaxed);
-                metrics.inc_error();
+                record_data_plane_error(&metrics, &err);
                 return Err(err);
             }
         }
@@ -1529,24 +2315,38 @@ fn transport_to_tun_loop(
                 }
                 match tun.send_packet(&payload) {
                     Ok(()) => {}
-                    Err(ShphError::Timeout) => thread::sleep(Duration::from_millis(5)),
+                    Err(ShphError::Timeout) => {
+                        metrics.inc_timeout();
+                        thread::sleep(Duration::from_millis(5))
+                    }
                     Err(ShphError::Unsupported(_)) => break,
+                    Err(ShphError::Tun(message)) => {
+                        if message.contains("exceeds") {
+                            metrics.inc_oversized_packet();
+                        } else {
+                            metrics.inc_malformed_packet();
+                        }
+                        continue;
+                    }
                     Err(err) => {
                         shutdown.store(true, Ordering::Relaxed);
-                        metrics.inc_error();
+                        record_data_plane_error(&metrics, &err);
                         return Err(err);
                     }
                 }
                 metrics.inc_bytes_recv(payload.len());
             }
-            Err(ShphError::Timeout) => thread::sleep(Duration::from_millis(5)),
+            Err(ShphError::Timeout) => {
+                metrics.inc_timeout();
+                thread::sleep(Duration::from_millis(5))
+            }
             Err(ShphError::ConnectionClosed) => {
                 shutdown.store(true, Ordering::Relaxed);
                 return Err(ShphError::ConnectionClosed);
             }
             Err(err) => {
                 shutdown.store(true, Ordering::Relaxed);
-                metrics.inc_error();
+                record_data_plane_error(&metrics, &err);
                 return Err(err);
             }
         }
@@ -1555,13 +2355,29 @@ fn transport_to_tun_loop(
     Ok(())
 }
 
+fn record_data_plane_error(metrics: &MetricsCollector, error: &ShphError) {
+    match error {
+        ShphError::Timeout => metrics.inc_timeout(),
+        ShphError::Tun(message) if message.contains("exceeds") => metrics.inc_oversized_packet(),
+        ShphError::Tun(_) => metrics.inc_malformed_packet(),
+        ShphError::Protocol(message) | ShphError::Crypto(message)
+            if message.contains("replay") || message.contains("stale nonce") =>
+        {
+            metrics.inc_replay_drop()
+        }
+        ShphError::Protocol(_) => metrics.inc_malformed_packet(),
+        _ => metrics.inc_error(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         apply_control_plane, build_control_plane_plan, build_dns_apply_command,
-        build_dns_restore_command, build_route_add_command, build_route_delete_command,
-        run_with_reconnect, transport_mode_to_str, validate_cidr, ControlPlaneGuard,
-        ControlPlanePlan, TransportMode,
+        build_dns_apply_commands, build_dns_restore_command, build_route_add_command,
+        build_route_delete_command, enforce_peer_policy, phase_a1_now_ms, run_with_reconnect,
+        transport_mode_to_str, validate_cidr, ControlPlaneGuard, ControlPlanePlan, HandshakeState,
+        KeyStore, KeyStoreConfig, TransportMode,
     };
     use shph_config::RoadmapConfig;
     use shph_config::{Config, ControlPlaneConfig};
@@ -1599,6 +2415,78 @@ mod tests {
     }
 
     #[test]
+    fn empty_peer_store_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-cli-pin-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keystore.json");
+        KeyStore::new(KeyStoreConfig::default())
+            .unwrap()
+            .save(&path)
+            .unwrap();
+        let state = HandshakeState {
+            peer_fingerprint_hex: "00".repeat(32),
+            peer_signing_pubkey_b64: String::new(),
+            session_keys: shph_core::SessionKeys {
+                send_nonce: 0,
+                recv_nonce: 0,
+                send_key: [0; 32],
+                recv_key: [0; 32],
+            },
+            transcript_hash_hex: String::new(),
+        };
+
+        let result = enforce_peer_policy(&path, "127.0.0.1:7000", &state, false);
+        assert!(
+            matches!(result, Err(ShphError::Auth(message)) if message.contains("no peers are pinned"))
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn peer_policy_requires_pinned_signing_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-cli-sign-pin-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keystore.json");
+        let mut keystore = KeyStore::new(KeyStoreConfig::default()).unwrap();
+        let peer = KeyStore::new(KeyStoreConfig::default()).unwrap();
+        keystore.add_contact(shph_core::Contact {
+            alias: "peer".into(),
+            endpoint: shph_core::Endpoint {
+                host: "127.0.0.1".into(),
+                port: 7000,
+            },
+            pubkey_b64: peer.public_key_b64(),
+            sign_pubkey_b64: None,
+        });
+        keystore.save(&path).unwrap();
+        let state = HandshakeState {
+            peer_fingerprint_hex: peer.fingerprint_hex(),
+            peer_signing_pubkey_b64: peer.identity.signing_public_b64(),
+            session_keys: shph_core::SessionKeys {
+                send_nonce: 0,
+                recv_nonce: 0,
+                send_key: [0; 32],
+                recv_key: [0; 32],
+            },
+            transcript_hash_hex: String::new(),
+        };
+
+        assert!(matches!(
+            enforce_peer_policy(&path, "127.0.0.1:7000", &state, true),
+            Err(ShphError::Auth(_))
+        ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn cidr_validation_checks_prefix() {
         assert!(validate_cidr("10.0.0.0/24").is_ok());
         assert!(validate_cidr("2001:db8::/64").is_ok());
@@ -1622,6 +2510,18 @@ mod tests {
         let restore_cmd = build_dns_restore_command("shph0", "ipv4").expect("dns restore command");
         assert!(!restore_cmd.is_empty());
         assert!(build_dns_apply_command("bad_ip", "shph0").is_err());
+    }
+
+    #[test]
+    fn dns_command_builder_preserves_multiple_servers() {
+        let commands =
+            build_dns_apply_commands(&["1.1.1.1".to_string(), "9.9.9.9".to_string()], "shph0")
+                .expect("dns commands");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0],
+            vec!["resolvectl", "dns", "shph0", "1.1.1.1", "9.9.9.9"]
+        );
     }
 
     #[test]

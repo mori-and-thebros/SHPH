@@ -16,7 +16,7 @@ pub struct ShroudCell {
 
 impl ShroudCell {
     pub fn new(profile: ShroudProfile, frame_type: u8, payload: &[u8]) -> Result<Self> {
-        if profile.cell_size < 64 || profile.cell_size > 16 * 1024 {
+        if !profile.is_valid() {
             return Err(ShphError::Protocol("invalid cell size".into()));
         }
         if payload.len() > profile.payload_capacity() {
@@ -37,6 +37,9 @@ pub fn encode_cell(profile: ShroudProfile, frame_type: u8, payload: &[u8]) -> Re
 }
 
 pub fn decode_cell(profile: ShroudProfile, cell: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !profile.is_valid() {
+        return Err(ShphError::Protocol("invalid cell size".into()));
+    }
     if cell.len() != profile.cell_size {
         return Err(ShphError::Protocol("cell size mismatch".into()));
     }
@@ -75,6 +78,21 @@ mod tests {
         // A cell buffer of the wrong length must be rejected, not indexed.
         let bad = vec![0u8; BALANCED.cell_size + 1];
         assert!(decode_cell(BALANCED, &bad).is_err());
+    }
+
+    #[test]
+    fn invalid_profile_size_is_rejected_without_indexing() {
+        let invalid = crate::stealth::ShroudProfile {
+            name: "invalid",
+            cell_size: 4,
+            send_interval: BALANCED.send_interval,
+            chaff_interval: BALANCED.chaff_interval,
+            max_payload_chunk: 1,
+            deterministic_padding: true,
+            adaptive_chunking: false,
+        };
+        assert!(encode_cell(invalid, 0x01, b"").is_err());
+        assert!(decode_cell(invalid, &[0u8; 4]).is_err());
     }
 
     #[test]

@@ -40,6 +40,51 @@ fn set_session(config_path: &PathBuf, session_toml: &str) {
     fs::write(config_path, cfg).expect("write config");
 }
 
+fn public_key(config: &PathBuf) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(config)
+        .arg("show-public-key")
+        .output()
+        .expect("show public key");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("public key utf8")
+        .trim()
+        .to_string()
+}
+
+fn signing_public_key(config: &PathBuf) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(config)
+        .arg("show-signing-public-key")
+        .output()
+        .expect("show signing public key");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("signing public key utf8")
+        .trim()
+        .to_string()
+}
+
+fn add_peer(config: &PathBuf, alias: &str, endpoint: &str, pubkey: &str, sign_pubkey: &str) {
+    let (host, port) = endpoint.rsplit_once(':').expect("endpoint");
+    let output = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(config)
+        .arg("add-peer")
+        .arg(alias)
+        .arg(host)
+        .arg(port)
+        .arg(pubkey)
+        .arg("--sign-pubkey")
+        .arg(sign_pubkey)
+        .output()
+        .expect("add peer");
+    assert!(output.status.success(), "add-peer failed");
+}
+
 #[test]
 fn up_runs_session_configured_data_plane() {
     if skip_when_unpermitted_loopback() {
@@ -70,6 +115,21 @@ fn up_runs_session_configured_data_plane() {
         .output()
         .expect("init client");
     assert!(init_client.status.success());
+    let bind = "127.0.0.1:7230";
+    add_peer(
+        &server_cfg,
+        "client",
+        bind,
+        &public_key(&client_cfg),
+        &signing_public_key(&client_cfg),
+    );
+    add_peer(
+        &client_cfg,
+        "server",
+        bind,
+        &public_key(&server_cfg),
+        &signing_public_key(&server_cfg),
+    );
 
     set_session(
         &server_cfg,
@@ -172,6 +232,21 @@ fn up_without_startup_payload_uses_loop_modes() {
         .output()
         .expect("init client");
     assert!(init_client.status.success());
+    let bind = "127.0.0.1:7231";
+    add_peer(
+        &server_cfg,
+        "client",
+        bind,
+        &public_key(&client_cfg),
+        &signing_public_key(&client_cfg),
+    );
+    add_peer(
+        &client_cfg,
+        "server",
+        bind,
+        &public_key(&server_cfg),
+        &signing_public_key(&server_cfg),
+    );
 
     set_session(
         &server_cfg,

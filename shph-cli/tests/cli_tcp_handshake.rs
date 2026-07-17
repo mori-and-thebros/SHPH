@@ -43,6 +43,55 @@ fn test_port() -> u16 {
     port
 }
 
+fn public_key(config: &PathBuf) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(config)
+        .arg("show-public-key")
+        .output()
+        .expect("show public key");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("public key utf8")
+        .trim()
+        .to_string()
+}
+
+fn signing_public_key(config: &PathBuf) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(config)
+        .arg("show-signing-public-key")
+        .output()
+        .expect("show signing public key");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("signing public key utf8")
+        .trim()
+        .to_string()
+}
+
+fn add_peer(config: &PathBuf, alias: &str, bind: &str, pubkey: &str, sign_pubkey: &str) {
+    let endpoint = bind.rsplit_once(':').expect("endpoint port");
+    let output = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(config)
+        .arg("add-peer")
+        .arg(alias)
+        .arg(endpoint.0)
+        .arg(endpoint.1)
+        .arg(pubkey)
+        .arg("--sign-pubkey")
+        .arg(sign_pubkey)
+        .output()
+        .expect("add peer");
+    assert!(
+        output.status.success(),
+        "add-peer stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_connect(bind: &str, client_cfg: &PathBuf) -> Result<std::process::Output, String> {
     for attempt in 0..8 {
         let connect_out = Command::new(env!("CARGO_BIN_EXE_shph"))
@@ -109,6 +158,20 @@ fn listen_and_connect_complete_handshake() {
     let server_cfg_for_thread = server_cfg.clone();
     let port = test_port();
     let bind = format!("127.0.0.1:{port}");
+    add_peer(
+        &server_cfg,
+        "client",
+        &bind,
+        &public_key(&client_cfg),
+        &signing_public_key(&client_cfg),
+    );
+    add_peer(
+        &client_cfg,
+        "server",
+        &bind,
+        &public_key(&server_cfg),
+        &signing_public_key(&server_cfg),
+    );
 
     let listen_handle = thread::spawn(move || {
         Command::new(env!("CARGO_BIN_EXE_shph"))

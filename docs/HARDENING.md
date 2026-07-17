@@ -98,12 +98,92 @@ Files: `shph-core/src/pqc.rs` (new), `shph-core/src/handshake.rs`,
   rejected unless they arrive from the authenticated peer address, closing an
   off-path injection/amplification surface.
 - **QUIC per-IP rate limiting** (parity with TCP accept path).
+
+## Increment 6 — Audit remediation and adapter hardening
+
+Files: `shph-cli/src/main.rs`, `shph-core/src/crypto.rs`,
+`shph-core/src/net.rs`, `shph-core/src/roadmap.rs`,
+`shph-config/src/lib.rs`, `shph-transport/src/lib.rs`.
+
+- **Configured peer pinning.** CLI sessions now reject authenticated identities
+  that are not present in the local keystore contact allowlist. The pinned
+  X25519 identity and Ed25519 handshake-signing key must both match. Outbound
+  sessions must also match the configured endpoint.
+- **Mandatory peer policy.** Empty contact stores no longer disable the
+  allowlist; sessions fail closed until the expected peer is registered.
+- **Cross-platform graceful shutdown.** Unix signal handlers and Windows
+  `SetConsoleCtrlHandler` callbacks feed the same cleanup-aware shutdown flag.
+- **Persistent control-plane lifecycle.** `apply`, `reconcile`, `undo`, and
+  `down` use an exact persisted state record so cleanup survives process
+  boundaries and repeated operator commands are predictable.
+- **Authenticated replay-state advancement.** Receive nonce state advances only
+  after AEAD verification succeeds, preventing an unauthenticated high-nonce
+  packet from permanently desynchronizing a session.
+- **File-adapter confinement and bounds.** Data-mule peer/envelope path
+  components are sanitized, configured file limits are capped at 256 KiB, and
+  recursive inbox scanning uses bounded reads.
+- **Safer config persistence.** Config writes are fsynced, owner-only on Unix,
+  and replaced through a temporary file instead of direct truncating writes.
+- **Endpoint parsing.** IPv6 bracket notation is accepted and zero/empty
+  endpoints are rejected.
+- **Bounded address fallback.** TCP hostname connection attempts try each
+  resolved address under one overall deadline.
+- **Keystore loading.** Unix final-component symlinks are refused and
+  encrypted PBKDF2 iteration counts are bounded before key derivation.
+- **Audit-journal loading.** Unix audit-journal reads and appends refuse a
+  replaced final-component symlink.
+- **Handshake time budgets.** TCP and QUIC handshake retries share one overall
+  deadline rather than multiplying the configured timeout per attempt.
+
+Regression tests cover the nonce-advance attack, path confinement, excessive
+file limits, and the existing UDP-permission test skip behavior.
 - **QUIC datagram truncation guard** — a hello filling the receive buffer is
   rejected rather than parsed as a truncated message.
+
+## Increment 7 — Roadmap primitive hardening
+
+- Roadmap validation rejects empty audit paths, zero retention, and unavailable
+  hardware identity providers instead of accepting configuration that cannot run.
+- Shamir recovery rejects duplicate, out-of-policy, and non-field share values;
+  CLI recovery accepts individual share JSON objects or arrays.
+- Ratchet audit reads fail closed on malformed journal entries, writes owner-only
+  files with fsync, and prunes through an atomic replacement.
+- Successful CLI handshakes record peer/transcript audit events after pinning.
+
+## Increment 8 — Lab-grade QUIC-shim, Shroud cells, and keystore encryption
+
+- The existing UDP transport remains explicitly a QUIC-like lab shim, but now
+  has a real round-trip test using fixed-size Shroud cells.
+- `SHPH_SHROUD_PROFILE=balanced|low-latency|bulk` wraps authenticated UDP-shim
+  frames in the selected fixed-size cell profile for lab experiments.
+- `SHPH_SHROUD_PROFILE=randomized-lab` additionally uses authenticated,
+  randomized inner padding inside fixed-size cells. This is a measurement and
+  framing experiment, not a claim of traffic-analysis resistance.
+- `SHPH_KEYSTORE_PASSWORD` enables password-encrypted keystore persistence using
+  PBKDF2-HMAC-SHA256 and ChaCha20-Poly1305; legacy plaintext keystores remain
+  loadable for migration.
+- These features do not claim standards-compliant QUIC, TLS fingerprint
+  mimicry, or anti-censorship effectiveness.
 
 Tests: 4 new PQ regression tests (hybrid roundtrip, downgrade-blocked, corrupted
 ciphertext breaks agreement, classical-only cannot derive) + 1 QUIC
 foreign-source rejection test.
+
+## Increment 9 — Lab prototype operational hardening
+
+The alternate transports now behave as bounded, repeatable lab adapters rather
+than placeholder queues:
+
+- Offline-mesh validates the session identifier, bounds queue scans, quarantines
+  malformed/oversized files, and acknowledges envelopes only after successful
+  authenticated consumption.
+- Data-mule uses unique temporary filenames, bounded recursive scans, symlink
+  avoidance, quarantine for poison files, stable envelope replay identity, and
+  post-authentication file removal.
+- Offline-mesh configuration now bounds `max_idle_entries` to a practical
+  replay-cache range.
+- `docs/LAB_PROTOTYPES.md` documents setup, replication/courier workflows,
+  failure behavior, and explicit non-claims.
 
 ## Threat-table impact (increment 4)
 
@@ -162,3 +242,53 @@ capabilities. Per `SECURITY.md`, SHPH still does **not** claim: browser/TLS/QUIC
 fingerprint parity, DPI evasion, constant-time guarantees beyond the crypto
 crates, or hostile-network adversarial posture. Those remain research-track
 items (`ROADMAP_OSS_AND_DELIVERY.md`).
+
+## Increment 10 — TUN and UDP-shim boundary hardening
+
+The working tree adds explicit resource and packet-boundary controls for the
+highest-priority lab risks:
+
+- `shph-tun` caps packets at 65,535 bytes, rejects oversized read buffers, and
+  validates IPv4/IPv6 version and length fields before TUN injection or
+  transport submission. IPv6 jumbo packets are intentionally unsupported.
+- The native CLI loop reads one byte beyond the maximum IP packet size so a
+  full buffer cannot hide truncation or oversize input.
+- QUIC-like UDP handshake timeouts are capped at five minutes, malformed
+  handshake datagrams are budgeted, and the per-source rate-limit table is
+  capped at 1,024 active IP entries with stale-entry pruning.
+- QUIC-like data receive filters foreign-source, malformed, truncated, and
+  unauthenticated/replayed datagrams in a bounded loop instead of immediately
+  desynchronizing the session.
+- Metrics expose malformed packets, replay drops, timeouts, and oversized
+  packets separately from generic errors.
+- Windows native-TUN selection now fails explicitly instead of silently
+  falling back to the developer stub. This prevents a configured tunnel from
+  appearing active while forwarding no packets.
+- DNS control-plane application preserves all configured servers: Linux uses a
+  single `resolvectl` update and Windows emits primary/secondary `netsh`
+  commands by address family.
+- TCP unauthenticated entry now has both a five-attempt bound and a hard
+  aggregate 60-second accept/handshake deadline.
+
+These changes do not turn the UDP shim into standards-compliant QUIC. Loss
+recovery, congestion control, stream multiplexing, authenticated close/error
+signaling, and interoperability remain open roadmap items.
+
+## Increment 11 — Queue, persistence, and input-boundary bug fixes
+
+- Data-Mule responder handshakes now commit the consumed peer hello before
+  waiting for the PQ ciphertext; the hello cannot be selected repeatedly.
+- Offline-mesh and Data-Mule polling quarantine malformed base64 candidates and
+  continue scanning for a later valid envelope.
+- File-adapter reads refuse final-component symlinks on Unix, and atomic
+  envelope writes use exclusive temp creation instead of truncatable names.
+- TCP connect setup uses `connect_timeout`, so endpoint connection
+  establishment is bounded by the configured timeout.
+- Unix stdin session mode preserves multiple lines received in one read and
+  rejects lines above 64 KiB rather than growing without a bound.
+- Config replacement uses unique exclusive temp files, removes failed temps,
+  and syncs the containing directory after rename on Unix.
+
+Regression coverage includes malformed-candidate continuation, symlink refusal,
+config temp-file symlink resistance, and the existing transport handshake/data
+plane suites.

@@ -3,9 +3,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,7 +37,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   build-and-test:
     name: Build & Test (${{ matrix.os }})
@@ -51,12 +51,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo build
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
       - name: cargo test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
         env:
           # Loopback integration tests self-skip on PermissionDenied.
           RUST_BACKTRACE: 1
+
+  demo:
+    name: Reproducible demo
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --locked
+        run: cargo build -p shph-cli --locked
+      - name: run all demos
+        run: ./scripts/demo.sh all
+
+  fuzz-smoke:
+    name: Fuzz harness smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run one fuzzing iteration per target
+        working-directory: fuzz
+        run: |
+          for target in frame_decode config_parse audit_record replay_window; do
+            cargo fuzz run "$target" -- -runs=1
+          done
 
   # Separate, clearly-scoped job for the experimental native TUN path on Linux.
   # Requires CAP_NET_ADMIN; guarded so it does not break the main matrix.
@@ -69,21 +98,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build with native TUN path
-        run: cargo build -p shph-cli
+        run: cargo build -p shph-cli --locked
       - name: smoke (requires CAP_NET_ADMIN; may be skipped by host policy)
         run: SHPH_TUN_NATIVE=1 cargo test -p shph-tun
 
-  # Periodic supply-chain advisory scan (Phase B.2). Non-blocking by default:
-  # continue-on-error so a fresh advisory does not fail the build/test matrix.
-  # Remove continue-on-error once a zero-warning baseline is enforced.
+  # Supply-chain advisory scan. The two currently accepted transitive TUI
+  # advisories are ignored explicitly; any new warning or vulnerability fails.
   audit:
     name: cargo audit (advisory scan)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: cargo audit
-        run: cargo audit
+        run: >
+          cargo audit
+          --ignore RUSTSEC-2024-0436
+          --ignore RUSTSEC-2026-0002
+          --deny warnings

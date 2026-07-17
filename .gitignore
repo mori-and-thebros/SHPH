@@ -1,6 +1,8 @@
 # Build artifacts
 /target/
 **/target/
+fuzz/corpus/
+fuzz/artifacts/
 
 # Editor / OS cruft
 .DS_Store

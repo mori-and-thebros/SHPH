@@ -32,6 +32,51 @@ fn test_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("shph-{name}-{pid}-{ts}"))
 }
 
+fn public_key(config: &PathBuf) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(config)
+        .arg("show-public-key")
+        .output()
+        .expect("show public key");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("public key utf8")
+        .trim()
+        .to_string()
+}
+
+fn signing_public_key(config: &PathBuf) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(config)
+        .arg("show-signing-public-key")
+        .output()
+        .expect("show signing public key");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("signing public key utf8")
+        .trim()
+        .to_string()
+}
+
+fn add_peer(config: &PathBuf, alias: &str, bind: &str, pubkey: &str, sign_pubkey: &str) {
+    let (host, port) = bind.rsplit_once(':').expect("endpoint");
+    let output = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(config)
+        .arg("add-peer")
+        .arg(alias)
+        .arg(host)
+        .arg(port)
+        .arg(pubkey)
+        .arg("--sign-pubkey")
+        .arg(sign_pubkey)
+        .output()
+        .expect("add peer");
+    assert!(output.status.success(), "add-peer failed");
+}
+
 #[test]
 fn send_once_and_recv_once_transfer_encrypted_payload() {
     if skip_when_unpermitted_loopback() {
@@ -62,6 +107,21 @@ fn send_once_and_recv_once_transfer_encrypted_payload() {
         .output()
         .expect("init client");
     assert!(init_client.status.success());
+    let bind = "127.0.0.1:7220";
+    add_peer(
+        &server_cfg,
+        "client",
+        bind,
+        &public_key(&client_cfg),
+        &signing_public_key(&client_cfg),
+    );
+    add_peer(
+        &client_cfg,
+        "server",
+        bind,
+        &public_key(&server_cfg),
+        &signing_public_key(&server_cfg),
+    );
 
     let server_cfg_for_thread = server_cfg.clone();
     let recv_handle = thread::spawn(move || {
@@ -70,7 +130,7 @@ fn send_once_and_recv_once_transfer_encrypted_payload() {
             .arg(server_cfg_for_thread)
             .arg("recv-once")
             .arg("--bind")
-            .arg("127.0.0.1:7220")
+            .arg(bind)
             .arg("--timeout-secs")
             .arg("3")
             .output()
@@ -84,7 +144,7 @@ fn send_once_and_recv_once_transfer_encrypted_payload() {
         .arg(&client_cfg)
         .arg("send-once")
         .arg("--peer")
-        .arg("127.0.0.1:7220")
+        .arg(bind)
         .arg("--text")
         .arg("hello-over-data-plane")
         .arg("--timeout-secs")

@@ -59,6 +59,7 @@ pub struct HandshakeMaterial {
 #[derive(Debug, Clone)]
 pub struct HandshakeState {
     pub peer_fingerprint_hex: String,
+    pub peer_signing_pubkey_b64: String,
     pub session_keys: SessionKeys,
     pub transcript_hash_hex: String,
 }
@@ -173,7 +174,7 @@ pub fn verify_and_derive(
     })?;
     let _ = initiator;
 
-    let mut shared = Vec::with_capacity(32 + 32);
+    let mut shared = zeroize::Zeroizing::new(Vec::with_capacity(32 + 32));
     shared.extend_from_slice(&ecdh_shared);
     shared.extend_from_slice(&pq_shared);
 
@@ -220,6 +221,7 @@ pub fn verify_and_derive(
 
     Ok(HandshakeState {
         peer_fingerprint_hex: compute_fingerprint_hex(&peer_identity_raw),
+        peer_signing_pubkey_b64: base64::engine::general_purpose::STANDARD.encode(peer_sign_public),
         session_keys: SessionKeys {
             send_key,
             recv_key,

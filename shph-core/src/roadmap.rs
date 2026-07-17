@@ -4,7 +4,7 @@ use base64::Engine as _;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -119,7 +119,7 @@ impl TransportAdapterConfig {
                 peer_id,
                 spool_dir,
                 poll_interval_ms,
-                ..
+                max_idle_entries,
             } => {
                 if node_id.trim().is_empty() || peer_id.trim().is_empty() {
                     return Err(ShphError::Config(
@@ -137,6 +137,11 @@ impl TransportAdapterConfig {
                 if *poll_interval_ms == 0 {
                     return Err(ShphError::Config(
                         "poll interval must be greater than zero".into(),
+                    ));
+                }
+                if *max_idle_entries == 0 || *max_idle_entries > 65_536 {
+                    return Err(ShphError::Config(
+                        "offline-mesh max_idle_entries must be between 1 and 65536".into(),
                     ));
                 }
                 Ok(())
@@ -166,6 +171,11 @@ impl TransportAdapterConfig {
                 if *max_file_bytes == 0 {
                     return Err(ShphError::Config(
                         "data-mule max_file_bytes must be greater than zero".into(),
+                    ));
+                }
+                if *max_file_bytes > 256 * 1024 {
+                    return Err(ShphError::Config(
+                        "data-mule max_file_bytes exceeds the 256 KiB safety cap".into(),
                     ));
                 }
                 Ok(())
@@ -222,21 +232,30 @@ impl IdentityProviderConfig {
                             .into(),
                     ))
                 } else {
-                    Ok(())
+                    Err(ShphError::Unsupported(
+                        "HSM PKCS#11 backend unavailable; configure software identity until a hardware backend is installed"
+                            .into(),
+                    ))
                 }
             }
             Self::YubikeyPiv { slot, .. } => {
                 if slot.trim().is_empty() {
                     Err(ShphError::Config("YubikeyPiv slot required".into()))
                 } else {
-                    Ok(())
+                    Err(ShphError::Unsupported(
+                        "YubiKey/PIV backend unavailable; configure software identity until hardware integration is installed"
+                            .into(),
+                    ))
                 }
             }
             Self::TpmBinding { aik_key_handle, .. } => {
                 if aik_key_handle.trim().is_empty() {
                     Err(ShphError::Config("TPM aik_key_handle required".into()))
                 } else {
-                    Ok(())
+                    Err(ShphError::Unsupported(
+                        "TPM binding backend unavailable; configure software identity until hardware integration is installed"
+                            .into(),
+                    ))
                 }
             }
         }
@@ -394,11 +413,23 @@ pub fn validate_roadmap(config: &RoadmapConfig) -> Result<()> {
     config.transport.validate()?;
     config.identity.validate()?;
     validate_shamir_config(&config.shamir)?;
+    if config.ratchet_audit.journal_path.trim().is_empty() {
+        return Err(ShphError::Config(
+            "ratchet audit journal_path must not be empty".into(),
+        ));
+    }
+    if config.ratchet_audit.max_entries == 0 {
+        return Err(ShphError::Config(
+            "ratchet audit max_entries must be greater than zero".into(),
+        ));
+    }
     Ok(())
 }
 
 pub fn validate_shamir_config(cfg: &ShamirConfig) -> Result<()> {
-    if cfg.enabled && (cfg.threshold == 0 || cfg.shares == 0 || cfg.threshold > cfg.shares) {
+    if cfg.enabled
+        && (cfg.threshold == 0 || cfg.shares == 0 || cfg.threshold > cfg.shares || cfg.shares > 255)
+    {
         return Err(ShphError::Config("invalid Shamir policy".into()));
     }
     Ok(())
@@ -414,12 +445,12 @@ pub fn offline_spool_path(base_dir: &str, session_id: &str) -> PathBuf {
 
 pub fn data_mule_inbox_path(inbox_dir: &str, peer: &str, envelope_id: &str) -> PathBuf {
     Path::new(inbox_dir)
-        .join(peer)
+        .join(sanitize_filename(peer))
         .join(format!("{}.shph", sanitize_filename(envelope_id)))
 }
 
 pub fn offline_session_id(node_a: &str, node_b: &str) -> String {
-    let mut nodes = [node_a, node_b];
+    let mut nodes = [sanitize_filename(node_a), sanitize_filename(node_b)];
     nodes.sort_unstable();
     format!("{}:{}", nodes[0], nodes[1])
 }
@@ -459,7 +490,7 @@ pub fn append_ratchet_audit_event(
 
 pub fn read_ratchet_audit_events(policy: &RatchetAuditConfig) -> Result<Vec<RatchetAuditRecord>> {
     let path = expand_path(&policy.journal_path);
-    let file = match fs::File::open(path) {
+    let file = match open_audit_read(&path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(ShphError::Io(err)),
@@ -470,9 +501,9 @@ pub fn read_ratchet_audit_events(policy: &RatchetAuditConfig) -> Result<Vec<Ratc
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(record) = serde_json::from_str::<RatchetAuditRecord>(&line) {
-            entries.push(record);
-        }
+        let record = serde_json::from_str::<RatchetAuditRecord>(&line)
+            .map_err(|e| ShphError::Protocol(format!("invalid audit entry: {e}")))?;
+        entries.push(record);
     }
     Ok(entries)
 }
@@ -514,24 +545,34 @@ pub fn recover_secret_from_shares(shares: &[ShamirShare], cfg: &ShamirConfig) ->
     if !cfg.enabled {
         return Ok(Vec::new());
     }
+    validate_shamir_config(cfg)?;
     if shares.len() < cfg.threshold {
         return Err(ShphError::from(ShamirError::TooFewShares));
-    }
-    if cfg.threshold == 0 {
-        return Err(ShphError::from(ShamirError::InvalidPolicy));
     }
 
     let mut decoded: Vec<(u64, Vec<u16>)> = Vec::with_capacity(cfg.threshold);
     let mut lens = BTreeSet::new();
+    let mut indices = BTreeSet::new();
 
-    for share in shares.iter().take(cfg.threshold) {
+    for share in shares {
         let values = decode_u16_array(&share.payload_b64)
             .map_err(|_| ShphError::from(ShamirError::DecodeFailed))?;
-        if share.index == 0 {
+        if share.index == 0 || usize::from(share.index) > cfg.shares {
             return Err(ShphError::from(ShamirError::BadShareCount));
         }
+        if !indices.insert(share.index) {
+            return Err(ShphError::from(ShamirError::BadShareCount));
+        }
+        if values.iter().any(|value| *value > 256) {
+            return Err(ShphError::from(ShamirError::DecodeFailed));
+        }
         lens.insert(values.len());
-        decoded.push((share.index as u64, values));
+        if decoded.len() < cfg.threshold {
+            decoded.push((share.index as u64, values));
+        }
+    }
+    if indices.len() < cfg.threshold {
+        return Err(ShphError::from(ShamirError::TooFewShares));
     }
     if lens.len() != 1 {
         return Err(ShphError::from(ShamirError::BadShareCount));
@@ -584,17 +625,15 @@ fn write_jsonl_line(path: &Path, record: &RatchetAuditRecord) -> Result<()> {
             fs::create_dir_all(parent).map_err(ShphError::Io)?;
         }
     }
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(ShphError::Io)?;
+    let mut f = open_audit_append(path).map_err(ShphError::Io)?;
+    restrict_audit_file_perms(path)?;
     writeln!(f, "{line}").map_err(ShphError::Io)?;
+    f.sync_all().map_err(ShphError::Io)?;
     Ok(())
 }
 
 fn prune_jsonl(path: &Path, max_entries: usize) -> Result<()> {
-    let file = match fs::File::open(path) {
+    let file = match open_audit_read(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(ShphError::Io(err)),
@@ -614,27 +653,108 @@ fn prune_jsonl(path: &Path, max_entries: usize) -> Result<()> {
     }
     let drop_n = records.len() - max_entries;
     let records = records.split_off(drop_n);
+    let mut tmp_path = path.to_path_buf();
+    let suffix = now_unix_ms()?;
+    tmp_path.set_extension(format!("jsonl.tmp.{}.{}", std::process::id(), suffix));
     let mut f = OpenOptions::new()
+        .create_new(true)
         .write(true)
-        .truncate(true)
-        .create(true)
-        .open(path)
+        .open(&tmp_path)
         .map_err(ShphError::Io)?;
+    restrict_audit_file_perms(&tmp_path)?;
     for record in records {
         let line = serde_json::to_string(&record).map_err(ShphError::Serialization)?;
-        writeln!(f, "{line}").map_err(ShphError::Io)?;
+        if let Err(err) = writeln!(f, "{line}").map_err(ShphError::Io) {
+            drop(f);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+    }
+    if let Err(err) = f.sync_all().map_err(ShphError::Io) {
+        drop(f);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    drop(f);
+    if let Err(err) = persist_audit_over(&tmp_path, path).map_err(ShphError::Io) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
     }
     Ok(())
 }
 
+fn persist_audit_over(tmp: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::rename(tmp, path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::remove_file(path);
+        fs::rename(tmp, path)
+    }
+}
+
+fn restrict_audit_file_perms(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn open_audit_read(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        File::open(path)
+    }
+}
+
+fn open_audit_append(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new().create(true).append(true).open(path)
+    }
+}
+
 fn sanitize_filename(input: &str) -> String {
-    input
+    let sanitized: String = input
         .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => ch,
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
         })
-        .collect()
+        .collect();
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn encode_u16_array(values: &[u16]) -> String {
@@ -759,6 +879,58 @@ mod tests {
     }
 
     #[test]
+    fn data_mule_paths_confine_peer_and_envelope_components() {
+        let path = data_mule_inbox_path("/tmp/inbox", "../../escape", "../payload");
+        assert_eq!(path, Path::new("/tmp/inbox/______escape/___payload.shph"));
+    }
+
+    #[test]
+    fn data_mule_rejects_excessive_file_limit() {
+        let cfg = TransportAdapterConfig::DataMule {
+            inbox_dir: "/tmp/in".to_string(),
+            outbox_dir: "/tmp/out".to_string(),
+            poll_interval_ms: 250,
+            max_file_bytes: 256 * 1024 + 1,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn offline_mesh_rejects_unbounded_replay_cache_configuration() {
+        let cfg = TransportAdapterConfig::OfflineMesh {
+            node_id: "node-a".to_string(),
+            peer_id: "node-b".to_string(),
+            spool_dir: "/tmp/shph-offline".to_string(),
+            poll_interval_ms: 250,
+            max_idle_entries: 65_537,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn hardware_identity_providers_fail_closed_until_backends_exist() {
+        let hsm = IdentityProviderConfig::HsmPkcs11 {
+            module_path: "/usr/lib/pkcs11.so".into(),
+            token_label: "token".into(),
+            slot: 0,
+            key_label: "key".into(),
+        };
+        assert!(matches!(hsm.validate(), Err(ShphError::Unsupported(_))));
+
+        let yubikey = IdentityProviderConfig::YubikeyPiv {
+            slot: "9a".into(),
+            pin: None,
+        };
+        assert!(matches!(yubikey.validate(), Err(ShphError::Unsupported(_))));
+
+        let tpm = IdentityProviderConfig::TpmBinding {
+            aik_key_handle: "0x81000001".into(),
+            pcr_profile: None,
+        };
+        assert!(matches!(tpm.validate(), Err(ShphError::Unsupported(_))));
+    }
+
+    #[test]
     fn validate_shamir_roundtrip_when_enabled() {
         let cfg = ShamirConfig {
             enabled: true,
@@ -770,6 +942,134 @@ mod tests {
         assert_eq!(shares.len(), 3);
         let recovered = recover_secret_from_shares(&shares[..2], &cfg).expect("recover");
         assert_eq!(recovered, secret);
+    }
+
+    #[test]
+    fn shamir_rejects_duplicate_out_of_range_and_non_field_shares() {
+        let cfg = ShamirConfig {
+            enabled: true,
+            threshold: 2,
+            shares: 3,
+        };
+        let shares = split_secret(b"secret", &cfg).expect("split");
+
+        assert!(matches!(
+            recover_secret_from_shares(&[shares[0].clone(), shares[0].clone()], &cfg),
+            Err(ShphError::Protocol(_))
+        ));
+
+        let mut out_of_range = shares[0].clone();
+        out_of_range.index = 4;
+        assert!(matches!(
+            recover_secret_from_shares(&[out_of_range, shares[1].clone()], &cfg),
+            Err(ShphError::Protocol(_))
+        ));
+
+        let mut non_field = shares[0].clone();
+        non_field.payload_b64 = encode_u16_array(&[257; 6]);
+        assert!(matches!(
+            recover_secret_from_shares(&[non_field, shares[1].clone()], &cfg),
+            Err(ShphError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn roadmap_validation_rejects_unrepresentable_shamir_share_count() {
+        let cfg = ShamirConfig {
+            enabled: true,
+            threshold: 2,
+            shares: 256,
+        };
+        assert!(validate_shamir_config(&cfg).is_err());
+        let roadmap = RoadmapConfig {
+            shamir: cfg,
+            ..RoadmapConfig::default()
+        };
+        assert!(validate_roadmap(&roadmap).is_err());
+    }
+
+    #[test]
+    fn ratchet_audit_rejects_malformed_entries_and_prunes_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-audit-{}-{}",
+            std::process::id(),
+            now_unix_ms().expect("clock")
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("audit.jsonl");
+        let policy = RatchetAuditConfig {
+            journal_path: path.to_string_lossy().into_owned(),
+            max_entries: 2,
+        };
+
+        append_ratchet_audit_event(
+            &policy,
+            "local-1".into(),
+            "peer-1".into(),
+            "tx-1".into(),
+            "connect",
+            "tcp",
+        )
+        .expect("append one");
+        append_ratchet_audit_event(
+            &policy,
+            "local-2".into(),
+            "peer-2".into(),
+            "tx-2".into(),
+            "connect",
+            "tcp",
+        )
+        .expect("append two");
+        append_ratchet_audit_event(
+            &policy,
+            "local-3".into(),
+            "peer-3".into(),
+            "tx-3".into(),
+            "connect",
+            "tcp",
+        )
+        .expect("append three");
+        let records = read_ratchet_audit_events(&policy).expect("read");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].peer_fingerprint, "peer-2");
+
+        fs::write(&path, b"{not-json}\n").expect("corrupt");
+        assert!(matches!(
+            read_ratchet_audit_events(&policy),
+            Err(ShphError::Protocol(_))
+        ));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ratchet_audit_refuses_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "shph-audit-symlink-{}-{}",
+            std::process::id(),
+            now_unix_ms().expect("clock")
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let target = dir.join("target.jsonl");
+        let link = dir.join("audit.jsonl");
+        fs::write(&target, b"").expect("target");
+        symlink(&target, &link).expect("symlink");
+        let policy = RatchetAuditConfig {
+            journal_path: link.to_string_lossy().into_owned(),
+            max_entries: 2,
+        };
+
+        assert!(append_ratchet_audit_event(
+            &policy,
+            "local".into(),
+            "peer".into(),
+            "transcript".into(),
+            "connect",
+            "tcp"
+        )
+        .is_err());
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

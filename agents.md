@@ -48,7 +48,7 @@ This repository is an active prototype-to-production hardening effort with stric
 3. The first checkpoint `checkpoint-phaseA-1.0.0` (commit `e0a5949`) is cut.
    Future checkpoints: refresh evidence + changelog, then
    `git tag -a checkpoint-phaseX-Y.Y.Z` per `docs/RELEASE_PROCEDURE.md`.
-4. Wire Windows graceful shutdown (`SetConsoleCtrlHandler` via `windows-sys`) - the
-   tracked A.2 follow-up; needs the Windows toolchain to verify.
+4. Verify Windows graceful shutdown (`SetConsoleCtrlHandler` via `windows-sys`)
+   with the native Windows toolchain.
 5. Next roadmap phase is **B.2 (Stability Before Feature Expansion)** — still locked
    pending sign-off. Re-check `docs/FUNDING_SPRINT_BOARD.md`.

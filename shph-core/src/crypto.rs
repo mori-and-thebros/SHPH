@@ -283,9 +283,14 @@ impl SendCipher {
     }
 }
 
+enum ReplayState {
+    Strict(Option<u64>),
+    Window(ReplayWindow),
+}
+
 pub struct ReceiveCipher {
     key: [u8; 32],
-    last_nonce: Option<u64>,
+    replay: ReplayState,
 }
 
 impl Drop for ReceiveCipher {
@@ -298,10 +303,16 @@ impl ReceiveCipher {
     pub fn new(key: [u8; 32]) -> Self {
         Self {
             key,
-            // Tracks the highest accepted counter nonce. Because the sender
-            // increments its nonce monotonically, any nonce <= the last
-            // accepted one is a replay or a stale/out-of-order frame.
-            last_nonce: None,
+            replay: ReplayState::Strict(None),
+        }
+    }
+
+    /// Construct a receiver for a datagram transport where authenticated
+    /// packets may arrive out of order. TCP callers should use [`Self::new`].
+    pub fn new_with_replay_window(key: [u8; 32], size: usize) -> Self {
+        Self {
+            key,
+            replay: ReplayState::Window(ReplayWindow::new(size)),
         }
     }
 
@@ -327,15 +338,35 @@ impl ReceiveCipher {
         // 4..12. Reject replays and stale/out-of-order nonces before
         // attempting decryption (fail-closed).
         let counter = nonce_counter(nonce_bytes)?;
-        if self.last_nonce.is_some_and(|last| counter <= last) {
-            return Err(ShphError::Crypto("replay or stale nonce rejected".into()));
-        }
-        self.last_nonce = Some(counter);
+        let mut candidate = match &self.replay {
+            ReplayState::Strict(last) => {
+                if last.is_some_and(|last| counter <= last) {
+                    return Err(ShphError::Crypto("replay or stale nonce rejected".into()));
+                }
+                None
+            }
+            ReplayState::Window(window) => {
+                let mut candidate = window.clone();
+                if !candidate.check_and_insert(counter) {
+                    return Err(ShphError::Crypto("replay or stale nonce rejected".into()));
+                }
+                Some(candidate)
+            }
+        };
 
         let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
-        cipher
+        let plaintext = cipher
             .decrypt(nonce, ciphertext_only)
-            .map_err(|e| ShphError::Crypto(e.to_string()))
+            .map_err(|e| ShphError::Crypto(e.to_string()))?;
+        // Advance replay state only after authentication succeeds. Otherwise
+        // an unauthenticated frame with a large nonce can permanently discard
+        // all legitimate lower-nonce frames and DoS the session.
+        match (&mut self.replay, candidate.take()) {
+            (ReplayState::Strict(last), None) => *last = Some(counter),
+            (ReplayState::Window(window), Some(next)) => *window = next,
+            _ => unreachable!("replay state candidate must match receiver mode"),
+        }
+        Ok(plaintext)
     }
 }
 
@@ -358,6 +389,7 @@ fn nonce_counter(nonce_bytes: &[u8]) -> Result<u64> {
 /// safely). This replaces an earlier implementation that cleared the whole set
 /// when it filled, which dropped all protection across the clear boundary (a
 /// previously-seen nonce became acceptable again after the clear).
+#[derive(Clone)]
 pub struct ReplayWindow {
     /// Highest accepted nonce so far (None until the first valid nonce).
     highest: Option<u64>,
@@ -489,6 +521,20 @@ mod tests {
         // Replaying the exact same ciphertext (same nonce 0) must be rejected.
         let replay = receiver.decrypt(&frame0);
         assert!(replay.is_err(), "replay must be rejected");
+    }
+
+    #[test]
+    fn unauthenticated_high_nonce_does_not_advance_replay_state() {
+        let key = [0x41u8; 32];
+        let mut sender = SendCipher::new(key);
+        let mut receiver = ReceiveCipher::new(key);
+        let valid = sender.encrypt(b"valid").expect("valid frame");
+
+        let mut forged = valid.clone();
+        forged[4..12].copy_from_slice(&u64::MAX.to_be_bytes());
+        forged[12] ^= 0x01;
+        assert!(receiver.decrypt(&forged).is_err());
+        assert_eq!(receiver.decrypt(&valid).expect("valid frame"), b"valid");
     }
 
     #[test]

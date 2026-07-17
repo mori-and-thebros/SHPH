@@ -1,5 +1,52 @@
 # Changelog
 
+## [Unreleased] — bug-fix and hardening pass (2026-07-15)
+
+- Added a standalone `cargo-fuzz` workspace with bounded fuzz targets for
+  Shroud-cell decoding, configuration parsing, audit-record deserialization,
+  and replay-window state transitions.
+- Added a public configuration parser entry point so fuzzing exercises the same
+  TOML deserialization path used by file loading.
+- Fixed Data-Mule responder handshakes leaving the consumed peer hello in the
+  inbox, which could cause the same hello to be selected again.
+- Fixed offline/Data-Mule queue polling so malformed payload candidates are
+  quarantined and do not block later valid envelopes.
+- Hardened file-adapter reads against final-component symlink traversal and
+  made envelope temp-file creation exclusive.
+- Bounded TCP connect setup with the configured timeout instead of relying on
+  platform-specific blocking connect behavior.
+- Fixed Unix stdin session mode dropping additional lines when one read
+  contained multiple newline-delimited messages; oversized lines now fail
+  closed at 64 KiB.
+- Hardened config persistence with unique exclusive temp files, cleanup on
+  failure, and parent-directory sync after replacement.
+- Hardened CLI peer authentication by pinning the Ed25519 handshake-signing
+  public key alongside the X25519 identity key.
+- Added bounded TCP address fallback, Unix keystore symlink refusal, and
+  encrypted-keystore KDF parameter bounds.
+- Bounded TCP/QUIC handshake retries to one overall timeout and added a hard
+  stdin line cap on non-Unix builds.
+- Hardened ratchet-audit journal reads/appends against final-component
+  symlink replacement.
+
+## [Unreleased] — audit remediation (2026-07-10)
+
+- Made CLI peer identity pinning mandatory; sessions now fail closed when no
+  expected peer is configured.
+- Added `show-public-key` to make safe `add-peer` registration straightforward.
+- Added Windows console-control shutdown handling via `SetConsoleCtrlHandler`.
+- Added idempotent `apply`, `reconcile`, and `undo` control-plane commands with
+  persisted applied-state tracking.
+- Preserved multiple configured DNS servers during control-plane application:
+  Linux uses one `resolvectl` update and Windows emits primary/secondary
+  `netsh` commands by address family.
+- Added a hard aggregate 60-second TCP accept/handshake deadline.
+- Made `SHPH_TUN_NATIVE=1` fail explicitly on Windows until signed Wintun
+  runtime integration exists; it no longer silently selects the stub backend.
+- Added regression coverage for multi-server DNS command generation and
+  cross-platform TUN-name validation.
+- Refreshed audit, evidence, and mirror verification artifacts.
+
 ## [Unreleased] — hardening-5: secret-material zeroization on drop (non-breaking, 2026-07-06)
 
 ### Security (secret hygiene)
@@ -261,5 +308,5 @@ Gates referenced below: `cargo fmt --all -- --check`,
 - `MetricsCollector` (bytes/packets/errors sent+recv) wired into one-shot and loop paths.
 
 ### Notes
-- Windows graceful shutdown via `SetConsoleCtrlHandler` tracked as a follow-up
-  (needs `windows-sys` + the Windows toolchain to verify).
+- Windows graceful shutdown via `SetConsoleCtrlHandler` is now wired through
+  `windows-sys`; native Windows verification remains an operator action.

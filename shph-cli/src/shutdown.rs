@@ -26,7 +26,7 @@ pub fn request_shutdown() {
     SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-/// Install SIGINT/SIGTERM handlers that mark shutdown requested.
+/// Install process signal handlers that mark shutdown requested.
 ///
 /// Safe to call once at process start. On non-unix targets this is a no-op.
 /// After this returns, a subsequent real signal will cause
@@ -59,14 +59,34 @@ unsafe fn install_unix_handlers() {
     libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
 }
 
-// NOTE: Windows graceful-shutdown via a console control handler requires
-// `SetConsoleCtrlHandler`, which is a Win32 API not exposed by the `libc`
-// crate. Adding a `windows-sys`/`winapi` dependency is tracked as an A.2
-// follow-up so it can be compiled and verified on the Windows toolchain.
-// Until then the Windows build relies on default Ctrl+C termination; the
-// connect loop's stdin read still checks `shutdown_requested()` between lines.
 #[cfg(windows)]
-unsafe fn install_windows_handlers() {}
+unsafe fn install_windows_handlers() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    unsafe extern "system" fn handle(ctrl_type: u32) -> windows_sys::core::BOOL {
+        const CTRL_C_EVENT: u32 = 0;
+        const CTRL_BREAK_EVENT: u32 = 1;
+        const CTRL_CLOSE_EVENT: u32 = 2;
+        const CTRL_LOGOFF_EVENT: u32 = 5;
+        const CTRL_SHUTDOWN_EVENT: u32 = 6;
+
+        if matches!(
+            ctrl_type,
+            CTRL_C_EVENT
+                | CTRL_BREAK_EVENT
+                | CTRL_CLOSE_EVENT
+                | CTRL_LOGOFF_EVENT
+                | CTRL_SHUTDOWN_EVENT
+        ) {
+            SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+            1
+        } else {
+            0
+        }
+    }
+
+    let _ = SetConsoleCtrlHandler(Some(handle), 1);
+}
 
 #[cfg(test)]
 mod tests {

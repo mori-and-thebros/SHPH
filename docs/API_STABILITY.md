@@ -8,7 +8,7 @@ review).
 
 ## 1. Current versioning
 
-- Workspace version: `0.4.0` (see root `Cargo.toml`). `v0.4.0` added hybrid
+- Workspace version: `0.5.0-dev.0` (see root `Cargo.toml`). `v0.4.0` added hybrid
   post-quantum key exchange (ML-KEM-768) to the handshake (breaking protocol bump
   `shph/4`). `v0.3.0` made the handshake signature a real Ed25519 signature
   (protocol bump `shph/3`).
@@ -21,7 +21,8 @@ SHPH's public API has three surfaces, with **different** stability tiers:
 
 ### Tier 1 — CLI (`shph` binary)
 - Stable within a checkpoint: the subcommands and their flags
-  (`init`, `add-peer`, `list-peers`, `show-config`, `send-once`, `recv-once`,
+  (`init`, `add-peer`, `list-peers`, `show-public-key`, `show-signing-public-key`,
+  `show-config`, `send-once`, `recv-once`,
   `up`, `listen`, `connect`) and the `--config`, `--transport`, `--text`,
   `--bind`, `--peer` flags.
 - **Freeze rule:** no subcommand or flag is *removed* or *renamed* during a

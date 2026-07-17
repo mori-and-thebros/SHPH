@@ -34,11 +34,11 @@ checkpoint-phaseB-1.0.0      # end of Phase B (B.1–B.2), funding validation
 vX.Y.Z                       # semantic-version point releases once a release line is live
 ```
 
-A versioned release line is now live: **`v0.3.0`** is the latest versioned
-release (the prior `0.1.0` was only captured via funding checkpoints). Going
-forward, SemVer releases (`vX.Y.Z`) are the authoritative tags; funding
-checkpoints remain as roadmap-anchored milestones. Each checkpoint tag carries
-the roadmap phase it closes.
+A versioned release line is live through **`v0.4.0`**. The current workspace is
+an unreleased development line, **`0.5.0-dev.0`**, and must not be described as
+`v0.4.0`. Going forward, SemVer releases (`vX.Y.Z`) are the authoritative tags;
+funding checkpoints remain roadmap-anchored milestones. Each checkpoint tag
+carries the roadmap phase it closes.
 
 ## 3. Cutting a checkpoint (procedure)
 
@@ -105,7 +105,7 @@ Update this manifest block in place at every checkpoint.
 A reviewer receiving a checkpoint should be able to do, with no extra context:
 
 1. Read `docs/FUNDERS.md` (what the project is / is not).
-2. Follow `docs/REPRODCIBILITY.md` to build `--locked`.
+2. Follow `docs/REPRODUCIBILITY.md` to build `--locked`.
 3. Run `scripts/capture_evidence.sh` and diff against the committed
    `docs/evidence/GATE_EVIDENCE.md` (gate totals must match).
 4. Run `scripts/demo.sh all` and confirm the expected fail-closed behavior.

@@ -24,12 +24,14 @@ pub use net::{Endpoint, TransportType, TunnelConfig};
 pub use pqc::{PqcKeypair, ML_KEM_768_CIPHERTEXT_BYTES, ML_KEM_768_PUBLIC_KEY_BYTES};
 pub use roadmap::{
     append_ratchet_audit_event, offline_spool_path, read_ratchet_audit_events,
-    serialize_shamir_share, validate_transport_adapter, DataMuleConfig, DataMuleEnvelope,
+    recover_secret_from_shares, serialize_shamir_share, split_secret, validate_identity_provider,
+    validate_roadmap, validate_transport_adapter, DataMuleConfig, DataMuleEnvelope,
     IdentityProviderConfig, OfflineMeshConfig, OfflineMeshEnvelope, PqcConfig, RatchetAuditPolicy,
     RatchetAuditRecord, RoadmapConfig, ShamirPolicy, ShamirShare, ShamirThresholdError,
     ShamirWarning, TransportAdapterConfig,
 };
 pub use stealth::{
-    profiles, stealth_profiles, ChunkDistribution, MorphProfile, ShroudProfile, StealthProfile,
-    TlsCamouflage, BALANCED, BULK, CAMOUFLAGE, LOW_LATENCY, MIMICRY_LAB, STEADY,
+    profiles, shroud_profile_by_name, stealth_profile_by_name, stealth_profiles, ChunkDistribution,
+    MorphProfile, ShroudProfile, StealthProfile, TlsCamouflage, BALANCED, BULK, CAMOUFLAGE,
+    LOW_LATENCY, MIMICRY_LAB, RANDOMIZED_LAB, STEADY,
 };

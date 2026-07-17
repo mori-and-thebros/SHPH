@@ -32,15 +32,40 @@ demo_happy() {
   fresh_dir "$a"; fresh_dir "$b"
   "$BIN" --config "$a/config.toml" init --new >/dev/null
   "$BIN" --config "$b/config.toml" init --new >/dev/null
+  local a_key b_key a_sign_key b_sign_key
+  a_key="$("$BIN" --config "$a/config.toml" show-public-key)"
+  b_key="$("$BIN" --config "$b/config.toml" show-public-key)"
+  a_sign_key="$("$BIN" --config "$a/config.toml" show-signing-public-key)"
+  b_sign_key="$("$BIN" --config "$b/config.toml" show-signing-public-key)"
+  "$BIN" --config "$a/config.toml" add-peer b 127.0.0.1 7251 "$b_key" \
+    --sign-pubkey "$b_sign_key" >/dev/null
+  "$BIN" --config "$b/config.toml" add-peer a 127.0.0.1 7251 "$a_key" \
+    --sign-pubkey "$a_sign_key" >/dev/null
   printf '[session]\nrole = "listen"\nbind = "127.0.0.1:7251"\ntimeout_secs = 4\nstartup_payload = "expect"\n' >> "$a/config.toml"
   printf '[session]\nrole = "connect"\npeer = "127.0.0.1:7251"\ntimeout_secs = 4\nstartup_payload = "demo-payload"\n' >> "$b/config.toml"
   "$BIN" --config "$a/config.toml" up > "$a.out" 2>&1 &
   local pid=$!
   sleep 0.4
-  "$BIN" --config "$b/config.toml" up > "$b.out" 2>&1 || true
-  wait "$pid" || true
-  echo "-- listener received:"; grep -E "Payload:|handshake recv-once ok" "$a.out" || true
-  echo "-- connector sent:";    grep -E "Sent bytes:|handshake send-once ok" "$b.out" || true
+  if ! "$BIN" --config "$b/config.toml" up > "$b.out" 2>&1; then
+    cat "$b.out"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 1
+  fi
+  if ! wait "$pid"; then
+    cat "$a.out"
+    return 1
+  fi
+  if ! grep -Eq "Payload: demo-payload|handshake recv-once ok" "$a.out"; then
+    cat "$a.out"
+    return 1
+  fi
+  if ! grep -Eq "Sent bytes:|handshake send-once ok" "$b.out"; then
+    cat "$b.out"
+    return 1
+  fi
+  echo "-- listener received:"; grep -E "Payload:|handshake recv-once ok" "$a.out"
+  echo "-- connector sent:";    grep -E "Sent bytes:|handshake send-once ok" "$b.out"
   echo ">> EXPECT: listener prints 'Payload: demo-payload' (decrypted), connector prints 'Sent bytes: 12'."
   echo
 }
@@ -55,7 +80,11 @@ demo_bad_cidr() {
   local rc=$?
   set -e
   echo "-- exit code: $rc"
-  grep -E "CIDR prefix out of range|Error:" "$d.out" || true
+  if [ "$rc" -eq 0 ] || ! grep -Eq "CIDR prefix out of range|Error:" "$d.out"; then
+    cat "$d.out"
+    return 1
+  fi
+  grep -E "CIDR prefix out of range|Error:" "$d.out"
   echo ">> EXPECT: non-zero exit and 'CIDR prefix out of range' (preflight atomicity, nothing applied)."
   echo
 }
@@ -70,7 +99,11 @@ demo_unreachable() {
   local rc=$?
   set -e
   echo "-- exit code: $rc"
-  grep -E "Reconnect: attempt 1/2|Session mode: connect" "$d.out" || true
+  if [ "$rc" -eq 0 ] || ! grep -Eq "Reconnect: attempt 1/2|Session mode: connect" "$d.out"; then
+    cat "$d.out"
+    return 1
+  fi
+  grep -E "Reconnect: attempt 1/2|Session mode: connect" "$d.out"
   echo ">> EXPECT: non-zero exit and 'Reconnect: attempt 1/2 failed' (bounded retries, then fail)."
   echo
 }

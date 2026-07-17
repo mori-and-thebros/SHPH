@@ -10,6 +10,10 @@ pub struct MetricsCollector {
     pub packets_sent: Arc<AtomicU64>,
     pub packets_recv: Arc<AtomicU64>,
     pub errors: Arc<AtomicU64>,
+    pub malformed_packets: Arc<AtomicU64>,
+    pub replay_drops: Arc<AtomicU64>,
+    pub timeouts: Arc<AtomicU64>,
+    pub oversized_packets: Arc<AtomicU64>,
 }
 
 impl MetricsCollector {
@@ -31,6 +35,22 @@ impl MetricsCollector {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn inc_malformed_packet(&self) {
+        self.malformed_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_replay_drop(&self) {
+        self.replay_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_timeout(&self) {
+        self.timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_oversized_packet(&self) {
+        self.oversized_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
@@ -38,6 +58,10 @@ impl MetricsCollector {
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
             packets_recv: self.packets_recv.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            malformed_packets: self.malformed_packets.load(Ordering::Relaxed),
+            replay_drops: self.replay_drops.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+            oversized_packets: self.oversized_packets.load(Ordering::Relaxed),
         }
     }
 }
@@ -49,4 +73,8 @@ pub struct MetricsSnapshot {
     pub packets_sent: u64,
     pub packets_recv: u64,
     pub errors: u64,
+    pub malformed_packets: u64,
+    pub replay_drops: u64,
+    pub timeouts: u64,
+    pub oversized_packets: u64,
 }

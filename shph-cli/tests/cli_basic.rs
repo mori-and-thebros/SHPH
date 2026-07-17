@@ -10,6 +10,9 @@ fn cli_help_contains_main_commands() {
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     assert!(stdout.contains("init"));
     assert!(stdout.contains("up"));
+    assert!(stdout.contains("apply"));
+    assert!(stdout.contains("reconcile"));
+    assert!(stdout.contains("undo"));
     assert!(stdout.contains("add-peer"));
     assert!(stdout.contains("handshake-sim"));
     assert!(stdout.contains("listen"));

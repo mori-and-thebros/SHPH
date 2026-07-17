@@ -31,10 +31,10 @@ These numbers regenerate from a clean checkout. Run the command to verify.
 
 | Signal | Value | Reproduce |
 | ------ | ----- | --------- |
-| Workspace tests passing | **83 passed, 0 failed** | `cargo test --workspace` |
-| Core security/crypto tests | 48 (39 unit + 9 integration) | `cargo test -p shph-core` |
-| Transport tests | 5 | `cargo test -p shph-transport` |
-| CLI unit + integration tests | 27 (19 unit + 8 integration) | `cargo test -p shph-cli` |
+| Workspace tests passing | **current totals in evidence** | `cargo test --workspace` |
+| Core security/crypto tests | 63 (54 unit + 9 integration) | `cargo test -p shph-core` |
+| Transport tests | 13 | `cargo test -p shph-transport` |
+| CLI unit + integration tests | current totals in evidence | `cargo test -p shph-cli` |
 | Lint cleanliness | 0 warnings (warnings = errors) | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Format cleanliness | clean | `cargo fmt --all -- --check` |
 | Reproducible build | yes (locked) | `cargo build --workspace --locked` |

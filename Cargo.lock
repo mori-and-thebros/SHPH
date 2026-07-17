@@ -1141,7 +1141,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shph-cli"
-version = "0.4.0"
+version = "0.5.0-dev.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1159,11 +1159,13 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
 name = "shph-config"
-version = "0.4.0"
+version = "0.5.0-dev.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1177,13 +1179,14 @@ dependencies = [
 
 [[package]]
 name = "shph-core"
-version = "0.4.0"
+version = "0.5.0-dev.0"
 dependencies = [
  "anyhow",
  "base64",
  "chacha20poly1305",
  "hex",
  "hkdf",
+ "libc",
  "ml-kem",
  "rand",
  "rand_core 0.6.4",
@@ -1194,29 +1197,32 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
  "x25519-dalek",
  "zeroize",
 ]
 
 [[package]]
 name = "shph-obfuscation"
-version = "0.4.0"
+version = "0.5.0-dev.0"
 dependencies = [
  "shph-core",
 ]
 
 [[package]]
 name = "shph-transport"
-version = "0.4.0"
+version = "0.5.0-dev.0"
 dependencies = [
  "base64",
+ "libc",
+ "rand",
  "serde_json",
  "shph-core",
 ]
 
 [[package]]
 name = "shph-tui"
-version = "0.4.0"
+version = "0.5.0-dev.0"
 dependencies = [
  "crossterm 0.27.0",
  "ratatui",
@@ -1226,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "shph-tun"
-version = "0.4.0"
+version = "0.5.0-dev.0"
 dependencies = [
  "libc",
  "shph-core",

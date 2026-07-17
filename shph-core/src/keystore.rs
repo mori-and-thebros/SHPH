@@ -3,28 +3,48 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 use crate::crypto::IdentityKeyPair;
 use crate::error::{Result, ShphError};
+use base64::Engine as _;
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 
 /// Maximum accepted keystore file size on load. A keystore is a small JSON
 /// document (identity keys + contacts); anything larger is almost certainly
 /// malicious or corrupt, and capping it prevents an attacker from forcing a
 /// huge allocation by pointing the loader at a giant file.
 const MAX_KEYSTORE_BYTES: u64 = 1 << 20; // 1 MiB
+const KEYSTORE_FORMAT_VERSION: u8 = 1;
+const KEYSTORE_PBKDF2_ITERATIONS: u32 = 100_000;
+const KEYSTORE_MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
+const KEYSTORE_SALT_BYTES: usize = 16;
+const KEYSTORE_NONCE_BYTES: usize = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
     pub alias: String,
     pub endpoint: crate::net::Endpoint,
     pub pubkey_b64: String,
+    /// Ed25519 signing public key pinned for handshake authentication.
+    ///
+    /// This is optional only at the serialization boundary so older
+    /// keystores can be read and then rejected by the peer-policy gate until
+    /// their contacts are upgraded.
+    #[serde(default)]
+    pub sign_pubkey_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KeyStoreConfig {
+    /// Reserved for a future encrypted keystore format. It is intentionally
+    /// not serialized because the current format does not encrypt secrets.
+    #[serde(skip)]
     pub password: Option<String>,
 }
 
@@ -41,6 +61,17 @@ struct StoredKeyStore {
     config: KeyStoreConfig,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredEncryptedKeyStore {
+    format: String,
+    version: u8,
+    kdf: String,
+    iterations: u32,
+    salt_b64: String,
+    nonce_b64: String,
+    ciphertext_b64: String,
+}
+
 #[derive(Clone)]
 pub struct KeyStore {
     pub identity: IdentityKeyPair,
@@ -50,6 +81,10 @@ pub struct KeyStore {
 
 impl KeyStore {
     pub fn new(config: KeyStoreConfig) -> Result<Self> {
+        let mut config = config;
+        if config.password.is_none() {
+            config.password = std::env::var("SHPH_KEYSTORE_PASSWORD").ok();
+        }
         Ok(Self {
             identity: IdentityKeyPair::generate()?,
             contacts: HashMap::new(),
@@ -83,8 +118,19 @@ impl KeyStore {
             contacts: self.contacts.clone(),
             config: self.config.clone(),
         };
-        let data = serde_json::to_string_pretty(&stored)?;
-        atomic_secret_write(path, data.as_bytes())
+        let data = if let Some(password) = self.config.password.as_deref() {
+            if password.is_empty() {
+                return Err(ShphError::KeyStore(
+                    "keystore password cannot be empty".into(),
+                ));
+            }
+            Zeroizing::new(serde_json::to_vec_pretty(&encrypt_keystore(
+                &stored, password,
+            )?)?)
+        } else {
+            Zeroizing::new(serde_json::to_vec_pretty(&stored)?)
+        };
+        atomic_secret_write(path, &data)
     }
 
     pub fn load(path: &Path, password: Option<&str>) -> Result<Self> {
@@ -96,7 +142,7 @@ impl KeyStore {
 
         // Bound the read: a keystore is tiny; reject anything oversized to
         // avoid a hostile/giant file forcing a large allocation.
-        let file = File::open(path)?;
+        let file = open_keystore_readonly(path)?;
         let len = file.metadata()?.len();
         if len > MAX_KEYSTORE_BYTES {
             return Err(ShphError::InvalidArgument(format!(
@@ -106,16 +152,34 @@ impl KeyStore {
         }
         // Also seek-check against a stream that lies about metadata.
         let mut limited = file.take(MAX_KEYSTORE_BYTES);
-        let mut buf = Vec::new();
+        let mut buf = Zeroizing::new(Vec::new());
         limited.read_to_end(&mut buf)?;
-        let contents = String::from_utf8(buf)
-            .map_err(|_| ShphError::InvalidArgument("keystore is not valid UTF-8".into()))?;
-        let stored: StoredKeyStore = serde_json::from_str(&contents)?;
+        let contents = Zeroizing::new(
+            String::from_utf8(std::mem::take(&mut *buf))
+                .map_err(|_| ShphError::InvalidArgument("keystore is not valid UTF-8".into()))?,
+        );
+        let value: serde_json::Value = serde_json::from_str(&contents)?;
+        let stored: StoredKeyStore = if value.get("format").and_then(serde_json::Value::as_str)
+            == Some("shph-encrypted-keystore")
+        {
+            let encrypted: StoredEncryptedKeyStore = serde_json::from_value(value)?;
+            let env_password = std::env::var("SHPH_KEYSTORE_PASSWORD").ok();
+            let password = password.or(env_password.as_deref()).ok_or_else(|| {
+                ShphError::KeyStore(
+                    "encrypted keystore requires SHPH_KEYSTORE_PASSWORD or an explicit password"
+                        .into(),
+                )
+            })?;
+            decrypt_keystore(&encrypted, password)?
+        } else {
+            serde_json::from_value(value)?
+        };
 
         let mut config = stored.config;
-        if config.password.is_none() {
-            config.password = password.map(ToOwned::to_owned);
-        }
+        config.password = password
+            .map(ToOwned::to_owned)
+            .or_else(|| std::env::var("SHPH_KEYSTORE_PASSWORD").ok())
+            .or(config.password);
         let identity = match &stored.sign_seed_b64 {
             Some(seed_b64) => {
                 let dh_seed = base64_decode_32(&stored.identity_private_b64, "identity private")?;
@@ -143,6 +207,97 @@ impl KeyStore {
     }
 }
 
+fn encrypt_keystore(stored: &StoredKeyStore, password: &str) -> Result<StoredEncryptedKeyStore> {
+    let plaintext = Zeroizing::new(serde_json::to_vec(stored)?);
+    let mut salt = [0u8; KEYSTORE_SALT_BYTES];
+    let mut nonce = [0u8; KEYSTORE_NONCE_BYTES];
+    let rng = ring::rand::SystemRandom::new();
+    ring::rand::SecureRandom::fill(&rng, &mut salt)?;
+    ring::rand::SecureRandom::fill(&rng, &mut nonce)?;
+    let key = derive_keystore_key(password, &salt, KEYSTORE_PBKDF2_ITERATIONS);
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&*key).map_err(|e| ShphError::Crypto(e.to_string()))?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: b"shph-encrypted-keystore-v1",
+            },
+        )
+        .map_err(|_| ShphError::KeyStore("keystore encryption failed".into()))?;
+    Ok(StoredEncryptedKeyStore {
+        format: "shph-encrypted-keystore".into(),
+        version: KEYSTORE_FORMAT_VERSION,
+        kdf: "pbkdf2-hmac-sha256".into(),
+        iterations: KEYSTORE_PBKDF2_ITERATIONS,
+        salt_b64: base64::engine::general_purpose::STANDARD.encode(salt),
+        nonce_b64: base64::engine::general_purpose::STANDARD.encode(nonce),
+        ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(ciphertext),
+    })
+}
+
+fn decrypt_keystore(encrypted: &StoredEncryptedKeyStore, password: &str) -> Result<StoredKeyStore> {
+    if encrypted.version != KEYSTORE_FORMAT_VERSION
+        || encrypted.format != "shph-encrypted-keystore"
+        || encrypted.kdf != "pbkdf2-hmac-sha256"
+        || encrypted.iterations < KEYSTORE_PBKDF2_ITERATIONS
+        || encrypted.iterations > KEYSTORE_MAX_PBKDF2_ITERATIONS
+    {
+        return Err(ShphError::KeyStore(
+            "unsupported encrypted keystore format".into(),
+        ));
+    }
+    let salt = decode_exact(&encrypted.salt_b64, KEYSTORE_SALT_BYTES, "keystore salt")?;
+    let nonce = decode_exact(&encrypted.nonce_b64, KEYSTORE_NONCE_BYTES, "keystore nonce")?;
+    let ciphertext = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(encrypted.ciphertext_b64.as_bytes())
+            .map_err(|_| ShphError::KeyStore("invalid keystore ciphertext".into()))?,
+    );
+    let key = derive_keystore_key(password, &salt, encrypted.iterations);
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&*key).map_err(|e| ShphError::Crypto(e.to_string()))?;
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad: b"shph-encrypted-keystore-v1",
+                },
+            )
+            .map_err(|_| ShphError::KeyStore("invalid keystore password or ciphertext".into()))?,
+    );
+    serde_json::from_slice(&plaintext).map_err(ShphError::Serialization)
+}
+
+fn derive_keystore_key(password: &str, salt: &[u8], iterations: u32) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        NonZeroU32::new(iterations.max(1)).unwrap_or(NonZeroU32::MIN),
+        salt,
+        password.as_bytes(),
+        &mut *key,
+    );
+    key
+}
+
+fn decode_exact(value: &str, expected: usize, label: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let decoded = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(value.as_bytes())
+            .map_err(|_| ShphError::KeyStore(format!("invalid {label} base64")))?,
+    );
+    if decoded.len() != expected {
+        return Err(ShphError::KeyStore(format!(
+            "{label} must be {expected} bytes"
+        )));
+    }
+    Ok(decoded)
+}
+
 /// Atomically write secret bytes to `path` with restrictive permissions.
 ///
 /// Writes to a temp file beside `path`, fsyncs, sets 0600 perms on Unix, then
@@ -162,7 +317,11 @@ fn atomic_secret_write(path: &Path, data: &[u8]) -> Result<()> {
     tmp.sync_all()?;
     drop(tmp);
 
-    persist_over(path, &tmp_path)
+    if let Err(err) = persist_over(path, &tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Create an exclusively-named temp file beside the target and return both the
@@ -178,14 +337,47 @@ fn create_temp_file(dir: &Path, target: &Path) -> Result<(File, PathBuf)> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("keystore");
-    let tmp_path = dir.join(format!(".{base}.tmp.{pid}.{nanos}"));
-    let file = File::create(&tmp_path)
-        .map_err(|e| ShphError::Io(io::Error::other(format!("temp create failed: {e}"))))?;
-    Ok((file, tmp_path))
+    for attempt in 0..32 {
+        let tmp_path = dir.join(format!(".{base}.tmp.{pid}.{nanos}.{attempt}"));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => return Ok((file, tmp_path)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(ShphError::Io(err)),
+        }
+    }
+    Err(ShphError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to allocate a unique keystore temp file",
+    )))
 }
 
-/// Cross-platform persist: rename on Unix, copy+remove on Windows (rename over
-/// an existing file is not atomic on all Windows filesystems).
+fn open_keystore_readonly(path: &Path) -> Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(ShphError::Io)
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ShphError::InvalidArgument(
+                "refusing to load a symlinked keystore".into(),
+            ));
+        }
+        File::open(path).map_err(ShphError::Io)
+    }
+}
+
+/// Cross-platform persist with crash-safe replacement semantics.
 fn persist_over(target: &Path, tmp: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -193,15 +385,13 @@ fn persist_over(target: &Path, tmp: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = std::fs::remove_file(target);
-        std::fs::copy(tmp, target)?;
-        let _ = std::fs::remove_file(tmp);
+        persist_over_windows(target, tmp)?;
     }
     Ok(())
 }
 
-/// On Unix, set the file mode to 0600 (owner read/write only). No-op on
-/// non-Unix targets (file ACLs are the operator's responsibility there).
+/// Set owner-only permissions on the target platform, failing closed if the
+/// platform-specific operation fails.
 fn restrict_secret_perms(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -210,13 +400,12 @@ fn restrict_secret_perms(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        restrict_secret_perms_windows(path)?;
     }
     Ok(())
 }
 
-/// On Unix, fail if the keystore file is readable or writable by group/other.
-/// This is a defensive check: a private key sitting in a 0644 file is a leak.
+/// Reject secret files whose platform permissions are not enforceable.
 fn assert_secret_file_perms(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -230,7 +419,121 @@ fn assert_secret_file_perms(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        assert_secret_file_perms_windows(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(ShphError::InvalidArgument(
+            "keystore path contains an embedded NUL".into(),
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn windows_error(operation: &str) -> ShphError {
+    use windows_sys::Win32::Foundation::GetLastError;
+    ShphError::Io(io::Error::new(
+        io::ErrorKind::Other,
+        format!("{operation} failed with Win32 error {}", unsafe {
+            GetLastError()
+        }),
+    ))
+}
+
+#[cfg(windows)]
+fn restrict_secret_perms_windows(path: &Path) -> Result<()> {
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    let path = wide_path(path)?;
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)\0".encode_utf16().collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut descriptor_size = 0u32;
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            &mut descriptor_size,
+        )
+    };
+    if ok == 0 {
+        return Err(windows_error(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        ));
+    }
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            (*(descriptor as *const windows_sys::Win32::Security::SECURITY_DESCRIPTOR)).Dacl,
+            std::ptr::null(),
+        )
+    };
+    unsafe {
+        LocalFree(descriptor as _);
+    }
+    if result != ERROR_SUCCESS {
+        return Err(ShphError::Io(io::Error::from_raw_os_error(result as i32)));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn assert_secret_file_perms_windows(path: &Path) -> Result<()> {
+    // Reassert the exact owner-only DACL on every load. This avoids trusting
+    // inherited or operator-modified permissions and fails closed if Windows
+    // cannot apply the protection.
+    restrict_secret_perms_windows(path)
+}
+
+#[cfg(windows)]
+fn persist_over_windows(target: &Path, tmp: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        REPLACEFILE_WRITE_THROUGH,
+    };
+
+    let target_w = wide_path(target)?;
+    let tmp_w = wide_path(tmp)?;
+    let result = if target.exists() {
+        unsafe {
+            ReplaceFileW(
+                target_w.as_ptr(),
+                tmp_w.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        }
+    } else {
+        unsafe {
+            MoveFileExW(
+                tmp_w.as_ptr(),
+                target_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if result == 0 {
+        return Err(windows_error("atomic keystore replacement"));
     }
     Ok(())
 }
@@ -382,5 +685,82 @@ mod tests {
             "temp files left behind: {leftovers:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn encrypted_keystore_requires_correct_password() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-ks-encrypted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keystore.json");
+        let ks = KeyStore::new(KeyStoreConfig {
+            password: Some("correct horse battery staple".into()),
+        })
+        .unwrap();
+        ks.save(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("shph-encrypted-keystore"));
+        assert!(KeyStore::load(&path, Some("wrong")).is_err());
+        let loaded = KeyStore::load(&path, Some("correct horse battery staple")).unwrap();
+        assert_eq!(loaded.public_key_b64(), ks.public_key_b64());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "shph-ks-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.json");
+        let link = dir.join("keystore.json");
+        let ks = KeyStore::new(KeyStoreConfig::default()).unwrap();
+        ks.save(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(KeyStore::load(&link, None).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encrypted_keystore_rejects_unsafe_iteration_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-ks-iterations-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keystore.json");
+        let ks = KeyStore::new(KeyStoreConfig {
+            password: Some("correct horse battery staple".into()),
+        })
+        .unwrap();
+        ks.save(&path).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["iterations"] = serde_json::Value::from(KEYSTORE_MAX_PBKDF2_ITERATIONS + 1);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+
+        assert!(KeyStore::load(&path, Some("correct horse battery staple")).is_err());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -2,13 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{ConfigError, Result};
 pub use shph_core::roadmap::{
     IdentityProviderConfig, PqcConfig, RatchetAuditConfig, RoadmapConfig, ShamirConfig,
     TransportAdapterConfig,
 };
+
+static CONFIG_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub mod error;
 
@@ -29,6 +35,8 @@ pub struct PeerConfig {
     pub alias: String,
     pub endpoint: String,
     pub pubkey: String,
+    #[serde(default)]
+    pub sign_pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,15 +127,43 @@ impl Default for Config {
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path).map_err(ConfigError::Io)?;
-        toml::from_str(&contents).map_err(ConfigError::Parse)
+        Self::parse(&contents)
+    }
+
+    pub fn parse(contents: &str) -> Result<Self> {
+        toml::from_str(contents).map_err(ConfigError::Parse)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let contents = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent).map_err(ConfigError::Io)?;
         }
-        fs::write(path, contents).map_err(ConfigError::Io)?;
+        let (mut file, tmp) = create_config_temp_file(path)?;
+        if let Err(err) = restrict_config_perms(&tmp).map_err(ConfigError::Io) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        if let Err(err) = file.write_all(contents.as_bytes()).map_err(ConfigError::Io) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        if let Err(err) = file.sync_all().map_err(ConfigError::Io) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        drop(file);
+        if let Err(err) = persist_config_over(&tmp, path).map_err(ConfigError::Io) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        sync_parent_dir(path).map_err(ConfigError::Io)?;
         Ok(())
     }
 
@@ -137,9 +173,84 @@ impl Config {
     }
 }
 
+fn create_config_temp_file(path: &Path) -> Result<(std::fs::File, std::path::PathBuf)> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ConfigError::Io(std::io::Error::other("system clock before unix epoch")))?
+        .as_nanos();
+
+    for attempt in 0..32 {
+        let counter = CONFIG_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(
+            ".{filename}.tmp-{}-{timestamp}-{counter}-{attempt}",
+            std::process::id()
+        ));
+        match OpenOptions::new().create_new(true).write(true).open(&tmp) {
+            Ok(file) => return Ok((file, tmp)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(ConfigError::Io(err)),
+        }
+    }
+
+    Err(ConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "unable to allocate a unique config temp file",
+    )))
+}
+
+fn persist_config_over(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::rename(tmp, path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::remove_file(path);
+        fs::rename(tmp, path)
+    }
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn restrict_config_perms(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Config, SessionRole};
+    use std::fs;
 
     #[test]
     fn parse_session_reconnect_and_control_plane() {
@@ -191,5 +302,36 @@ max_delay_ms = 2000
             Some(vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()])
         );
         assert_eq!(cp.dry_run, Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_follow_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "shph-config-temp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("mkdir");
+        let target = root.join("victim");
+        let config = root.join("config.toml");
+        let predictable_tmp = root.join("config.tmp");
+        fs::write(&target, b"must remain unchanged").expect("victim");
+        symlink(&target, &predictable_tmp).expect("temp symlink");
+
+        Config::default().save(&config).expect("save config");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("read victim"),
+            "must remain unchanged"
+        );
+        assert!(config.exists());
+        assert!(predictable_tmp.exists());
+        fs::remove_dir_all(root).ok();
     }
 }

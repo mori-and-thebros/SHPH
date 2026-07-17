@@ -9,3 +9,5 @@ description = "Transport abstraction interfaces for SHPH"
 shph-core = { path = "../shph-core" }
 serde_json = { workspace = true }
 base64 = { workspace = true }
+rand = { workspace = true }
+libc = { workspace = true }

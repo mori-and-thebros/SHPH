@@ -57,8 +57,8 @@
 - `cargo test --workspace` (52 passed, 0 failed)
 
 ## Known caveats / follow-ups
-- Windows graceful shutdown via `SetConsoleCtrlHandler` (needs `windows-sys`,
-  verifiable on Windows only) — tracked from A.2.
+- Windows graceful shutdown via `SetConsoleCtrlHandler` is wired through
+  `windows-sys`; native Windows verification remains.
 - `ring` cross-compile to Windows needs `x86_64-w64-mingw32-gcc` (not present
   here); Windows target not `cargo check`-able in this sandbox.
 - This sandbox sometimes denies loopback; transport tests have skip-guards.
