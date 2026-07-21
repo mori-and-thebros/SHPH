@@ -100,13 +100,13 @@ verify() {
   tmpa="$(mktemp)"; tmpb="$(mktemp)"
   # shellcheck disable=SC2164
   ( cd "$a" && find . -type f \
-      -not -path './target/*' -not -path './.git/*' \
+      -not -path '*/target/*' -not -path './.git/*' \
       -not -path './fuzz/corpus/*' -not -path './fuzz/artifacts/*' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
       -not -path './Cargo.lock' -exec md5sum {} \; ) | sort -k2 > "$tmpa"
   ( cd "$b" && find . -type f \
-      -not -path './target/*' -not -path './.git/*' \
+      -not -path '*/target/*' -not -path './.git/*' \
       -not -path './fuzz/corpus/*' -not -path './fuzz/artifacts/*' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
