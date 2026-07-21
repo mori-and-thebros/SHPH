@@ -74,3 +74,5 @@ copied into reviewed evidence, not committed as raw build artifacts.
 
 `classical-lab` is a classical X25519 measurement only. It is not a production
 fallback and must never be presented as equivalent to the hybrid profile.
+When run under WSL2, the runner labels the output `platform=wsl2`; those
+results must remain separate from native-Linux evidence.

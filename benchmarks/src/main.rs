@@ -68,13 +68,31 @@ fn usage(message: &str) -> ! {
 }
 
 fn print_metadata(options: Options) {
-    println!("# platform=native-linux");
+    println!("# platform={}", platform_name());
     println!("# profile={}", options.profile.as_str());
     println!("# iterations={}", options.iterations);
     println!("# commit={}", command_output("git", &["rev-parse", "HEAD"]));
     println!("# rustc={}", command_output("rustc", &["--version"]));
     println!("# kernel={}", command_output("uname", &["-srvm"]));
     println!("# cpu={}", cpu_model());
+}
+
+fn platform_name() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        if std::fs::read_to_string("/proc/version")
+            .map(|contents| contents.to_ascii_lowercase().contains("microsoft"))
+            .unwrap_or(false)
+        {
+            return "wsl2";
+        }
+        return "native-linux";
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::consts::OS
+    }
 }
 
 fn command_output(program: &str, args: &[&str]) -> String {
