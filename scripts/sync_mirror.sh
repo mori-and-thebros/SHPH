@@ -23,10 +23,12 @@ set -euo pipefail
 LINUX_DIR="/home/mori/SHPH_working_copy"
 WINDOWS_MIRROR="/mnt/d/FUNDING NEEDED/snap-shroud-rs"
 
-# Paths never mirrored: build output, lockfile (platform-specific), local-only dirs.
+# Paths never mirrored: build output, lockfiles, fuzz data, and local-only dirs.
 # NOTE: .git/ IS mirrored so both trees share tag/history/HEAD (true mirror).
 EXCLUDES=(
   --exclude='target/'
+  --exclude='fuzz/corpus/'
+  --exclude='fuzz/artifacts/'
   --exclude='Cargo.lock'
   --exclude='THE WORKING ONE/'
   --exclude='.agents/'
@@ -99,11 +101,13 @@ verify() {
   # shellcheck disable=SC2164
   ( cd "$a" && find . -type f \
       -not -path './target/*' -not -path './.git/*' \
+      -not -path './fuzz/corpus/*' -not -path './fuzz/artifacts/*' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
       -not -name 'Cargo.lock' -exec md5sum {} \; ) | sort -k2 > "$tmpa"
   ( cd "$b" && find . -type f \
       -not -path './target/*' -not -path './.git/*' \
+      -not -path './fuzz/corpus/*' -not -path './fuzz/artifacts/*' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
       -not -name 'Cargo.lock' -exec md5sum {} \; ) | sort -k2 > "$tmpb"
