@@ -46,7 +46,9 @@ not fixed-size shaped cells.
 
 ### 1.2 Protocol version and cryptographic construction
 
-Current wire protocol tag: **`shph/4`** (`shph-core/src/handshake.rs`).
+Current wire protocol tags: **`shph/5/secure-default`** and
+**`shph/5/classical-lab`** (`shph-core/src/handshake.rs`). The former is the
+production default; the latter is an explicit benchmark-only profile.
 
 The handshake (`Hello` message) binds together, per side:
 
@@ -57,8 +59,8 @@ The handshake (`Hello` message) binds together, per side:
   private-key operation at all, so anyone could forge a valid `sig`. The
   current design uses a real Ed25519 detached signature via `ring`.
 - An ML-KEM-768 (FIPS-203) encapsulation public key and ciphertext
-  (`pqc_pub_b64`, `pqc_ct_b64`) — post-quantum KEM layered on top of the
-  classical exchange (`v0.4.0`).
+  (`pqc_pub_b64`, `pqc_ct_b64`) — optional post-quantum KEM material in the
+  secure-default profile, layered on top of the classical exchange.
 - An ephemeral X25519 public key, a 32-byte nonce, and a timestamp.
 - `sig`: the Ed25519 signature over the serialized transcript (all of the
   above fields), so a MITM cannot swap in its own signing key, PQ key, or
@@ -165,7 +167,7 @@ It does **not** currently claim to protect:
 ChaCha20-Poly1305 AEAD-encrypted; the handshake transcript itself carries
 public keys, a nonce, a timestamp, and a signature — no static application
 secret is exposed on the wire. A passive observer today gets: packet sizes,
-timing, the fact that a `shph/4` handshake occurred, and (for TCP) the
+timing, the fact that a `shph/5` handshake occurred, and (for TCP) the
 underlying TCP metadata (source/destination IP:port, TCP header fields). No
 padding/shaping is currently applied on the wire (see §1 — `shph-obfuscation`
 is not wired in yet), so **traffic-analysis resistance is not covered**, even
@@ -247,7 +249,7 @@ a recognizable custom framing (length-prefixed hello + AEAD frames over raw
 TCP, or a UDP shim), with no TLS/QUIC fingerprint mimicry and no padding/
 shaping actually applied at the transport layer despite the `stealth.rs`
 profile *data* existing in `shph-core`. A moderately capable DPI system could
-likely fingerprint the `shph/4` hello structure. This matches the project's
+likely fingerprint the `shph/5` hello structure. This matches the project's
 own non-claims but is worth stating plainly: **the "Shroud" traffic-shaping
 half of the project's name is currently aspirational at the wire level**, not
 yet implemented for the shipped transports.

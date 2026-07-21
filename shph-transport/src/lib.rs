@@ -7,10 +7,10 @@ use base64::Engine as _;
 use rand::RngCore;
 use shph_core::roadmap::{data_mule_inbox_path, offline_session_id};
 use shph_core::{
-    absorb_responder_pq, build_hello, finalize_initiator_pq, verify_and_derive, DataMuleConfig,
-    DataMuleEnvelope, HandshakeState, Hello, IdentityKeyPair, OfflineMeshConfig,
-    OfflineMeshEnvelope, ReceiveCipher, Result, SendCipher, ShphError, ShroudProfile,
-    ML_KEM_768_CIPHERTEXT_BYTES,
+    absorb_responder_pq, build_hello_with_profile, finalize_initiator_pq, verify_and_derive,
+    DataMuleConfig, DataMuleEnvelope, HandshakeProfile, HandshakeState, Hello, IdentityKeyPair,
+    OfflineMeshConfig, OfflineMeshEnvelope, ReceiveCipher, Result, SendCipher, ShphError,
+    ShroudProfile, ML_KEM_768_CIPHERTEXT_BYTES,
 };
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -317,11 +317,29 @@ pub fn connect_and_handshake(
     timeout_secs: u64,
     mode: TransportMode,
 ) -> Result<HandshakeState> {
+    connect_and_handshake_with_profile(
+        peer,
+        local_identity,
+        timeout_secs,
+        mode,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn connect_and_handshake_with_profile(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    mode: TransportMode,
+    profile: HandshakeProfile,
+) -> Result<HandshakeState> {
     match mode {
-        TransportMode::Tcp => tcp_handshake_client(peer, local_identity, timeout_secs),
+        TransportMode::Tcp => {
+            tcp_handshake_client_with_profile(peer, local_identity, timeout_secs, profile)
+        }
         TransportMode::Quic => {
             let (_socket, _peer, state) =
-                quic_handshake_client(peer, local_identity, timeout_secs)?;
+                quic_handshake_client_with_profile(peer, local_identity, timeout_secs, profile)?;
             Ok(state)
         }
         TransportMode::OfflineMesh | TransportMode::DataMule => Err(ShphError::InvalidArgument(
@@ -336,11 +354,33 @@ pub fn accept_handshake(
     timeout_secs: u64,
     mode: TransportMode,
 ) -> Result<HandshakeState> {
+    accept_handshake_with_profile(
+        bind_addr,
+        local_identity,
+        timeout_secs,
+        mode,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn accept_handshake_with_profile(
+    bind_addr: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    mode: TransportMode,
+    profile: HandshakeProfile,
+) -> Result<HandshakeState> {
     match mode {
-        TransportMode::Tcp => tcp_handshake_server(bind_addr, local_identity, timeout_secs),
-        TransportMode::Quic => {
-            Ok(quic_handshake_server(bind_addr, local_identity, timeout_secs)?.2)
+        TransportMode::Tcp => {
+            tcp_handshake_server_with_profile(bind_addr, local_identity, timeout_secs, profile)
         }
+        TransportMode::Quic => Ok(quic_handshake_server_with_profile(
+            bind_addr,
+            local_identity,
+            timeout_secs,
+            profile,
+        )?
+        .2),
         TransportMode::OfflineMesh | TransportMode::DataMule => Err(ShphError::InvalidArgument(
             "offline/data-mule require direct config-based APIs".into(),
         )),
@@ -352,7 +392,21 @@ pub fn offline_mesh_connect_and_handshake(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
-    let material = build_hello(local_identity)?;
+    offline_mesh_connect_and_handshake_with_profile(
+        cfg,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn offline_mesh_connect_and_handshake_with_profile(
+    cfg: &OfflineMeshConfig,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<HandshakeState> {
+    let material = build_hello_with_profile(local_identity, profile)?;
     let mut writer = OfflineMeshWriteState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let mut reader = OfflineMeshReadState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let timeout = Duration::from_secs(timeout_secs.max(1));
@@ -366,8 +420,10 @@ pub fn offline_mesh_connect_and_handshake(
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
 
     let mut material = material;
-    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
-    writer.send_payload(&ct)?;
+    if profile.uses_pqc() {
+        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        writer.send_payload(&ct)?;
+    }
     verify_and_derive(local_identity, &material, &peer_hello, true)
 }
 
@@ -376,7 +432,21 @@ pub fn offline_mesh_accept_and_handshake(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
-    let material = build_hello(local_identity)?;
+    offline_mesh_accept_and_handshake_with_profile(
+        cfg,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn offline_mesh_accept_and_handshake_with_profile(
+    cfg: &OfflineMeshConfig,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<HandshakeState> {
+    let material = build_hello_with_profile(local_identity, profile)?;
     let mut writer = OfflineMeshWriteState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let mut reader = OfflineMeshReadState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let timeout = Duration::from_secs(timeout_secs.max(1));
@@ -387,9 +457,11 @@ pub fn offline_mesh_accept_and_handshake(
     let local_hello =
         serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?;
     writer.send_payload(&local_hello)?;
-    let ct_payload = reader.receive_payload(timeout)?;
     let mut material = material;
-    absorb_responder_pq(&mut material, &ct_payload)?;
+    if profile.uses_pqc() {
+        let ct_payload = reader.receive_payload(timeout)?;
+        absorb_responder_pq(&mut material, &ct_payload)?;
+    }
     verify_and_derive(local_identity, &material, &peer_hello, false)
 }
 
@@ -398,7 +470,21 @@ pub fn offline_mesh_connect_secure_session(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let material = build_hello(local_identity)?;
+    offline_mesh_connect_secure_session_with_profile(
+        cfg,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn offline_mesh_connect_secure_session_with_profile(
+    cfg: &OfflineMeshConfig,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
+    let material = build_hello_with_profile(local_identity, profile)?;
     let mut writer = OfflineMeshWriteState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let mut reader = OfflineMeshReadState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let timeout = Duration::from_secs(timeout_secs.max(1));
@@ -411,8 +497,10 @@ pub fn offline_mesh_connect_secure_session(
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
 
     let mut material = material;
-    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
-    writer.send_payload(&ct)?;
+    if profile.uses_pqc() {
+        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        writer.send_payload(&ct)?;
+    }
     let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
     let session = SecureSession {
         inner: SecureSessionInner::OfflineMesh(OfflineMeshSession::new(
@@ -430,7 +518,21 @@ pub fn offline_mesh_accept_secure_session(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let material = build_hello(local_identity)?;
+    offline_mesh_accept_secure_session_with_profile(
+        cfg,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn offline_mesh_accept_secure_session_with_profile(
+    cfg: &OfflineMeshConfig,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
+    let material = build_hello_with_profile(local_identity, profile)?;
     let mut writer = OfflineMeshWriteState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let mut reader = OfflineMeshReadState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let timeout = Duration::from_secs(timeout_secs.max(1));
@@ -441,9 +543,11 @@ pub fn offline_mesh_accept_secure_session(
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
-    let ct_payload = reader.receive_payload(timeout)?;
     let mut material = material;
-    absorb_responder_pq(&mut material, &ct_payload)?;
+    if profile.uses_pqc() {
+        let ct_payload = reader.receive_payload(timeout)?;
+        absorb_responder_pq(&mut material, &ct_payload)?;
+    }
 
     let state = verify_and_derive(local_identity, &material, &peer_hello, false)?;
     let session = SecureSession {
@@ -463,7 +567,23 @@ pub fn data_mule_connect_and_handshake(
     peer_node: &str,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
-    let material = build_hello(local_identity)?;
+    data_mule_connect_and_handshake_with_profile(
+        cfg,
+        local_identity,
+        peer_node,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn data_mule_connect_and_handshake_with_profile(
+    cfg: &DataMuleConfig,
+    local_identity: &IdentityKeyPair,
+    peer_node: &str,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<HandshakeState> {
+    let material = build_hello_with_profile(local_identity, profile)?;
     let mut writer = DataMuleWriteState::new(cfg, &local_identity.public_key_b64(), peer_node);
     let mut reader = DataMuleReadState::new(cfg, &local_identity.public_key_b64(), Some(peer_node));
     let timeout = Duration::from_secs(timeout_secs.max(1));
@@ -475,8 +595,10 @@ pub fn data_mule_connect_and_handshake(
     let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
     let mut material = material;
-    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
-    writer.send_payload(&ct)?;
+    if profile.uses_pqc() {
+        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        writer.send_payload(&ct)?;
+    }
     verify_and_derive(local_identity, &material, &peer_hello, true)
 }
 
@@ -485,7 +607,21 @@ pub fn data_mule_accept_and_handshake(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
-    let material = build_hello(local_identity)?;
+    data_mule_accept_and_handshake_with_profile(
+        cfg,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn data_mule_accept_and_handshake_with_profile(
+    cfg: &DataMuleConfig,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<HandshakeState> {
+    let material = build_hello_with_profile(local_identity, profile)?;
     let local_node = local_identity.public_key_b64();
     let mut reader = DataMuleReadState::new(cfg, &local_identity.public_key_b64(), None);
     let timeout = Duration::from_secs(timeout_secs.max(1));
@@ -504,9 +640,11 @@ pub fn data_mule_accept_and_handshake(
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
-    let ct_payload = reader.receive_payload(timeout)?;
     let mut material = material;
-    absorb_responder_pq(&mut material, &ct_payload)?;
+    if profile.uses_pqc() {
+        let ct_payload = reader.receive_payload(timeout)?;
+        absorb_responder_pq(&mut material, &ct_payload)?;
+    }
     verify_and_derive(local_identity, &material, &peer_hello, false)
 }
 
@@ -516,7 +654,23 @@ pub fn data_mule_connect_secure_session(
     peer_node: &str,
     timeout_secs: u64,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let material = build_hello(local_identity)?;
+    data_mule_connect_secure_session_with_profile(
+        cfg,
+        local_identity,
+        peer_node,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn data_mule_connect_secure_session_with_profile(
+    cfg: &DataMuleConfig,
+    local_identity: &IdentityKeyPair,
+    peer_node: &str,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
+    let material = build_hello_with_profile(local_identity, profile)?;
     let local_node = local_identity.public_key_b64();
     let mut writer = DataMuleWriteState::new(cfg, &local_node, peer_node);
     let mut reader = DataMuleReadState::new(cfg, &local_node, Some(peer_node));
@@ -529,8 +683,10 @@ pub fn data_mule_connect_secure_session(
     let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
     let mut material = material;
-    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
-    writer.send_payload(&ct)?;
+    if profile.uses_pqc() {
+        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        writer.send_payload(&ct)?;
+    }
     let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
 
     let session = SecureSession {
@@ -550,7 +706,21 @@ pub fn data_mule_accept_secure_session(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let material = build_hello(local_identity)?;
+    data_mule_accept_secure_session_with_profile(
+        cfg,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn data_mule_accept_secure_session_with_profile(
+    cfg: &DataMuleConfig,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
+    let material = build_hello_with_profile(local_identity, profile)?;
     let local_node = local_identity.public_key_b64();
     let mut reader = DataMuleReadState::new(cfg, &local_node, None);
     let timeout = Duration::from_secs(timeout_secs.max(1));
@@ -569,9 +739,11 @@ pub fn data_mule_accept_secure_session(
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
-    let ct_payload = reader.receive_payload(timeout)?;
     let mut material = material;
-    absorb_responder_pq(&mut material, &ct_payload)?;
+    if profile.uses_pqc() {
+        let ct_payload = reader.receive_payload(timeout)?;
+        absorb_responder_pq(&mut material, &ct_payload)?;
+    }
 
     let state = verify_and_derive(local_identity, &material, &peer_hello, false)?;
 
@@ -592,9 +764,30 @@ pub fn connect_secure_session(
     timeout_secs: u64,
     mode: TransportMode,
 ) -> Result<(SecureSession, HandshakeState)> {
+    connect_secure_session_with_profile(
+        peer,
+        local_identity,
+        timeout_secs,
+        mode,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn connect_secure_session_with_profile(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    mode: TransportMode,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
     match mode {
         TransportMode::Tcp => {
-            let (stream, state) = tcp_connect_and_handshake(peer, local_identity, timeout_secs)?;
+            let (stream, state) = tcp_connect_and_handshake_with_profile(
+                peer,
+                local_identity,
+                timeout_secs,
+                profile,
+            )?;
             Ok((
                 SecureSession {
                     inner: SecureSessionInner::Tcp(SecureTcpSession::new(
@@ -608,7 +801,7 @@ pub fn connect_secure_session(
         }
         TransportMode::Quic => {
             let (socket, peer_addr, state) =
-                quic_connect_and_handshake(peer, local_identity, timeout_secs)?;
+                quic_handshake_client_with_profile(peer, local_identity, timeout_secs, profile)?;
             Ok((
                 SecureSession {
                     inner: SecureSessionInner::Quic(ExperimentalQuicSession::new(
@@ -634,7 +827,26 @@ pub fn connect_secure_session_lab(
     mode: TransportMode,
     lab: QuicLabConfig,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let (session, state) = connect_secure_session(peer, local_identity, timeout_secs, mode)?;
+    connect_secure_session_lab_with_profile(
+        peer,
+        local_identity,
+        timeout_secs,
+        mode,
+        lab,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn connect_secure_session_lab_with_profile(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    mode: TransportMode,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
+    let (session, state) =
+        connect_secure_session_with_profile(peer, local_identity, timeout_secs, mode, profile)?;
     if let (TransportMode::Quic, Some(profile)) = (mode, lab.shroud_profile) {
         return Ok((session.with_quic_profile(profile)?, state));
     }
@@ -647,10 +859,30 @@ pub fn accept_secure_session(
     timeout_secs: u64,
     mode: TransportMode,
 ) -> Result<(SecureSession, HandshakeState)> {
+    accept_secure_session_with_profile(
+        bind_addr,
+        local_identity,
+        timeout_secs,
+        mode,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn accept_secure_session_with_profile(
+    bind_addr: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    mode: TransportMode,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
     match mode {
         TransportMode::Tcp => {
-            let (stream, state) =
-                tcp_accept_and_handshake(bind_addr, local_identity, timeout_secs)?;
+            let (stream, state) = tcp_accept_and_handshake_with_profile(
+                bind_addr,
+                local_identity,
+                timeout_secs,
+                profile,
+            )?;
             Ok((
                 SecureSession {
                     inner: SecureSessionInner::Tcp(SecureTcpSession::new(
@@ -663,8 +895,12 @@ pub fn accept_secure_session(
             ))
         }
         TransportMode::Quic => {
-            let (socket, peer_addr, state) =
-                quic_accept_and_handshake(bind_addr, local_identity, timeout_secs)?;
+            let (socket, peer_addr, state) = quic_handshake_server_with_profile(
+                bind_addr,
+                local_identity,
+                timeout_secs,
+                profile,
+            )?;
             Ok((
                 SecureSession {
                     inner: SecureSessionInner::Quic(ExperimentalQuicSession::new(
@@ -690,7 +926,26 @@ pub fn accept_secure_session_lab(
     mode: TransportMode,
     lab: QuicLabConfig,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let (session, state) = accept_secure_session(bind_addr, local_identity, timeout_secs, mode)?;
+    accept_secure_session_lab_with_profile(
+        bind_addr,
+        local_identity,
+        timeout_secs,
+        mode,
+        lab,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn accept_secure_session_lab_with_profile(
+    bind_addr: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    mode: TransportMode,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
+    let (session, state) =
+        accept_secure_session_with_profile(bind_addr, local_identity, timeout_secs, mode, profile)?;
     if let (TransportMode::Quic, Some(profile)) = (mode, lab.shroud_profile) {
         return Ok((session.with_quic_profile(profile)?, state));
     }
@@ -800,15 +1055,29 @@ pub fn tcp_handshake_client(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
+    tcp_handshake_client_with_profile(
+        peer,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn tcp_handshake_client_with_profile(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<HandshakeState> {
     let mut stream = connect_tcp_with_timeout(peer, timeout_secs)?;
     apply_timeout(&stream, timeout_secs)?;
-    let mut material = build_hello(local_identity)?;
+    let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
     let peer_hello = read_tcp_hello(&mut stream)?;
-    // Initiator: encapsulate against the responder's PQ public key and deliver
-    // the ciphertext as a bounded follow-up message before deriving keys.
-    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
-    write_tcp_pq_ct(&mut stream, &ct)?;
+    if profile.uses_pqc() {
+        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        write_tcp_pq_ct(&mut stream, &ct)?;
+    }
     verify_and_derive(local_identity, &material, &peer_hello, true)
 }
 
@@ -817,7 +1086,22 @@ pub fn tcp_handshake_server(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
-    tcp_accept_and_handshake(bind_addr, local_identity, timeout_secs).map(|(_, state)| state)
+    tcp_handshake_server_with_profile(
+        bind_addr,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn tcp_handshake_server_with_profile(
+    bind_addr: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<HandshakeState> {
+    tcp_accept_and_handshake_with_profile(bind_addr, local_identity, timeout_secs, profile)
+        .map(|(_, state)| state)
 }
 
 pub fn tcp_connect_and_handshake(
@@ -825,13 +1109,29 @@ pub fn tcp_connect_and_handshake(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<(TcpStream, HandshakeState)> {
+    tcp_connect_and_handshake_with_profile(
+        peer,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn tcp_connect_and_handshake_with_profile(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<(TcpStream, HandshakeState)> {
     let mut stream = connect_tcp_with_timeout(peer, timeout_secs)?;
     apply_timeout(&stream, timeout_secs)?;
-    let mut material = build_hello(local_identity)?;
+    let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
     let peer_hello = read_tcp_hello(&mut stream)?;
-    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
-    write_tcp_pq_ct(&mut stream, &ct)?;
+    if profile.uses_pqc() {
+        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        write_tcp_pq_ct(&mut stream, &ct)?;
+    }
     let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
     Ok((stream, state))
 }
@@ -896,6 +1196,20 @@ pub fn tcp_accept_and_handshake(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<(TcpStream, HandshakeState)> {
+    tcp_accept_and_handshake_with_profile(
+        bind_addr,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn tcp_accept_and_handshake_with_profile(
+    bind_addr: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<(TcpStream, HandshakeState)> {
     let listener = TcpListener::bind(bind_addr).map_err(|e| ShphError::Transport(e.to_string()))?;
     listener.set_nonblocking(true).map_err(ShphError::Io)?;
     // Bounded handshake loop on the unauthenticated entry path: tolerate
@@ -942,19 +1256,21 @@ pub fn tcp_accept_and_handshake(
 
         match read_tcp_hello(&mut stream) {
             Ok(peer_hello) => {
-                let mut material = build_hello(local_identity)?;
+                let mut material = build_hello_with_profile(local_identity, profile)?;
                 write_tcp_hello(&mut stream, &material.local_hello)?;
-                let ct = match read_tcp_pq_ct(&mut stream) {
-                    Ok(ct) => ct,
-                    Err(ShphError::ConnectionClosed) | Err(ShphError::Protocol(_)) => {
-                        last_err = Some(ShphError::ConnectionClosed);
+                if profile.uses_pqc() {
+                    let ct = match read_tcp_pq_ct(&mut stream) {
+                        Ok(ct) => ct,
+                        Err(ShphError::ConnectionClosed) | Err(ShphError::Protocol(_)) => {
+                            last_err = Some(ShphError::ConnectionClosed);
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if absorb_responder_pq(&mut material, &ct).is_err() {
+                        last_err = Some(ShphError::Handshake("pq decapsulation failed".into()));
                         continue;
                     }
-                    Err(err) => return Err(err),
-                };
-                if absorb_responder_pq(&mut material, &ct).is_err() {
-                    last_err = Some(ShphError::Handshake("pq decapsulation failed".into()));
-                    continue;
                 }
                 match verify_and_derive(local_identity, &material, &peer_hello, false) {
                     Ok(state) => return Ok((stream, state)),
@@ -1211,6 +1527,20 @@ pub fn quic_handshake_client(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
+    quic_handshake_client_with_profile(
+        peer,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn quic_handshake_client_with_profile(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
     let peer_addr = parse_socket_addr(peer)?;
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| ShphError::Transport(e.to_string()))?;
     let timeout_secs = bounded_quic_timeout_secs(timeout_secs);
@@ -1221,7 +1551,7 @@ pub fn quic_handshake_client(
         .set_write_timeout(Some(Duration::from_secs(timeout_secs)))
         .map_err(ShphError::Io)?;
 
-    let material = build_hello(local_identity)?;
+    let material = build_hello_with_profile(local_identity, profile)?;
     let mut buf = vec![0u8; MAX_QUIC_HELLO_BYTES];
     let mut last_err: Option<ShphError> = None;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -1239,15 +1569,17 @@ pub fn quic_handshake_client(
         match peer_hello {
             Ok((peer_hello, addr)) if addr == peer_addr => {
                 let mut material = material;
-                let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(ShphError::Timeout);
+                if profile.uses_pqc() {
+                    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(ShphError::Timeout);
+                    }
+                    socket
+                        .set_write_timeout(Some(remaining))
+                        .map_err(ShphError::Io)?;
+                    write_quic_pq_ct(&socket, peer_addr, &ct)?;
                 }
-                socket
-                    .set_write_timeout(Some(remaining))
-                    .map_err(ShphError::Io)?;
-                write_quic_pq_ct(&socket, peer_addr, &ct)?;
                 let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
                 return Ok((socket, peer_addr, state));
             }
@@ -1268,6 +1600,20 @@ pub fn quic_handshake_server(
     local_identity: &IdentityKeyPair,
     timeout_secs: u64,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
+    quic_handshake_server_with_profile(
+        bind_addr,
+        local_identity,
+        timeout_secs,
+        HandshakeProfile::SecureDefault,
+    )
+}
+
+pub fn quic_handshake_server_with_profile(
+    bind_addr: &str,
+    local_identity: &IdentityKeyPair,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
     let socket = UdpSocket::bind(bind_addr).map_err(|e| ShphError::Transport(e.to_string()))?;
     let timeout_secs = bounded_quic_timeout_secs(timeout_secs);
     socket
@@ -1277,7 +1623,7 @@ pub fn quic_handshake_server(
         .set_write_timeout(Some(Duration::from_secs(timeout_secs)))
         .map_err(ShphError::Io)?;
 
-    let material = build_hello(local_identity)?;
+    let material = build_hello_with_profile(local_identity, profile)?;
     let mut line = vec![0u8; MAX_QUIC_HELLO_BYTES];
     let mut peer_hello = None;
     let mut invalid_handshake_datagrams = 0usize;
@@ -1334,8 +1680,10 @@ pub fn quic_handshake_server(
         .map_err(ShphError::Io)?;
     write_tcp_hello_to_peer(&socket, peer_addr, &material.local_hello)?;
     let mut material = material;
-    let ct = read_quic_pq_ct(&socket, peer_addr)?;
-    absorb_responder_pq(&mut material, &ct)?;
+    if profile.uses_pqc() {
+        let ct = read_quic_pq_ct(&socket, peer_addr)?;
+        absorb_responder_pq(&mut material, &ct)?;
+    }
     let state = verify_and_derive(local_identity, &material, &peer_hello, false)?;
     Ok((socket, peer_addr, state))
 }

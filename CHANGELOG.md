@@ -34,6 +34,13 @@
   not overwritten.
 - Added a Linux-first benchmarking roadmap with explicit security/performance
   profile rules; no protocol mode behavior changed.
+- Implemented explicit `secure-default` and `classical-lab` handshake profiles.
+  Profiles are signed and transcript-bound, profile mismatches fail closed, and
+  the CLI/config expose classical benchmarking only as an explicit opt-in.
+- Bumped the unreleased handshake protocol identity to `shph/5`; `shph/4`
+  peers are intentionally incompatible with the profile-aware wire format.
+- Added a standalone native-Linux benchmark runner under `benchmarks/` for
+  handshake, framing, AEAD, and replay measurements with environment metadata.
 
 ## [Unreleased] — audit remediation (2026-07-10)
 

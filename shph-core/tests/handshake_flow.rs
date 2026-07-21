@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use shph_core::{
-    absorb_responder_pq, build_hello, finalize_initiator_pq, verify_and_derive, HandshakeMaterial,
-    IdentityKeyPair,
+    absorb_responder_pq, build_hello, build_hello_with_profile, finalize_initiator_pq,
+    verify_and_derive, HandshakeMaterial, HandshakeProfile, IdentityKeyPair,
 };
 
 /// Perform the in-memory hybrid PQ exchange exactly as the transports do:
@@ -183,4 +183,63 @@ fn wrong_peer_signing_key_rejected() {
         res.is_err(),
         "signature must not verify under a swapped signing public key"
     );
+}
+
+fn classical_exchange(
+    initiator: &IdentityKeyPair,
+    responder: &IdentityKeyPair,
+) -> (shph_core::HandshakeState, shph_core::HandshakeState) {
+    let init_mat = build_hello_with_profile(initiator, HandshakeProfile::ClassicalLab).unwrap();
+    let resp_mat = build_hello_with_profile(responder, HandshakeProfile::ClassicalLab).unwrap();
+    let init_state = verify_and_derive(initiator, &init_mat, &resp_mat.local_hello, true).unwrap();
+    let resp_state = verify_and_derive(responder, &resp_mat, &init_mat.local_hello, false).unwrap();
+    (init_state, resp_state)
+}
+
+#[test]
+fn classical_lab_roundtrip_derives_complementary_keys() {
+    let initiator = IdentityKeyPair::generate().unwrap();
+    let responder = IdentityKeyPair::generate().unwrap();
+    let (init_state, resp_state) = classical_exchange(&initiator, &responder);
+
+    assert_eq!(
+        init_state.session_keys.send_key,
+        resp_state.session_keys.recv_key
+    );
+    assert_eq!(
+        init_state.session_keys.recv_key,
+        resp_state.session_keys.send_key
+    );
+}
+
+#[test]
+fn classical_lab_has_no_pq_material() {
+    let identity = IdentityKeyPair::generate().unwrap();
+    let material = build_hello_with_profile(&identity, HandshakeProfile::ClassicalLab).unwrap();
+    assert!(material.local_pqc.is_none());
+    assert!(material.local_hello.pqc_pub_b64.is_none());
+    assert!(material.local_hello.pqc_ct_b64.is_none());
+}
+
+#[test]
+fn profile_mismatch_is_rejected() {
+    let local = IdentityKeyPair::generate().unwrap();
+    let peer = IdentityKeyPair::generate().unwrap();
+    let local_material = build_hello(&local).unwrap();
+    let peer_material = build_hello_with_profile(&peer, HandshakeProfile::ClassicalLab).unwrap();
+
+    let result = verify_and_derive(&local, &local_material, &peer_material.local_hello, true);
+    assert!(result.is_err(), "secure-default must reject classical-lab");
+}
+
+#[test]
+fn classical_lab_rejects_pq_exchange_attempt() {
+    let local = IdentityKeyPair::generate().unwrap();
+    let peer = IdentityKeyPair::generate().unwrap();
+    let mut local_material =
+        build_hello_with_profile(&local, HandshakeProfile::ClassicalLab).unwrap();
+    let peer_material = build_hello_with_profile(&peer, HandshakeProfile::ClassicalLab).unwrap();
+
+    let result = finalize_initiator_pq(&mut local_material, &peer_material.local_hello);
+    assert!(result.is_err());
 }

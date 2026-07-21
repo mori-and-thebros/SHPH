@@ -1,7 +1,9 @@
 # SHPH Benchmarking Plan
 
-This is a planning document. It does not enable new protocol modes or change
-the current secure-default handshake.
+This document defines the Linux-first benchmark method and the explicit
+handshake profiles used by the benchmark harness. Native operation remains
+`secure-default`; benchmark-only classical operation requires an explicit
+profile on both peers.
 
 ## Default Environment
 
@@ -40,6 +42,11 @@ with native Linux results.
 must explicitly select it, its protocol identity must be distinct, and
 `secure-default` peers must reject it.
 
+The profile implementation lives in `shph-core/src/handshake.rs` and
+`shph-transport/src/lib.rs`. The standalone runner is outside the production
+workspace under `benchmarks/`, so benchmark dependencies and output do not
+alter the shipped binary workspace.
+
 ## Obstacles and Controls
 
 - Stabilize CPU frequency, background load, and process affinity where
@@ -52,8 +59,18 @@ must explicitly select it, its protocol identity must be distinct, and
   difference.
 - Treat the QUIC-like adapter as a lab shim, not standards-compliant QUIC.
 
-## Planned Commands
+## Commands
 
-The exact Criterion harness and command set will be added after this
-methodology is reviewed. Results should be generated from a clean checkout and
-stored as reviewed evidence, not raw build artifacts.
+Run from native Linux:
+
+```bash
+cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile secure-default --iterations 100
+cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile classical-lab --iterations 100
+```
+
+The runner prints environment metadata followed by CSV rows for complete
+handshakes, framing, AEAD, and replay-window operations. Results should be
+copied into reviewed evidence, not committed as raw build artifacts.
+
+`classical-lab` is a classical X25519 measurement only. It is not a production
+fallback and must never be presented as equivalent to the hybrid profile.

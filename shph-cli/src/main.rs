@@ -11,17 +11,20 @@ use shph_core::{
     recover_secret_from_shares,
     roadmap::{DataMuleConfig, OfflineMeshConfig, RoadmapConfig},
     split_secret, validate_identity_provider, validate_roadmap, verify_and_derive, Contact,
-    Endpoint, HandshakeState, KeyStore, KeyStoreConfig, MetricsCollector, Result, ShamirShare,
-    ShphError,
+    Endpoint, HandshakeProfile, HandshakeState, KeyStore, KeyStoreConfig, MetricsCollector, Result,
+    ShamirShare, ShphError,
 };
 use shph_transport::{
-    accept_secure_session_lab, connect_secure_session_lab, data_mule_accept_and_handshake,
-    data_mule_accept_secure_session, data_mule_connect_and_handshake,
-    data_mule_connect_secure_session, offline_mesh_accept_and_handshake,
-    offline_mesh_accept_secure_session, offline_mesh_connect_and_handshake,
-    offline_mesh_connect_secure_session, quic_handshake_client, quic_handshake_server,
-    tcp_handshake_client, tcp_handshake_server, QuicLabConfig, SecureReceiver, SecureSender,
-    SecureSession, TransportMode,
+    accept_secure_session_lab_with_profile, connect_secure_session_lab_with_profile,
+    data_mule_accept_and_handshake_with_profile, data_mule_accept_secure_session_with_profile,
+    data_mule_connect_and_handshake_with_profile, data_mule_connect_secure_session_with_profile,
+    offline_mesh_accept_and_handshake_with_profile,
+    offline_mesh_accept_secure_session_with_profile,
+    offline_mesh_connect_and_handshake_with_profile,
+    offline_mesh_connect_secure_session_with_profile, quic_handshake_client_with_profile,
+    quic_handshake_server_with_profile, tcp_handshake_client_with_profile,
+    tcp_handshake_server_with_profile, QuicLabConfig, SecureReceiver, SecureSender, SecureSession,
+    TransportMode,
 };
 use shph_tun::{TunDevice, TUN_READ_BUFFER_BYTES};
 use std::fs;
@@ -82,6 +85,9 @@ enum Commands {
         /// Optional transport override (tcp|quic|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// Handshake profile (secure-default or classical-lab)
+        #[arg(long)]
+        handshake_profile: Option<String>,
     },
     /// Bring down the VPN tunnel
     Down,
@@ -156,6 +162,9 @@ enum Commands {
         /// Optional transport override (tcp|quic|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// Handshake profile (secure-default or classical-lab)
+        #[arg(long)]
+        handshake_profile: Option<String>,
     },
     /// Connect to a peer and perform one TCP handshake
     Connect {
@@ -166,6 +175,9 @@ enum Commands {
         /// Optional transport override (tcp|quic|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// Handshake profile (secure-default or classical-lab)
+        #[arg(long)]
+        handshake_profile: Option<String>,
     },
     /// Send one encrypted payload over a freshly established TCP session
     SendOnce {
@@ -178,6 +190,9 @@ enum Commands {
         /// Optional transport override (tcp|quic|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// Handshake profile (secure-default or classical-lab)
+        #[arg(long)]
+        handshake_profile: Option<String>,
     },
     /// Receive one encrypted payload after TCP handshake
     RecvOnce {
@@ -188,6 +203,9 @@ enum Commands {
         /// Optional transport override (tcp|quic|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// Handshake profile (secure-default or classical-lab)
+        #[arg(long)]
+        handshake_profile: Option<String>,
     },
 }
 
@@ -207,16 +225,28 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { new } => handle_init(&config_path, &keystore_path, new)?,
-        Commands::Up { config, transport } => {
+        Commands::Up {
+            config,
+            transport,
+            handshake_profile,
+        } => {
             let path = config.unwrap_or(config_path);
             let config = load_config(&path)?;
             let mode = resolve_transport_mode(transport.as_deref(), config.roadmap.as_ref())?;
+            let profile = resolve_handshake_profile(
+                handshake_profile.as_deref(),
+                config
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.handshake_profile),
+            )?;
             let path_keystore = keystore_path_from_config(&path);
             handle_up(
                 &path,
                 &path_keystore,
                 &config,
                 mode,
+                profile,
                 config.roadmap.as_ref(),
             )?
         }
@@ -268,6 +298,7 @@ fn main() -> Result<()> {
             bind,
             timeout_secs,
             transport,
+            handshake_profile,
         } => {
             let config = load_config(&config_path)?;
             handle_listen(
@@ -275,6 +306,13 @@ fn main() -> Result<()> {
                 &bind,
                 timeout_secs,
                 transport,
+                resolve_handshake_profile(
+                    handshake_profile.as_deref(),
+                    config
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.handshake_profile),
+                )?,
                 config.roadmap.as_ref(),
             )?
         }
@@ -282,6 +320,7 @@ fn main() -> Result<()> {
             peer,
             timeout_secs,
             transport,
+            handshake_profile,
         } => {
             let config = load_config(&config_path)?;
             handle_connect(
@@ -289,6 +328,13 @@ fn main() -> Result<()> {
                 &peer,
                 timeout_secs,
                 transport,
+                resolve_handshake_profile(
+                    handshake_profile.as_deref(),
+                    config
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.handshake_profile),
+                )?,
                 config.roadmap.as_ref(),
             )?
         }
@@ -297,6 +343,7 @@ fn main() -> Result<()> {
             text,
             timeout_secs,
             transport,
+            handshake_profile,
         } => {
             let config = load_config(&config_path)?;
             handle_send_once(
@@ -305,6 +352,13 @@ fn main() -> Result<()> {
                 &text,
                 timeout_secs,
                 transport,
+                resolve_handshake_profile(
+                    handshake_profile.as_deref(),
+                    config
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.handshake_profile),
+                )?,
                 config.roadmap.as_ref(),
             )?
         }
@@ -312,6 +366,7 @@ fn main() -> Result<()> {
             bind,
             timeout_secs,
             transport,
+            handshake_profile,
         } => {
             let config = load_config(&config_path)?;
             handle_recv_once(
@@ -319,6 +374,13 @@ fn main() -> Result<()> {
                 &bind,
                 timeout_secs,
                 transport,
+                resolve_handshake_profile(
+                    handshake_profile.as_deref(),
+                    config
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.handshake_profile),
+                )?,
                 config.roadmap.as_ref(),
             )?
         }
@@ -355,9 +417,11 @@ fn handle_up(
     keystore_path: &Path,
     config: &Config,
     transport: TransportMode,
+    profile: HandshakeProfile,
     _roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     validate_config_roadmap(config)?;
+    announce_handshake_profile(profile);
     let tun = TunDevice::open(&config.interface_name)?;
     println!("SHPH up");
     println!("  Interface: {}", tun.name());
@@ -424,6 +488,7 @@ fn handle_up(
                         bind,
                         timeout_secs,
                         Some(transport_mode_to_str(transport).to_string()),
+                        profile,
                         roadmap,
                     )?;
                 } else {
@@ -439,6 +504,7 @@ fn handle_up(
                                 bind,
                                 timeout_secs,
                                 transport,
+                                profile,
                                 config.roadmap.as_ref(),
                             )
                         },
@@ -458,6 +524,7 @@ fn handle_up(
                         payload,
                         timeout_secs,
                         Some(transport_mode_to_str(transport).to_string()),
+                        profile,
                         roadmap,
                     )?;
                 } else {
@@ -473,6 +540,7 @@ fn handle_up(
                                 peer,
                                 timeout_secs,
                                 transport,
+                                profile,
                                 config.roadmap.as_ref(),
                             )
                         },
@@ -1086,6 +1154,7 @@ fn handle_listen(
     bind: &str,
     timeout_secs: u64,
     transport: Option<String>,
+    profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     if let Some(roadmap) = roadmap {
@@ -1093,21 +1162,38 @@ fn handle_listen(
         validate_identity_provider(&roadmap.identity)?;
     }
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
+    announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
     let state = match mode {
-        TransportMode::Tcp => tcp_handshake_server(bind, &keystore.identity, timeout_secs)?,
+        TransportMode::Tcp => {
+            tcp_handshake_server_with_profile(bind, &keystore.identity, timeout_secs, profile)?
+        }
         TransportMode::Quic => {
-            let (_socket, _peer, state) =
-                quic_handshake_server(bind, &keystore.identity, timeout_secs)?;
+            let (_socket, _peer, state) = quic_handshake_server_with_profile(
+                bind,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?;
             state
         }
         TransportMode::OfflineMesh => {
             let cfg = roadmap_offline_mesh_config(roadmap)?;
-            offline_mesh_accept_and_handshake(&cfg, &keystore.identity, timeout_secs)?
+            offline_mesh_accept_and_handshake_with_profile(
+                &cfg,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?
         }
         TransportMode::DataMule => {
             let cfg = roadmap_data_mule_config(roadmap)?;
-            data_mule_accept_and_handshake(&cfg, &keystore.identity, timeout_secs)?
+            data_mule_accept_and_handshake_with_profile(
+                &cfg,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?
         }
     };
     enforce_peer_policy(keystore_path, bind, &state, false)?;
@@ -1121,6 +1207,7 @@ fn handle_connect(
     peer: &str,
     timeout_secs: u64,
     transport: Option<String>,
+    profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     if let Some(roadmap) = roadmap {
@@ -1128,21 +1215,39 @@ fn handle_connect(
         validate_identity_provider(&roadmap.identity)?;
     }
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
+    announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
     let state = match mode {
-        TransportMode::Tcp => tcp_handshake_client(peer, &keystore.identity, timeout_secs)?,
+        TransportMode::Tcp => {
+            tcp_handshake_client_with_profile(peer, &keystore.identity, timeout_secs, profile)?
+        }
         TransportMode::Quic => {
-            let (_socket, _peer_addr, state) =
-                quic_handshake_client(peer, &keystore.identity, timeout_secs)?;
+            let (_socket, _peer_addr, state) = quic_handshake_client_with_profile(
+                peer,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?;
             state
         }
         TransportMode::OfflineMesh => {
             let cfg = roadmap_offline_mesh_config(roadmap)?;
-            offline_mesh_connect_and_handshake(&cfg, &keystore.identity, timeout_secs)?
+            offline_mesh_connect_and_handshake_with_profile(
+                &cfg,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?
         }
         TransportMode::DataMule => {
             let cfg = roadmap_data_mule_config(roadmap)?;
-            data_mule_connect_and_handshake(&cfg, &keystore.identity, peer, timeout_secs)?
+            data_mule_connect_and_handshake_with_profile(
+                &cfg,
+                &keystore.identity,
+                peer,
+                timeout_secs,
+                profile,
+            )?
         }
     };
     enforce_peer_policy(keystore_path, peer, &state, true)?;
@@ -1157,6 +1262,7 @@ fn handle_send_once(
     text: &str,
     timeout_secs: u64,
     transport: Option<String>,
+    profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     if let Some(roadmap) = roadmap {
@@ -1171,24 +1277,50 @@ fn handle_send_once(
     println!("  Initial metrics: {:?}", metrics.snapshot());
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     let lab = quic_lab_config()?;
+    announce_handshake_profile(profile);
     let (mut session, state) = match mode {
         TransportMode::Tcp => {
             let keystore = KeyStore::load(keystore_path, None)?;
-            connect_secure_session_lab(peer, &keystore.identity, timeout_secs, mode, lab)?
+            connect_secure_session_lab_with_profile(
+                peer,
+                &keystore.identity,
+                timeout_secs,
+                mode,
+                lab,
+                profile,
+            )?
         }
         TransportMode::Quic => {
             let keystore = KeyStore::load(keystore_path, None)?;
-            connect_secure_session_lab(peer, &keystore.identity, timeout_secs, mode, lab)?
+            connect_secure_session_lab_with_profile(
+                peer,
+                &keystore.identity,
+                timeout_secs,
+                mode,
+                lab,
+                profile,
+            )?
         }
         TransportMode::OfflineMesh => {
             let keystore = KeyStore::load(keystore_path, None)?;
             let cfg = roadmap_offline_mesh_config(roadmap)?;
-            offline_mesh_connect_secure_session(&cfg, &keystore.identity, timeout_secs)?
+            offline_mesh_connect_secure_session_with_profile(
+                &cfg,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?
         }
         TransportMode::DataMule => {
             let keystore = KeyStore::load(keystore_path, None)?;
             let cfg = roadmap_data_mule_config(roadmap)?;
-            data_mule_connect_secure_session(&cfg, &keystore.identity, peer, timeout_secs)?
+            data_mule_connect_secure_session_with_profile(
+                &cfg,
+                &keystore.identity,
+                peer,
+                timeout_secs,
+                profile,
+            )?
         }
     };
     enforce_peer_policy(keystore_path, peer, &state, true)?;
@@ -1209,6 +1341,7 @@ fn handle_recv_once(
     bind: &str,
     timeout_secs: u64,
     transport: Option<String>,
+    profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     if let Some(roadmap) = roadmap {
@@ -1223,24 +1356,49 @@ fn handle_recv_once(
     println!("  Initial metrics: {:?}", metrics.snapshot());
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     let lab = quic_lab_config()?;
+    announce_handshake_profile(profile);
     let (mut session, state) = match mode {
         TransportMode::Tcp => {
             let keystore = KeyStore::load(keystore_path, None)?;
-            accept_secure_session_lab(bind, &keystore.identity, timeout_secs, mode, lab)?
+            accept_secure_session_lab_with_profile(
+                bind,
+                &keystore.identity,
+                timeout_secs,
+                mode,
+                lab,
+                profile,
+            )?
         }
         TransportMode::Quic => {
             let keystore = KeyStore::load(keystore_path, None)?;
-            accept_secure_session_lab(bind, &keystore.identity, timeout_secs, mode, lab)?
+            accept_secure_session_lab_with_profile(
+                bind,
+                &keystore.identity,
+                timeout_secs,
+                mode,
+                lab,
+                profile,
+            )?
         }
         TransportMode::OfflineMesh => {
             let keystore = KeyStore::load(keystore_path, None)?;
             let cfg = roadmap_offline_mesh_config(roadmap)?;
-            offline_mesh_accept_secure_session(&cfg, &keystore.identity, timeout_secs)?
+            offline_mesh_accept_secure_session_with_profile(
+                &cfg,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?
         }
         TransportMode::DataMule => {
             let keystore = KeyStore::load(keystore_path, None)?;
             let cfg = roadmap_data_mule_config(roadmap)?;
-            data_mule_accept_secure_session(&cfg, &keystore.identity, timeout_secs)?
+            data_mule_accept_secure_session_with_profile(
+                &cfg,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?
         }
     };
     enforce_peer_policy(keystore_path, bind, &state, false)?;
@@ -1300,6 +1458,26 @@ fn transport_mode_to_str(mode: TransportMode) -> &'static str {
         TransportMode::Quic => "quic",
         TransportMode::OfflineMesh => "offline-mesh",
         TransportMode::DataMule => "data-mule",
+    }
+}
+
+fn resolve_handshake_profile(
+    cli_value: Option<&str>,
+    config_value: Option<HandshakeProfile>,
+) -> Result<HandshakeProfile> {
+    let profile = match cli_value {
+        Some(value) => value.parse()?,
+        None => config_value.unwrap_or_default(),
+    };
+    Ok(profile)
+}
+
+fn announce_handshake_profile(profile: HandshakeProfile) {
+    println!("  Handshake profile: {}", profile.as_str());
+    if profile == HandshakeProfile::ClassicalLab {
+        println!(
+            "  WARNING: classical-lab is benchmark-only and removes ML-KEM; both peers must opt in"
+        );
     }
 }
 
@@ -1949,22 +2127,39 @@ fn run_listen_loop(
     bind: &str,
     timeout_secs: u64,
     mode: TransportMode,
+    profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
+    announce_handshake_profile(profile);
     let (mut session, state) = match mode {
-        TransportMode::Tcp | TransportMode::Quic => {
-            accept_secure_session_lab(bind, &keystore.identity, timeout_secs, mode, lab)?
-        }
+        TransportMode::Tcp | TransportMode::Quic => accept_secure_session_lab_with_profile(
+            bind,
+            &keystore.identity,
+            timeout_secs,
+            mode,
+            lab,
+            profile,
+        )?,
         TransportMode::OfflineMesh => {
             let cfg = roadmap_offline_mesh_config(roadmap)?;
-            offline_mesh_accept_secure_session(&cfg, &keystore.identity, timeout_secs)?
+            offline_mesh_accept_secure_session_with_profile(
+                &cfg,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?
         }
         TransportMode::DataMule => {
             let cfg = roadmap_data_mule_config(roadmap)?;
-            data_mule_accept_secure_session(&cfg, &keystore.identity, timeout_secs)?
+            data_mule_accept_secure_session_with_profile(
+                &cfg,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?
         }
     };
     enforce_peer_policy(keystore_path, bind, &state, false)?;
@@ -2028,22 +2223,40 @@ fn run_connect_loop(
     peer: &str,
     timeout_secs: u64,
     mode: TransportMode,
+    profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
+    announce_handshake_profile(profile);
     let (mut session, state) = match mode {
-        TransportMode::Tcp | TransportMode::Quic => {
-            connect_secure_session_lab(peer, &keystore.identity, timeout_secs, mode, lab)?
-        }
+        TransportMode::Tcp | TransportMode::Quic => connect_secure_session_lab_with_profile(
+            peer,
+            &keystore.identity,
+            timeout_secs,
+            mode,
+            lab,
+            profile,
+        )?,
         TransportMode::OfflineMesh => {
             let cfg = roadmap_offline_mesh_config(roadmap)?;
-            offline_mesh_connect_secure_session(&cfg, &keystore.identity, timeout_secs)?
+            offline_mesh_connect_secure_session_with_profile(
+                &cfg,
+                &keystore.identity,
+                timeout_secs,
+                profile,
+            )?
         }
         TransportMode::DataMule => {
             let cfg = roadmap_data_mule_config(roadmap)?;
-            data_mule_connect_secure_session(&cfg, &keystore.identity, peer, timeout_secs)?
+            data_mule_connect_secure_session_with_profile(
+                &cfg,
+                &keystore.identity,
+                peer,
+                timeout_secs,
+                profile,
+            )?
         }
     };
     enforce_peer_policy(keystore_path, peer, &state, true)?;

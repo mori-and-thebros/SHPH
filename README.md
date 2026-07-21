@@ -34,6 +34,12 @@ SHPH is **functional for controlled lab environments**, but still **not producti
   - `tcp` (stable), `quic` (experimental), `offline-mesh` (experimental), `data-mule` (experimental).
 - Standalone fuzzing harnesses for Shroud-cell framing, TOML configuration,
   audit-record JSON, and replay-window state transitions live under `fuzz/`.
+- Explicit benchmark profiles are available:
+  - `secure-default` keeps authenticated Ed25519 + X25519 + mandatory ML-KEM-768.
+  - `classical-lab` is a visible benchmark-only X25519 mode and requires both
+    peers to opt in; it is rejected by secure-default peers.
+- Native Linux benchmark runner:
+  `cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile secure-default`
 
 ### Not done yet
 
@@ -107,6 +113,7 @@ role = "listen"         # or "connect"
 bind = "127.0.0.1:7231" # listen only
 peer = "127.0.0.1:7231" # connect only
 timeout_secs = 5
+handshake_profile = "secure-default" # or "classical-lab" for paired lab runs
 
 [session.reconnect]
 enabled = true

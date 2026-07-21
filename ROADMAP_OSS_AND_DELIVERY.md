@@ -191,7 +191,7 @@ scheduler behavior can distort measurements.
 6. **Regression tracking** — publish median/p95/p99 latency, throughput,
    memory/allocation observations, variance, and the exact command used.
 
-### Proposed security/performance profiles
+### Implemented security/performance profiles
 
 Profiles must be explicit, visible in logs/metrics, and selected by both peers.
 They must never create an implicit downgrade path.
@@ -208,6 +208,14 @@ They must never create an implicit downgrade path.
 - **`transport-lab`** — benchmark-only adapter selection profile for isolating
   TCP, the QUIC-like shim, offline-mesh, or data-mule costs without changing
   the cryptographic security contract.
+
+`secure-default` and `classical-lab` are now implemented as distinct signed
+handshake identities. The profile is carried in every hello, bound to the
+signature and transcript, and included in HKDF context. Existing APIs retain
+the secure-default behavior. `classical-lab` has no ML-KEM material, requires
+explicit selection on both peers, and fails closed against profile mismatch.
+The CLI accepts `--handshake-profile`, and `[session].handshake_profile` is
+available for long-running sessions.
 
 Disabling ML-KEM is therefore a **separate, visibly non-production protocol
 profile**, not a runtime switch that silently weakens `secure-default`.
@@ -237,6 +245,14 @@ the report states which security properties were removed.
 - Every result includes environment metadata and security profile.
 - Production defaults remain hybrid and fail closed on profile mismatch.
 - A benchmark regression is reproduced twice before being treated as a bug.
+
+Current implementation status:
+
+- Core/transport profile behavior: complete.
+- Focused profile and config regression tests: complete.
+- Dependency-light native Linux runner: complete.
+- Criterion statistical reports, adapter matrix, and reviewed evidence
+  publication: remaining.
 
 ---
 

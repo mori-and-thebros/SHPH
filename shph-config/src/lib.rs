@@ -13,6 +13,7 @@ pub use shph_core::roadmap::{
     IdentityProviderConfig, PqcConfig, RatchetAuditConfig, RoadmapConfig, ShamirConfig,
     TransportAdapterConfig,
 };
+pub use shph_core::HandshakeProfile;
 
 static CONFIG_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
@@ -91,6 +92,8 @@ pub struct SessionConfig {
     pub bind: Option<String>,
     pub peer: Option<String>,
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub handshake_profile: Option<HandshakeProfile>,
     pub reconnect: Option<ReconnectConfig>,
     pub startup_payload: Option<String>,
 }
@@ -341,6 +344,43 @@ max_delay_ms = 2000
             Some(vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()])
         );
         assert_eq!(cp.dry_run, Some(true));
+    }
+
+    #[test]
+    fn session_handshake_profile_defaults_to_secure_default() {
+        let cfg = toml::from_str::<Config>(
+            r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[session]
+role = "connect"
+peer = "127.0.0.1:7000"
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.session.unwrap().handshake_profile, None);
+    }
+
+    #[test]
+    fn session_handshake_profile_parses_classical_lab() {
+        let cfg = toml::from_str::<Config>(
+            r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[session]
+role = "connect"
+handshake_profile = "classical-lab"
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(
+            cfg.session.unwrap().handshake_profile,
+            Some(shph_core::HandshakeProfile::ClassicalLab)
+        );
     }
 
     #[cfg(unix)]

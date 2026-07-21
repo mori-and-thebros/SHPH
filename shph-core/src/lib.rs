@@ -15,7 +15,8 @@ pub use crypto::{IdentityKeyPair, ReceiveCipher, ReplayWindow, SendCipher, Sessi
 pub use error::{Result, ShphError};
 pub use framing::{decode_cell, encode_cell, ShroudCell};
 pub use handshake::{
-    absorb_responder_pq, build_hello, finalize_initiator_pq, verify_and_derive, HandshakeMaterial,
+    absorb_responder_pq, build_hello, build_hello_with_profile, finalize_initiator_pq,
+    verify_and_derive, verify_and_derive_with_profile, HandshakeMaterial, HandshakeProfile,
     HandshakeState, HandshakeVersion, Hello,
 };
 pub use keystore::{compute_fingerprint_hex, Contact, KeyStore, KeyStoreConfig};
