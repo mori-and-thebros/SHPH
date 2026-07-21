@@ -19,24 +19,25 @@ The primary baseline is a **native Linux host**. Record:
 Windows is a secondary validation platform. WSL measurements must not be mixed
 with native Linux results.
 
-## Planned Measurements
+## Measurements
 
-1. Crypto primitives: AEAD, X25519, ML-KEM-768, HKDF, and key generation.
-2. Handshake phases: serialization, classical exchange, PQ exchange, and full
-   authenticated setup.
-3. Data plane: throughput and p50/p95/p99 latency by payload size.
-4. Framing: Shroud-cell encode/decode, padding, and replay-window operations.
-5. Adapters: TCP, QUIC-like lab shim, offline-mesh, and data-mule separately.
-6. Resource behavior: allocations, memory growth, CPU saturation, and variance.
+1. Handshake latency: complete authenticated setup for each handshake profile.
+2. Framing latency: encode/decode by payload size.
+3. AEAD latency: encryption by payload size.
+4. Replay latency: nonce-window insertion cost.
+5. Adapter latency: TCP, QUIC-like lab shim, offline-mesh, and data-mule
+   measured separately in later phases.
+6. Throughput and resource behavior: allocations, memory growth, CPU
+   saturation, variance, and sustained data-plane performance.
 
-## Planned Profiles
+## Profiles and dimensions
 
 | Profile | Intended use | Security status |
 | --- | --- | --- |
 | `secure-default` | Normal operation and production baseline | Default; hybrid X25519 + ML-KEM-768 |
 | `classical-lab` | Measure X25519 without ML-KEM overhead | Explicit benchmark-only profile |
-| `framing-lab` | Measure cell/padding overhead | Authentication and AEAD retained |
-| `transport-lab` | Isolate adapter costs | No cryptographic downgrade implied |
+| `framing-lab` | Measurement dimension for cell/padding cost | Authentication and AEAD retained |
+| `transport-lab` | Measurement dimension for adapter cost | No cryptographic downgrade implied |
 
 `classical-lab` must not be implemented as an unnoticed fallback. Both peers
 must explicitly select it, its protocol identity must be distinct, and
@@ -46,6 +47,37 @@ The profile implementation lives in `shph-core/src/handshake.rs` and
 `shph-transport/src/lib.rs`. The standalone runner is outside the production
 workspace under `benchmarks/`, so benchmark dependencies and output do not
 alter the shipped binary workspace.
+
+`secure-default` and `classical-lab` are protocol profiles. `framing-lab` and
+`transport-lab` are benchmark dimensions and do not create additional
+cryptographic negotiation modes.
+
+## Output interpretation
+
+The runner emits CSV rows with:
+
+| Column | Meaning |
+| --- | --- |
+| `benchmark` | Operation being measured |
+| `profile` | Handshake profile used for the run |
+| `payload_bytes` | Payload size; `0` means not payload-sized |
+| `iterations` | Number of timed samples |
+| `min_ns` | Fastest observed sample |
+| `p50_ns` | Median sample |
+| `p95_ns` | 95th-percentile sample |
+| `p99_ns` | 99th-percentile sample |
+| `max_ns` | Slowest observed sample |
+| `mean_ns` | Arithmetic mean |
+
+The handshake row measures the full in-memory setup, including hello
+construction, signatures, X25519, ML-KEM when enabled, and key derivation.
+It does not measure socket transfer or network round-trip time. Framing and
+AEAD rows cover payload sizes of 64, 256, 1024, and 4096 bytes; framing is
+capped by the selected cell capacity.
+
+For latency work, report at least p50 and p95, keep p99 when the sample count
+supports it, and do not treat a single short smoke run as a stable estimate.
+Use separate runs for each profile and payload size.
 
 ## Obstacles and Controls
 
@@ -69,10 +101,22 @@ cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile classical
 ```
 
 The runner prints environment metadata followed by CSV rows for complete
-handshakes, framing, AEAD, and replay-window operations. Results should be
-copied into reviewed evidence, not committed as raw build artifacts.
+handshakes, framing, AEAD, and replay-window operations. It records the
+release build profile, timing clock, and an explicit note that these are local
+operation latencies rather than network RTTs. Results should be copied into
+reviewed evidence, not committed as raw build artifacts.
 
 `classical-lab` is a classical X25519 measurement only. It is not a production
 fallback and must never be presented as equivalent to the hybrid profile.
 When run under WSL2, the runner labels the output `platform=wsl2`; those
 results must remain separate from native-Linux evidence.
+
+Recommended evidence table:
+
+| Environment | Profile | Payload | Iterations | p50 | p95 | p99 | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| native Linux | secure-default | 1024 | 10000 | ... | ... | ... | clean host |
+| native Linux | classical-lab | 1024 | 10000 | ... | ... | ... | benchmark-only |
+
+Do not claim that `classical-lab` is “faster SHPH” without stating that it
+removes ML-KEM and therefore provides a different security contract.

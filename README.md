@@ -39,7 +39,9 @@ SHPH is **functional for controlled lab environments**, but still **not producti
   - `classical-lab` is a visible benchmark-only X25519 mode and requires both
     peers to opt in; it is rejected by secure-default peers.
 - Native Linux benchmark runner:
-  `cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile secure-default`
+  `cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile secure-default --iterations 10000`
+  It reports min/p50/p95/p99/max/mean latency for handshakes, framing,
+  AEAD, and replay operations across multiple payload sizes.
 
 ### Not done yet
 

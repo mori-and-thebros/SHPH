@@ -180,9 +180,10 @@ scheduler behavior can distort measurements.
    Rust toolchain, compiler flags, dependency lockfile, and benchmark revision.
 2. **Microbenchmarks** — measure AEAD, X25519, ML-KEM-768, HKDF, framing,
    Shroud-cell processing, replay-window operations, config parsing, and audit
-   record parsing.
+   record parsing, reporting min/p50/p95/p99/max/mean latency.
 3. **Handshake benchmarks** — measure complete authenticated handshakes,
-   separating classical work, ML-KEM work, serialization, and allocation cost.
+   separating secure-default and classical-lab results, with p50/p95/p99
+   latency and explicit security-profile labels.
 4. **Data-plane benchmarks** — measure throughput and latency across payload
    sizes, batching choices, and controlled concurrency.
 5. **Adapter benchmarks** — measure TCP, the QUIC-like lab shim, offline-mesh,
@@ -251,6 +252,7 @@ Current implementation status:
 - Core/transport profile behavior: complete.
 - Focused profile and config regression tests: complete.
 - Dependency-light native Linux runner: complete.
+- Latency distribution output and payload-size matrix: complete.
 - Criterion statistical reports, adapter matrix, and reviewed evidence
   publication: remaining.
 
