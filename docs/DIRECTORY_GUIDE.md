@@ -17,6 +17,7 @@ This file is the canonical map for `SHPH_working_copy`.
 - `shph-tun/`: TUN abstraction crate.
 - `shph-tui/`: optional terminal UI shell.
 - `fuzz/`: standalone cargo-fuzz targets for parser and replay robustness.
+- `docs/BENCHMARKING.md`: Linux-first benchmark methodology, profiles, and obstacles.
 
 ## Workspace Workspace Paths to Remember
 

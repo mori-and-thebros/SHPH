@@ -166,6 +166,78 @@ Keep these as explicit optional features, not part of mandatory funding readines
   production QUIC, or effective anti-observation traffic shaping. The
   Shroud-cell path is lab-only and opt-in.
 
+## Benchmarking and Performance Profiles (Planned)
+
+Benchmarking will use a **native Linux host as the default environment**.
+Windows benchmarking is a secondary platform-validation track, not the source
+of the primary performance baseline. WSL results must be labeled separately
+from native Linux results because virtualization, filesystem mounts, and
+scheduler behavior can distort measurements.
+
+### Benchmark phases
+
+1. **Methodology freeze** — record OS release, kernel, CPU model, governor,
+   Rust toolchain, compiler flags, dependency lockfile, and benchmark revision.
+2. **Microbenchmarks** — measure AEAD, X25519, ML-KEM-768, HKDF, framing,
+   Shroud-cell processing, replay-window operations, config parsing, and audit
+   record parsing.
+3. **Handshake benchmarks** — measure complete authenticated handshakes,
+   separating classical work, ML-KEM work, serialization, and allocation cost.
+4. **Data-plane benchmarks** — measure throughput and latency across payload
+   sizes, batching choices, and controlled concurrency.
+5. **Adapter benchmarks** — measure TCP, the QUIC-like lab shim, offline-mesh,
+   and data-mule behavior independently; do not present the lab shim as
+   standards-compliant QUIC.
+6. **Regression tracking** — publish median/p95/p99 latency, throughput,
+   memory/allocation observations, variance, and the exact command used.
+
+### Proposed security/performance profiles
+
+Profiles must be explicit, visible in logs/metrics, and selected by both peers.
+They must never create an implicit downgrade path.
+
+- **`secure-default`** — production profile; authenticated Ed25519 handshake,
+  X25519, mandatory ML-KEM-768 hybrid derivation, AEAD, replay protection, and
+  normal framing protections. This remains the default.
+- **`classical-lab`** — benchmark-only profile for measuring X25519 without
+  ML-KEM overhead. It must use a distinct protocol/profile identifier, require
+  explicit opt-in on both peers, and be rejected by production-default peers.
+- **`framing-lab`** — benchmark-only profile for comparing cell/padding costs
+  while retaining authentication, AEAD, and replay protection. It must not be
+  described as traffic-analysis resistance.
+- **`transport-lab`** — benchmark-only adapter selection profile for isolating
+  TCP, the QUIC-like shim, offline-mesh, or data-mule costs without changing
+  the cryptographic security contract.
+
+Disabling ML-KEM is therefore a **separate, visibly non-production protocol
+profile**, not a runtime switch that silently weakens `secure-default`.
+Benchmark results from different profiles are not directly comparable unless
+the report states which security properties were removed.
+
+### Benchmark obstacles
+
+- CPU frequency scaling, turbo behavior, thermal throttling, background load,
+  and VM scheduling can overwhelm small crypto differences.
+- ML-KEM cost varies significantly by CPU and compiler; one Linux result is not
+  a universal performance claim.
+- Loopback measures host-stack behavior, not real link loss, MTU, jitter,
+  congestion, or cross-machine scheduling.
+- Concurrent fuzzing, CI runners, containers, and WSL mounts contaminate
+  filesystem and scheduler measurements.
+- Classical-only and hybrid handshakes have different security properties, so
+  comparisons must be labeled rather than marketed as equivalent.
+- Benchmark harnesses can accidentally measure allocations, logging, key
+  generation, or setup work instead of the intended steady-state operation.
+- Windows native TUN, route/DNS privileges, and the current QUIC-like shim
+  require separate capability and platform notes.
+
+### Exit criteria for this roadmap item
+
+- Native Linux baseline is reproducible from documented commands.
+- Every result includes environment metadata and security profile.
+- Production defaults remain hybrid and fail closed on profile mismatch.
+- A benchmark regression is reproduced twice before being treated as a bug.
+
 ---
 
 ## Funding-Critical KPI (Monthly)

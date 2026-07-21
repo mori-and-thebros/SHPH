@@ -32,6 +32,8 @@
   refused final-component symlinks on Unix.
 - Made malformed file-adapter quarantine collision-safe so rejected evidence is
   not overwritten.
+- Added a Linux-first benchmarking roadmap with explicit security/performance
+  profile rules; no protocol mode behavior changed.
 
 ## [Unreleased] — audit remediation (2026-07-10)
 
