@@ -292,3 +292,13 @@ signaling, and interoperability remain open roadmap items.
 Regression coverage includes malformed-candidate continuation, symlink refusal,
 config temp-file symlink resistance, and the existing transport handshake/data
 plane suites.
+
+## Increment 12 — Configuration and quarantine hardening
+
+- Configuration loading refuses final-component symlinks on Unix, caps input
+  at 1 MiB, and rejects non-UTF-8 contents before TOML parsing.
+- File-adapter quarantine names are collision-safe, preserving earlier
+  rejected evidence instead of overwriting it.
+
+Regression coverage includes oversized-config rejection, Unix config symlink
+refusal, and quarantine collision preservation.

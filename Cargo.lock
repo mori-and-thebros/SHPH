@@ -1170,6 +1170,7 @@ dependencies = [
  "anyhow",
  "clap",
  "home",
+ "libc",
  "serde",
  "serde_json",
  "shph-core",

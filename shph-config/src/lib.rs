@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +15,7 @@ pub use shph_core::roadmap::{
 };
 
 static CONFIG_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_CONFIG_BYTES: u64 = 1 << 20;
 
 pub mod error;
 
@@ -126,7 +127,30 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let contents = fs::read_to_string(path).map_err(ConfigError::Io)?;
+        let file = open_config_readonly(path).map_err(ConfigError::Io)?;
+        let metadata = file.metadata().map_err(ConfigError::Io)?;
+        if metadata.len() > MAX_CONFIG_BYTES {
+            return Err(ConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("configuration exceeds {MAX_CONFIG_BYTES} bytes"),
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_CONFIG_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(ConfigError::Io)?;
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(ConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("configuration exceeds {MAX_CONFIG_BYTES} bytes"),
+            )));
+        }
+        let contents = String::from_utf8(bytes).map_err(|err| {
+            ConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("configuration is not valid UTF-8: {err}"),
+            ))
+        })?;
         Self::parse(&contents)
     }
 
@@ -170,6 +194,21 @@ impl Config {
     pub fn default_config_path() -> std::path::PathBuf {
         let home = home::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         home.join(".shph").join("config.toml")
+    }
+}
+
+fn open_config_readonly(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
     }
 }
 
@@ -249,7 +288,7 @@ fn restrict_config_perms(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, SessionRole};
+    use super::{Config, SessionRole, MAX_CONFIG_BYTES};
     use std::fs;
 
     #[test]
@@ -332,6 +371,47 @@ max_delay_ms = 2000
         );
         assert!(config.exists());
         assert!(predictable_tmp.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn load_rejects_oversized_configuration() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-config-oversized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("config.toml");
+        fs::write(&path, vec![b'x'; (MAX_CONFIG_BYTES + 1) as usize]).expect("write");
+
+        assert!(Config::load(&path).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "shph-config-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("mkdir");
+        let target = root.join("target.toml");
+        let link = root.join("config.toml");
+        fs::write(&target, "interface_name = \"shph0\"\n").expect("target");
+        symlink(&target, &link).expect("symlink");
+
+        assert!(Config::load(&link).is_err());
         fs::remove_dir_all(root).ok();
     }
 }

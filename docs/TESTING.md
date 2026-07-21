@@ -36,6 +36,20 @@ configuration parsing, audit-record parsing, and replay-window state. See
 `fuzz/README.md` for setup and bounded run commands. Fuzzing is an additional
 security gate, not a substitute for the deterministic test suite.
 
+### 30-minute fuzz campaign (Linux, 2026-07-21)
+
+All four targets ran concurrently under nightly `rustc 1.99.0-nightly` for
+`-max_total_time=1800`. Every target exited with code 0 and produced no crash,
+leak, OOM, or timeout artifacts:
+
+- `frame_decode`: 654,172,020 executions; coverage 69; corpus 13 files.
+- `config_parse`: 35,979,131 executions; coverage 3,932; corpus 2,915 files.
+- `audit_record`: 330,407,632 executions; coverage 1,344; corpus 1,946 files.
+- `replay_window`: 1,101,717,299 executions; coverage 49; corpus 53 files.
+
+This is campaign evidence for the current harnesses, not a proof of absence of
+security defects.
+
 ## Platform-targeted test runs executed for this sync
 
 - Linux workspace root: `/home/mori/SHPH_working_copy`

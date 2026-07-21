@@ -211,10 +211,36 @@ fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
 }
 
 fn quarantine_file(path: &Path) {
-    let mut rejected = path.to_path_buf();
-    rejected.set_extension("rejected");
-    if fs::rename(path, &rejected).is_err() {
-        let _ = fs::remove_file(path);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rejected");
+    let primary = parent.join(format!("{stem}.rejected"));
+    let mut candidates = VecDeque::from([primary]);
+    for attempt in 0..32 {
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        candidates.push_back(parent.join(format!(
+            "{stem}.rejected.{}.{}.{}",
+            std::process::id(),
+            counter,
+            attempt
+        )));
+    }
+
+    while let Some(rejected) = candidates.pop_front() {
+        match fs::hard_link(path, &rejected) {
+            Ok(()) => {
+                if fs::remove_file(path).is_err() {
+                    let _ = fs::remove_file(&rejected);
+                }
+                return;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return,
+        }
     }
 }
 
@@ -2621,6 +2647,38 @@ mod tests {
         assert!(out.is_empty());
         assert!(!bad.exists());
         assert!(root.join("bad.rejected").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_quarantine_preserves_existing_rejection() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-quarantine-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let bad = root.join("bad.shph");
+        let existing = root.join("bad.rejected");
+        fs::write(&bad, b"not-json").unwrap();
+        fs::write(&existing, b"previous evidence").unwrap();
+
+        let mut out = Vec::new();
+        let mut scanned = 0;
+        collect_shph_files(&root, &mut out, 4096, 0, &mut scanned).unwrap();
+
+        assert_eq!(fs::read_to_string(existing).unwrap(), "previous evidence");
+        assert!(root
+            .read_dir()
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("bad.rejected.")
+            }));
+        assert!(!bad.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

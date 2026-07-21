@@ -13,4 +13,5 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+libc = { workspace = true }
 home = "0.5"

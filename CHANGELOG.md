@@ -28,6 +28,10 @@
   stdin line cap on non-Unix builds.
 - Hardened ratchet-audit journal reads/appends against final-component
   symlink replacement.
+- Bounded configuration loading to 1 MiB, rejected non-UTF-8 input, and
+  refused final-component symlinks on Unix.
+- Made malformed file-adapter quarantine collision-safe so rejected evidence is
+  not overwritten.
 
 ## [Unreleased] — audit remediation (2026-07-10)
 
