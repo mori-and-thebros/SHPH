@@ -1151,6 +1151,31 @@ struct PeerRateLimiter {
     seen: std::collections::HashMap<String, Vec<Instant>>,
 }
 
+#[doc(hidden)]
+pub struct PeerRateLimiterProbe {
+    inner: PeerRateLimiter,
+}
+
+#[doc(hidden)]
+impl Default for PeerRateLimiterProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[doc(hidden)]
+impl PeerRateLimiterProbe {
+    pub fn new() -> Self {
+        Self {
+            inner: PeerRateLimiter::new(),
+        }
+    }
+
+    pub fn check(&mut self, addr: SocketAddr) -> bool {
+        self.inner.check_and_record(addr).is_ok()
+    }
+}
+
 impl PeerRateLimiter {
     fn new() -> Self {
         Self {

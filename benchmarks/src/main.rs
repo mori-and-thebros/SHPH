@@ -110,6 +110,7 @@ fn main() {
     }
     if matches!(options.suite, Suite::All | Suite::Quic) {
         bench_quic_loopback(options);
+        bench_quic_impairment(options);
     }
     if matches!(options.suite, Suite::All | Suite::Scalability) {
         bench_long_session(options);
@@ -671,6 +672,71 @@ fn bench_quic_loopback(options: Options) {
         &samples,
         finish_measurement(start),
         "UDP_loopback; not standards_compliant_QUIC; no_loss_injection",
+    );
+}
+
+fn bench_quic_impairment(options: Options) {
+    let mut reorder_samples = Vec::with_capacity(options.iterations);
+    let mut loss_samples = Vec::with_capacity(options.iterations);
+    let start = begin_measurement();
+    for iteration in 0..options.iterations {
+        let payloads = [
+            format!("quic-lab-{iteration}-first").into_bytes(),
+            format!("quic-lab-{iteration}-second").into_bytes(),
+        ];
+        let key = [0x6bu8; 32];
+        let mut sender = SendCipher::new(key);
+        let first = sender.encrypt(&payloads[0]).expect("first frame");
+        let second = sender.encrypt(&payloads[1]).expect("second frame");
+
+        let reorder_start = Instant::now();
+        let mut receiver = ReceiveCipher::new_with_replay_window(key, 128);
+        let second_plain = receiver.decrypt(&second).expect("reordered second frame");
+        let first_plain = receiver.decrypt(&first).expect("reordered first frame");
+        assert_eq!(second_plain, payloads[1]);
+        assert_eq!(first_plain, payloads[0]);
+        reorder_samples.push(reorder_start.elapsed().as_nanos());
+
+        let loss_start = Instant::now();
+        let mut loss_receiver = ReceiveCipher::new_with_replay_window(key, 128);
+        let delivered = loss_receiver.decrypt(&second).expect("post-loss frame");
+        assert_eq!(delivered, payloads[1]);
+        loss_samples.push(loss_start.elapsed().as_nanos());
+    }
+    let runtime = finish_measurement(start);
+    emit_latency(
+        "quic_shim_impairment",
+        options,
+        "quic_shim_reordering",
+        0,
+        &reorder_samples,
+        runtime,
+        "in_memory_authenticated_reordering; first frame intentionally delayed",
+    );
+    emit_latency(
+        "quic_shim_impairment",
+        options,
+        "quic_shim_loss_tolerance",
+        0,
+        &loss_samples,
+        runtime,
+        "in_memory_one_frame_loss; receiver advances over missing nonce",
+    );
+    let mut limiter = shph_transport::PeerRateLimiterProbe::new();
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    for _ in 0..(options.iterations.max(8) + 1) {
+        if limiter.check("127.0.0.1:7000".parse().expect("probe address")) {
+            accepted += 1;
+        } else {
+            rejected += 1;
+        }
+    }
+    println!(
+        "rate,{},{},{},1,,,,,,,,0,-,-,-,-,-,-,-,-,accepted={accepted};rejected={rejected};per_ip_rate_limit_probe",
+        options.profile.as_str(),
+        "quic_shim_rate_limit",
+        0
     );
 }
 

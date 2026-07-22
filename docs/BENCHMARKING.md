@@ -138,3 +138,25 @@ SHPH_TUN_NATIVE=1 scripts/benchmark_operator.sh --mode tun --tun-native 1 --conf
 ```
 
 For native Linux two-host evidence, run authenticated listener/connector configs with `SHPH_TUN_NATIVE=1`, generate traffic through the tunnel with `iperf3`/`ping`, capture CPU and RSS during saturation, record packet size/MTU, then repeat after a controlled disconnect. Keep native Linux, WSL2, Windows, containers, VMs, and two-host results in separate evidence tables. `randomized-lab` and the QUIC-like UDP shim remain lab experiments, not stealth or standards-compliant QUIC claims.
+
+### Local QUIC impairment evidence
+
+The `quic` suite also exercises deterministic local behavior:
+
+- authenticated frame reordering within the replay window;
+- one missing frame followed by a valid later frame; and
+- the per-IP handshake rate-limit cap.
+
+Example WSL2 smoke evidence from July 22, 2026:
+
+```text
+profile=secure-default platform=wsl2 iterations=32
+quic_shim_reordering p50=1749ns p99=1779ns
+quic_shim_loss_tolerance p50=880ns p99=910ns
+quic_shim_rate_limit accepted=8 rejected=25
+```
+
+This is local crypto/replay and limiter evidence only. It does not represent
+packet loss recovery over a real network, congestion behavior, or native TUN
+throughput. The existing transport tests separately cover source binding and
+authenticated reordering.
