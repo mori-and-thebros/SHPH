@@ -184,6 +184,10 @@ run_tun() {
     skip tun "native TUN benchmark is Linux-only; Windows requires provisioned signed Wintun"
     return 0
   fi
+  if [[ ! -r /dev/net/tun || ! -w /dev/net/tun ]]; then
+    skip tun "/dev/net/tun is not readable and writable by this process"
+    return 0
+  fi
   if [[ ! -e /dev/net/tun ]]; then
     skip tun "/dev/net/tun is unavailable"
     return 0

@@ -160,3 +160,13 @@ This is local crypto/replay and limiter evidence only. It does not represent
 packet loss recovery over a real network, congestion behavior, or native TUN
 throughput. The existing transport tests separately cover source binding and
 authenticated reordering.
+
+### Host-level execution notes
+
+On July 22, 2026, this WSL2 host exposed `/dev/net/tun` but the process had no
+effective `CAP_NET_ADMIN`; direct native-TUN startup failed closed with the
+expected permission error. An unprivileged user/network namespace could create
+native TUN interfaces and complete both authenticated endpoint handshakes, but
+same-namespace routing produced 100% ping loss and is not valid two-host
+evidence. Persistent `ip netns` setup was blocked by `/run/netns` permission
+restrictions. These are capability/topology notes, not SHPH throughput results.
