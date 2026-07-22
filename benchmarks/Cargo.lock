@@ -674,7 +674,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 name = "shph-benchmarks"
 version = "0.5.0-dev.0"
 dependencies = [
+ "libc",
  "shph-core",
+ "shph-transport",
 ]
 
 [[package]]
@@ -700,6 +702,17 @@ dependencies = [
  "windows-sys 0.61.2",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "shph-transport"
+version = "0.5.0-dev.0"
+dependencies = [
+ "base64",
+ "libc",
+ "rand",
+ "serde_json",
+ "shph-core",
 ]
 
 [[package]]

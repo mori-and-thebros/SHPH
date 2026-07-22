@@ -39,9 +39,13 @@ SHPH is **functional for controlled lab environments**, but still **not producti
   - `classical-lab` is a visible benchmark-only X25519 mode and requires both
     peers to opt in; it is rejected by secure-default peers.
 - Native Linux benchmark runner:
-  `cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile secure-default --iterations 10000`
-  It reports min/p50/p95/p99/max/mean latency for handshakes, framing,
-  AEAD, and replay operations across multiple payload sizes.
+  `cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile secure-default --suite all --iterations 10000 --frames 100000`
+  It reports p50/p95/p99/p99.9 latency, in-memory goodput/wire rate, CPU,
+  RSS, peak RSS, allocation pressure, Shroud profiles, and QUIC-shim loopback
+  measurements; it does not replace live TUN/two-host testing.
+- Operator benchmark wrapper: `scripts/benchmark_operator.sh` measures real
+  lifecycle, control-plane, reconnect, and native-TUN prerequisites without
+  fabricating unsupported results.
 
 ### Not done yet
 

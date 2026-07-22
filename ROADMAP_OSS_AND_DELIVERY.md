@@ -252,9 +252,14 @@ Current implementation status:
 - Core/transport profile behavior: complete.
 - Focused profile and config regression tests: complete.
 - Dependency-light native Linux runner: complete.
-- Latency distribution output and payload-size matrix: complete.
-- Criterion statistical reports, adapter matrix, and reviewed evidence
-  publication: remaining.
+- Latency distribution output, p99.9 reporting, payload-size matrix, CPU/RSS,
+  allocation counters, Shroud profile rows, QUIC-shim loopback rows, and
+  million-frame replay/nonce coverage: complete.
+- Operator wrapper for lifecycle, control-plane, reconnect, and native-TUN
+  prerequisite/timing checks: complete.
+- Real native Linux TUN saturation, two-machine RTT/jitter, injected QUIC-shim
+  impairment runs, Criterion reports, and reviewed evidence publication: remaining
+  because they require operator hosts, privileges, or external traffic tools.
 
 ---
 

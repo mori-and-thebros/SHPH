@@ -120,3 +120,21 @@ Recommended evidence table:
 
 Do not claim that `classical-lab` is “faster SHPH” without stating that it
 removes ML-KEM and therefore provides a different security contract.
+
+## Expanded benchmark coverage
+
+The standalone runner now supports `--suite all|core|dataplane|resource|shroud|quic|scalability`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, Shroud profiles, QUIC-shim loopback handshake timing, and long-session replay/nonce behavior.
+
+These are local measurements, not proof of live VPN throughput, TUN performance, network RTT, reconnect recovery, or control-plane cost. Use `scripts/benchmark_operator.sh` for real-process lifecycle, reconnect, control-plane, and native-TUN prerequisite/timing checks. It emits explicit `SKIP` records when a host, privilege, peer, or tool is unavailable.
+
+Recommended commands:
+
+```bash
+cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite all --iterations 10000 --frames 100000
+scripts/benchmark_operator.sh --mode lifecycle --config /path/to/config.toml
+scripts/benchmark_operator.sh --mode control-plane --config /path/to/config.toml
+scripts/benchmark_operator.sh --mode reconnect --config /path/to/config.toml
+SHPH_TUN_NATIVE=1 scripts/benchmark_operator.sh --mode tun --tun-native 1 --config /path/to/config.toml
+```
+
+For native Linux two-host evidence, run authenticated listener/connector configs with `SHPH_TUN_NATIVE=1`, generate traffic through the tunnel with `iperf3`/`ping`, capture CPU and RSS during saturation, record packet size/MTU, then repeat after a controlled disconnect. Keep native Linux, WSL2, Windows, containers, VMs, and two-host results in separate evidence tables. `randomized-lab` and the QUIC-like UDP shim remain lab experiments, not stealth or standards-compliant QUIC claims.

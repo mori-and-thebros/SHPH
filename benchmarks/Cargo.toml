@@ -7,4 +7,6 @@ publish = false
 [workspace]
 
 [dependencies]
+libc = "0.2"
 shph-core = { path = "../shph-core" }
+shph-transport = { path = "../shph-transport" }
