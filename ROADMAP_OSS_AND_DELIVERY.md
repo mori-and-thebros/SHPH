@@ -11,7 +11,7 @@ Make SHPH a **funding-ready, open-source VPN** with:
 
 Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claims, and optional experimental transports.
 
-## Current State (as of 2026-07-10)
+## Current State (as of 2026-07-28)
 
 ### What is already built
 
@@ -35,7 +35,21 @@ regressions, release/process documents, and evidence artifacts are maintained.
 This does not make SHPH a production VPN or establish hostile-network,
 anti-censorship, or conformant-QUIC claims.
 
-Remaining work is explicitly optional or deployment-specific:
+The next delivery sequence is now explicit:
+
+1. **Shroud lab phase** — make the cell/framing path useful, measurable, and
+   honest about its limits.
+2. **Hardening and optimization phase** — find and fix defects, reduce
+   allocations and tail latency, and repeat the benchmark gates.
+3. **Big move / release-readiness gate** — freeze claims, publish evidence,
+   and prepare the Linux/Windows operator release.
+4. **Windows TUN phase** — integrate and validate a signed Wintun runtime as
+   the final platform-delivery step.
+
+These phases are sequential. The later phase must not be marked complete based
+on placeholder implementations or local-only scores.
+
+Remaining work is explicitly phase-gated or deployment-specific:
 
 - Native Windows route/DNS execution still requires operator validation on a
   privileged Windows host; native Windows TUN now fails explicitly until a
@@ -44,6 +58,13 @@ Remaining work is explicitly optional or deployment-specific:
   identity providers remain unimplemented.
 - A lab-grade password-encrypted keystore path now exists; production key
   management remains unimplemented.
+
+### Phase-gate rule
+
+The current benchmark evidence is WSL2 local-runner evidence from
+`docs/BENCHMARK_RESULTS_2026-07-28.md`. It is useful for regression tracking,
+but it is not native-TUN, two-host, or production-VPN evidence. Each phase
+below must preserve that distinction.
 
 ---
 
@@ -132,13 +153,166 @@ Remaining work is explicitly optional or deployment-specific:
 
 ---
 
-## Optional / Research Track (do not block funding milestone)
+## Next Delivery Sequence
+
+The following sequence supersedes the earlier “optional / research” framing for
+the explicitly approved Shroud-to-Windows-TUN work. It does not turn the
+experimental transports into stealth, anti-censorship, or standards-compliant
+QUIC claims.
+
+### Phase C — Shroud Lab Completion
+
+**Objective:** turn the current Shroud-cell lab path into a useful,
+instrumented, testable framing experiment without presenting it as stealth.
+
+**Work items**
+
+- Define and document cell framing invariants, size limits, padding behavior,
+  profile semantics, and authenticated failure behavior.
+- Add coverage for balanced, low-latency, bulk, randomized-lab, and
+  extreme-lab profiles,
+  including malformed cells, truncation, oversize input, replay, and
+  profile-mismatch cases.
+- Separate framing overhead from cryptographic cost in benchmark output.
+- Add deterministic fixtures and reviewed examples for each profile.
+- Document that the current UDP adapter remains a lab shim and is not QUIC.
+
+**Exit criteria**
+
+- Every lab profile has round-trip, negative, and regression tests.
+- Shroud benchmark rows include payload size, cell size, overhead, and tail
+  latency.
+- No profile is selected implicitly by a production configuration.
+- Docs state the exact non-claims: no stealth guarantee, fingerprint
+  resistance, censorship bypass, or QUIC interoperability.
+
+**Current status:** complete for the controlled lab scope. Core cell
+invariants, explicit frame types, profile-wide round trips, the raw-cell
+versus user-payload capacity boundary, canonical padding, the authenticated
+malformed-input matrix, separated framing/AEAD benchmark rows, and explicit
+profile-selection/non-claims documentation are covered by tests and evidence.
+Native/live benchmark evidence remains outside this Phase C completion claim.
+
+### Phase D — Hardening and Optimization
+
+**Objective:** complete another bug-finding pass and improve the measured
+implementation before the release-readiness move.
+
+**Work items**
+
+- Re-run static review, dependency review, fuzz targets, malformed-input
+  tests, replay/nonce boundary tests, and lifecycle tests.
+- Investigate the QUIC-shim handshake tail outlier and add a repeatability
+  threshold before accepting any optimization.
+- Reduce avoidable allocations in handshake, frame processing, and
+  long-session paths; measure allocation rate and RSS over sustained runs.
+- Benchmark secure-default and classical-lab separately without treating them
+  as equivalent security profiles.
+- Add native Linux TUN and two-host test plans, with explicit `SKIP` evidence
+  when privileges or tools are unavailable.
+- Fix only confirmed defects or measurable regressions; preserve fail-closed
+  behavior.
+
+**Exit criteria**
+
+- `cargo fmt --all -- --check`, strict Clippy, workspace tests, locked build,
+  and benchmark checks pass.
+- Fuzzing and regression suites have documented commands and non-placeholder
+  coverage.
+- Benchmark changes are reproduced on two runs and recorded with environment
+  metadata.
+- No known high-severity correctness or security issue remains open.
+
+### Phase D-A — Pre-Completion Audit Gate
+
+**Objective:** subject the hardened, non-TUN implementation to an external
+audit before declaring Phase D complete.
+
+This is a mandatory gate between implementation work and Phase D completion.
+It does not begin Windows TUN work and does not require native TUN evidence.
+
+**Work items**
+
+- Freeze the audit input tree and record the exact workspace version, commit,
+  lockfiles, platform, and validation commands.
+- Provide the auditor with the production workspace, fuzz harnesses,
+  benchmark/evidence docs, threat model, non-claims, and known accepted risks.
+- Record every audit finding with severity, affected path, reproducibility,
+  disposition, and regression-test requirement.
+- Fix confirmed correctness, security, reliability, and documentation issues;
+  reject only demonstrably false positives with written rationale.
+- Re-run focused regressions for every fix, then repeat the complete Phase D
+  validation gate and mirror verification.
+- Publish an audit disposition note before advancing to Phase E.
+
+**Exit criteria**
+
+- Audit scope and exact input snapshot are recorded.
+- Every finding is fixed, accepted with documented rationale, or explicitly
+  deferred outside the release scope.
+- High-severity findings are zero; any medium-severity residual risk has an
+  owner, rationale, and mitigation.
+- Focused regression tests cover every accepted fix.
+- Full fmt, Clippy, workspace test/build, fuzz-manifest, audit, diff, and
+  mirror-parity checks pass after remediation.
+- The audit disposition is linked from the Phase D scorecard and release
+  evidence.
+
+### Phase E — Big Move / Release Readiness
+
+**Objective:** convert the hardened lab state into a reviewable release
+candidate without overstating platform or network evidence.
+
+**Work items**
+
+- Freeze the protocol/profile and public-API claims for the release candidate.
+- Publish benchmark results, limitations, threat model, dependency scan, and
+  reproducibility evidence together.
+- Reconcile Linux working copy and Windows mirror, then verify checksums.
+- Run the complete release checklist and create a SemVer release tag only when
+  the documented criteria are met.
+- Keep production claims limited to the validated platform and transport scope.
+
+**Exit criteria**
+
+- Release manifest, changelog, audit evidence, and benchmark report agree on
+  the same version and commit.
+- Mirror parity is verified.
+- All unsupported capabilities remain explicitly labeled as unavailable,
+  lab-only, or operator-dependent.
+- A reviewer can reproduce the claimed results from the documentation.
+
+### Phase F — Windows TUN Delivery
+
+**Objective:** integrate and validate the final Windows data-plane backend.
+
+**Work items**
+
+- Provision a signed, version-pinned Wintun runtime and define its packaging
+  and verification procedure.
+- Replace the current explicit failure path with a real Windows TUN backend;
+  never silently fall back to a stub.
+- Validate interface lifecycle, packet I/O, route/DNS apply/rollback,
+  shutdown, reconnect, and privilege/error reporting on supported Windows
+  versions.
+- Add Windows-specific integration evidence and keep it separate from WSL2
+  and native-Linux benchmark results.
+
+**Exit criteria**
+
+- A two-node authenticated Windows tunnel transfers packets through Wintun.
+- Start, stop, reconnect, rollback, and failure paths are tested on a
+  privileged Windows host.
+- Signed-runtime provenance and supported-version documentation are complete.
+- Windows TUN claims are not marked complete until the above evidence exists.
+
+## Optional / Research Track (does not replace the delivery sequence)
 
 Keep these as explicit optional features, not part of mandatory funding readiness.
 
 ### Transport Research
 - Browser-like TLS/QUIC fingerprint shaping
-- QUIC production hardening
+- QUIC production hardening beyond the current standards-QUIC lab path
 - Adaptive timing/cell-size morphology
 
 ### Extreme Transport Modes
@@ -165,6 +339,16 @@ Keep these as explicit optional features, not part of mandatory funding readines
 - These primitives are not represented as production hardware integrations,
   production QUIC, or effective anti-observation traffic shaping. The
   Shroud-cell path is lab-only and opt-in.
+
+### Standards QUIC progress
+
+- The explicit standards path now uses Quinn/rustls RFC QUIC with bounded
+  control streams and RFC 9221 DATAGRAM support.
+- CLI support is available for `listen`, `connect`, `send-once`, and
+  `recv-once` through `--transport quic-standard --quic-cert PATH`.
+- The legacy `--transport quic` UDP shim is unchanged.
+- Continuous `up` mode, async TUN bridging, native TUN, and production
+  certificate/PKI operations remain future work and are not claimed complete.
 
 ## Benchmarking and Performance Profiles (Planned)
 

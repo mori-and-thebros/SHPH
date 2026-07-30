@@ -2,11 +2,12 @@
 
 SHPH is an open-source **VPN-first project** focused on private, testable, and auditable secure networking.
 
-It ships a functional TCP-first secure transport plus explicitly experimental
-QUIC-shim and Shroud-cell lab paths. These are not standards-compliant QUIC or
+It ships a functional TCP-first secure transport plus an explicitly
+experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
+Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-07-15)
+## Current Status (2026-07-30)
 
 SHPH is **functional for controlled lab environments**, but still **not production-hardened** for hostile-network claims.
 
@@ -26,12 +27,18 @@ SHPH is **functional for controlled lab environments**, but still **not producti
   silently using the developer stub.
 - Lab-only controls:
   - set `SHPH_KEYSTORE_PASSWORD` before `init` to encrypt the keystore at rest.
-  - set `SHPH_SHROUD_PROFILE=balanced|low-latency|bulk` with `--transport quic`
-    to wrap UDP-shim frames in fixed-size Shroud cells. Profiles include
-    `balanced`, `low-latency`, `bulk`, and the lab-only `randomized-lab`
-    profile, whose authenticated inner padding is randomized.
+  - set `SHPH_SHROUD_PROFILE=off|low|medium|high|extreme-lab` with
+    `--transport quic` to choose explicit lab intensity. `off` is the default;
+    `low`, `medium`, and `high` map to `low-latency`, `balanced`, and `bulk`.
+    `extreme-lab` uses a larger randomized experimental cell. Named profiles
+    such as `randomized-lab` remain accepted.
 - Transport options on CLI/session paths:
-  - `tcp` (stable), `quic` (experimental), `offline-mesh` (experimental), `data-mule` (experimental).
+  - `tcp` (stable), `quic` (experimental UDP shim), `quic-standard`
+    (opt-in RFC QUIC for `listen`/`connect`/one-shot commands),
+    `offline-mesh` (experimental), `data-mule` (experimental).
+  - `quic-standard` requires `--quic-cert` and trusted out-of-band
+    certificate distribution. `up --transport quic-standard` is rejected until
+    the async TUN bridge is implemented; native TUN is not part of this path.
 - Standalone fuzzing harnesses for Shroud-cell framing, TOML configuration,
   audit-record JSON, and replay-window state transitions live under `fuzz/`.
 - Explicit benchmark profiles are available:
@@ -58,6 +65,8 @@ SHPH is **functional for controlled lab environments**, but still **not producti
 - Full production anti-observation claims are explicitly out of scope at this stage.
 
 For the delivery/funding roadmap, see `ROADMAP_OSS_AND_DELIVERY.md`.
+The active sequence is Shroud lab completion, hardening and optimization,
+release-readiness (“big move”), then Windows TUN delivery.
 
 SHPH inherits core concepts from the Shroud lineage (adaptive framing and profile-driven morphology concepts), reworked for a VPN-first architecture.
 
@@ -107,6 +116,14 @@ cargo run -p shph-cli -- --config /tmp/shph-b/config.toml send-once --peer 127.0
 # one-shot encrypted payload demo over QUIC shim (experimental)
 cargo run -p shph-cli -- --config /tmp/shph-a/config.toml recv-once --bind 127.0.0.1:7220 --transport quic
 cargo run -p shph-cli -- --config /tmp/shph-b/config.toml send-once --peer 127.0.0.1:7220 --text "hello" --transport quic
+
+# standards QUIC one-shot demo; copy server.der to the client out of band
+cargo run -p shph-cli -- --config /tmp/shph-a/config.toml recv-once \
+  --bind 127.0.0.1:7220 --transport quic-standard \
+  --quic-cert /tmp/server.der
+cargo run -p shph-cli -- --config /tmp/shph-b/config.toml send-once \
+  --peer 127.0.0.1:7220 --text "hello" --transport quic-standard \
+  --quic-cert /tmp/server.der
 ```
 
 ## Session `up` Mode
@@ -210,7 +227,9 @@ Additional docs:
 - `docs/SUPPLY_CHAIN_SCAN.md` (cargo-audit scanner + advisory triage)
 - `docs/HARDENING.md` (post-funding security-hardening summary + threat impact)
 - `docs/BENCHMARKING.md` (Linux-first benchmark methodology and profile plan)
+- `docs/BENCHMARK_RESULTS_2026-07-28.md` (latest versioned benchmark scores and evidence limits)
 - `docs/LAB_PROTOTYPES.md` (operational guide for QUIC-shim, offline-mesh, and data-mule labs)
+- `docs/QUIC_STANDARDS.md` (RFC QUIC architecture, usage, and verification)
 - `docs/evidence/CARGO_AUDIT.txt` (regenerable advisory-scan output)
 - `docs/DESCRIBE_PROJECT_SONNET5.md` (independent external description + threat model)
 - `docs/EXTERNAL_AUDIT_SONNET5.md` (independent external gate-verification audit)

@@ -21,8 +21,8 @@ fn hybrid_exchange(
     let mut resp_mat = build_hello(responder).expect("build resp hello");
 
     // Initiator encapsulates against the responder's PQ public key.
-    let ct =
-        finalize_initiator_pq(&mut init_mat, &resp_mat.local_hello).expect("initiator finalize");
+    let ct = finalize_initiator_pq(initiator, &mut init_mat, &resp_mat.local_hello)
+        .expect("initiator finalize");
     // Responder decapsulates the initiator's ciphertext.
     absorb_responder_pq(&mut resp_mat, &ct).expect("responder absorb");
 
@@ -111,8 +111,8 @@ fn corrupted_pq_ciphertext_breaks_key_agreement() {
     let mut init_mat = build_hello(&initiator).unwrap();
     let mut resp_mat = build_hello(&responder).unwrap();
 
-    let mut ct =
-        finalize_initiator_pq(&mut init_mat, &resp_mat.local_hello).expect("initiator finalize");
+    let mut ct = finalize_initiator_pq(&initiator, &mut init_mat, &resp_mat.local_hello)
+        .expect("initiator finalize");
     // Tamper: flip a byte in the ciphertext the responder will decapsulate.
     ct[0] ^= 0xff;
     absorb_responder_pq(&mut resp_mat, &ct).expect("responder absorb (decap is permissive)");
@@ -240,6 +240,6 @@ fn classical_lab_rejects_pq_exchange_attempt() {
         build_hello_with_profile(&local, HandshakeProfile::ClassicalLab).unwrap();
     let peer_material = build_hello_with_profile(&peer, HandshakeProfile::ClassicalLab).unwrap();
 
-    let result = finalize_initiator_pq(&mut local_material, &peer_material.local_hello);
+    let result = finalize_initiator_pq(&local, &mut local_material, &peer_material.local_hello);
     assert!(result.is_err());
 }

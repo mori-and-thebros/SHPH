@@ -7,11 +7,12 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::PublicKey;
 
-use crate::crypto::{hkdf_sha256, IdentityKeyPair, SessionKeys};
+use crate::crypto::{hkdf_sha256_into, IdentityKeyPair, SessionKeys};
 use crate::error::{Result, ShphError};
 use crate::keystore::compute_fingerprint_hex;
 
 const HANDSHAKE_VERSION: u8 = 5;
+const MAX_SIGNED_PAYLOAD_BYTES: usize = 1_400;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -135,17 +136,34 @@ pub fn build_hello_with_profile(
     // The PQ ciphertext each side sends is computed against the peer's PQ public
     // key, which is only known after the hellos are exchanged. It is filled in
     // during verify_and_derive; the hello carries an empty placeholder here.
-    let mut signed_payload = Vec::new();
-    signed_payload.extend_from_slice(profile.protocol_tag().as_bytes());
-    signed_payload.extend_from_slice(local_identity.public().as_bytes());
-    signed_payload.extend_from_slice(&sign_pub);
+    let mut signed_payload = [0u8; MAX_SIGNED_PAYLOAD_BYTES];
+    let mut signed_len = 0;
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        profile.protocol_tag().as_bytes(),
+    )?;
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        local_identity.public().as_bytes(),
+    )?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &sign_pub)?;
     if let Some(pqc_pub) = &pqc_pub {
-        signed_payload.extend_from_slice(pqc_pub);
+        append_signed_part(&mut signed_payload, &mut signed_len, pqc_pub)?;
     }
-    signed_payload.extend_from_slice(local_ephemeral.public().as_bytes());
-    signed_payload.extend_from_slice(&local_nonce);
-    signed_payload.extend_from_slice(&timestamp_secs.to_be_bytes());
-    let sig = local_identity.sign_handshake(&signed_payload);
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        local_ephemeral.public().as_bytes(),
+    )?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &local_nonce)?;
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        &timestamp_secs.to_be_bytes(),
+    )?;
+    let sig = local_identity.sign_handshake(&signed_payload[..signed_len]);
 
     let local_hello = Hello {
         proto: profile.protocol_tag().to_string(),
@@ -184,12 +202,79 @@ pub fn verify_and_derive(
     verify_and_derive_with_profile(local_identity, material, peer_hello, initiator)
 }
 
+pub fn verify_hello_signature(
+    local_identity: &IdentityKeyPair,
+    material: &HandshakeMaterial,
+    peer_hello: &Hello,
+) -> Result<()> {
+    let profile = material.profile;
+    if peer_hello.profile != profile || peer_hello.proto != profile.protocol_tag() {
+        return Err(ShphError::Handshake("protocol mismatch".into()));
+    }
+    if material.local_hello.proto != profile.protocol_tag()
+        || material.local_hello.profile != profile
+    {
+        return Err(ShphError::Handshake(
+            "local protocol profile mismatch".into(),
+        ));
+    }
+
+    let peer_identity_raw = decode_32(&peer_hello.identity_pub_b64, "peer identity")?;
+    let peer_ephemeral_raw = decode_32(&peer_hello.ephemeral_pub_b64, "peer ephemeral")?;
+    let peer_nonce = decode_32(&peer_hello.nonce_b64, "peer nonce")?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ShphError::Handshake("system clock before unix epoch".into()))?
+        .as_secs();
+    if now.abs_diff(peer_hello.timestamp_secs) > 300 {
+        return Err(ShphError::Handshake("peer timestamp out of window".into()));
+    }
+
+    let peer_sign_public = decode_32(&peer_hello.sign_pub_b64, "peer signing key")?;
+    let peer_pqc_pub = peer_hello
+        .pqc_pub_b64
+        .as_deref()
+        .map(|value| b64_decode(value, "peer PQ public key"))
+        .transpose()?;
+    if profile.uses_pqc() != peer_pqc_pub.is_some() {
+        return Err(ShphError::Handshake(
+            "peer post-quantum profile material mismatch".into(),
+        ));
+    }
+
+    let mut signed_payload = [0u8; MAX_SIGNED_PAYLOAD_BYTES];
+    let mut signed_len = 0;
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        profile.protocol_tag().as_bytes(),
+    )?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &peer_identity_raw)?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &peer_sign_public)?;
+    if let Some(peer_pqc_pub) = &peer_pqc_pub {
+        append_signed_part(&mut signed_payload, &mut signed_len, peer_pqc_pub)?;
+    }
+    append_signed_part(&mut signed_payload, &mut signed_len, &peer_ephemeral_raw)?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &peer_nonce)?;
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        &peer_hello.timestamp_secs.to_be_bytes(),
+    )?;
+    local_identity.verify_handshake_signature(
+        &signed_payload[..signed_len],
+        &peer_hello.sig,
+        &peer_sign_public,
+    )
+}
+
 pub fn verify_and_derive_with_profile(
     local_identity: &IdentityKeyPair,
     material: &HandshakeMaterial,
     peer_hello: &Hello,
     initiator: bool,
 ) -> Result<HandshakeState> {
+    verify_hello_signature(local_identity, material, peer_hello)?;
     let profile = material.profile;
     if peer_hello.profile != profile || peer_hello.proto != profile.protocol_tag() {
         return Err(ShphError::Handshake("protocol mismatch".into()));
@@ -226,18 +311,27 @@ pub fn verify_and_derive_with_profile(
             "peer post-quantum profile material mismatch".into(),
         ));
     }
-    let mut signed_payload = Vec::new();
-    signed_payload.extend_from_slice(profile.protocol_tag().as_bytes());
-    signed_payload.extend_from_slice(&peer_identity_raw);
-    signed_payload.extend_from_slice(&peer_sign_public);
+    let mut signed_payload = [0u8; MAX_SIGNED_PAYLOAD_BYTES];
+    let mut signed_len = 0;
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        profile.protocol_tag().as_bytes(),
+    )?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &peer_identity_raw)?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &peer_sign_public)?;
     if let Some(peer_pqc_pub) = &peer_pqc_pub {
-        signed_payload.extend_from_slice(peer_pqc_pub);
+        append_signed_part(&mut signed_payload, &mut signed_len, peer_pqc_pub)?;
     }
-    signed_payload.extend_from_slice(&peer_ephemeral_raw);
-    signed_payload.extend_from_slice(&peer_nonce);
-    signed_payload.extend_from_slice(&peer_hello.timestamp_secs.to_be_bytes());
+    append_signed_part(&mut signed_payload, &mut signed_len, &peer_ephemeral_raw)?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &peer_nonce)?;
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        &peer_hello.timestamp_secs.to_be_bytes(),
+    )?;
     local_identity.verify_handshake_signature(
-        &signed_payload,
+        &signed_payload[..signed_len],
         &peer_hello.sig,
         &peer_sign_public,
     )?;
@@ -272,10 +366,10 @@ pub fn verify_and_derive_with_profile(
     };
     let _ = initiator;
 
-    let mut shared = zeroize::Zeroizing::new(Vec::with_capacity(32 + 32));
-    shared.extend_from_slice(&ecdh_shared);
+    let mut shared = zeroize::Zeroizing::new([0u8; 64]);
+    shared[..32].copy_from_slice(&ecdh_shared);
     if let Some(pq_shared) = pq_shared {
-        shared.extend_from_slice(&pq_shared);
+        shared[32..].copy_from_slice(&pq_shared);
     }
 
     let (first, second) = if material.local_hello.identity_pub_b64 <= peer_hello.identity_pub_b64 {
@@ -305,30 +399,28 @@ pub fn verify_and_derive_with_profile(
     // Wrap HKDF outputs in `Zeroizing` so the raw key material is wiped when
     // these bindings go out of scope, rather than lingering in freed heap
     // memory until the page is reused.
-    let send_key_raw = zeroize::Zeroizing::new(hkdf_sha256(
-        &shared,
+    let mut send_key = [0u8; 32];
+    hkdf_sha256_into(
+        &shared[..if profile.uses_pqc() { 64 } else { 32 }],
         &[
             b"shph-session-v2",
             profile.protocol_tag().as_bytes(),
             &transcript_hash,
             direction[0],
         ],
-        32,
-    )?);
-    let recv_key_raw = zeroize::Zeroizing::new(hkdf_sha256(
-        &shared,
+        &mut send_key,
+    )?;
+    let mut recv_key = [0u8; 32];
+    hkdf_sha256_into(
+        &shared[..if profile.uses_pqc() { 64 } else { 32 }],
         &[
             b"shph-session-v2",
             profile.protocol_tag().as_bytes(),
             &transcript_hash,
             direction[1],
         ],
-        32,
-    )?);
-    let mut send_key = [0u8; 32];
-    let mut recv_key = [0u8; 32];
-    send_key.copy_from_slice(&send_key_raw[..32]);
-    recv_key.copy_from_slice(&recv_key_raw[..32]);
+        &mut recv_key,
+    )?;
 
     Ok(HandshakeState {
         peer_fingerprint_hex: compute_fingerprint_hex(&peer_identity_raw),
@@ -343,6 +435,24 @@ pub fn verify_and_derive_with_profile(
     })
 }
 
+fn append_signed_part(
+    buffer: &mut [u8; MAX_SIGNED_PAYLOAD_BYTES],
+    length: &mut usize,
+    part: &[u8],
+) -> Result<()> {
+    let end = length
+        .checked_add(part.len())
+        .ok_or_else(|| ShphError::Handshake("signed payload length overflow".into()))?;
+    if end > buffer.len() {
+        return Err(ShphError::Handshake(
+            "signed payload exceeds handshake limit".into(),
+        ));
+    }
+    buffer[*length..end].copy_from_slice(part);
+    *length = end;
+    Ok(())
+}
+
 /// Initiator half of the hybrid PQ exchange.
 ///
 /// After receiving the responder's hello, the initiator encapsulates against the
@@ -351,6 +461,7 @@ pub fn verify_and_derive_with_profile(
 /// derived PQ shared secret onto `material` so the subsequent
 /// [`verify_and_derive_with_pq`] call can consume it.
 pub fn finalize_initiator_pq(
+    local_identity: &IdentityKeyPair,
     material: &mut HandshakeMaterial,
     peer_hello: &Hello,
 ) -> Result<Vec<u8>> {
@@ -359,6 +470,7 @@ pub fn finalize_initiator_pq(
             "classical lab profile does not use post-quantum exchange".into(),
         ));
     }
+    verify_hello_signature(local_identity, material, peer_hello)?;
     let peer_pqc_pub = b64_decode(
         peer_hello
             .pqc_pub_b64

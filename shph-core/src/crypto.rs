@@ -221,15 +221,35 @@ pub struct SessionKeys {
 }
 
 pub fn hkdf_sha256(input_key: &[u8], info: &[&[u8]], output_len: usize) -> Result<Vec<u8>> {
-    let salt = info.iter().fold(Vec::new(), |mut acc, i| {
-        acc.extend_from_slice(i);
-        acc
-    });
-    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), input_key);
     let mut output = vec![0u8; output_len];
-    hkdf.expand(&[], &mut output)
-        .map_err(|e| ShphError::Crypto(e.to_string()))?;
+    hkdf_sha256_into(input_key, info, &mut output)?;
     Ok(output)
+}
+
+pub fn hkdf_sha256_into(input_key: &[u8], info: &[&[u8]], output: &mut [u8]) -> Result<()> {
+    const STACK_SALT_BYTES: usize = 256;
+    let salt_len = info.iter().map(|part| part.len()).sum::<usize>();
+    if salt_len <= STACK_SALT_BYTES {
+        let mut salt = [0u8; STACK_SALT_BYTES];
+        let mut offset = 0;
+        for part in info {
+            salt[offset..offset + part.len()].copy_from_slice(part);
+            offset += part.len();
+        }
+        let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt[..salt_len]), input_key);
+        hkdf.expand(&[], output)
+            .map_err(|e| ShphError::Crypto(e.to_string()))?;
+        return Ok(());
+    }
+
+    let mut salt = Vec::with_capacity(salt_len);
+    for part in info {
+        salt.extend_from_slice(part);
+    }
+    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), input_key);
+    hkdf.expand(&[], output)
+        .map_err(|e| ShphError::Crypto(e.to_string()))?;
+    Ok(())
 }
 
 /// Maximum AEAD counter nonce before the session MUST rekey. ChaCha20-Poly1305
@@ -429,8 +449,12 @@ impl ReplayWindow {
                     // the old highest), then shift the bitmap down by the gap.
                     // A gap larger than the window simply resets the bitmap.
                     let gap = nonce - highest;
-                    if gap >= self.size as u64 {
+                    if gap > self.size as u64 {
                         self.bits.iter_mut().for_each(|w| *w = 0);
+                    } else if gap == self.size as u64 {
+                        self.bits.iter_mut().for_each(|w| *w = 0);
+                        let last_word = self.bits.len() - 1;
+                        self.bits[last_word] |= 1u64 << 63;
                     } else {
                         self.shift_down(gap as usize);
                         // After shifting, bit index (gap-1) corresponds to the
@@ -494,9 +518,19 @@ impl ReplayWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        constant_time_eq, nonce_counter, IdentityKeyPair, ReceiveCipher, ReplayWindow, SendCipher,
-        SessionKeys, AEAD_NONCE_LIMIT,
+        constant_time_eq, hkdf_sha256, hkdf_sha256_into, nonce_counter, IdentityKeyPair,
+        ReceiveCipher, ReplayWindow, SendCipher, SessionKeys, AEAD_NONCE_LIMIT,
     };
+
+    #[test]
+    fn hkdf_into_matches_allocating_helper() {
+        let input = [0x41u8; 64];
+        let info = [b"shph-session-v2".as_slice(), b"test-context".as_slice()];
+        let expected = hkdf_sha256(&input, &info, 32).expect("allocating HKDF");
+        let mut actual = [0u8; 32];
+        hkdf_sha256_into(&input, &info, &mut actual).expect("in-place HKDF");
+        assert_eq!(expected, actual);
+    }
 
     #[test]
     fn send_and_receive_roundtrip_succeeds() {
@@ -641,6 +675,16 @@ mod tests {
         w.check_and_insert(42);
         // Equal to highest -> duplicate, rejected.
         assert!(!w.check_and_insert(42));
+    }
+
+    #[test]
+    fn replay_window_rejects_replay_at_exact_window_boundary() {
+        let mut w = ReplayWindow::new(128);
+        assert!(w.check_and_insert(0));
+        assert!(w.check_and_insert(128));
+        // The original highest is exactly at the new window's oldest tracked
+        // boundary and was already accepted, so it must remain rejected.
+        assert!(!w.check_and_insert(0));
     }
 
     #[test]

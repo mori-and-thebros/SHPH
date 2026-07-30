@@ -1,7 +1,10 @@
 //! SHPH transport abstractions.
 //!
 //! Includes stable TCP transport today plus an experimental QUIC-like
-//! UDP datagram shim for phased adoption.
+//! UDP datagram shim for phased adoption, and an opt-in standards-compliant
+//! QUIC transport backed by Quinn.
+
+pub mod standards_quic;
 
 use base64::Engine as _;
 use rand::RngCore;
@@ -28,14 +31,9 @@ const MAX_QUIC_HELLO_BYTES: usize = 12 * 1024;
 const SHROUD_AEAD_OVERHEAD: usize = 12 + 16;
 const SHROUD_LENGTH_PREFIX: usize = 2;
 const QUIC_HANDSHAKE_ATTEMPTS: usize = 3;
-const MAX_QUIC_HANDSHAKE_DATAGRAMS: usize = 64;
 const MAX_QUIC_INVALID_DATAGRAMS_PER_RECV: usize = 8;
 const MAX_QUIC_TRACKED_PEERS: usize = 1024;
 const MAX_QUIC_IDLE_TIMEOUT_SECS: u64 = 300;
-/// Maximum number of inbound TCP handshake attempts the accept path will
-/// tolerate from malformed/early-closing peers before giving up. This bounds
-/// the effort an unauthenticated attacker can force on the entry path.
-const TCP_HANDSHAKE_ATTEMPTS: usize = 5;
 const TCP_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Per-source connection-rate limiting for the unauthenticated TCP entry path.
@@ -47,10 +45,11 @@ const TCP_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
 const PEER_RATE_WINDOW: Duration = Duration::from_secs(10);
 const MAX_CONNECTS_PER_PEER_PER_WINDOW: usize = 8;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
     Tcp,
     Quic,
+    QuicStandard,
     OfflineMesh,
     DataMule,
 }
@@ -60,6 +59,7 @@ impl TransportMode {
         match value.to_ascii_lowercase().as_str() {
             "tcp" => Ok(Self::Tcp),
             "quic" => Ok(Self::Quic),
+            "quic-standard" | "quic-std" | "quic-rfc" => Ok(Self::QuicStandard),
             "offline-mesh" | "offlinemesh" => Ok(Self::OfflineMesh),
             "data-mule" | "data_mule" | "datamule" => Ok(Self::DataMule),
             _ => Err(ShphError::InvalidArgument(format!(
@@ -342,6 +342,9 @@ pub fn connect_and_handshake_with_profile(
                 quic_handshake_client_with_profile(peer, local_identity, timeout_secs, profile)?;
             Ok(state)
         }
+        TransportMode::QuicStandard => Err(ShphError::Unsupported(
+            "quic-standard uses the async standards_quic API".into(),
+        )),
         TransportMode::OfflineMesh | TransportMode::DataMule => Err(ShphError::InvalidArgument(
             "offline/data-mule require direct config-based APIs".into(),
         )),
@@ -381,6 +384,9 @@ pub fn accept_handshake_with_profile(
             profile,
         )?
         .2),
+        TransportMode::QuicStandard => Err(ShphError::Unsupported(
+            "quic-standard uses the async standards_quic API".into(),
+        )),
         TransportMode::OfflineMesh | TransportMode::DataMule => Err(ShphError::InvalidArgument(
             "offline/data-mule require direct config-based APIs".into(),
         )),
@@ -421,7 +427,7 @@ pub fn offline_mesh_connect_and_handshake_with_profile(
 
     let mut material = material;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
         writer.send_payload(&ct)?;
     }
     verify_and_derive(local_identity, &material, &peer_hello, true)
@@ -498,7 +504,7 @@ pub fn offline_mesh_connect_secure_session_with_profile(
 
     let mut material = material;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
         writer.send_payload(&ct)?;
     }
     let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
@@ -596,7 +602,7 @@ pub fn data_mule_connect_and_handshake_with_profile(
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
     let mut material = material;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
         writer.send_payload(&ct)?;
     }
     verify_and_derive(local_identity, &material, &peer_hello, true)
@@ -684,7 +690,7 @@ pub fn data_mule_connect_secure_session_with_profile(
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
     let mut material = material;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
         writer.send_payload(&ct)?;
     }
     let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
@@ -814,6 +820,9 @@ pub fn connect_secure_session_with_profile(
                 state,
             ))
         }
+        TransportMode::QuicStandard => Err(ShphError::Unsupported(
+            "quic-standard uses the async standards_quic API".into(),
+        )),
         TransportMode::OfflineMesh | TransportMode::DataMule => Err(ShphError::InvalidArgument(
             "offline/data-mule require direct config-based APIs".into(),
         )),
@@ -913,6 +922,9 @@ pub fn accept_secure_session_with_profile(
                 state,
             ))
         }
+        TransportMode::QuicStandard => Err(ShphError::Unsupported(
+            "quic-standard uses the async standards_quic API".into(),
+        )),
         TransportMode::OfflineMesh | TransportMode::DataMule => Err(ShphError::InvalidArgument(
             "offline/data-mule require direct config-based APIs".into(),
         )),
@@ -1074,8 +1086,9 @@ pub fn tcp_handshake_client_with_profile(
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
     let peer_hello = read_tcp_hello(&mut stream)?;
+    shph_core::verify_hello_signature(local_identity, &material, &peer_hello)?;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
         write_tcp_pq_ct(&mut stream, &ct)?;
     }
     verify_and_derive(local_identity, &material, &peer_hello, true)
@@ -1129,7 +1142,7 @@ pub fn tcp_connect_and_handshake_with_profile(
     write_tcp_hello(&mut stream, &material.local_hello)?;
     let peer_hello = read_tcp_hello(&mut stream)?;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
         write_tcp_pq_ct(&mut stream, &ct)?;
     }
     let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
@@ -1141,8 +1154,9 @@ pub fn tcp_connect_and_handshake_with_profile(
 /// Tracks recent accepted-connect timestamps per peer IP. A peer that has
 /// already opened `MAX_CONNECTS_PER_PEER_PER_WINDOW` connections within the
 /// rolling `PEER_RATE_WINDOW` is rejected (its stale entries are pruned first)
-/// before any handshake work is performed. This complements the per-loop
-/// `TCP_HANDSHAKE_ATTEMPTS` bound, which only governs a single accept loop.
+/// before any handshake work is performed. This complements the per-call
+/// deadline, which bounds total unauthenticated work without terminating the
+/// listener after a fixed number of malformed peers.
 struct PeerRateLimiter {
     window: Duration,
     max: usize,
@@ -1237,18 +1251,13 @@ pub fn tcp_accept_and_handshake_with_profile(
 ) -> Result<(TcpStream, HandshakeState)> {
     let listener = TcpListener::bind(bind_addr).map_err(|e| ShphError::Transport(e.to_string()))?;
     listener.set_nonblocking(true).map_err(ShphError::Io)?;
-    // Bounded handshake loop on the unauthenticated entry path: tolerate
-    // malformed/early-closing peers up to TCP_HANDSHAKE_ATTEMPTS, then fail
-    // closed. Genuine listener failures and timeouts propagate immediately so
-    // an attacker cannot exhaust the attempt budget with a slow/blocked socket.
+    // Bound each listener invocation by a deadline, but do not let malformed
+    // unauthenticated peers consume a process-lifetime attempt budget.
     let mut last_err: Option<ShphError> = None;
     let mut rate_limiter = PeerRateLimiter::new();
     let deadline = Instant::now()
         + Duration::from_secs(timeout_secs.max(1).min(TCP_HANDSHAKE_DEADLINE.as_secs()));
-    for _ in 0..TCP_HANDSHAKE_ATTEMPTS {
-        if Instant::now() >= deadline {
-            break;
-        }
+    while Instant::now() < deadline {
         let (mut stream, peer_addr) = loop {
             match listener.accept() {
                 Ok(accepted) => break accepted,
@@ -1282,6 +1291,12 @@ pub fn tcp_accept_and_handshake_with_profile(
         match read_tcp_hello(&mut stream) {
             Ok(peer_hello) => {
                 let mut material = build_hello_with_profile(local_identity, profile)?;
+                if let Err(err) =
+                    shph_core::verify_hello_signature(local_identity, &material, &peer_hello)
+                {
+                    last_err = Some(err);
+                    continue;
+                }
                 write_tcp_hello(&mut stream, &material.local_hello)?;
                 if profile.uses_pqc() {
                     let ct = match read_tcp_pq_ct(&mut stream) {
@@ -1318,9 +1333,7 @@ pub fn tcp_accept_and_handshake_with_profile(
             Err(err) => return Err(err),
         }
     }
-    Err(last_err.unwrap_or(ShphError::Transport(
-        "handshake attempt budget exhausted".into(),
-    )))
+    Err(last_err.unwrap_or(ShphError::Timeout))
 }
 
 fn write_tcp_hello(stream: &mut TcpStream, hello: &Hello) -> Result<()> {
@@ -1594,8 +1607,9 @@ pub fn quic_handshake_client_with_profile(
         match peer_hello {
             Ok((peer_hello, addr)) if addr == peer_addr => {
                 let mut material = material;
+                shph_core::verify_hello_signature(local_identity, &material, &peer_hello)?;
                 if profile.uses_pqc() {
-                    let ct = finalize_initiator_pq(&mut material, &peer_hello)?;
+                    let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(ShphError::Timeout);
@@ -1651,7 +1665,6 @@ pub fn quic_handshake_server_with_profile(
     let material = build_hello_with_profile(local_identity, profile)?;
     let mut line = vec![0u8; MAX_QUIC_HELLO_BYTES];
     let mut peer_hello = None;
-    let mut invalid_handshake_datagrams = 0usize;
     // Per-source rate limit, mirroring the TCP accept path: a single host that
     // floods the UDP entry path is dropped before its hello is parsed, so it
     // cannot exhaust the handshake loop budget or burn CPU on deserialization.
@@ -1668,28 +1681,19 @@ pub fn quic_handshake_server_with_profile(
                 }
                 match decode_quic_hello(len, &line[..len], peer_addr) {
                     Ok(hello) => {
+                        if shph_core::verify_hello_signature(local_identity, &material, &hello.0)
+                            .is_err()
+                        {
+                            continue;
+                        }
                         peer_hello = Some(hello);
                         break;
                     }
-                    Err(_) => {
-                        invalid_handshake_datagrams += 1;
-                        if invalid_handshake_datagrams >= MAX_QUIC_HANDSHAKE_DATAGRAMS {
-                            return Err(ShphError::Protocol(
-                                "too many invalid QUIC handshake datagrams".into(),
-                            ));
-                        }
-                    }
+                    Err(_) => continue,
                 }
             }
             Err(ShphError::Timeout) => continue,
-            Err(ShphError::Protocol(_)) => {
-                invalid_handshake_datagrams += 1;
-                if invalid_handshake_datagrams >= MAX_QUIC_HANDSHAKE_DATAGRAMS {
-                    return Err(ShphError::Protocol(
-                        "too many invalid QUIC handshake datagrams".into(),
-                    ));
-                }
-            }
+            Err(ShphError::Protocol(_)) => continue,
             Err(err) => return Err(err),
         }
     }
@@ -1705,6 +1709,7 @@ pub fn quic_handshake_server_with_profile(
         .map_err(ShphError::Io)?;
     write_tcp_hello_to_peer(&socket, peer_addr, &material.local_hello)?;
     let mut material = material;
+    shph_core::verify_hello_signature(local_identity, &material, &peer_hello)?;
     if profile.uses_pqc() {
         let ct = read_quic_pq_ct(&socket, peer_addr)?;
         absorb_responder_pq(&mut material, &ct)?;
@@ -1981,7 +1986,7 @@ fn write_encrypted_quic_frame(
         cipher.encrypt(payload)?
     };
     let encrypted = if let Some(profile) = shroud_profile {
-        shph_core::encode_cell(profile, 0x01, &encrypted)?
+        shph_core::encode_cell(profile, shph_core::SHROUD_FRAME_DATA, &encrypted)?
     } else {
         encrypted
     };
@@ -2076,13 +2081,13 @@ fn decode_encrypted_quic_frame(
     }
 
     let payload = &packet[4..];
-    let payload = if let Some(profile) = shroud_profile {
+    if let Some(profile) = shroud_profile {
         if !profile.is_valid() {
             return Err(ShphError::Protocol("invalid Shroud profile".into()));
         }
-        let encrypted = shph_core::decode_cell(profile, payload)?
+        let encrypted = shph_core::decode_cell_payload(profile, payload)?
             .ok_or_else(|| ShphError::Protocol("unexpected shroud chaff frame".into()))?;
-        let padded = cipher.decrypt(&encrypted)?;
+        let padded = cipher.decrypt(encrypted)?;
         if padded.len() < SHROUD_LENGTH_PREFIX {
             return Err(ShphError::Protocol(
                 "Shroud payload missing length prefix".into(),
@@ -2096,14 +2101,9 @@ fn decode_encrypted_quic_frame(
                 "Shroud payload length exceeds profile capacity".into(),
             ));
         }
-        padded[SHROUD_LENGTH_PREFIX..SHROUD_LENGTH_PREFIX + payload_len].to_vec()
+        Ok(padded[SHROUD_LENGTH_PREFIX..SHROUD_LENGTH_PREFIX + payload_len].to_vec())
     } else {
-        payload.to_vec()
-    };
-    if shroud_profile.is_some() {
-        Ok(payload)
-    } else {
-        cipher.decrypt(&payload)
+        cipher.decrypt(payload)
     }
 }
 fn write_tcp_all_or_closed(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
@@ -2308,10 +2308,12 @@ impl OfflineMeshReadState {
         let mut candidates: Vec<(PathBuf, OfflineMeshEnvelope)> = Vec::new();
 
         if queue_dir.exists() {
+            let mut scanned = 0usize;
             for entry in fs::read_dir(&queue_dir).map_err(ShphError::Io)? {
-                if candidates.len() >= MAX_QUEUE_SCAN_ENTRIES {
+                scanned = scanned.saturating_add(1);
+                if scanned > MAX_QUEUE_SCAN_ENTRIES {
                     return Err(ShphError::ResourceExhausted(
-                        "offline-mesh queue contains too many envelopes to scan safely".into(),
+                        "offline-mesh queue contains too many entries to scan safely".into(),
                     ));
                 }
                 let entry = entry.map_err(ShphError::Io)?;
@@ -2725,9 +2727,13 @@ mod tests {
         decode_encrypted_quic_frame, PeerRateLimiter, TransportMode,
         MAX_CONNECTS_PER_PEER_PER_WINDOW, MAX_QUIC_TRACKED_PEERS,
     };
+    use shph_core::{HandshakeProfile, IdentityKeyPair};
     use std::fs;
-    use std::net::SocketAddr;
+    use std::io::Write;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn transport_mode_parses_supported_values() {
@@ -2787,6 +2793,56 @@ mod tests {
     }
 
     #[test]
+    fn tcp_listener_survives_malformed_peer_flood() {
+        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve TCP port");
+        let address = probe.local_addr().expect("probe address");
+        drop(probe);
+
+        let server_identity = IdentityKeyPair::generate().expect("server identity");
+        let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_identity_for_thread = server_identity.clone();
+        let server_address = address.to_string();
+        let server = thread::spawn(move || {
+            super::tcp_accept_and_handshake_with_profile(
+                &server_address,
+                &server_identity_for_thread,
+                5,
+                HandshakeProfile::ClassicalLab,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        for _ in 0..6 {
+            let mut stream = TcpStream::connect(address).expect("malformed peer connection");
+            stream
+                .write_all(b"not-a-valid-hello\n")
+                .expect("malformed hello");
+        }
+
+        let client_address = address.to_string();
+        let valid = thread::spawn(move || {
+            super::tcp_handshake_client_with_profile(
+                &client_address,
+                &client_identity,
+                5,
+                HandshakeProfile::ClassicalLab,
+            )
+        })
+        .join()
+        .expect("valid client thread");
+        assert!(
+            valid.is_ok(),
+            "valid peer should connect after malformed peers"
+        );
+
+        let accepted = server.join().expect("server thread");
+        assert!(
+            accepted.is_ok(),
+            "listener should remain alive after malformed peers"
+        );
+    }
+
+    #[test]
     fn peer_rate_limiter_bounds_source_table() {
         let mut rl = PeerRateLimiter::new();
         for octet in 0..MAX_QUIC_TRACKED_PEERS {
@@ -2807,6 +2863,118 @@ mod tests {
         let mut cipher = ReceiveCipher::new([7u8; 32]);
         assert!(decode_encrypted_quic_frame(&[0, 0, 0, 0], 4, &mut cipher, None).is_err());
         assert!(decode_encrypted_quic_frame(&[0, 0, 0, 1, 9, 9], 6, &mut cipher, None).is_err());
+    }
+
+    fn shroud_packet(
+        profile: shph_core::ShroudProfile,
+        cipher: &mut shph_core::SendCipher,
+        payload_len: usize,
+    ) -> Vec<u8> {
+        let plaintext_capacity = profile.payload_capacity() - (12 + 16);
+        let mut padded = vec![0u8; plaintext_capacity];
+        padded[..2].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        for byte in &mut padded[2..2 + payload_len] {
+            *byte = 0x5a;
+        }
+        let encrypted = cipher.encrypt(&padded).unwrap();
+        let cell =
+            shph_core::encode_cell(profile, shph_core::SHROUD_FRAME_DATA, &encrypted).unwrap();
+        let mut packet = Vec::with_capacity(4 + cell.len());
+        packet.extend_from_slice(&(cell.len() as u32).to_be_bytes());
+        packet.extend_from_slice(&cell);
+        packet
+    }
+
+    #[test]
+    fn quic_shroud_decoder_accepts_each_profile() {
+        use shph_core::{profiles, ReceiveCipher, SendCipher};
+
+        for profile in profiles() {
+            let key = [0x31u8; 32];
+            let mut sender = SendCipher::new(key);
+            let packet = shroud_packet(*profile, &mut sender, 1);
+            let mut receiver = ReceiveCipher::new_with_replay_window(key, 128);
+            assert_eq!(
+                decode_encrypted_quic_frame(&packet, packet.len(), &mut receiver, Some(*profile))
+                    .unwrap(),
+                vec![0x5a]
+            );
+        }
+    }
+
+    #[test]
+    fn quic_shroud_decoder_rejects_profile_size_mismatch() {
+        use shph_core::{ReceiveCipher, SendCipher, BALANCED, LOW_LATENCY};
+
+        let key = [0x32u8; 32];
+        let mut sender = SendCipher::new(key);
+        let packet = shroud_packet(BALANCED, &mut sender, 1);
+        let mut receiver = ReceiveCipher::new_with_replay_window(key, 128);
+        assert!(decode_encrypted_quic_frame(
+            &packet,
+            packet.len(),
+            &mut receiver,
+            Some(LOW_LATENCY)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn quic_shroud_decoder_rejects_non_canonical_outer_padding() {
+        use shph_core::{ReceiveCipher, SendCipher, BALANCED};
+
+        let key = [0x33u8; 32];
+        let mut sender = SendCipher::new(key);
+        let mut packet = shroud_packet(BALANCED, &mut sender, 1);
+        let last = packet.len() - 1;
+        packet[last] = 1;
+        let mut receiver = ReceiveCipher::new_with_replay_window(key, 128);
+        assert!(
+            decode_encrypted_quic_frame(&packet, packet.len(), &mut receiver, Some(BALANCED))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn quic_shroud_decoder_rejects_inner_payload_length_over_profile_limit() {
+        use shph_core::{ReceiveCipher, SendCipher, BALANCED};
+
+        let key = [0x34u8; 32];
+        let plaintext_capacity = BALANCED.payload_capacity() - (12 + 16);
+        let mut padded = vec![0u8; plaintext_capacity];
+        let declared = BALANCED.max_payload_chunk + 1;
+        padded[..2].copy_from_slice(&(declared as u16).to_be_bytes());
+        let mut sender = SendCipher::new(key);
+        let encrypted = sender.encrypt(&padded).unwrap();
+        let cell =
+            shph_core::encode_cell(BALANCED, shph_core::SHROUD_FRAME_DATA, &encrypted).unwrap();
+        let mut packet = Vec::with_capacity(4 + cell.len());
+        packet.extend_from_slice(&(cell.len() as u32).to_be_bytes());
+        packet.extend_from_slice(&cell);
+        let mut receiver = ReceiveCipher::new_with_replay_window(key, 128);
+        assert!(
+            decode_encrypted_quic_frame(&packet, packet.len(), &mut receiver, Some(BALANCED))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn quic_shroud_decoder_rejects_replayed_cell() {
+        use shph_core::{ReceiveCipher, SendCipher, BALANCED};
+
+        let key = [0x35u8; 32];
+        let mut sender = SendCipher::new(key);
+        let packet = shroud_packet(BALANCED, &mut sender, 1);
+        let mut receiver = ReceiveCipher::new_with_replay_window(key, 128);
+        assert_eq!(
+            decode_encrypted_quic_frame(&packet, packet.len(), &mut receiver, Some(BALANCED))
+                .unwrap(),
+            vec![0x5a]
+        );
+        assert!(
+            decode_encrypted_quic_frame(&packet, packet.len(), &mut receiver, Some(BALANCED))
+                .is_err()
+        );
     }
 
     #[test]

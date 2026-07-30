@@ -22,14 +22,14 @@ use shph_transport::{
     offline_mesh_accept_secure_session_with_profile,
     offline_mesh_connect_and_handshake_with_profile,
     offline_mesh_connect_secure_session_with_profile, quic_handshake_client_with_profile,
-    quic_handshake_server_with_profile, tcp_handshake_client_with_profile,
+    quic_handshake_server_with_profile, standards_quic, tcp_handshake_client_with_profile,
     tcp_handshake_server_with_profile, QuicLabConfig, SecureReceiver, SecureSender, SecureSession,
     TransportMode,
 };
 use shph_tun::{TunDevice, TUN_READ_BUFFER_BYTES};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::Command;
@@ -38,10 +38,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{future::Future, net::SocketAddr};
 use zeroize::Zeroize;
 
 const MAX_STDIN_LINE_BYTES: usize = 64 * 1024;
 const MAX_SHAMIR_SECRET_BYTES: u64 = 64 * 1024;
+const MAX_SHAMIR_SHARE_FILES: usize = 255;
+const MAX_SHAMIR_SHARE_FILE_BYTES: u64 = 256 * 1024;
+const MAX_SHAMIR_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SHAMIR_TOTAL_SHARES: usize = 255;
+const MAX_CONTROL_PLANE_STATE_BYTES: u64 = 64 * 1024;
+const QUIC_PAYLOAD_ACK: &[u8] = b"shph/standards-quic/payload-ack-v1";
 
 fn phase_a1_now_ms() -> Result<u64> {
     Ok(SystemTime::now()
@@ -82,9 +89,12 @@ enum Commands {
         /// Config file to use
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Optional transport override (tcp|quic|offline-mesh|data-mule)
+        /// Optional transport override (tcp|quic|quic-standard|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// DER certificate path for standards QUIC; servers write it and clients trust it out of band
+        #[arg(long)]
+        quic_cert: Option<PathBuf>,
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
@@ -118,7 +128,11 @@ enum Commands {
         sign_pubkey: String,
     },
     /// Show configuration
-    ShowConfig,
+    ShowConfig {
+        /// Include plaintext credential fields in the output.
+        #[arg(long)]
+        show_secrets: bool,
+    },
     /// Validate optional roadmap adapters and trust configuration
     ValidateRoadmap,
     /// Split a secret into configured Shamir shares
@@ -159,9 +173,12 @@ enum Commands {
         bind: String,
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
-        /// Optional transport override (tcp|quic|offline-mesh|data-mule)
+        /// Optional transport override (tcp|quic|quic-standard|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// DER certificate path for standards QUIC; clients must receive the server certificate out of band
+        #[arg(long)]
+        quic_cert: Option<PathBuf>,
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
@@ -172,9 +189,12 @@ enum Commands {
         peer: String,
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
-        /// Optional transport override (tcp|quic|offline-mesh|data-mule)
+        /// Optional transport override (tcp|quic|quic-standard|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// DER certificate path for standards QUIC; clients must receive the server certificate out of band
+        #[arg(long)]
+        quic_cert: Option<PathBuf>,
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
@@ -187,9 +207,12 @@ enum Commands {
         text: String,
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
-        /// Optional transport override (tcp|quic|offline-mesh|data-mule)
+        /// Optional transport override (tcp|quic|quic-standard|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// DER certificate path for standards QUIC; clients must receive the server certificate out of band
+        #[arg(long)]
+        quic_cert: Option<PathBuf>,
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
@@ -200,9 +223,12 @@ enum Commands {
         bind: String,
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
-        /// Optional transport override (tcp|quic|offline-mesh|data-mule)
+        /// Optional transport override (tcp|quic|quic-standard|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// DER certificate path for standards QUIC; clients must receive the server certificate out of band
+        #[arg(long)]
+        quic_cert: Option<PathBuf>,
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
@@ -228,11 +254,17 @@ fn main() -> Result<()> {
         Commands::Up {
             config,
             transport,
+            quic_cert: _,
             handshake_profile,
         } => {
             let path = config.unwrap_or(config_path);
             let config = load_config(&path)?;
             let mode = resolve_transport_mode(transport.as_deref(), config.roadmap.as_ref())?;
+            if mode == TransportMode::QuicStandard {
+                return Err(ShphError::Unsupported(
+                    "quic-standard is available for listen/connect/send-once/recv-once; the async TUN bridge is not enabled in up yet".into(),
+                ));
+            }
             let profile = resolve_handshake_profile(
                 handshake_profile.as_deref(),
                 config
@@ -274,7 +306,7 @@ fn main() -> Result<()> {
             pubkey,
             sign_pubkey,
         )?,
-        Commands::ShowConfig => handle_show_config(&config_path)?,
+        Commands::ShowConfig { show_secrets } => handle_show_config(&config_path, show_secrets)?,
         Commands::ValidateRoadmap => handle_validate_roadmap(&config_path)?,
         Commands::ShamirSplit {
             secret_file,
@@ -298,6 +330,7 @@ fn main() -> Result<()> {
             bind,
             timeout_secs,
             transport,
+            quic_cert,
             handshake_profile,
         } => {
             let config = load_config(&config_path)?;
@@ -306,6 +339,7 @@ fn main() -> Result<()> {
                 &bind,
                 timeout_secs,
                 transport,
+                quic_cert.as_deref(),
                 resolve_handshake_profile(
                     handshake_profile.as_deref(),
                     config
@@ -320,6 +354,7 @@ fn main() -> Result<()> {
             peer,
             timeout_secs,
             transport,
+            quic_cert,
             handshake_profile,
         } => {
             let config = load_config(&config_path)?;
@@ -328,6 +363,7 @@ fn main() -> Result<()> {
                 &peer,
                 timeout_secs,
                 transport,
+                quic_cert.as_deref(),
                 resolve_handshake_profile(
                     handshake_profile.as_deref(),
                     config
@@ -343,6 +379,7 @@ fn main() -> Result<()> {
             text,
             timeout_secs,
             transport,
+            quic_cert,
             handshake_profile,
         } => {
             let config = load_config(&config_path)?;
@@ -352,6 +389,7 @@ fn main() -> Result<()> {
                 &text,
                 timeout_secs,
                 transport,
+                quic_cert.as_deref(),
                 resolve_handshake_profile(
                     handshake_profile.as_deref(),
                     config
@@ -366,6 +404,7 @@ fn main() -> Result<()> {
             bind,
             timeout_secs,
             transport,
+            quic_cert,
             handshake_profile,
         } => {
             let config = load_config(&config_path)?;
@@ -374,6 +413,7 @@ fn main() -> Result<()> {
                 &bind,
                 timeout_secs,
                 transport,
+                quic_cert.as_deref(),
                 resolve_handshake_profile(
                     handshake_profile.as_deref(),
                     config
@@ -488,6 +528,7 @@ fn handle_up(
                         bind,
                         timeout_secs,
                         Some(transport_mode_to_str(transport).to_string()),
+                        None,
                         profile,
                         roadmap,
                     )?;
@@ -524,6 +565,7 @@ fn handle_up(
                         payload,
                         timeout_secs,
                         Some(transport_mode_to_str(transport).to_string()),
+                        None,
                         profile,
                         roadmap,
                     )?;
@@ -573,6 +615,91 @@ fn handle_up(
             Err(err)
         }
     }
+}
+
+fn bounded_cli_timeout(timeout_secs: u64) -> Duration {
+    Duration::from_secs(timeout_secs.clamp(1, 300))
+}
+
+fn parse_socket_addr(value: &str) -> Result<SocketAddr> {
+    value
+        .to_socket_addrs()
+        .map_err(|_| ShphError::Config(format!("invalid socket address: {value}")))?
+        .next()
+        .ok_or_else(|| ShphError::Config(format!("unable to resolve socket address: {value}")))
+}
+
+fn run_async<F, T>(future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| ShphError::Internal(format!("create async runtime: {err}")))?;
+    runtime.block_on(future)
+}
+
+const MAX_QUIC_CERTIFICATE_BYTES: u64 = 64 * 1024;
+
+fn read_quic_certificate(path: &Path) -> Result<Vec<u8>> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(ShphError::Io)?
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        let metadata = fs::symlink_metadata(path).map_err(ShphError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ShphError::InvalidArgument(
+                "refusing to read symlinked QUIC certificate".into(),
+            ));
+        }
+        fs::File::open(path).map_err(ShphError::Io)?
+    };
+
+    let metadata = file.metadata().map_err(ShphError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(ShphError::InvalidArgument(
+            "QUIC certificate path must reference a regular file".into(),
+        ));
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_QUIC_CERTIFICATE_BYTES {
+        return Err(ShphError::Config(format!(
+            "QUIC certificate must be between 1 and {MAX_QUIC_CERTIFICATE_BYTES} bytes"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_QUIC_CERTIFICATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ShphError::Io)?;
+    if bytes.len() as u64 > MAX_QUIC_CERTIFICATE_BYTES {
+        return Err(ShphError::Config(
+            "QUIC certificate exceeds size limit".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn write_quic_certificate(path: &Path, certificate: &[u8]) -> Result<()> {
+    if certificate.is_empty() || certificate.len() as u64 > MAX_QUIC_CERTIFICATE_BYTES {
+        return Err(ShphError::Config(
+            "generated QUIC certificate has an invalid size".into(),
+        ));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(ShphError::InvalidArgument(
+                "refusing to replace symlinked QUIC certificate".into(),
+            ));
+        }
+    }
+    write_owner_only_file(path, certificate)
 }
 
 fn handle_down(config_path: &Path) -> Result<()> {
@@ -631,8 +758,40 @@ fn control_plane_state_path(config_path: &Path) -> PathBuf {
 
 fn load_control_plane_state(config_path: &Path) -> Result<PersistedControlPlaneState> {
     let state_path = control_plane_state_path(config_path);
-    let contents = fs::read_to_string(&state_path).map_err(ShphError::Io)?;
+    let file = open_control_plane_state_readonly(&state_path).map_err(ShphError::Io)?;
+    let metadata = file.metadata().map_err(ShphError::Io)?;
+    if metadata.len() > MAX_CONTROL_PLANE_STATE_BYTES {
+        return Err(ShphError::Protocol(format!(
+            "control-plane state exceeds {MAX_CONTROL_PLANE_STATE_BYTES} bytes"
+        )));
+    }
+    let mut contents = Vec::new();
+    file.take(MAX_CONTROL_PLANE_STATE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(ShphError::Io)?;
+    if contents.len() as u64 > MAX_CONTROL_PLANE_STATE_BYTES {
+        return Err(ShphError::Protocol(format!(
+            "control-plane state exceeds {MAX_CONTROL_PLANE_STATE_BYTES} bytes"
+        )));
+    }
+    let contents = String::from_utf8(contents)
+        .map_err(|_| ShphError::Protocol("control-plane state is not valid UTF-8".into()))?;
     serde_json::from_str(&contents).map_err(ShphError::Serialization)
+}
+
+fn open_control_plane_state_readonly(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::open(path)
+    }
 }
 
 fn save_control_plane_state(config_path: &Path, state: &PersistedControlPlaneState) -> Result<()> {
@@ -672,6 +831,12 @@ fn save_control_plane_state(config_path: &Path, state: &PersistedControlPlaneSta
     if let Err(err) = fs::rename(&temp_path, &state_path).map_err(ShphError::Io) {
         let _ = fs::remove_file(&temp_path);
         return Err(err);
+    }
+    #[cfg(unix)]
+    if let Some(parent) = state_path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(ShphError::Io)?;
     }
     Ok(())
 }
@@ -870,8 +1035,15 @@ fn handle_add_peer(
     Ok(())
 }
 
-fn handle_show_config(config_path: &Path) -> Result<()> {
-    let config = load_config(config_path)?;
+fn handle_show_config(config_path: &Path, show_secrets: bool) -> Result<()> {
+    let mut config = load_config(config_path)?;
+    if !show_secrets {
+        if let Some(obfuscation) = config.obfuscation.as_mut() {
+            if let Some(shadowsocks) = obfuscation.shadowsocks.as_mut() {
+                shadowsocks.password = "<redacted>".into();
+            }
+        }
+    }
     let rendered = toml::to_string_pretty(&config).map_err(|e| ShphError::Config(e.to_string()))?;
     println!("{rendered}");
     Ok(())
@@ -921,10 +1093,7 @@ fn validate_config_roadmap(config: &Config) -> Result<()> {
                 stealth.profile
             )));
         }
-        if !shph_core::profiles()
-            .iter()
-            .any(|profile| profile.name == stealth.shroud_profile)
-        {
+        if shph_core::shroud_profile_by_selection(&stealth.shroud_profile).is_none() {
             return Err(ShphError::Config(format!(
                 "unknown shroud profile: {}",
                 stealth.shroud_profile
@@ -973,15 +1142,43 @@ fn handle_shamir_recover(config_path: &Path, paths: &[PathBuf], output_file: &Pa
             "at least one share file is required".into(),
         ));
     }
+    if paths.len() > MAX_SHAMIR_SHARE_FILES {
+        return Err(ShphError::InvalidArgument(format!(
+            "too many Shamir share files (maximum {MAX_SHAMIR_SHARE_FILES})"
+        )));
+    }
     let mut shares = Vec::with_capacity(paths.len());
+    let mut total_bytes = 0u64;
     for path in paths {
-        let bytes = fs::read(path).map_err(ShphError::Io)?;
+        let file = fs::File::open(path).map_err(ShphError::Io)?;
+        let length = file.metadata()?.len();
+        if length > MAX_SHAMIR_SHARE_FILE_BYTES
+            || total_bytes.saturating_add(length) > MAX_SHAMIR_TOTAL_BYTES
+        {
+            return Err(ShphError::InvalidArgument(
+                "Shamir share input exceeds the configured size limits".into(),
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(length);
+        let mut bytes = Vec::with_capacity(length as usize);
+        file.take(MAX_SHAMIR_SHARE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_SHAMIR_SHARE_FILE_BYTES {
+            return Err(ShphError::InvalidArgument(
+                "Shamir share input exceeds the configured size limits".into(),
+            ));
+        }
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         if value.is_array() {
             let file_shares: Vec<ShamirShare> = serde_json::from_value(value)?;
             shares.extend(file_shares);
         } else {
             shares.push(serde_json::from_value(value)?);
+        }
+        if shares.len() > MAX_SHAMIR_TOTAL_SHARES {
+            return Err(ShphError::InvalidArgument(
+                "too many decoded Shamir shares".into(),
+            ));
         }
     }
     let mut recovered = recover_secret_from_shares(&shares, &roadmap.shamir)?;
@@ -1037,6 +1234,13 @@ fn open_secret_input(path: &Path) -> Result<fs::File> {
     }
     #[cfg(not(unix))]
     {
+        shph_core::ensure_not_reparse_point(path)?;
+        let metadata = fs::symlink_metadata(path).map_err(ShphError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ShphError::InvalidArgument(
+                "refusing to read a symlinked secret input".into(),
+            ));
+        }
         fs::File::open(path).map_err(ShphError::Io)
     }
 }
@@ -1078,6 +1282,7 @@ fn write_owner_only_file(path: &Path, data: &[u8]) -> Result<()> {
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
     }
     if let Err(error) = (|| -> Result<()> {
+        shph_core::enforce_owner_only_file_permissions(&temp)?;
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
@@ -1154,6 +1359,7 @@ fn handle_listen(
     bind: &str,
     timeout_secs: u64,
     transport: Option<String>,
+    quic_cert_path: Option<&Path>,
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
@@ -1164,6 +1370,30 @@ fn handle_listen(
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
+    if mode == TransportMode::QuicStandard {
+        let cert_path = quic_cert_path.ok_or_else(|| {
+            ShphError::Config(
+                "--quic-cert is required with --transport quic-standard on listen".into(),
+            )
+        })?;
+        let bind_addr = parse_socket_addr(bind)?;
+        let timeout = bounded_cli_timeout(timeout_secs);
+        let state = run_async(async {
+            let server = standards_quic::server_endpoint(
+                bind_addr,
+                standards_quic::StandardsQuicConfig::default(),
+            )?;
+            write_quic_certificate(cert_path, &server.certificate_der)?;
+            println!("  Standards QUIC certificate: {}", cert_path.display());
+            let connection =
+                standards_quic::accept(&server, &keystore.identity, profile, timeout).await?;
+            Ok(connection.handshake)
+        })?;
+        enforce_peer_policy(keystore_path, bind, &state, false)?;
+        append_handshake_audit(roadmap, &keystore.identity, bind, &state, "listen", mode)?;
+        print_handshake_state("listen", bind, &state);
+        return Ok(());
+    }
     let state = match mode {
         TransportMode::Tcp => {
             tcp_handshake_server_with_profile(bind, &keystore.identity, timeout_secs, profile)?
@@ -1195,6 +1425,11 @@ fn handle_listen(
                 profile,
             )?
         }
+        TransportMode::QuicStandard => {
+            return Err(ShphError::Unsupported(
+                "quic-standard uses the async standards_quic API".into(),
+            ))
+        }
     };
     enforce_peer_policy(keystore_path, bind, &state, false)?;
     append_handshake_audit(roadmap, &keystore.identity, bind, &state, "listen", mode)?;
@@ -1207,6 +1442,7 @@ fn handle_connect(
     peer: &str,
     timeout_secs: u64,
     transport: Option<String>,
+    quic_cert_path: Option<&Path>,
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
@@ -1217,6 +1453,40 @@ fn handle_connect(
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
+    if mode == TransportMode::QuicStandard {
+        let cert_path = quic_cert_path.ok_or_else(|| {
+            ShphError::Config(
+                "--quic-cert is required with --transport quic-standard on connect".into(),
+            )
+        })?;
+        let certificate = read_quic_certificate(cert_path)?;
+        let peer_addr = parse_socket_addr(peer)?;
+        let timeout_duration = bounded_cli_timeout(timeout_secs);
+        let state = run_async(async {
+            let endpoint = standards_quic::client_endpoint(
+                "0.0.0.0:0".parse().expect("valid ephemeral endpoint"),
+                &certificate,
+                standards_quic::StandardsQuicConfig::default(),
+            )?;
+            let connection = standards_quic::connect(
+                &endpoint,
+                peer_addr,
+                "localhost",
+                &keystore.identity,
+                profile,
+                timeout_duration,
+            )
+            .await?;
+            let state = connection.handshake;
+            endpoint.close(0u32.into(), b"handshake complete");
+            endpoint.wait_idle().await;
+            Ok(state)
+        })?;
+        enforce_peer_policy(keystore_path, peer, &state, true)?;
+        append_handshake_audit(roadmap, &keystore.identity, peer, &state, "connect", mode)?;
+        print_handshake_state("connect", peer, &state);
+        return Ok(());
+    }
     let state = match mode {
         TransportMode::Tcp => {
             tcp_handshake_client_with_profile(peer, &keystore.identity, timeout_secs, profile)?
@@ -1249,6 +1519,11 @@ fn handle_connect(
                 profile,
             )?
         }
+        TransportMode::QuicStandard => {
+            return Err(ShphError::Unsupported(
+                "quic-standard uses the async standards_quic API".into(),
+            ))
+        }
     };
     enforce_peer_policy(keystore_path, peer, &state, true)?;
     append_handshake_audit(roadmap, &keystore.identity, peer, &state, "connect", mode)?;
@@ -1256,12 +1531,14 @@ fn handle_connect(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_send_once(
     keystore_path: &Path,
     peer: &str,
     text: &str,
     timeout_secs: u64,
     transport: Option<String>,
+    quic_cert_path: Option<&Path>,
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
@@ -1278,6 +1555,55 @@ fn handle_send_once(
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     let lab = quic_lab_config()?;
     announce_handshake_profile(profile);
+    if mode == TransportMode::QuicStandard {
+        let cert_path = quic_cert_path.ok_or_else(|| {
+            ShphError::Config(
+                "--quic-cert is required with --transport quic-standard on send-once".into(),
+            )
+        })?;
+        let certificate = read_quic_certificate(cert_path)?;
+        let peer_addr = parse_socket_addr(peer)?;
+        let keystore = KeyStore::load(keystore_path, None)?;
+        let state = run_async(async {
+            let endpoint = standards_quic::client_endpoint(
+                "0.0.0.0:0".parse().expect("valid ephemeral endpoint"),
+                &certificate,
+                standards_quic::StandardsQuicConfig::default(),
+            )?;
+            let mut connection = standards_quic::connect(
+                &endpoint,
+                peer_addr,
+                "localhost",
+                &keystore.identity,
+                profile,
+                bounded_cli_timeout(timeout_secs),
+            )
+            .await?;
+            enforce_peer_policy(keystore_path, peer, &connection.handshake, true)?;
+            connection.send_datagram_wait(text.as_bytes()).await?;
+            let ack =
+                tokio::time::timeout(bounded_cli_timeout(timeout_secs), connection.recv_control())
+                    .await
+                    .map_err(|_| ShphError::Timeout)??;
+            if ack != QUIC_PAYLOAD_ACK {
+                return Err(ShphError::Protocol(
+                    "unexpected QUIC one-shot payload acknowledgement".into(),
+                ));
+            }
+            let state = connection.handshake;
+            endpoint.close(0u32.into(), b"payload sent");
+            endpoint.wait_idle().await;
+            Ok(state)
+        })?;
+        append_handshake_audit(roadmap, &keystore.identity, peer, &state, "send", mode)?;
+        metrics.inc_bytes_sent(text.len());
+        print_handshake_state("send-once", peer, &state);
+        println!("  Sent bytes: {}", text.len());
+        println!("  Session id: {session_id}");
+        println!("  Session end: {}ms", phase_a1_now_ms()?);
+        println!("  Final metrics: {:?}", metrics.snapshot());
+        return Ok(());
+    }
     let (mut session, state) = match mode {
         TransportMode::Tcp => {
             let keystore = KeyStore::load(keystore_path, None)?;
@@ -1322,6 +1648,11 @@ fn handle_send_once(
                 profile,
             )?
         }
+        TransportMode::QuicStandard => {
+            return Err(ShphError::Unsupported(
+                "quic-standard uses the async standards_quic API".into(),
+            ))
+        }
     };
     enforce_peer_policy(keystore_path, peer, &state, true)?;
     let keystore = KeyStore::load(keystore_path, None)?;
@@ -1341,6 +1672,7 @@ fn handle_recv_once(
     bind: &str,
     timeout_secs: u64,
     transport: Option<String>,
+    quic_cert_path: Option<&Path>,
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
@@ -1357,6 +1689,49 @@ fn handle_recv_once(
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     let lab = quic_lab_config()?;
     announce_handshake_profile(profile);
+    if mode == TransportMode::QuicStandard {
+        let cert_path = quic_cert_path.ok_or_else(|| {
+            ShphError::Config(
+                "--quic-cert is required with --transport quic-standard on recv-once".into(),
+            )
+        })?;
+        let keystore = KeyStore::load(keystore_path, None)?;
+        let bind_addr = parse_socket_addr(bind)?;
+        let result = run_async(async {
+            let server = standards_quic::server_endpoint(
+                bind_addr,
+                standards_quic::StandardsQuicConfig::default(),
+            )?;
+            write_quic_certificate(cert_path, &server.certificate_der)?;
+            println!("  Standards QUIC certificate: {}", cert_path.display());
+            let mut connection = standards_quic::accept(
+                &server,
+                &keystore.identity,
+                profile,
+                bounded_cli_timeout(timeout_secs),
+            )
+            .await?;
+            enforce_peer_policy(keystore_path, bind, &connection.handshake, false)?;
+            let payload = connection.recv_datagram().await?;
+            connection.send_control(QUIC_PAYLOAD_ACK).await?;
+            let peer_connection = connection.connection.clone();
+            let _ =
+                tokio::time::timeout(bounded_cli_timeout(timeout_secs), peer_connection.closed())
+                    .await;
+            Ok((connection.handshake, payload.to_vec()))
+        })?;
+        let (state, payload) = result;
+        append_handshake_audit(roadmap, &keystore.identity, bind, &state, "recv", mode)?;
+        metrics.inc_bytes_recv(payload.len());
+        let plaintext = String::from_utf8(payload)
+            .map_err(|_| ShphError::Protocol("payload not valid utf8".into()))?;
+        print_handshake_state("recv-once", bind, &state);
+        println!("  Payload: {plaintext}");
+        println!("  Session id: {session_id}");
+        println!("  Session end: {}ms", phase_a1_now_ms()?);
+        println!("  Final metrics: {:?}", metrics.snapshot());
+        return Ok(());
+    }
     let (mut session, state) = match mode {
         TransportMode::Tcp => {
             let keystore = KeyStore::load(keystore_path, None)?;
@@ -1399,6 +1774,11 @@ fn handle_recv_once(
                 timeout_secs,
                 profile,
             )?
+        }
+        TransportMode::QuicStandard => {
+            return Err(ShphError::Unsupported(
+                "quic-standard uses the async standards_quic API".into(),
+            ))
         }
     };
     enforce_peer_policy(keystore_path, bind, &state, false)?;
@@ -1456,6 +1836,7 @@ fn transport_mode_to_str(mode: TransportMode) -> &'static str {
     match mode {
         TransportMode::Tcp => "tcp",
         TransportMode::Quic => "quic",
+        TransportMode::QuicStandard => "quic-standard",
         TransportMode::OfflineMesh => "offline-mesh",
         TransportMode::DataMule => "data-mule",
     }
@@ -1510,13 +1891,17 @@ fn quic_lab_config() -> Result<QuicLabConfig> {
     let Some(name) = std::env::var("SHPH_SHROUD_PROFILE").ok() else {
         return Ok(QuicLabConfig::default());
     };
-    let profile = shph_core::shroud_profile_by_name(&name).ok_or_else(|| {
-        ShphError::Config(format!(
-            "unknown SHPH_SHROUD_PROFILE '{name}'; expected balanced, low-latency, bulk, or randomized-lab"
-        ))
-    })?;
+    let profile = parse_shroud_profile_name(&name)?;
     Ok(QuicLabConfig {
-        shroud_profile: Some(profile),
+        shroud_profile: profile,
+    })
+}
+
+fn parse_shroud_profile_name(name: &str) -> Result<Option<shph_core::ShroudProfile>> {
+    shph_core::shroud_profile_by_selection(name).ok_or_else(|| {
+        ShphError::Config(format!(
+            "unknown SHPH_SHROUD_PROFILE '{name}'; expected off, low, medium, high, extreme-lab, or a named lab profile"
+        ))
     })
 }
 
@@ -1951,7 +2336,7 @@ fn build_route_add_command(cidr: &str, interface_name: &str) -> Result<Vec<Strin
         Ok(vec![
             "ip".to_string(),
             "route".to_string(),
-            "replace".to_string(),
+            "add".to_string(),
             cidr.to_string(),
             "dev".to_string(),
             interface_name.to_string(),
@@ -2161,6 +2546,11 @@ fn run_listen_loop(
                 profile,
             )?
         }
+        TransportMode::QuicStandard => {
+            return Err(ShphError::Unsupported(
+                "quic-standard uses the async standards_quic API".into(),
+            ))
+        }
     };
     enforce_peer_policy(keystore_path, bind, &state, false)?;
     append_handshake_audit(
@@ -2257,6 +2647,11 @@ fn run_connect_loop(
                 timeout_secs,
                 profile,
             )?
+        }
+        TransportMode::QuicStandard => {
+            return Err(ShphError::Unsupported(
+                "quic-standard uses the async standards_quic API".into(),
+            ))
         }
     };
     enforce_peer_policy(keystore_path, peer, &state, true)?;
@@ -2588,9 +2983,10 @@ mod tests {
     use super::{
         apply_control_plane, build_control_plane_plan, build_dns_apply_command,
         build_dns_apply_commands, build_dns_restore_command, build_route_add_command,
-        build_route_delete_command, enforce_peer_policy, phase_a1_now_ms, run_with_reconnect,
+        build_route_delete_command, control_plane_state_path, enforce_peer_policy,
+        load_control_plane_state, parse_shroud_profile_name, phase_a1_now_ms, run_with_reconnect,
         transport_mode_to_str, validate_cidr, ControlPlaneGuard, ControlPlanePlan, HandshakeState,
-        KeyStore, KeyStoreConfig, TransportMode,
+        KeyStore, KeyStoreConfig, TransportMode, MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
     use shph_config::{Config, ControlPlaneConfig};
@@ -2613,6 +3009,56 @@ mod tests {
         });
         assert!(out.is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn shroud_profile_resolver_accepts_all_lab_profiles() {
+        for profile in shph_core::profiles() {
+            assert_eq!(
+                parse_shroud_profile_name(profile.name).unwrap(),
+                Some(*profile)
+            );
+        }
+    }
+
+    #[test]
+    fn shroud_profile_resolver_rejects_unknown_profiles() {
+        let result = parse_shroud_profile_name("production-stealth");
+        assert!(
+            matches!(result, Err(ShphError::Config(message)) if message.contains("unknown SHPH_SHROUD_PROFILE"))
+        );
+    }
+
+    #[test]
+    fn shroud_profile_resolver_supports_disabled_and_intensity_aliases() {
+        assert_eq!(parse_shroud_profile_name("off").unwrap(), None);
+        assert_eq!(
+            parse_shroud_profile_name("low").unwrap(),
+            Some(shph_core::LOW_LATENCY)
+        );
+        assert_eq!(
+            parse_shroud_profile_name("medium").unwrap(),
+            Some(shph_core::BALANCED)
+        );
+        assert_eq!(
+            parse_shroud_profile_name("high").unwrap(),
+            Some(shph_core::BULK)
+        );
+        assert_eq!(
+            parse_shroud_profile_name("extreme-lab").unwrap(),
+            Some(shph_core::EXTREME_LAB)
+        );
+    }
+
+    #[test]
+    fn shroud_profiles_are_explicitly_lab_only() {
+        assert!(shph_core::profiles()
+            .iter()
+            .all(|profile| profile.is_valid()));
+        assert!(shph_core::shroud_profile_by_name("randomized-lab")
+            .expect("randomized profile")
+            .name
+            .ends_with("-lab"));
     }
 
     #[test]
@@ -2711,9 +3157,57 @@ mod tests {
     fn route_command_builders_validate_and_emit_commands() {
         let add_cmd = build_route_add_command("10.12.0.0/16", "shph0").expect("route add command");
         assert!(!add_cmd.is_empty());
+        if cfg!(target_os = "linux") {
+            assert_eq!(add_cmd[2], "add");
+        }
         let del_cmd = build_route_delete_command("10.12.0.0/16").expect("route del command");
         assert!(!del_cmd.is_empty());
         assert!(build_route_add_command("10.12.0.0/64", "shph0").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_plane_state_loader_rejects_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "shph-cli-state-symlink-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        let state = control_plane_state_path(&config);
+        let target = dir.join("target.json");
+        std::fs::write(
+            &target,
+            r#"{"interface_name":"shph0","routes":[],"dns_servers":[]}"#,
+        )
+        .unwrap();
+        symlink(&target, &state).unwrap();
+
+        assert!(load_control_plane_state(&config).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn control_plane_state_loader_rejects_oversized_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-cli-state-large-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        let state = control_plane_state_path(&config);
+        std::fs::write(
+            &state,
+            vec![b'x'; (MAX_CONTROL_PLANE_STATE_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        assert!(load_control_plane_state(&config).is_err());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -2863,11 +3357,49 @@ mod tests {
     fn transport_mode_parse_supports_tcp_and_quic() {
         assert!(TransportMode::parse("tcp").is_ok());
         assert!(TransportMode::parse("quic").is_ok());
+        assert_eq!(
+            TransportMode::parse("quic-standard").unwrap(),
+            TransportMode::QuicStandard
+        );
+        assert_eq!(
+            TransportMode::parse("quic-rfc").unwrap(),
+            TransportMode::QuicStandard
+        );
         assert!(TransportMode::parse("offline-mesh").is_ok());
         assert!(TransportMode::parse("data-mule").is_ok());
         assert!(TransportMode::parse("bad").is_err());
         assert_eq!(transport_mode_to_str(TransportMode::Tcp), "tcp");
         assert_eq!(transport_mode_to_str(TransportMode::Quic), "quic");
+        assert_eq!(
+            transport_mode_to_str(TransportMode::QuicStandard),
+            "quic-standard"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quic_certificate_writer_rejects_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "shph-cli-quic-cert-symlink-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.der");
+        let cert = dir.join("server.der");
+        std::fs::write(&target, b"existing").unwrap();
+        symlink(&target, &cert).unwrap();
+
+        let result = super::write_quic_certificate(&cert, b"replacement");
+        assert!(matches!(
+            result,
+            Err(ShphError::InvalidArgument(message))
+                if message.contains("symlinked QUIC certificate")
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"existing");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

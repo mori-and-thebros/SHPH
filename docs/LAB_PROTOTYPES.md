@@ -14,15 +14,66 @@ source address, bounds datagrams, and rejects replayed AEAD counters.
 For fixed-size lab framing:
 
 ```text
-SHPH_SHROUD_PROFILE=balanced
-SHPH_SHROUD_PROFILE=low-latency
-SHPH_SHROUD_PROFILE=bulk
+SHPH_SHROUD_PROFILE=off
+SHPH_SHROUD_PROFILE=low
+SHPH_SHROUD_PROFILE=medium
+SHPH_SHROUD_PROFILE=high
+SHPH_SHROUD_PROFILE=extreme-lab
+```
+
+Named compatibility profiles remain available:
+
+```text
 SHPH_SHROUD_PROFILE=randomized-lab
 ```
 
 `randomized-lab` randomizes authenticated inner padding while retaining a
 fixed-size cell. This is useful for measuring framing behavior; it is not
 traffic-analysis resistance or browser/TLS/QUIC fingerprint mimicry.
+
+## Standards QUIC module
+
+For real RFC QUIC behavior, use `--transport quic-standard` with
+`--quic-cert` on `listen`, `connect`, `send-once`, or `recv-once`, or use the
+explicit `shph_transport::standards_quic` API documented in
+`docs/QUIC_STANDARDS.md`. It is separate from `--transport quic`, which
+remains the compatibility name for the legacy UDP shim. The standards module
+uses Quinn/rustls TLS 1.3, reliable QUIC streams for control messages, and RFC
+9221 QUIC DATAGRAM frames for tunnel payloads. Continuous `up` mode and native
+TUN are intentionally not supported by this path yet.
+
+Intensity semantics:
+
+| Selection | Effective profile | Behavior |
+| --- | --- | --- |
+| `off` | none | No Shroud wrapping; ordinary authenticated UDP-shim frames |
+| `low` | `low-latency` | Smaller cells and lower framing delay |
+| `medium` | `balanced` | Default lab balance of cell size and padding |
+| `high` | `bulk` | Larger cells for bulk-oriented experiments |
+| `extreme-lab` | `extreme-lab` | 8 KiB randomized lab cells; highest overhead |
+
+The intensity names are convenience aliases, not security levels. Higher
+intensity does not mean stronger cryptography or stealth.
+
+For a no-Shroud baseline, leave `SHPH_SHROUD_PROFILE` unset or set it to
+`off`. For repeatable comparisons, use the same named selection on both peers
+and record it with the benchmark environment.
+
+Shroud activation is explicit and lab-only. The `SHPH_SHROUD_PROFILE`
+environment variable is the transport activation path today; if it is unset,
+the transport remains unwrapped. `off` also explicitly disables wrapping. A
+`[stealth].shroud_profile` value is validated as configuration metadata but
+does not silently activate Shroud. Unknown names are rejected. There is no
+implicit fallback from an invalid profile.
+
+Each cell has the fixed `SD` header, a data/chaff frame type, a two-byte
+big-endian payload length, and fixed-size padding. The user-data
+`max_payload_chunk` limit is enforced at the data transport boundary, while
+the low-level cell API separately enforces raw cell capacity for authenticated
+ciphertext. Unknown frame types, malformed lengths, wrong cell sizes, and
+profile mismatches fail closed.
+Encoded cells use canonical zero outer padding; altered padding is rejected
+before the frame is exposed to the transport layer.
 
 ## Offline mesh spool
 
@@ -90,11 +141,13 @@ cp -a /tmp/shph-mule/outbox/. /tmp/shph-mule/inbox/
 ## Lab acceptance checklist
 
 1. Run `cargo test --workspace`.
-2. Run a QUIC-shim round trip with `randomized-lab`.
-3. Exercise a malformed or oversized courier file and confirm it becomes
+2. Run the focused Shroud matrix with
+   `cargo test -p shph-transport quic_shroud`.
+3. Run a QUIC-shim round trip with `randomized-lab`.
+4. Exercise a malformed or oversized courier file and confirm it becomes
    `.rejected`.
-4. Copy an offline/data-mule envelope between distinct spool roots.
-5. Verify the receiver can retry an envelope after a failed authentication
+5. Copy an offline/data-mule envelope between distinct spool roots.
+6. Verify the receiver can retry an envelope after a failed authentication
    attempt and consumes it only after successful decryption.
 
 None of these prototypes should be exposed as a production VPN transport

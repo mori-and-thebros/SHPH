@@ -377,6 +377,30 @@ fn open_keystore_readonly(path: &Path) -> Result<File> {
     }
 }
 
+pub fn ensure_not_reparse_point(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
+        };
+        let path = wide_path(path)?;
+        let attributes = unsafe { GetFileAttributesW(path.as_ptr()) };
+        if attributes == INVALID_FILE_ATTRIBUTES {
+            return Err(windows_error("GetFileAttributesW"));
+        }
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ShphError::InvalidArgument(
+                "refusing to access a Windows reparse point".into(),
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Cross-platform persist with crash-safe replacement semantics.
 fn persist_over(target: &Path, tmp: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -403,6 +427,10 @@ fn restrict_secret_perms(path: &Path) -> Result<()> {
         restrict_secret_perms_windows(path)?;
     }
     Ok(())
+}
+
+pub fn enforce_owner_only_file_permissions(path: &Path) -> Result<()> {
+    restrict_secret_perms(path)
 }
 
 /// Reject secret files whose platform permissions are not enforceable.

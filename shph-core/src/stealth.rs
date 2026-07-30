@@ -72,6 +72,16 @@ pub const RANDOMIZED_LAB: ShroudProfile = ShroudProfile {
     adaptive_chunking: true,
 };
 
+pub const EXTREME_LAB: ShroudProfile = ShroudProfile {
+    name: "extreme-lab",
+    cell_size: 8192,
+    send_interval: Duration::from_millis(20),
+    chaff_interval: Duration::from_secs(1),
+    max_payload_chunk: 6144,
+    deterministic_padding: false,
+    adaptive_chunking: true,
+};
+
 /// Stealth profile for DPI evasion
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StealthProfile {
@@ -154,7 +164,7 @@ pub const MIMICRY_LAB: StealthProfile = StealthProfile {
 };
 
 pub fn profiles() -> &'static [ShroudProfile] {
-    &[BALANCED, LOW_LATENCY, BULK, RANDOMIZED_LAB]
+    &[BALANCED, LOW_LATENCY, BULK, RANDOMIZED_LAB, EXTREME_LAB]
 }
 
 pub fn stealth_profiles() -> &'static [StealthProfile] {
@@ -168,6 +178,17 @@ pub fn shroud_profile_by_name(name: &str) -> Option<ShroudProfile> {
         .find(|profile| profile.name == name)
 }
 
+pub fn shroud_profile_by_selection(name: &str) -> Option<Option<ShroudProfile>> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" => Some(None),
+        "low" | "low-latency" => Some(Some(LOW_LATENCY)),
+        "medium" | "balanced" => Some(Some(BALANCED)),
+        "high" | "bulk" => Some(Some(BULK)),
+        "extreme" | "extreme-lab" => Some(Some(EXTREME_LAB)),
+        "randomized-lab" => Some(Some(RANDOMIZED_LAB)),
+        _ => None,
+    }
+}
 pub fn stealth_profile_by_name(name: &str) -> Option<StealthProfile> {
     stealth_profiles()
         .iter()
@@ -177,7 +198,10 @@ pub fn stealth_profile_by_name(name: &str) -> Option<StealthProfile> {
 
 #[cfg(test)]
 mod tests {
-    use super::{shroud_profile_by_name, ShroudProfile, BALANCED};
+    use super::{
+        profiles, shroud_profile_by_name, shroud_profile_by_selection, ShroudProfile, BALANCED,
+        EXTREME_LAB,
+    };
 
     #[test]
     fn randomized_lab_profile_is_available_and_valid() {
@@ -193,5 +217,32 @@ mod tests {
             ..BALANCED
         };
         assert!(!invalid.is_valid());
+    }
+
+    #[test]
+    fn selection_aliases_cover_off_to_extreme() {
+        assert_eq!(shroud_profile_by_selection("off"), Some(None));
+        assert_eq!(
+            shroud_profile_by_selection("low"),
+            Some(Some(super::LOW_LATENCY))
+        );
+        assert_eq!(
+            shroud_profile_by_selection("medium"),
+            Some(Some(super::BALANCED))
+        );
+        assert_eq!(shroud_profile_by_selection("high"), Some(Some(super::BULK)));
+        assert_eq!(
+            shroud_profile_by_selection("extreme-lab"),
+            Some(Some(EXTREME_LAB))
+        );
+        assert!(shroud_profile_by_selection("unknown").is_none());
+    }
+
+    #[test]
+    fn extreme_lab_profile_is_valid_and_listed() {
+        assert!(EXTREME_LAB.is_valid());
+        assert!(profiles()
+            .iter()
+            .any(|profile| profile.name == "extreme-lab"));
     }
 }

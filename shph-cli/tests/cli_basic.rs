@@ -20,4 +20,13 @@ fn cli_help_contains_main_commands() {
     assert!(stdout.contains("send-once"));
     assert!(stdout.contains("recv-once"));
     assert!(stdout.contains("up"));
+
+    let recv_help = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .args(["recv-once", "--help"])
+        .output()
+        .expect("run recv-once --help");
+    assert!(recv_help.status.success());
+    let recv_help_stdout = String::from_utf8(recv_help.stdout).expect("recv help utf8");
+    assert!(recv_help_stdout.contains("quic-standard"));
+    assert!(recv_help_stdout.contains("--quic-cert"));
 }
