@@ -1,0 +1,23 @@
+[package]
+name = "shph-transport"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Transport abstraction interfaces for SHPH"
+
+[dependencies]
+shph-core = { path = "../shph-core" }
+shph-tun = { path = "../shph-tun" }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+libc = { workspace = true }
+zeroize = { workspace = true }
+bytes = "1.5"
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "0.13"
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }

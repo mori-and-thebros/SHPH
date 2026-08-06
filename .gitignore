@@ -1,0 +1,24 @@
+# Build artifacts
+/target/
+**/target/
+fuzz/corpus/
+fuzz/artifacts/
+/benchmark-runs/
+/wintun.dll
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Stray working dirs (kept locally, not versioned)
+/THE WORKING ONE/
+
+# Per-agent local state
+.agents/
+.codex/
+.gapcode/
+
+# Legacy local state from early two-host validation harness drafts
+/.two-host-validation/

@@ -1,0 +1,12 @@
+[package]
+name = "shph-benchmarks"
+version = "0.5.0-dev.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+libc = "0.2"
+shph-core = { path = "../shph-core" }
+shph-transport = { path = "../shph-transport" }
