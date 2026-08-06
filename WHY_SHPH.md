@@ -141,7 +141,7 @@ The detailed non-claims and threat model are in `SECURITY.md` and
 
 Start with these public artifacts:
 
-1. `docs/FIVE_MINUTE_QUICKSTART.md` — establish a local authenticated,
+1. `FIVE_MINUTE_QUICKSTART.md` — establish a local authenticated,
    encrypted TCP exchange.
 2. `CONTRIBUTING.md` — reproduce formatting, lint, test, and locked-build
    checks.
