@@ -236,6 +236,8 @@ Additional docs:
 - `docs/DIRECTORY_GUIDE.md`
 - `docs/REPRODUCIBILITY.md`
 - `docs/SYNC.md` (mirroring working copy <-> Windows tree)
+- `docs/WHY_SHPH.md` (project rationale, transport focus, and funding case)
+- `docs/FIVE_MINUTE_QUICKSTART.md` (local authenticated encrypted exchange)
 - `docs/FUNDERS.md` (what SHPH is/is-not, for grant reviewers)
 - `docs/CRYPTO_FUNDING_BOOTSTRAP.md` (crypto-only bootstrap campaign draft)
 - `docs/RISK_MATRIX.md` (current limits + explicit exclusions)
