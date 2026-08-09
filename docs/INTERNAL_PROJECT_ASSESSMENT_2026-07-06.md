@@ -1,17 +1,15 @@
-# Describe the Project — Sonnet 5
+# Internal Project Assessment
 
-**Author:** Claude Sonnet 5 (external, independent read of the codebase)
+**Assessment type:** Internal source and local-execution assessment; not an
+independent security audit
 **Date (UTC):** 2026-07-06
-**Scope:** `D:\FUNDING NEEDED\snap-shroud-rs` at commit `7de572e` (workspace
-version `0.4.0` + unreleased `hardening-5`), cross-checked against the
-canonical Linux checkout `/home/mori/SHPH_working_copy`.
+**Scope:** SHPH source tree at commit `7de572e` (workspace version `0.4.0`
+plus unreleased hardening changes).
 
-This document is a from-scratch description of what SHPH is, how it is built,
-and what its threat model actually is, derived by reading the code and
-running it — not by summarizing the project's own marketing docs. Where this
-assessment agrees with `SECURITY.md` / `docs/RISK_MATRIX.md`, that is
-independent corroboration, not a copy; disagreements, if any, are called out
-explicitly.
+This document is a from-scratch internal description of what SHPH is, how it
+is built, and what its threat model actually is, derived by reading the code
+and running it rather than by summarizing the project's own marketing docs.
+It is not independent corroboration, certification, or an external audit.
 
 ## 1. What SHPH is
 
@@ -83,7 +81,7 @@ The confirmed data plane uses ChaCha20-Poly1305 AEAD framing
 - `Drop`/`ZeroizeOnDrop` on `SendCipher`, `ReceiveCipher`, `SessionKeys`, and
   the Ed25519 signing seed inside `IdentityKeyPair`, so the 32-byte session
   keys and signing seed are wiped from heap memory when the objects are
-  dropped (`hardening-5`, verified live in this session: 4 passing
+  dropped (`hardening-5`, verified in the recorded run: 4 passing
   `zeroize`-on-drop regression tests).
 
 ### 1.3 Identity and key storage
@@ -102,9 +100,8 @@ memory locking / `mlock`).
 
 `shph-transport/src/lib.rs`:
 
-- TCP accept path bounds the number of malformed/early-closing/wrong-key
-  handshake attempts it will tolerate from a single connection sequence
-  (`TCP_HANDSHAKE_ATTEMPTS = 5`) and enforces `MAX_HELLO_BYTES` /
+- TCP accept path uses deadline-bounded work for malformed/early-closing/
+  wrong-key peers and enforces `MAX_HELLO_BYTES` /
   `MAX_FRAME_BYTES` size caps before parsing, so an unauthenticated peer has a
   bounded ability to consume server effort or memory.
 - A per-source-IP rate limiter (`PeerRateLimiter`) gates both TCP and the QUIC
@@ -203,8 +200,8 @@ though confidentiality of payload contents is.
 
 ### 2.4 Adversary: unauthenticated flooder (handshake-spam / connect-spam, no valid keys)
 
-**Partially covered.** Per-source-IP rate limiting and bounded handshake
-attempt counts (TCP: 5 attempts; size-capped hello/frame parsing) bound the
+**Partially covered.** Per-source-IP rate limiting and deadline-bounded
+handshake work (with size-capped hello/frame parsing) bound the
 cost a single misbehaving or flooding IP can impose. This is **not** a defense
 against a distributed flood from many source IPs, nor against an attacker who
 can spoof source IPs on UDP (the QUIC shim's rate limiter and source-binding
@@ -226,7 +223,7 @@ itself: the Ed25519 signature is classical and would be forgeable by an
 adversary with a large quantum computer capable of breaking EdDSA — so a
 future quantum-capable *active* attacker could still MITM a live handshake
 even though a passive quantum-capable *recorder* could not decrypt past
-sessions. This distinction is worth stating explicitly for funders/auditors:
+sessions. This distinction is worth stating explicitly:
 SHPH's PQ story today is "confidentiality-only harvest-now-decrypt-later
 protection," not "full post-quantum authentication."
 
@@ -274,14 +271,14 @@ maturity stage.
 | Active MITM during handshake | Covered | Ed25519 transcript signature over full hello | None identified beyond classical EdDSA's own limits |
 | Frame replay | Covered | Sliding-window nonce anti-replay, fail-closed | None identified |
 | Frame tamper/truncation | Covered | AEAD auth + length bounds + fail-closed decode | None identified |
-| Handshake flood, single source | Partially covered | Per-IP rate limit + bounded attempts + size caps | No distributed-flood or IP-spoofing defense |
+| Handshake flood, single source | Partially covered | Per-IP rate limit + deadline + signature-before-PQ + size caps | No distributed-flood or IP-spoofing defense |
 | Harvest-now-decrypt-later (confidentiality) | Covered | Hybrid ML-KEM-768 + X25519 HKDF, fail-closed | N/A |
 | Quantum-capable active MITM (authentication) | Not covered | — | Ed25519 signature is classical only |
 | Endpoint/host compromise | Not covered | — | No HSM/TPM/YubiKey; keys readable by anyone with host access |
 | DPI/censorship detection or blocking | Not covered | — | No fingerprint parity; `stealth.rs` profiles not wired to wire format |
 | Malicious/vulnerable dependency | Low residual risk | `cargo audit` in CI, vetted crypto crates | 2 accepted transitive advisories, unmaintained-but-unexploited `paste` |
 
-## 4. Notable observations for funders / auditors
+## 4. Notable observations
 
 - The `v0.3.0` fix (real Ed25519 signatures replacing a public-data digest) is
   the single highest-impact security commit in the project's history — before

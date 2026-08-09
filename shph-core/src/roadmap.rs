@@ -4,12 +4,22 @@ use base64::Engine as _;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Result, ShphError};
+
+const MAX_AUDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_AUDIT_LINE_BYTES: usize = 64 * 1024;
+const MAX_AUDIT_ENTRIES: usize = 100_000;
+const SHAMIR_PRIME: u64 = 257;
+const MAX_SHAMIR_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_SHAMIR_SECRET_BYTES: usize = MAX_SHAMIR_PAYLOAD_BYTES / 2;
+const MAX_SHAMIR_RECOVERY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SHAMIR_PAYLOAD_B64_BYTES: usize = MAX_SHAMIR_PAYLOAD_BYTES.div_ceil(3) * 4;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -495,13 +505,32 @@ pub fn read_ratchet_audit_events(policy: &RatchetAuditConfig) -> Result<Vec<Ratc
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(ShphError::Io(err)),
     };
+    if file.metadata()?.len() > MAX_AUDIT_FILE_BYTES {
+        return Err(ShphError::ResourceExhausted(
+            "ratchet audit journal exceeds the 8 MiB safety limit".into(),
+        ));
+    }
     let mut entries = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line.map_err(ShphError::Io)?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = read_bounded_line(&mut reader, &mut line).map_err(ShphError::Io)?;
+        if read == 0 {
+            break;
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| ShphError::Protocol("audit entry is not valid UTF-8".into()))?
+            .trim_end_matches(['\r', '\n']);
         if line.trim().is_empty() {
             continue;
         }
-        let record = serde_json::from_str::<RatchetAuditRecord>(&line)
+        if entries.len() >= MAX_AUDIT_ENTRIES {
+            return Err(ShphError::ResourceExhausted(
+                "ratchet audit journal contains too many entries".into(),
+            ));
+        }
+        let record = serde_json::from_str::<RatchetAuditRecord>(line)
             .map_err(|e| ShphError::Protocol(format!("invalid audit entry: {e}")))?;
         entries.push(record);
     }
@@ -515,14 +544,19 @@ pub fn split_secret(secret: &[u8], cfg: &ShamirConfig) -> Result<Vec<ShamirShare
     if cfg.threshold == 0 || cfg.shares == 0 || cfg.threshold > cfg.shares || cfg.shares > 255 {
         return Err(ShphError::from(ShamirError::InvalidPolicy));
     }
+    if secret.len() > MAX_SHAMIR_SECRET_BYTES {
+        return Err(ShphError::ResourceExhausted(
+            "Shamir secret exceeds the safety limit".into(),
+        ));
+    }
 
     let mut rng = rand::thread_rng();
-    let prime = 257u64;
+    let prime = SHAMIR_PRIME;
     let mut rows: Vec<Vec<u16>> = vec![Vec::with_capacity(secret.len()); cfg.shares];
     for &byte in secret {
         let mut coeffs = vec![byte as u64];
         for _ in 1..cfg.threshold {
-            coeffs.push((rng.next_u64() % (prime - 2)) + 1);
+            coeffs.push(sample_field_element(&mut rng, prime));
         }
         for x in 1..=(cfg.shares as u64) {
             let value = gf_eval(&coeffs, x, prime) as u16;
@@ -549,14 +583,28 @@ pub fn recover_secret_from_shares(shares: &[ShamirShare], cfg: &ShamirConfig) ->
     if shares.len() < cfg.threshold {
         return Err(ShphError::from(ShamirError::TooFewShares));
     }
+    if shares.len() > cfg.shares {
+        return Err(ShphError::from(ShamirError::BadShareCount));
+    }
 
     let mut decoded: Vec<(u64, Vec<u16>)> = Vec::with_capacity(cfg.threshold);
     let mut lens = BTreeSet::new();
     let mut indices = BTreeSet::new();
+    let mut decoded_bytes = 0usize;
 
     for share in shares {
         let values = decode_u16_array(&share.payload_b64)
             .map_err(|_| ShphError::from(ShamirError::DecodeFailed))?;
+        decoded_bytes = decoded_bytes
+            .checked_add(values.len().saturating_mul(2))
+            .ok_or_else(|| {
+                ShphError::ResourceExhausted("Shamir recovery input is too large".into())
+            })?;
+        if decoded_bytes > MAX_SHAMIR_RECOVERY_BYTES {
+            return Err(ShphError::ResourceExhausted(
+                "Shamir recovery input exceeds the safety limit".into(),
+            ));
+        }
         if share.index == 0 || usize::from(share.index) > cfg.shares {
             return Err(ShphError::from(ShamirError::BadShareCount));
         }
@@ -638,21 +686,37 @@ fn prune_jsonl(path: &Path, max_entries: usize) -> Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(ShphError::Io(err)),
     };
-    let mut records = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line.map_err(ShphError::Io)?;
+    if file.metadata()?.len() > MAX_AUDIT_FILE_BYTES {
+        return Err(ShphError::ResourceExhausted(
+            "ratchet audit journal exceeds the 8 MiB safety limit".into(),
+        ));
+    }
+    let keep = max_entries.clamp(1, MAX_AUDIT_ENTRIES);
+    let mut records = VecDeque::with_capacity(keep);
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = read_bounded_line(&mut reader, &mut line).map_err(ShphError::Io)?;
+        if read == 0 {
+            break;
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| ShphError::Protocol("audit entry is not valid UTF-8".into()))?
+            .trim_end_matches(['\r', '\n']);
         if line.trim().is_empty() {
             continue;
         }
-        let record = serde_json::from_str::<RatchetAuditRecord>(&line)
+        let record = serde_json::from_str::<RatchetAuditRecord>(line)
             .map_err(|e| ShphError::Protocol(format!("invalid audit entry: {e}")))?;
-        records.push(record);
+        records.push_back(record);
+        if records.len() > keep {
+            records.pop_front();
+        }
     }
-    if records.len() <= max_entries {
+    if records.len() < keep {
         return Ok(());
     }
-    let drop_n = records.len() - max_entries;
-    let records = records.split_off(drop_n);
     let mut tmp_path = path.to_path_buf();
     let suffix = now_unix_ms()?;
     tmp_path.set_extension(format!("jsonl.tmp.{}.{}", std::process::id(), suffix));
@@ -681,6 +745,30 @@ fn prune_jsonl(path: &Path, max_entries: usize) -> Result<()> {
         return Err(err);
     }
     Ok(())
+}
+
+fn read_bounded_line(reader: &mut BufReader<File>, line: &mut Vec<u8>) -> io::Result<usize> {
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(line.len());
+        }
+        let take = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        if line.len().saturating_add(take) > MAX_AUDIT_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ratchet audit entry exceeds the 64 KiB line limit",
+            ));
+        }
+        line.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        if line.last() == Some(&b'\n') {
+            return Ok(line.len());
+        }
+    }
 }
 
 fn persist_audit_over(tmp: &Path, path: &Path) -> io::Result<()> {
@@ -766,17 +854,37 @@ fn encode_u16_array(values: &[u16]) -> String {
 }
 
 fn decode_u16_array(raw_b64: &str) -> Result<Vec<u16>> {
+    if raw_b64.len() > MAX_SHAMIR_PAYLOAD_B64_BYTES {
+        return Err(ShphError::ResourceExhausted(
+            "Shamir share payload exceeds the safety limit".into(),
+        ));
+    }
     let raw = base64::engine::general_purpose::STANDARD
         .decode(raw_b64)
         .map_err(|_| ShphError::Protocol("invalid share payload".into()))?;
     if raw.len() % 2 != 0 {
         return Err(ShphError::Protocol("invalid share payload length".into()));
     }
+    if raw.len() > MAX_SHAMIR_PAYLOAD_BYTES {
+        return Err(ShphError::ResourceExhausted(
+            "Shamir share payload exceeds the safety limit".into(),
+        ));
+    }
     let mut values = Vec::with_capacity(raw.len() / 2);
     for bytes in raw.chunks_exact(2) {
         values.push(u16::from_le_bytes([bytes[0], bytes[1]]));
     }
     Ok(values)
+}
+
+fn sample_field_element<R: RngCore>(rng: &mut R, prime: u64) -> u64 {
+    let threshold = ((u128::from(u64::MAX) + 1) / u128::from(prime)) * u128::from(prime);
+    loop {
+        let value = rng.next_u64();
+        if u128::from(value) < threshold {
+            return value % prime;
+        }
+    }
 }
 
 fn gf_eval(coeffs: &[u64], x: u64, p: u64) -> u64 {
@@ -970,6 +1078,56 @@ mod tests {
         assert!(matches!(
             recover_secret_from_shares(&[non_field, shares[1].clone()], &cfg),
             Err(ShphError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn shamir_rejects_oversized_split_secret() {
+        let cfg = ShamirConfig {
+            enabled: true,
+            threshold: 2,
+            shares: 3,
+        };
+        let secret = vec![0u8; MAX_SHAMIR_SECRET_BYTES + 1];
+        assert!(matches!(
+            split_secret(&secret, &cfg),
+            Err(ShphError::ResourceExhausted(_))
+        ));
+    }
+
+    #[test]
+    fn shamir_rejects_more_shares_than_policy_allows() {
+        let source_cfg = ShamirConfig {
+            enabled: true,
+            threshold: 2,
+            shares: 3,
+        };
+        let recovery_cfg = ShamirConfig {
+            enabled: true,
+            threshold: 2,
+            shares: 2,
+        };
+        let shares = split_secret(b"secret", &source_cfg).expect("split");
+        assert!(matches!(
+            recover_secret_from_shares(&shares, &recovery_cfg),
+            Err(ShphError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn shamir_rejects_decoded_share_above_payload_limit() {
+        let cfg = ShamirConfig {
+            enabled: true,
+            threshold: 1,
+            shares: 1,
+        };
+        let oversized = ShamirShare {
+            index: 1,
+            payload_b64: encode_u16_array(&vec![0u16; (MAX_SHAMIR_PAYLOAD_BYTES / 2) + 1]),
+        };
+        assert!(matches!(
+            recover_secret_from_shares(&[oversized], &cfg),
+            Err(ShphError::Protocol(_)) | Err(ShphError::ResourceExhausted(_))
         ));
     }
 

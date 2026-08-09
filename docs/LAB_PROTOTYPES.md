@@ -31,6 +31,26 @@ SHPH_SHROUD_PROFILE=randomized-lab
 fixed-size cell. This is useful for measuring framing behavior; it is not
 traffic-analysis resistance or browser/TLS/QUIC fingerprint mimicry.
 
+## Shroud 2.0 morphology lab
+
+The standards-QUIC API also exposes an explicit morphology experiment under
+`shph_transport::shroud2`. It selects bounded payload-size classes and bounded
+inter-datagram delay, then carries a versioned, length-checked envelope over
+authenticated RFC 9221 DATAGRAM frames. It is useful for measuring overhead,
+tail latency, and payload preservation:
+
+```text
+let mut morphology = MorphologyEngine::new(MorphologyProfile::WebBrowsingLab);
+connection
+    .send_morphology_datagram(&mut morphology, b"lab payload")
+    .await?;
+let payload = connection.recv_morphology_datagram().await?;
+```
+
+This is an opt-in lab morphology tool. It does not provide browser fingerprint
+parity, active-probe deflection, censorship bypass, or a stealth guarantee.
+See `docs/SHROUD_2_IMPLEMENTATION.md` for the implementation disposition.
+
 ## Standards QUIC module
 
 For real RFC QUIC behavior, use `--transport quic-standard` with

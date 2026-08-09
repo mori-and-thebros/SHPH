@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 serde_json = "1.0"
 shph-config = { path = "../shph-config" }
 shph-core = { path = "../shph-core" }
+shph-transport = { path = "../shph-transport" }
 
 [[bin]]
 name = "frame_decode"
@@ -37,6 +38,13 @@ bench = false
 [[bin]]
 name = "replay_window"
 path = "fuzz_targets/replay_window.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shroud2_datagram"
+path = "fuzz_targets/shroud2_datagram.rs"
 test = false
 doc = false
 bench = false

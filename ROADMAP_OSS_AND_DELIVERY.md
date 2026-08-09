@@ -11,7 +11,7 @@ Make SHPH a **funding-ready, open-source VPN** with:
 
 Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claims, and optional experimental transports.
 
-## Current State (as of 2026-07-28)
+## Current State (as of 2026-08-08)
 
 ### What is already built
 
@@ -26,6 +26,14 @@ Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claim
 - CLI and docs baseline in place.
 - Roadmap validation, Shamir split/recovery, and ratchet-audit export primitives
   are available behind explicit CLI commands.
+- Paired local benchmark evidence is available for WSL2/Linux and native
+  Windows, including secure-default/classical-lab handshake, authenticated
+  goodput, morphology, allocation, replay, and lab-shim measurements. See
+  `docs/BENCHMARK_RESULTS_2026-08-05.md`.
+- Native Windows workspace validation was refreshed on August 8, 2026:
+  locked build/check, strict Clippy, 180 tests, Windows-only Wintun and ACL
+  regressions, release build, and both local benchmark profiles pass. See
+  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-08.md`.
 
 ### Mandatory-track status
 
@@ -43,7 +51,7 @@ The next delivery sequence is now explicit:
    allocations and tail latency, and repeat the benchmark gates.
 3. **Big move / release-readiness gate** — freeze claims, publish evidence,
    and prepare the Linux/Windows operator release.
-4. **Windows TUN phase** — integrate and validate a signed Wintun runtime as
+4. **Windows TUN phase** — integrate and validate an operator-approved Wintun runtime as
    the final platform-delivery step.
 
 These phases are sequential. The later phase must not be marked complete based
@@ -52,8 +60,13 @@ on placeholder implementations or local-only scores.
 Remaining work is explicitly phase-gated or deployment-specific:
 
 - Native Windows route/DNS execution still requires operator validation on a
-  privileged Windows host; native Windows TUN now fails explicitly until a
-  signed Wintun runtime is provisioned and integrated.
+  privileged Windows host. The hash-pinned Wintun loader/session/packet backend is
+  wired into `TunDevice`, and native Windows unit/build/benchmark gates now
+  pass, but live adapter creation, packet I/O, rollback, reconnect, and
+  two-node forwarding remain host-gated.
+- Native Linux two-host forwarding and live TUN performance remain
+  host-gated. The current 20/20 namespace/lifecycle result measures
+  open/hold/close behavior only, not packet forwarding or VPN throughput.
 - Production QUIC, effective anti-observation shaping, and hardware-backed
   identity providers remain unimplemented.
 - A lab-grade password-encrypted keystore path now exists; production key
@@ -61,10 +74,12 @@ Remaining work is explicitly phase-gated or deployment-specific:
 
 ### Phase-gate rule
 
-The current benchmark evidence is WSL2 local-runner evidence from
-`docs/BENCHMARK_RESULTS_2026-07-28.md`. It is useful for regression tracking,
-but it is not native-TUN, two-host, or production-VPN evidence. Each phase
-below must preserve that distinction.
+The current paired benchmark evidence is
+`docs/BENCHMARK_RESULTS_2026-08-05.md`; historical baseline results remain in
+`docs/BENCHMARK_RESULTS_2026-07-28.md` and the Shroud morphology report in
+`docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`. These reports are useful for
+regression tracking, but they are not native-TUN, two-host, or production-VPN
+evidence. Each phase below must preserve that distinction.
 
 ---
 
@@ -258,6 +273,12 @@ It does not begin Windows TUN work and does not require native TUN evidence.
 - The audit disposition is linked from the Phase D scorecard and release
   evidence.
 
+**Current status (2026-08-08):** local implementation, hardening,
+fuzz-smoke, regression, and paired WSL2/native-Windows benchmark work is
+complete for the controlled lab scope. Phase D remains open as a delivery gate
+until native Linux two-host TUN evidence and privileged Windows Wintun packet
+evidence are recorded.
+
 ### Phase E — Big Move / Release Readiness
 
 **Objective:** convert the hardened lab state into a reviewable release
@@ -268,7 +289,7 @@ candidate without overstating platform or network evidence.
 - Freeze the protocol/profile and public-API claims for the release candidate.
 - Publish benchmark results, limitations, threat model, dependency scan, and
   reproducibility evidence together.
-- Reconcile Linux working copy and Windows mirror, then verify checksums.
+- Reconcile configured Linux and Windows checkouts, then verify checksums.
 - Run the complete release checklist and create a SemVer release tag only when
   the documented criteria are met.
 - Keep production claims limited to the validated platform and transport scope.
@@ -282,6 +303,12 @@ candidate without overstating platform or network evidence.
   lab-only, or operator-dependent.
 - A reviewer can reproduce the claimed results from the documentation.
 
+**Current status (2026-08-08):** preparation is in progress, but Phase E is
+not complete. The benchmark/evidence bundle is published for
+`0.6.0-dev.0`; the release snapshot, final claims freeze, mirror-parity
+check, final release checklist, and release tag remain gated on the
+outstanding native TUN evidence.
+
 ### Phase F — Windows TUN Delivery
 
 **Objective:** integrate and validate the final Windows data-plane backend.
@@ -290,8 +317,8 @@ candidate without overstating platform or network evidence.
 
 - Provision a signed, version-pinned Wintun runtime and define its packaging
   and verification procedure.
-- Replace the current explicit failure path with a real Windows TUN backend;
-  never silently fall back to a stub.
+- Validate the wired Windows TUN backend on an approved elevated host; never
+  silently fall back to a stub.
 - Validate interface lifecycle, packet I/O, route/DNS apply/rollback,
   shutdown, reconnect, and privilege/error reporting on supported Windows
   versions.
@@ -306,12 +333,18 @@ candidate without overstating platform or network evidence.
 - Signed-runtime provenance and supported-version documentation are complete.
 - Windows TUN claims are not marked complete until the above evidence exists.
 
+**Current status (2026-08-08):** the backend, Windows-only unit coverage,
+signed-runtime inspection, and non-elevated fail-closed path are complete.
+The live elevated adapter, packet, control-plane, reconnect, shutdown, and
+two-node gates remain open.
+
 ## Optional / Research Track (does not replace the delivery sequence)
 
 Keep these as explicit optional features, not part of mandatory funding readiness.
 
 ### Transport Research
 - Browser-like TLS/QUIC fingerprint shaping
+- Exact wire-level JA4 capture through a lower-level TLS/QUIC observation hook
 - QUIC production hardening beyond the current standards-QUIC lab path
 - Adaptive timing/cell-size morphology
 
@@ -339,6 +372,14 @@ Keep these as explicit optional features, not part of mandatory funding readines
 - These primitives are not represented as production hardware integrations,
   production QUIC, or effective anti-observation traffic shaping. The
   Shroud-cell path is lab-only and opt-in.
+- The reviewed Shroud 2.0 subset now has an opt-in standards-QUIC morphology
+  API for bounded size classes, authenticated padding, and bounded delay.
+- Standards QUIC also has an opt-in passive JA4-compatible observability
+  plugin. It records bounded public rustls ClientHello metadata for lab
+  diagnostics; live observations are explicitly partial and do not spoof or
+  reshape the handshake.
+  Browser fingerprint forgery and active-probe decoy routing remain
+  deliberately out of scope; see `docs/SHROUD_2_IMPLEMENTATION.md`.
 
 ### Standards QUIC progress
 
@@ -347,10 +388,14 @@ Keep these as explicit optional features, not part of mandatory funding readines
 - CLI support is available for `listen`, `connect`, `send-once`, and
   `recv-once` through `--transport quic-standard --quic-cert PATH`.
 - The legacy `--transport quic` UDP shim is unchanged.
-- Continuous `up` mode, async TUN bridging, native TUN, and production
-  certificate/PKI operations remain future work and are not claimed complete.
+- Continuous Linux native-TUN `up` mode now uses the asynchronous
+  `AsyncTunDevice` bridge with bounded queues and blocking transport workers.
+  Linux standards-QUIC `up` also has a bounded RFC 9221 DATAGRAM-to-TUN bridge.
+  The Windows Wintun backend remains pending native-host validation, while
+  production certificate/PKI operations and live two-host evidence remain
+  future work and are not claimed complete.
 
-## Benchmarking and Performance Profiles (Planned)
+## Benchmarking and Performance Profiles
 
 Benchmarking will use a **native Linux host as the default environment**.
 Windows benchmarking is a secondary platform-validation track, not the source
@@ -440,9 +485,19 @@ Current implementation status:
   allocation counters, Shroud profile rows, QUIC-shim loopback rows, and
   million-frame replay/nonce coverage: complete.
 - Operator wrapper for lifecycle, control-plane, reconnect, and native-TUN
-  prerequisite/timing checks: complete.
-- Real native Linux TUN saturation, two-machine RTT/jitter, injected QUIC-shim
-  impairment runs, Criterion reports, and reviewed evidence publication: remaining
+  prerequisite/timing checks is complete; isolated namespace smoke and
+  open/hold/close lifecycle benchmark scripts are also available.
+- Paired WSL2/Linux and native Windows local benchmark capture is complete for
+  the `0.6.0-dev.0` development line; the full score tables, commands, raw-capture
+  paths, and interpretation limits are recorded in
+  `docs/BENCHMARK_RESULTS_2026-08-05.md`. The latest native Windows gate
+  record is `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-08.md`.
+- Native Linux TUN lifecycle, packet-boundary validation, complete-write
+  enforcement, and zeroizing bridge buffers: complete for capability-gated
+  local evidence; see `docs/NATIVE_TUN_STATUS_2026-08-04.md`.
+- Real native Linux TUN saturation, two-machine RTT/jitter, injected
+  standards-QUIC impairment runs, Windows process CPU/RSS instrumentation,
+  Criterion reports, and reviewed native-TUN evidence publication: remaining
   because they require operator hosts, privileges, or external traffic tools.
 
 ---

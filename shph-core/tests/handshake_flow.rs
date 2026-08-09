@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use shph_core::{
     absorb_responder_pq, build_hello, build_hello_with_profile, finalize_initiator_pq,
-    verify_and_derive, HandshakeMaterial, HandshakeProfile, IdentityKeyPair,
+    verify_and_derive, HandshakeMaterial, HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy,
 };
 
 /// Perform the in-memory hybrid PQ exchange exactly as the transports do:
@@ -21,15 +21,41 @@ fn hybrid_exchange(
     let mut resp_mat = build_hello(responder).expect("build resp hello");
 
     // Initiator encapsulates against the responder's PQ public key.
-    let ct = finalize_initiator_pq(initiator, &mut init_mat, &resp_mat.local_hello)
-        .expect("initiator finalize");
+    let init_policy = PeerPolicy::single(PeerPin::for_identity(responder));
+    let resp_policy = PeerPolicy::single(PeerPin::for_identity(initiator));
+    let ct = finalize_initiator_pq(
+        initiator,
+        &mut init_mat,
+        &resp_mat.local_hello,
+        &init_policy,
+    )
+    .expect("initiator finalize");
     // Responder decapsulates the initiator's ciphertext.
-    absorb_responder_pq(&mut resp_mat, &ct).expect("responder absorb");
+    absorb_responder_pq(
+        responder,
+        &mut resp_mat,
+        &init_mat.local_hello,
+        &ct,
+        &resp_policy,
+    )
+    .expect("responder absorb");
 
-    let init_state =
-        verify_and_derive(initiator, &init_mat, &resp_mat.local_hello, true).expect("init verify");
-    let resp_state =
-        verify_and_derive(responder, &resp_mat, &init_mat.local_hello, false).expect("resp verify");
+    let init_state = verify_and_derive(
+        initiator,
+        &init_mat,
+        &resp_mat.local_hello,
+        true,
+        &init_policy,
+    )
+    .expect("init verify");
+    let resp_state = verify_and_derive(
+        responder,
+        &resp_mat,
+        &init_mat.local_hello,
+        false,
+        &resp_policy,
+    )
+    .expect("resp verify");
     (init_state, resp_state, init_mat, resp_mat)
 }
 
@@ -60,7 +86,13 @@ fn handshake_rejects_bad_protocol() {
     let mut peer_hello = build_hello(&peer).expect("build peer hello").local_hello;
     peer_hello.proto = "invalid".to_string();
 
-    let result = verify_and_derive(&local, &local_hello, &peer_hello, true);
+    let result = verify_and_derive(
+        &local,
+        &local_hello,
+        &peer_hello,
+        true,
+        &PeerPolicy::single(PeerPin::for_identity(&peer)),
+    );
     assert!(result.is_err());
 }
 
@@ -95,7 +127,13 @@ fn missing_pq_shared_secret_blocks_downgrade() {
     let peer = IdentityKeyPair::generate().unwrap();
     let local_mat = build_hello(&local).unwrap();
     let peer_mat = build_hello(&peer).unwrap();
-    let res = verify_and_derive(&local, &local_mat, &peer_mat.local_hello, true);
+    let res = verify_and_derive(
+        &local,
+        &local_mat,
+        &peer_mat.local_hello,
+        true,
+        &PeerPolicy::single(PeerPin::for_identity(&peer)),
+    );
     assert!(
         res.is_err(),
         "derivation without the PQ shared secret must fail (downgrade resistance)"
@@ -103,7 +141,7 @@ fn missing_pq_shared_secret_blocks_downgrade() {
 }
 
 #[test]
-fn corrupted_pq_ciphertext_breaks_key_agreement() {
+fn corrupted_pq_ciphertext_changes_the_bound_kdf_transcript() {
     // If an attacker tampers with the initiator's PQ ciphertext, the responder
     // decapsulates a different shared secret and the derived keys diverge.
     let initiator = IdentityKeyPair::generate().unwrap();
@@ -111,19 +149,49 @@ fn corrupted_pq_ciphertext_breaks_key_agreement() {
     let mut init_mat = build_hello(&initiator).unwrap();
     let mut resp_mat = build_hello(&responder).unwrap();
 
-    let mut ct = finalize_initiator_pq(&initiator, &mut init_mat, &resp_mat.local_hello)
-        .expect("initiator finalize");
+    let init_policy = PeerPolicy::single(PeerPin::for_identity(&responder));
+    let resp_policy = PeerPolicy::single(PeerPin::for_identity(&initiator));
+    let mut ct = finalize_initiator_pq(
+        &initiator,
+        &mut init_mat,
+        &resp_mat.local_hello,
+        &init_policy,
+    )
+    .expect("initiator finalize");
     // Tamper: flip a byte in the ciphertext the responder will decapsulate.
     ct[0] ^= 0xff;
-    absorb_responder_pq(&mut resp_mat, &ct).expect("responder absorb (decap is permissive)");
+    absorb_responder_pq(
+        &responder,
+        &mut resp_mat,
+        &init_mat.local_hello,
+        &ct,
+        &resp_policy,
+    )
+    .expect("responder absorb (decap is permissive)");
 
-    let init_state =
-        verify_and_derive(&initiator, &init_mat, &resp_mat.local_hello, true).expect("init verify");
-    let resp_state = verify_and_derive(&responder, &resp_mat, &init_mat.local_hello, false)
-        .expect("resp verify");
+    let init_state = verify_and_derive(
+        &initiator,
+        &init_mat,
+        &resp_mat.local_hello,
+        true,
+        &init_policy,
+    )
+    .expect("init verify");
+    let resp_state = verify_and_derive(
+        &responder,
+        &resp_mat,
+        &init_mat.local_hello,
+        false,
+        &resp_policy,
+    )
+    .expect("resp verify");
     assert_ne!(
         init_state.session_keys.send_key, resp_state.session_keys.recv_key,
         "tampered PQ ciphertext must break the shared key"
+    );
+    assert_ne!(
+        init_state.transcript_hash_hex, resp_state.transcript_hash_hex,
+        "the exact PQ ciphertext must be bound into each side's KDF transcript"
     );
 }
 
@@ -140,7 +208,13 @@ fn forged_signature_is_rejected() {
     forged.sign_pub_b64 = victim_mat.local_hello.sign_pub_b64.clone();
     forged.sig = victim_mat.local_hello.sig.clone();
 
-    let res = verify_and_derive(&victim, &victim_mat, &forged, true);
+    let res = verify_and_derive(
+        &victim,
+        &victim_mat,
+        &forged,
+        true,
+        &PeerPolicy::single(PeerPin::for_identity(&attacker)),
+    );
     assert!(
         res.is_err(),
         "a signature over different transcript fields must NOT verify (MITM resistance)"
@@ -161,7 +235,13 @@ fn tampered_signature_bytes_rejected() {
     hello.sig = base64::engine::general_purpose::STANDARD.encode(sig_raw);
 
     let local_mat = build_hello(&id).unwrap();
-    let res = verify_and_derive(&id, &local_mat, &hello, true);
+    let res = verify_and_derive(
+        &id,
+        &local_mat,
+        &hello,
+        true,
+        &PeerPolicy::single(PeerPin::for_identity(&peer)),
+    );
     assert!(
         res.is_err(),
         "a tampered Ed25519 signature must be rejected"
@@ -178,11 +258,41 @@ fn wrong_peer_signing_key_rejected() {
         base64::engine::general_purpose::STANDARD.encode(other.signing_public_bytes());
 
     let local_mat = build_hello(&id).unwrap();
-    let res = verify_and_derive(&id, &local_mat, &hello, true);
+    let res = verify_and_derive(
+        &id,
+        &local_mat,
+        &hello,
+        true,
+        &PeerPolicy::single(PeerPin::for_identity(&peer)),
+    );
     assert!(
         res.is_err(),
         "signature must not verify under a swapped signing public key"
     );
+}
+
+#[test]
+fn responder_policy_rejection_precedes_pq_decapsulation() {
+    let responder = IdentityKeyPair::generate().unwrap();
+    let expected_peer = IdentityKeyPair::generate().unwrap();
+    let attacker = IdentityKeyPair::generate().unwrap();
+    let mut responder_material = build_hello(&responder).unwrap();
+    let attacker_material = build_hello(&attacker).unwrap();
+    let policy = PeerPolicy::single(PeerPin::for_identity(&expected_peer));
+
+    let result = absorb_responder_pq(
+        &responder,
+        &mut responder_material,
+        &attacker_material.local_hello,
+        &[0u8; 7],
+        &policy,
+    );
+
+    assert!(
+        matches!(result, Err(shph_core::ShphError::Auth(_))),
+        "policy rejection must happen before malformed PQ ciphertext reaches decapsulation"
+    );
+    assert!(responder_material.pq_shared.is_none());
 }
 
 fn classical_exchange(
@@ -191,8 +301,22 @@ fn classical_exchange(
 ) -> (shph_core::HandshakeState, shph_core::HandshakeState) {
     let init_mat = build_hello_with_profile(initiator, HandshakeProfile::ClassicalLab).unwrap();
     let resp_mat = build_hello_with_profile(responder, HandshakeProfile::ClassicalLab).unwrap();
-    let init_state = verify_and_derive(initiator, &init_mat, &resp_mat.local_hello, true).unwrap();
-    let resp_state = verify_and_derive(responder, &resp_mat, &init_mat.local_hello, false).unwrap();
+    let init_state = verify_and_derive(
+        initiator,
+        &init_mat,
+        &resp_mat.local_hello,
+        true,
+        &PeerPolicy::single(PeerPin::for_identity(responder)),
+    )
+    .unwrap();
+    let resp_state = verify_and_derive(
+        responder,
+        &resp_mat,
+        &init_mat.local_hello,
+        false,
+        &PeerPolicy::single(PeerPin::for_identity(initiator)),
+    )
+    .unwrap();
     (init_state, resp_state)
 }
 
@@ -228,7 +352,13 @@ fn profile_mismatch_is_rejected() {
     let local_material = build_hello(&local).unwrap();
     let peer_material = build_hello_with_profile(&peer, HandshakeProfile::ClassicalLab).unwrap();
 
-    let result = verify_and_derive(&local, &local_material, &peer_material.local_hello, true);
+    let result = verify_and_derive(
+        &local,
+        &local_material,
+        &peer_material.local_hello,
+        true,
+        &PeerPolicy::single(PeerPin::for_identity(&peer)),
+    );
     assert!(result.is_err(), "secure-default must reject classical-lab");
 }
 
@@ -240,6 +370,11 @@ fn classical_lab_rejects_pq_exchange_attempt() {
         build_hello_with_profile(&local, HandshakeProfile::ClassicalLab).unwrap();
     let peer_material = build_hello_with_profile(&peer, HandshakeProfile::ClassicalLab).unwrap();
 
-    let result = finalize_initiator_pq(&local, &mut local_material, &peer_material.local_hello);
+    let result = finalize_initiator_pq(
+        &local,
+        &mut local_material,
+        &peer_material.local_hello,
+        &PeerPolicy::single(PeerPin::for_identity(&peer)),
+    );
     assert!(result.is_err());
 }

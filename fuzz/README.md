@@ -18,6 +18,8 @@ cargo install cargo-fuzz --locked
 - `audit_record`: JSONL ratchet-audit record deserialization.
 - `replay_window`: replay-window state transitions over arbitrary nonce
   sequences.
+- `shroud2_datagram`: bounded Shroud 2.0 lab-envelope parsing and
+  morphology-size selection.
 
 ## Run
 
@@ -26,11 +28,17 @@ From the repository root:
 ```bash
 cd fuzz
 cargo fuzz list
-cargo fuzz run frame_decode -- -max_total_time=60
+cargo fuzz run frame_decode -- -dict=shroud.dict -max_total_time=60
 cargo fuzz run config_parse -- -max_total_time=60
 cargo fuzz run audit_record -- -max_total_time=60
 cargo fuzz run replay_window -- -max_total_time=60
+cargo fuzz run shroud2_datagram -- -max_total_time=60
 ```
+
+The `frame_decode` harness selects every current profile:
+`balanced`, `low-latency`, `bulk`, `randomized-lab`, and `extreme-lab`.
+The dictionary supplies the `SD` header and data/chaff frame markers so
+mutations reach deeper framing branches sooner.
 
 Corpus and crash artifacts are written below `fuzz/corpus/` and
 `fuzz/artifacts/`; these paths are ignored by Git. Keep minimized,

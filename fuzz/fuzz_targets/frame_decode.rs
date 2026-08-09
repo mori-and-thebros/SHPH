@@ -1,13 +1,18 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shph_core::{decode_cell, ShroudProfile, BALANCED, BULK, LOW_LATENCY};
+use shph_core::{
+    decode_cell, ShroudProfile, BALANCED, BULK, EXTREME_LAB, LOW_LATENCY, RANDOMIZED_LAB,
+};
 
 fn profile_for(selector: u8) -> ShroudProfile {
-    match selector % 3 {
+    match selector % 5 {
         0 => BALANCED,
         1 => LOW_LATENCY,
-        _ => BULK,
+        2 => BULK,
+        3 => RANDOMIZED_LAB,
+        4 => EXTREME_LAB,
+        _ => unreachable!(),
     }
 }
 

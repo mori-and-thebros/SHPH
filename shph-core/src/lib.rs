@@ -22,7 +22,7 @@ pub use framing::{
 pub use handshake::{
     absorb_responder_pq, build_hello, build_hello_with_profile, finalize_initiator_pq,
     verify_and_derive, verify_and_derive_with_profile, verify_hello_signature, HandshakeMaterial,
-    HandshakeProfile, HandshakeState, HandshakeVersion, Hello,
+    HandshakeProfile, HandshakeState, HandshakeVersion, Hello, PeerPin, PeerPolicy,
 };
 pub use keystore::{
     compute_fingerprint_hex, enforce_owner_only_file_permissions, ensure_not_reparse_point,

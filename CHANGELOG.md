@@ -1,6 +1,68 @@
 # Changelog
 
-## [Unreleased] — bug-fix and hardening pass (2026-07-15)
+## [0.6.0-dev.0] — release-polish and native-platform hardening (2026-08-09)
+
+This is a development release. It is not a production-ready transport, an
+independent security audit, or evidence that the remaining native two-host TUN
+release gates have been completed.
+
+### Windows native TUN validation refresh
+
+- Recorded a fresh native Windows validation run: locked workspace checks,
+  strict Clippy, release builds, 180 passing workspace tests, Windows-only
+  Wintun and ACL regressions, and both local benchmark profiles.
+- Removed the host-incompatible strict signed-target DLL flag while retaining
+  application-local loading, elevation checks, SHA-256 pinning, and validator
+  Authenticode verification.
+- Captured a post-loader native Wintun adapter/session smoke and documented the
+  remaining packet-I/O, route/DNS rollback confirmation, reconnect, shutdown,
+  and two-node evidence gates.
+- Fixed Windows route rollback to include the adapter interface in the
+  generated `netsh delete route` command.
+
+### Security-assessment remediation
+
+- Made responder-side ML-KEM decapsulation policy-aware: the peer hello
+  signature and configured identity/signing-key pin are verified before PQ
+  decapsulation in every transport, including file adapters and standards
+  QUIC.
+- Added collision-safe peer-limiter eviction and corrected its distributed
+  source regression assertion.
+- Added mandatory application-local Wintun SHA-256 pinning through
+  `SHPH_WINTUN_SHA256`; missing, malformed, oversized, or mismatched runtimes
+  fail closed before DLL loading.
+- Zeroized keystore serialization staging and password-bearing configuration
+  holders on drop, while retaining explicit documentation for unavoidable
+  API/string copies.
+- Added the `shroud2_datagram` target to the CI fuzz smoke loop.
+- Made native Linux and Windows bridge disconnects retryable unless shutdown
+  was requested locally, so reconnect policy is exercised after a remote close.
+- Made public TCP send/receive helpers retain caller-owned AEAD cipher state,
+  preventing accidental per-frame nonce-counter resets.
+- Added the native Linux two-host validation harness, including host/container
+  exclusion, private external state, interval CPU/RSS capture, `iperf3`
+  readiness checks, routed ping/goodput measurements, and reconnect evidence.
+- Added GitHub issue/PR templates plus a publication checklist that requires
+  monitored private vulnerability reporting and sanitized evidence review.
+- Made a remotely closed standards-QUIC native-TUN bridge fail explicitly
+  instead of completing successfully, and reject standards-QUIC reconnect
+  configuration until certificate continuity is implemented.
+
+### Standards/TUN hardening and documentation
+
+- Disabled TLS 1.3 early data (0-RTT) in both explicit standards-QUIC TLS
+  builders, preventing replayable application input before the SHPH handshake.
+- Bounded opt-in JA4 SNI recording to 255 UTF-8 bytes and preserved the
+  partial-observation/non-spoofing contract.
+- Rejected oversized standards-QUIC TUN datagrams before copying them into
+  zeroizing packet buffers and capped the malformed-datagram close budget.
+- Retried interrupted native-TUN syscalls, reported native EOF consistently,
+  and wiped rejected packets from caller-provided read buffers.
+- Reconciled README, security, testing, funder, and standards-QUIC docs with
+  the implemented Linux native-TUN bridge and its remaining host-evidence
+  gates.
+
+### Transport, configuration, and fuzzing hardening
 
 - Added a standalone `cargo-fuzz` workspace with bounded fuzz targets for
   Shroud-cell decoding, configuration parsing, audit-record deserialization,
@@ -42,7 +104,7 @@
 - Added a standalone native-Linux benchmark runner under `benchmarks/` for
   handshake, framing, AEAD, and replay measurements with environment metadata.
 
-## [Unreleased] — audit remediation (2026-07-10)
+### Earlier development-line remediation
 
 - Made CLI peer identity pinning mandatory; sessions now fail closed when no
   expected peer is configured.
@@ -60,9 +122,8 @@
   cross-platform TUN-name validation.
 - Refreshed audit, evidence, and mirror verification artifacts.
 
-## [Unreleased] — hardening-5: secret-material zeroization on drop (non-breaking, 2026-07-06)
+### Secret-material zeroization
 
-### Security (secret hygiene)
 - **Session AEAD keys are now zeroized on drop.** `SendCipher` and
   `ReceiveCipher` implement `Drop` to wipe the 32-byte ChaCha20-Poly1305 session
   key, so live traffic keys no longer persist in heap memory after a session
@@ -76,11 +137,9 @@
   `verify_and_derive` are wrapped in `Zeroizing<Vec<u8>>` and wiped once copied
   into the session keys.
 
-### Non-breaking
 - No wire-format, protocol-tag, or public-API change. The `zeroize` crate was
   already a direct dependency of `shph-core`; no new dependency added.
 
-### Tests
 - 4 new regression tests for zeroize-on-drop (`SendCipher`, `ReceiveCipher`,
   `SessionKeys`, `IdentityKeyPair`). Workspace tests 79 -> 83 (0 failed).
 

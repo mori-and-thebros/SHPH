@@ -5,27 +5,28 @@ land changes, plus the project's release and governance process.
 
 ## Prerequisites
 
-- Rust stable (latest stable toolchain). Install via <https://rustup.rs>.
+- Rust `1.96.0` (the pinned toolchain in `rust-toolchain.toml`). Install via
+  <https://rustup.rs>.
 - A C compiler for `ring`'s build script (any platform toolchain works).
 - Optional (Linux native TUN testing): `CAP_NET_ADMIN` / root and `/dev/net/tun`.
 
 ## Build & Test (clone-to-tested from docs)
 
 ```bash
-git clone <repo-url> shph
+git clone https://github.com/mori-and-thebros/shph.git
 cd shph
 
 # Format check
 cargo fmt --all -- --check
 
 # Lint (warnings are errors in CI)
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # Build
-cargo build --workspace
+cargo build --workspace --locked
 
 # Test
-cargo test --workspace
+cargo test --workspace --locked
 ```
 
 All four commands must pass before a change can merge. See `docs/TESTING.md`
@@ -51,7 +52,7 @@ docs/             testing, control-plane, sprint board, reproducibility
 ## Code Style
 
 - `cargo fmt --all` is authoritative; do not hand-format.
-- No warnings: `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+- No warnings: `cargo clippy --workspace --all-targets --locked -- -D warnings` is clean.
 - Prefer minimal, conservative edits; fix root causes over surface patches.
 - Fail closed: protocol/transport/IO errors should terminate the relevant
   session, never corrupt state or `unwrap` on untrusted input.
@@ -62,29 +63,37 @@ docs/             testing, control-plane, sprint board, reproducibility
 ## Phase-Gating Discipline
 
 SHPH uses strict phase-gating (see `docs/FUNDING_SPRINT_BOARD.md`). Do **not**
-mark a phase complete unless every task and evidence criterion is satisfied and
-mirrored across the working and Windows trees.
+mark a phase complete unless every task and evidence criterion is satisfied
+and recorded in the repository.
 
 ## Pull Requests
 
 1. Branch from `main`.
 2. Ensure `fmt`, `clippy`, and `test` all pass.
-3. Update relevant docs (`docs/`, `CONTEXT_SUMMARY.md`, sprint board) and mirror
-   the change to the Windows tree if it affects source/docs.
+3. Update the relevant documentation and evidence when behavior or validation
+   changes.
 4. Describe behavior changes, test coverage, and any follow-ups.
+5. Do not include private keys, keystores, raw two-host logs, credentials, or
+   generated benchmark data in a pull request.
 
 ## Release Checklist
 
 Before tagging a release:
 
 - [ ] `cargo fmt --all -- --check` clean
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
-- [ ] `cargo test --workspace` passes on Linux **and** Windows
+- [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings` clean
+- [ ] `cargo test --workspace --locked` passes on Linux **and** Windows
 - [ ] `CHANGELOG`/release notes updated
 - [ ] `Cargo.lock` committed and reproducible (see `docs/REPRODUCIBILITY.md`)
 - [ ] Version bumped consistently in workspace `Cargo.toml`
 - [ ] Security posture in `SECURITY.md` still accurate (no over-claims)
-- [ ] Windows mirror in sync with the release commit
+- [ ] Monitored private security-reporting channel is enabled in the hosted repository
+- [ ] Native two-host evidence is captured or explicitly marked pending
+- [ ] Any supported checkout used for release validation is in sync
+- [ ] No private keystores, runtime DLLs, benchmark working directories, or
+      unreviewed evidence logs are staged for publication
+- [ ] Native Linux two-host and Windows Wintun reports retain their platform
+      boundaries; do not represent WSL or local benchmarks as native tunnel data
 
 ## Governance
 

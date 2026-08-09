@@ -1,10 +1,16 @@
 use shph_core::{
-    absorb_responder_pq, build_hello_with_profile, decode_cell, encode_cell, finalize_initiator_pq,
-    HandshakeProfile, IdentityKeyPair, ReceiveCipher, ReplayWindow, SendCipher, BALANCED, BULK,
-    LOW_LATENCY, RANDOMIZED_LAB,
+    absorb_responder_pq, build_hello_with_profile, decode_cell, decode_cell_payload, encode_cell,
+    finalize_initiator_pq, HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy,
+    ReceiveCipher, ReplayWindow, SendCipher, BALANCED, BULK, LOW_LATENCY, RANDOMIZED_LAB,
 };
-use shph_transport::{quic_handshake_client_with_profile, quic_handshake_server_with_profile};
+use shph_transport::shroud2::{
+    decode_datagram, encode_datagram, MorphologyEngine, MorphologyProfile,
+};
+use shph_transport::{
+    quic_handshake_client_with_profile, quic_handshake_server_on_socket_with_profile,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::VecDeque;
 use std::env;
 use std::hint::black_box;
 use std::net::UdpSocket;
@@ -107,6 +113,10 @@ fn main() {
     }
     if matches!(options.suite, Suite::All | Suite::Shroud) {
         bench_shroud_profiles(options);
+        bench_shroud2_morphology(options);
+        bench_shroud2_delay(options);
+        bench_shroud2_long_session(options);
+        bench_shroud2_impairment(options);
     }
     if matches!(options.suite, Suite::All | Suite::Quic) {
         bench_quic_loopback(options);
@@ -232,7 +242,7 @@ fn platform_name() -> &'static str {
         {
             return "wsl2";
         }
-        return "native-linux";
+        "native-linux"
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -394,28 +404,26 @@ fn emit_latency(
         .peak_rss_kib
         .map_or_else(|| "-".to_string(), |value| value.to_string());
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        name,
-        options.profile.as_str(),
-        scenario,
-        payload_bytes,
-        samples.len(),
-        stats.min_ns,
-        stats.p50_ns,
-        stats.p95_ns,
-        stats.p99_ns,
-        stats.p999_ns,
-        stats.max_ns,
-        stats.mean_ns,
-        runtime.elapsed_ns / 1_000_000,
-        "-",
-        "-",
-        cpu_pct,
-        runtime.alloc.calls,
-        runtime.alloc.bytes,
-        rss_kib,
-        peak_rss_kib,
-        notes
+        "{name},{profile},{scenario},{payload_bytes},{samples},{min},{p50},{p95},{p99},{p999},{max},{mean},{elapsed},-,-,{cpu},{alloc_calls},{alloc_bytes},{rss},{peak},{notes}",
+        name = name,
+        profile = options.profile.as_str(),
+        scenario = scenario,
+        payload_bytes = payload_bytes,
+        samples = samples.len(),
+        min = stats.min_ns,
+        p50 = stats.p50_ns,
+        p95 = stats.p95_ns,
+        p99 = stats.p99_ns,
+        p999 = stats.p999_ns,
+        max = stats.max_ns,
+        mean = stats.mean_ns,
+        elapsed = runtime.elapsed_ns / 1_000_000,
+        cpu = cpu_pct,
+        alloc_calls = runtime.alloc.calls,
+        alloc_bytes = runtime.alloc.bytes,
+        rss = rss_kib,
+        peak = peak_rss_kib,
+        notes = notes,
     );
 }
 
@@ -437,23 +445,16 @@ fn emit_rate(
     let peak_rss_kib = runtime
         .peak_rss_kib
         .map_or_else(|| "-".to_string(), |value| value.to_string());
+    let goodput = format!("{goodput_mbps:.3}");
+    let wire = format!("{wire_mbps:.3}");
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        "rate",
+        "rate,{},{},{},1,-,-,-,-,-,-,-,{},{},{},{},{},{},{},{},{}",
         options.profile.as_str(),
         scenario,
         payload_bytes,
-        1,
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
         runtime.elapsed_ns / 1_000_000,
-        format!("{goodput_mbps:.3}"),
-        format!("{wire_mbps:.3}"),
+        goodput,
+        wire,
         cpu_pct,
         runtime.alloc.calls,
         runtime.alloc.bytes,
@@ -473,13 +474,38 @@ fn bench_handshake(options: Options) {
         let mut init = build_hello_with_profile(&initiator, options.profile).expect("init hello");
         let mut resp = build_hello_with_profile(&responder, options.profile).expect("resp hello");
         if options.profile.uses_pqc() {
-            let ct = finalize_initiator_pq(&mut init, &resp.local_hello).expect("encapsulate");
-            absorb_responder_pq(&mut resp, &ct).expect("decapsulate");
+            let ct = finalize_initiator_pq(
+                &initiator,
+                &mut init,
+                &resp.local_hello,
+                &shph_core::PeerPolicy::single(shph_core::PeerPin::for_identity(&responder)),
+            )
+            .expect("encapsulate");
+            absorb_responder_pq(
+                &responder,
+                &mut resp,
+                &init.local_hello,
+                &ct,
+                &PeerPolicy::single(PeerPin::for_identity(&initiator)),
+            )
+            .expect("decapsulate");
         }
-        let init_state = shph_core::verify_and_derive(&initiator, &init, &resp.local_hello, true)
-            .expect("init derive");
-        let resp_state = shph_core::verify_and_derive(&responder, &resp, &init.local_hello, false)
-            .expect("resp derive");
+        let init_state = shph_core::verify_and_derive(
+            &initiator,
+            &init,
+            &resp.local_hello,
+            true,
+            &shph_core::PeerPolicy::single(shph_core::PeerPin::for_identity(&responder)),
+        )
+        .expect("init derive");
+        let resp_state = shph_core::verify_and_derive(
+            &responder,
+            &resp,
+            &init.local_hello,
+            false,
+            &shph_core::PeerPolicy::single(shph_core::PeerPin::for_identity(&initiator)),
+        )
+        .expect("resp derive");
         black_box((init_state, resp_state));
         samples.push(sample_start.elapsed().as_nanos());
     }
@@ -597,31 +623,335 @@ fn bench_shroud_profiles(options: Options) {
         ("low-latency", LOW_LATENCY),
         ("bulk", BULK),
         ("randomized-lab", RANDOMIZED_LAB),
+        ("extreme-lab", shph_core::EXTREME_LAB),
     ] {
-        let payload_bytes = 256.min(profile.payload_capacity());
+        let payload_bytes = 256.min(profile.max_payload_chunk);
         let payload = vec![0x5a; payload_bytes];
-        let mut samples = Vec::with_capacity(options.iterations);
-        let start = begin_measurement();
-        for _ in 0..options.iterations {
-            let sample_start = Instant::now();
-            let cell = encode_cell(profile, 0x01, &payload).expect("encode cell");
-            let decoded = decode_cell(profile, &cell).expect("decode cell");
-            black_box(decoded);
-            samples.push(sample_start.elapsed().as_nanos());
-        }
         let overhead_pct = (profile.cell_size as f64 / payload_bytes as f64 - 1.0) * 100.0;
+        let framing_samples = measure_shroud_framing(profile, &payload, options.iterations);
+        emit_latency(
+            "shroud_framing",
+            options,
+            &format!("shroud_{name}_encode_decode"),
+            payload_bytes,
+            &framing_samples,
+            runtime_for_samples(&framing_samples),
+            &format!(
+                "cell_bytes={};padding_overhead_pct={overhead_pct:.2};raw_cell_only",
+                profile.cell_size
+            ),
+        );
+        let aead_payload = shroud_aead_plaintext(profile, &payload);
+        let aead_samples = measure_shroud_aead(&aead_payload, options.iterations);
+        emit_latency(
+            "shroud_aead",
+            options,
+            &format!("shroud_{name}_fixed_cell_aead"),
+            payload_bytes,
+            &aead_samples,
+            runtime_for_samples(&aead_samples),
+            &format!(
+                "plaintext_bytes={};ciphertext_bytes={};fixed_cell_crypto_only",
+                aead_payload.len(),
+                aead_payload.len() + 12 + 16
+            ),
+        );
+        let combined_samples = measure_shroud_framing(profile, &aead_payload, options.iterations);
         emit_latency(
             "shroud_profile",
             options,
             &format!("shroud_{name}"),
             payload_bytes,
+            &combined_samples,
+            runtime_for_samples(&combined_samples),
+            &format!(
+                "cell_bytes={};padding_overhead_pct={overhead_pct:.2};combined_raw_cell_path",
+                profile.cell_size,
+            ),
+        );
+        bench_shroud_decode_alloc(options, name, profile, &aead_payload);
+    }
+}
+
+fn bench_shroud2_morphology(options: Options) {
+    let payload = vec![0x5a; 1_024];
+    let path_mtu = 1_450;
+    for (name, profile) in [
+        ("low-latency", MorphologyProfile::LowLatency),
+        ("web-browsing-lab", MorphologyProfile::WebBrowsingLab),
+        ("video-streaming-lab", MorphologyProfile::VideoStreamingLab),
+        ("bulk-lab", MorphologyProfile::BulkLab),
+    ] {
+        let mut morphology = MorphologyEngine::from_seed(profile, 0x5348_524f_5544);
+        let mut samples = Vec::with_capacity(options.iterations);
+        let mut minimum_target = usize::MAX;
+        let mut maximum_target = 0usize;
+        let start = begin_measurement();
+        for _ in 0..options.iterations {
+            let sample_start = Instant::now();
+            let target = morphology
+                .target_size(payload.len(), path_mtu)
+                .expect("morphology target");
+            let datagram =
+                encode_datagram(&payload, target, path_mtu).expect("morphology encode");
+            let decoded = decode_datagram(&datagram, path_mtu).expect("morphology decode");
+            black_box(decoded);
+            minimum_target = minimum_target.min(target);
+            maximum_target = maximum_target.max(target);
+            samples.push(sample_start.elapsed().as_nanos());
+        }
+        emit_latency(
+            "shroud2_morphology",
+            options,
+            &format!("shroud2_{name}_encode_decode"),
+            payload.len(),
             &samples,
             finish_measurement(start),
             &format!(
-                "cell_bytes={};padding_overhead_pct={overhead_pct:.2};randomized_padding_not_modeled",
-                profile.cell_size
+                "path_mtu={path_mtu};target_min={minimum_target};target_max={maximum_target};random_padding=true;authenticated_quic_datagram_path"
             ),
         );
+    }
+}
+
+fn bench_shroud2_delay(options: Options) {
+    for (name, profile) in [
+        ("low-latency", MorphologyProfile::LowLatency),
+        ("web-browsing-lab", MorphologyProfile::WebBrowsingLab),
+        ("video-streaming-lab", MorphologyProfile::VideoStreamingLab),
+        ("bulk-lab", MorphologyProfile::BulkLab),
+    ] {
+        let mut morphology = MorphologyEngine::from_seed(profile, 0x5348_524f_5544);
+        let start = begin_measurement();
+        let samples = (0..options.iterations)
+            .map(|_| morphology.next_delay().as_nanos())
+            .collect::<Vec<_>>();
+        let min_delay = samples.iter().copied().min().unwrap_or_default();
+        let max_delay = samples.iter().copied().max().unwrap_or_default();
+        emit_latency(
+            "shroud2_delay",
+            options,
+            &format!("shroud2_{name}_sampled_delay"),
+            0,
+            &samples,
+            finish_measurement(start),
+            &format!(
+                "sampled_inter_datagram_delay;min_delay_ns={min_delay};max_delay_ns={max_delay};no_scheduler_sleep"
+            ),
+        );
+    }
+}
+
+fn bench_shroud2_long_session(options: Options) {
+    let payload = vec![0x17; 1_024];
+    let path_mtu = 1_450;
+    let profile = MorphologyProfile::WebBrowsingLab;
+    let mut morphology = MorphologyEngine::from_seed(profile, 0x4c4f_4e47);
+    let mut delivered_bytes = 0usize;
+    let mut wire_bytes = 0usize;
+    let mut intended_delay_ns = 0u128;
+    let start = begin_measurement();
+    for _ in 0..options.frames {
+        let target = morphology
+            .target_size(payload.len(), path_mtu)
+            .expect("long-session target");
+        let datagram = encode_datagram(&payload, target, path_mtu).expect("long-session encode");
+        let decoded = decode_datagram(&datagram, path_mtu).expect("long-session decode");
+        assert_eq!(decoded, payload);
+        delivered_bytes += decoded.len();
+        wire_bytes += datagram.len();
+        intended_delay_ns += morphology.next_delay().as_nanos();
+    }
+    let runtime = finish_measurement(start);
+    let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
+    emit_rate(
+        options,
+        "shroud2_long_session",
+        payload.len(),
+        runtime,
+        delivered_bytes as f64 / seconds / 1_000_000.0,
+        wire_bytes as f64 / seconds / 1_000_000.0,
+        &format!(
+            "profile=web-browsing-lab;frames={};intended_delay_ns={intended_delay_ns};local_encode_decode_only",
+            options.frames
+        ),
+    );
+}
+
+fn bench_shroud2_impairment(options: Options) {
+    let payload_size = 8;
+    let path_mtu = 1_450;
+    let profile = MorphologyProfile::WebBrowsingLab;
+    let queue_capacity = 8usize;
+    let mut morphology = MorphologyEngine::from_seed(profile, 0x494d_5041);
+    let mut queue = VecDeque::with_capacity(queue_capacity);
+    let mut delivered = 0usize;
+    let mut injected_loss = 0usize;
+    let mut congestion_drops = 0usize;
+    let mut reordered = 0usize;
+    let mut decode_failures = 0usize;
+    let mut last_sequence = None;
+    let start = begin_measurement();
+
+    for sequence in 0..options.frames {
+        if sequence % 17 == 0 {
+            injected_loss += 1;
+            continue;
+        }
+        if queue.len() >= queue_capacity {
+            congestion_drops += 1;
+            continue;
+        }
+        let payload = sequence.to_be_bytes();
+        let target = morphology
+            .target_size(payload_size, path_mtu)
+            .expect("impairment target");
+        let datagram = encode_datagram(&payload, target, path_mtu).expect("impairment encode");
+        if sequence % 7 == 0 && !queue.is_empty() {
+            queue.push_front((sequence, datagram));
+        } else {
+            queue.push_back((sequence, datagram));
+        }
+
+        if sequence % 16 == 15 {
+            for _ in 0..3 {
+                let Some((delivered_sequence, datagram)) = queue.pop_front() else {
+                    break;
+                };
+                match last_sequence {
+                    Some(previous) if delivered_sequence < previous => reordered += 1,
+                    _ => {}
+                }
+                last_sequence = Some(delivered_sequence);
+                match decode_datagram(&datagram, path_mtu) {
+                    Ok(payload) if payload.len() == 8 => delivered += 1,
+                    Ok(_) | Err(_) => decode_failures += 1,
+                }
+            }
+        }
+    }
+
+    while let Some((delivered_sequence, datagram)) = queue.pop_front() {
+        match last_sequence {
+            Some(previous) if delivered_sequence < previous => reordered += 1,
+            _ => {}
+        }
+        last_sequence = Some(delivered_sequence);
+        match decode_datagram(&datagram, path_mtu) {
+            Ok(payload) if payload.len() == 8 => delivered += 1,
+            Ok(_) | Err(_) => decode_failures += 1,
+        }
+    }
+
+    let runtime = finish_measurement(start);
+    let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
+    let goodput = delivered as f64 * payload_size as f64 / seconds / 1_000_000.0;
+    let wire_rate = delivered as f64 * path_mtu as f64 / seconds / 1_000_000.0;
+    emit_rate(
+        options,
+        "shroud2_impairment",
+        payload_size,
+        runtime,
+        goodput,
+        wire_rate,
+        &format!(
+            "profile=web-browsing-lab;frames={};queue_capacity={queue_capacity};injected_loss={injected_loss};congestion_drops={congestion_drops};reordered={reordered};delivered={delivered};decode_failures={decode_failures};deterministic_local_emulator",
+            options.frames
+        ),
+    );
+}
+
+fn shroud_aead_plaintext(
+    profile: shph_core::ShroudProfile,
+    payload: &[u8],
+) -> Vec<u8> {
+    let plaintext_capacity = profile.payload_capacity() - (12 + 16);
+    let mut padded = vec![0u8; plaintext_capacity];
+    padded[..2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    padded[2..2 + payload.len()].copy_from_slice(payload);
+    padded
+}
+
+fn measure_shroud_framing(
+    profile: shph_core::ShroudProfile,
+    payload: &[u8],
+    iterations: usize,
+) -> Vec<u128> {
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let sample_start = Instant::now();
+        let cell = encode_cell(profile, shph_core::SHROUD_FRAME_DATA, payload).expect("encode cell");
+        let decoded = decode_cell(profile, &cell).expect("decode cell");
+        black_box(decoded);
+        samples.push(sample_start.elapsed().as_nanos());
+    }
+    samples
+}
+
+fn bench_shroud_decode_alloc(
+    options: Options,
+    name: &str,
+    profile: shph_core::ShroudProfile,
+    payload: &[u8],
+) {
+    let cell = encode_cell(profile, shph_core::SHROUD_FRAME_DATA, payload).expect("encode cell");
+
+    let mut owned_samples = Vec::with_capacity(options.iterations);
+    let owned_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        let decoded = decode_cell(profile, &cell).expect("owned decode");
+        black_box(decoded);
+        owned_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "shroud_decode_owned",
+        options,
+        &format!("shroud_{name}_owned"),
+        payload.len(),
+        &owned_samples,
+        finish_measurement(owned_start),
+        "owned_payload_copy; allocation baseline",
+    );
+
+    let mut borrowed_samples = Vec::with_capacity(options.iterations);
+    let borrowed_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        let decoded = decode_cell_payload(profile, &cell).expect("borrowed decode");
+        black_box(decoded);
+        borrowed_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "shroud_decode_borrowed",
+        options,
+        &format!("shroud_{name}_borrowed"),
+        payload.len(),
+        &borrowed_samples,
+        finish_measurement(borrowed_start),
+        "borrowed_payload_view; no decode allocation",
+    );
+}
+
+fn measure_shroud_aead(plaintext: &[u8], iterations: usize) -> Vec<u128> {
+    let key = [0x42u8; 32];
+    let mut sender = shph_core::SendCipher::new(key);
+    let mut receiver = shph_core::ReceiveCipher::new_with_replay_window(key, 128);
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let sample_start = Instant::now();
+        let encrypted = sender.encrypt(plaintext).expect("encrypt");
+        let decrypted = receiver.decrypt(&encrypted).expect("decrypt");
+        black_box(decrypted);
+        samples.push(sample_start.elapsed().as_nanos());
+    }
+    samples
+}
+
+fn runtime_for_samples(samples: &[u128]) -> RuntimeStats {
+    RuntimeStats {
+        elapsed_ns: samples.iter().sum(),
+        ..RuntimeStats::default()
     }
 }
 
@@ -632,16 +962,18 @@ fn bench_quic_loopback(options: Options) {
         let sample_start = Instant::now();
         let mut completed = false;
         for _attempt in 0..5 {
-            let probe = UdpSocket::bind("127.0.0.1:0").expect("UDP bind");
-            let address = probe.local_addr().expect("UDP address");
-            drop(probe);
+            let server_socket = UdpSocket::bind("127.0.0.1:0").expect("UDP bind");
+            let address = server_socket.local_addr().expect("UDP address");
             let server_identity = IdentityKeyPair::generate().expect("server identity");
             let client_identity = IdentityKeyPair::generate().expect("client identity");
+            let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+            let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
             let server_profile = options.profile;
             let server = thread::spawn(move || {
-                quic_handshake_server_with_profile(
-                    &address.to_string(),
+                quic_handshake_server_on_socket_with_profile(
+                    server_socket,
                     &server_identity,
+                    &server_policy,
                     1,
                     server_profile,
                 )
@@ -649,6 +981,7 @@ fn bench_quic_loopback(options: Options) {
             let client = quic_handshake_client_with_profile(
                 &address.to_string(),
                 &client_identity,
+                &client_policy,
                 1,
                 options.profile,
             );
@@ -733,10 +1066,8 @@ fn bench_quic_impairment(options: Options) {
         }
     }
     println!(
-        "rate,{},{},{},1,,,,,,,,0,-,-,-,-,-,-,-,-,accepted={accepted};rejected={rejected};per_ip_rate_limit_probe",
-        options.profile.as_str(),
-        "quic_shim_rate_limit",
-        0
+        "rate,{},quic_shim_rate_limit,0,1,,,,,,,,0,-,-,-,-,-,-,-,-,accepted={accepted};rejected={rejected};per_ip_rate_limit_probe",
+        options.profile.as_str()
     );
 }
 

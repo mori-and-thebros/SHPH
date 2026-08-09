@@ -4,7 +4,11 @@
 //! UDP datagram shim for phased adoption, and an opt-in standards-compliant
 //! QUIC transport backed by Quinn.
 
+pub mod ja4;
+pub mod shroud2;
 pub mod standards_quic;
+#[cfg(target_os = "linux")]
+pub mod standards_tun;
 
 use base64::Engine as _;
 use rand::RngCore;
@@ -12,8 +16,8 @@ use shph_core::roadmap::{data_mule_inbox_path, offline_session_id};
 use shph_core::{
     absorb_responder_pq, build_hello_with_profile, finalize_initiator_pq, verify_and_derive,
     DataMuleConfig, DataMuleEnvelope, HandshakeProfile, HandshakeState, Hello, IdentityKeyPair,
-    OfflineMeshConfig, OfflineMeshEnvelope, ReceiveCipher, Result, SendCipher, ShphError,
-    ShroudProfile, ML_KEM_768_CIPHERTEXT_BYTES,
+    OfflineMeshConfig, OfflineMeshEnvelope, PeerPolicy, ReceiveCipher, Result, SendCipher,
+    ShphError, ShroudProfile, ML_KEM_768_CIPHERTEXT_BYTES,
 };
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -110,7 +114,78 @@ enum SecureReceiverInner {
 const MAX_FILE_ADAPTER_BYTES: u64 = 256 * 1024;
 const MAX_QUEUE_SCAN_ENTRIES: usize = 4096;
 const MAX_QUEUE_SCAN_DEPTH: usize = 16;
+const MAX_QUEUE_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_QUEUE_CANDIDATE_MEMORY: usize = 4 * 1024 * 1024;
+const MAX_ADAPTER_METADATA_BYTES: usize = 1024;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct ClaimedFile {
+    original: PathBuf,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct OfflineMeshCandidate {
+    path: PathBuf,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+struct DataMuleCandidate {
+    path: PathBuf,
+    created_at_unix_ms: u64,
+    envelope_id: String,
+    from_node: String,
+    to_node: String,
+}
+
+fn account_scan_entry(scanned: &mut usize) -> Result<()> {
+    *scanned = scanned.saturating_add(1);
+    if *scanned > MAX_QUEUE_SCAN_ENTRIES {
+        return Err(ShphError::ResourceExhausted(
+            "file adapter queue contains too many entries to scan safely".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn account_scan_bytes(scanned_bytes: &mut u64, bytes: u64) -> Result<()> {
+    *scanned_bytes = scanned_bytes.saturating_add(bytes);
+    if *scanned_bytes > MAX_QUEUE_SCAN_BYTES {
+        return Err(ShphError::ResourceExhausted(
+            "file adapter scan byte budget exhausted".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn account_candidate_memory(
+    candidate_memory: &mut usize,
+    path: &Path,
+    metadata: &[&str],
+) -> Result<()> {
+    if metadata
+        .iter()
+        .any(|value| value.len() > MAX_ADAPTER_METADATA_BYTES)
+    {
+        return Err(ShphError::Protocol(
+            "file adapter envelope metadata exceeds safety bounds".into(),
+        ));
+    }
+    let cost = 128usize.saturating_add(
+        path.to_string_lossy()
+            .len()
+            .saturating_add(metadata.iter().map(|value| value.len()).sum()),
+    );
+    *candidate_memory = candidate_memory.saturating_add(cost);
+    if *candidate_memory > MAX_QUEUE_CANDIDATE_MEMORY {
+        return Err(ShphError::ResourceExhausted(
+            "file adapter candidate memory budget exhausted".into(),
+        ));
+    }
+    Ok(())
+}
 
 fn now_unix_ms() -> Result<u64> {
     Ok(SystemTime::now()
@@ -131,7 +206,9 @@ fn sanitize_component(input: &str) -> String {
 
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
+        ensure_no_reparse_components(parent).map_err(ShphError::Io)?;
         fs::create_dir_all(parent).map_err(ShphError::Io)?;
+        ensure_no_reparse_components(parent).map_err(ShphError::Io)?;
     }
 
     let filename = path
@@ -152,27 +229,18 @@ fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     drop(file);
 
-    if let Err(err) = fs::rename(&tmp, path) {
+    if let Err(_err) = fs::rename(&tmp, path) {
         #[cfg(windows)]
         {
-            if path.exists() {
-                if let Err(remove_err) = fs::remove_file(path).map_err(ShphError::Io) {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(remove_err);
-                }
-                if let Err(rename_err) = fs::rename(&tmp, path).map_err(ShphError::Io) {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(rename_err);
-                }
-            } else {
+            if let Err(replace_err) = persist_file_over_windows(&tmp, path) {
                 let _ = fs::remove_file(&tmp);
-                return Err(ShphError::Io(err));
+                return Err(ShphError::Io(replace_err));
             }
         }
         #[cfg(not(windows))]
         {
             let _ = fs::remove_file(&tmp);
-            return Err(ShphError::Io(err));
+            return Err(ShphError::Io(_err));
         }
     }
 
@@ -196,6 +264,7 @@ fn create_atomic_temp_file(parent: &Path, filename: &str) -> Result<(File, PathB
 }
 
 fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
+    ensure_no_reparse_components(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -206,15 +275,28 @@ fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
     }
     #[cfg(not(unix))]
     {
+        ensure_no_reparse_components(path)?;
         File::open(path)
     }
 }
 
 fn quarantine_file(path: &Path) {
+    let original = path.to_path_buf();
+    move_file_to_rejected(path, &original);
+}
+
+fn quarantine_claimed_file(claimed: ClaimedFile) {
+    move_file_to_rejected(&claimed.path, &claimed.original);
+}
+
+fn move_file_to_rejected(path: &Path, original: &Path) {
     let Some(parent) = path.parent() else {
         return;
     };
-    let stem = path
+    if ensure_no_reparse_components(parent).is_err() {
+        return;
+    }
+    let stem = original
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or("rejected");
@@ -231,17 +313,222 @@ fn quarantine_file(path: &Path) {
     }
 
     while let Some(rejected) = candidates.pop_front() {
-        match fs::hard_link(path, &rejected) {
+        match rename_without_replace(path, &rejected) {
             Ok(()) => {
-                if fs::remove_file(path).is_err() {
-                    let _ = fs::remove_file(&rejected);
-                }
                 return;
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(_) => return,
         }
     }
+}
+
+fn claim_file(path: &Path) -> io::Result<Option<ClaimedFile>> {
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    ensure_no_reparse_components(path)?;
+    ensure_no_reparse_components(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("envelope");
+    for attempt in 0..32 {
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let claimed = parent.join(format!(
+            ".{name}.processing.{}.{}.{}",
+            std::process::id(),
+            counter,
+            attempt
+        ));
+        match rename_without_replace(path, &claimed) {
+            Ok(()) => {
+                return Ok(Some(ClaimedFile {
+                    original: path.to_path_buf(),
+                    path: claimed,
+                }));
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to claim file adapter candidate",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn rename_without_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file adapter path contains an embedded NUL",
+        )
+    })?;
+    let to = CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file adapter path contains an embedded NUL",
+        )
+    })?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+        return rename_without_replace_by_link(&from, &to);
+    }
+    Err(error)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn rename_without_replace(from: &Path, to: &Path) -> io::Result<()> {
+    rename_without_replace_by_link(from, to)
+}
+
+#[cfg(unix)]
+fn rename_without_replace_by_link(from: &std::ffi::CStr, to: &std::ffi::CStr) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let from_path = Path::new(std::ffi::OsStr::from_bytes(from.to_bytes()));
+    let to_path = Path::new(std::ffi::OsStr::from_bytes(to.to_bytes()));
+    if to_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination already exists",
+        ));
+    }
+    fs::hard_link(from_path, to_path)?;
+    fs::remove_file(from_path)
+}
+
+#[cfg(windows)]
+fn rename_without_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let wide = |path: &Path| {
+        let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if value.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file adapter path contains an embedded NUL",
+            ));
+        }
+        value.push(0);
+        Ok(value)
+    };
+    let from = wide(from)?;
+    let to = wide(to)?;
+    let result = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_without_replace(from: &Path, to: &Path) -> io::Result<()> {
+    if to.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination already exists",
+        ));
+    }
+    fs::rename(from, to)
+}
+
+fn ensure_no_reparse_components(path: &Path) -> io::Result<()> {
+    let mut current = Some(path);
+    while let Some(component) = current {
+        if component.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to traverse symlink component '{}'",
+                        component.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        #[cfg(windows)]
+        if component.exists() {
+            shph_core::ensure_not_reparse_point(component)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        }
+        current = component.parent();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn persist_file_over_windows(tmp: &Path, path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        REPLACEFILE_WRITE_THROUGH,
+    };
+
+    let wide = |value: &Path| {
+        let mut encoded: Vec<u16> = value.as_os_str().encode_wide().collect();
+        if encoded.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file adapter path contains an embedded NUL",
+            ));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    };
+    let tmp_w = wide(tmp)?;
+    let path_w = wide(path)?;
+    let result = if path.exists() {
+        unsafe {
+            ReplaceFileW(
+                path_w.as_ptr(),
+                tmp_w.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        }
+    } else {
+        unsafe {
+            MoveFileExW(
+                tmp_w.as_ptr(),
+                path_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn read_file_bytes(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
@@ -314,12 +601,14 @@ fn bounded_quic_timeout_secs(timeout_secs: u64) -> u64 {
 pub fn connect_and_handshake(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
 ) -> Result<HandshakeState> {
     connect_and_handshake_with_profile(
         peer,
         local_identity,
+        policy,
         timeout_secs,
         mode,
         HandshakeProfile::SecureDefault,
@@ -329,17 +618,23 @@ pub fn connect_and_handshake(
 pub fn connect_and_handshake_with_profile(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
     match mode {
         TransportMode::Tcp => {
-            tcp_handshake_client_with_profile(peer, local_identity, timeout_secs, profile)
+            tcp_handshake_client_with_profile(peer, local_identity, policy, timeout_secs, profile)
         }
         TransportMode::Quic => {
-            let (_socket, _peer, state) =
-                quic_handshake_client_with_profile(peer, local_identity, timeout_secs, profile)?;
+            let (_socket, _peer, state) = quic_handshake_client_with_profile(
+                peer,
+                local_identity,
+                policy,
+                timeout_secs,
+                profile,
+            )?;
             Ok(state)
         }
         TransportMode::QuicStandard => Err(ShphError::Unsupported(
@@ -354,12 +649,14 @@ pub fn connect_and_handshake_with_profile(
 pub fn accept_handshake(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
 ) -> Result<HandshakeState> {
     accept_handshake_with_profile(
         bind_addr,
         local_identity,
+        policy,
         timeout_secs,
         mode,
         HandshakeProfile::SecureDefault,
@@ -369,17 +666,23 @@ pub fn accept_handshake(
 pub fn accept_handshake_with_profile(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
     match mode {
-        TransportMode::Tcp => {
-            tcp_handshake_server_with_profile(bind_addr, local_identity, timeout_secs, profile)
-        }
+        TransportMode::Tcp => tcp_handshake_server_with_profile(
+            bind_addr,
+            local_identity,
+            policy,
+            timeout_secs,
+            profile,
+        ),
         TransportMode::Quic => Ok(quic_handshake_server_with_profile(
             bind_addr,
             local_identity,
+            policy,
             timeout_secs,
             profile,
         )?
@@ -396,11 +699,13 @@ pub fn accept_handshake_with_profile(
 pub fn offline_mesh_connect_and_handshake(
     cfg: &OfflineMeshConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
     offline_mesh_connect_and_handshake_with_profile(
         cfg,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -409,6 +714,7 @@ pub fn offline_mesh_connect_and_handshake(
 pub fn offline_mesh_connect_and_handshake_with_profile(
     cfg: &OfflineMeshConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
@@ -427,20 +733,22 @@ pub fn offline_mesh_connect_and_handshake_with_profile(
 
     let mut material = material;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
         writer.send_payload(&ct)?;
     }
-    verify_and_derive(local_identity, &material, &peer_hello, true)
+    verify_and_derive(local_identity, &material, &peer_hello, true, policy)
 }
 
 pub fn offline_mesh_accept_and_handshake(
     cfg: &OfflineMeshConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
     offline_mesh_accept_and_handshake_with_profile(
         cfg,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -449,6 +757,7 @@ pub fn offline_mesh_accept_and_handshake(
 pub fn offline_mesh_accept_and_handshake_with_profile(
     cfg: &OfflineMeshConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
@@ -460,25 +769,34 @@ pub fn offline_mesh_accept_and_handshake_with_profile(
     let peer_payload = reader.receive_payload(timeout)?;
     let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
+    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     let local_hello =
         serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?;
     writer.send_payload(&local_hello)?;
     let mut material = material;
     if profile.uses_pqc() {
         let ct_payload = reader.receive_payload(timeout)?;
-        absorb_responder_pq(&mut material, &ct_payload)?;
+        absorb_responder_pq(
+            local_identity,
+            &mut material,
+            &peer_hello,
+            &ct_payload,
+            policy,
+        )?;
     }
-    verify_and_derive(local_identity, &material, &peer_hello, false)
+    verify_and_derive(local_identity, &material, &peer_hello, false, policy)
 }
 
 pub fn offline_mesh_connect_secure_session(
     cfg: &OfflineMeshConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(SecureSession, HandshakeState)> {
     offline_mesh_connect_secure_session_with_profile(
         cfg,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -487,6 +805,7 @@ pub fn offline_mesh_connect_secure_session(
 pub fn offline_mesh_connect_secure_session_with_profile(
     cfg: &OfflineMeshConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
@@ -504,10 +823,10 @@ pub fn offline_mesh_connect_secure_session_with_profile(
 
     let mut material = material;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
         writer.send_payload(&ct)?;
     }
-    let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
+    let state = verify_and_derive(local_identity, &material, &peer_hello, true, policy)?;
     let session = SecureSession {
         inner: SecureSessionInner::OfflineMesh(OfflineMeshSession::new(
             OfflineMeshWriteState::new(cfg, &cfg.node_id, &cfg.peer_id),
@@ -522,11 +841,13 @@ pub fn offline_mesh_connect_secure_session_with_profile(
 pub fn offline_mesh_accept_secure_session(
     cfg: &OfflineMeshConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(SecureSession, HandshakeState)> {
     offline_mesh_accept_secure_session_with_profile(
         cfg,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -535,6 +856,7 @@ pub fn offline_mesh_accept_secure_session(
 pub fn offline_mesh_accept_secure_session_with_profile(
     cfg: &OfflineMeshConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
@@ -546,16 +868,23 @@ pub fn offline_mesh_accept_secure_session_with_profile(
     let peer_payload = reader.receive_payload(timeout)?;
     let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
+    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
     let mut material = material;
     if profile.uses_pqc() {
         let ct_payload = reader.receive_payload(timeout)?;
-        absorb_responder_pq(&mut material, &ct_payload)?;
+        absorb_responder_pq(
+            local_identity,
+            &mut material,
+            &peer_hello,
+            &ct_payload,
+            policy,
+        )?;
     }
 
-    let state = verify_and_derive(local_identity, &material, &peer_hello, false)?;
+    let state = verify_and_derive(local_identity, &material, &peer_hello, false, policy)?;
     let session = SecureSession {
         inner: SecureSessionInner::OfflineMesh(OfflineMeshSession::new(
             OfflineMeshWriteState::new(cfg, &cfg.node_id, &cfg.peer_id),
@@ -571,12 +900,14 @@ pub fn data_mule_connect_and_handshake(
     cfg: &DataMuleConfig,
     local_identity: &IdentityKeyPair,
     peer_node: &str,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
     data_mule_connect_and_handshake_with_profile(
         cfg,
         local_identity,
         peer_node,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -586,6 +917,7 @@ pub fn data_mule_connect_and_handshake_with_profile(
     cfg: &DataMuleConfig,
     local_identity: &IdentityKeyPair,
     peer_node: &str,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
@@ -602,20 +934,22 @@ pub fn data_mule_connect_and_handshake_with_profile(
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
     let mut material = material;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
         writer.send_payload(&ct)?;
     }
-    verify_and_derive(local_identity, &material, &peer_hello, true)
+    verify_and_derive(local_identity, &material, &peer_hello, true, policy)
 }
 
 pub fn data_mule_accept_and_handshake(
     cfg: &DataMuleConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
     data_mule_accept_and_handshake_with_profile(
         cfg,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -624,6 +958,7 @@ pub fn data_mule_accept_and_handshake(
 pub fn data_mule_accept_and_handshake_with_profile(
     cfg: &DataMuleConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
@@ -641,6 +976,7 @@ pub fn data_mule_accept_and_handshake_with_profile(
         }
     };
     reader.commit_envelope(&peer_envelope)?;
+    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     let peer_node = peer_envelope.envelope.from_node;
     let mut writer = DataMuleWriteState::new(cfg, &local_node, &peer_node);
     writer.send_payload(
@@ -649,21 +985,29 @@ pub fn data_mule_accept_and_handshake_with_profile(
     let mut material = material;
     if profile.uses_pqc() {
         let ct_payload = reader.receive_payload(timeout)?;
-        absorb_responder_pq(&mut material, &ct_payload)?;
+        absorb_responder_pq(
+            local_identity,
+            &mut material,
+            &peer_hello,
+            &ct_payload,
+            policy,
+        )?;
     }
-    verify_and_derive(local_identity, &material, &peer_hello, false)
+    verify_and_derive(local_identity, &material, &peer_hello, false, policy)
 }
 
 pub fn data_mule_connect_secure_session(
     cfg: &DataMuleConfig,
     local_identity: &IdentityKeyPair,
     peer_node: &str,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(SecureSession, HandshakeState)> {
     data_mule_connect_secure_session_with_profile(
         cfg,
         local_identity,
         peer_node,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -673,6 +1017,7 @@ pub fn data_mule_connect_secure_session_with_profile(
     cfg: &DataMuleConfig,
     local_identity: &IdentityKeyPair,
     peer_node: &str,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
@@ -690,10 +1035,10 @@ pub fn data_mule_connect_secure_session_with_profile(
         .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
     let mut material = material;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
         writer.send_payload(&ct)?;
     }
-    let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
+    let state = verify_and_derive(local_identity, &material, &peer_hello, true, policy)?;
 
     let session = SecureSession {
         inner: SecureSessionInner::DataMule(DataMuleSession::new(
@@ -710,11 +1055,13 @@ pub fn data_mule_connect_secure_session_with_profile(
 pub fn data_mule_accept_secure_session(
     cfg: &DataMuleConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(SecureSession, HandshakeState)> {
     data_mule_accept_secure_session_with_profile(
         cfg,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -723,6 +1070,7 @@ pub fn data_mule_accept_secure_session(
 pub fn data_mule_accept_secure_session_with_profile(
     cfg: &DataMuleConfig,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
@@ -740,6 +1088,7 @@ pub fn data_mule_accept_secure_session_with_profile(
         }
     };
     reader.commit_envelope(&envelope)?;
+    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     let peer_node = envelope.envelope.from_node;
     let mut writer = DataMuleWriteState::new(cfg, &local_node, &peer_node);
     writer.send_payload(
@@ -748,10 +1097,16 @@ pub fn data_mule_accept_secure_session_with_profile(
     let mut material = material;
     if profile.uses_pqc() {
         let ct_payload = reader.receive_payload(timeout)?;
-        absorb_responder_pq(&mut material, &ct_payload)?;
+        absorb_responder_pq(
+            local_identity,
+            &mut material,
+            &peer_hello,
+            &ct_payload,
+            policy,
+        )?;
     }
 
-    let state = verify_and_derive(local_identity, &material, &peer_hello, false)?;
+    let state = verify_and_derive(local_identity, &material, &peer_hello, false, policy)?;
 
     let session = SecureSession {
         inner: SecureSessionInner::DataMule(DataMuleSession::new(
@@ -767,12 +1122,14 @@ pub fn data_mule_accept_secure_session_with_profile(
 pub fn connect_secure_session(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
 ) -> Result<(SecureSession, HandshakeState)> {
     connect_secure_session_with_profile(
         peer,
         local_identity,
+        policy,
         timeout_secs,
         mode,
         HandshakeProfile::SecureDefault,
@@ -782,6 +1139,7 @@ pub fn connect_secure_session(
 pub fn connect_secure_session_with_profile(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
@@ -791,6 +1149,7 @@ pub fn connect_secure_session_with_profile(
             let (stream, state) = tcp_connect_and_handshake_with_profile(
                 peer,
                 local_identity,
+                policy,
                 timeout_secs,
                 profile,
             )?;
@@ -806,8 +1165,13 @@ pub fn connect_secure_session_with_profile(
             ))
         }
         TransportMode::Quic => {
-            let (socket, peer_addr, state) =
-                quic_handshake_client_with_profile(peer, local_identity, timeout_secs, profile)?;
+            let (socket, peer_addr, state) = quic_handshake_client_with_profile(
+                peer,
+                local_identity,
+                policy,
+                timeout_secs,
+                profile,
+            )?;
             Ok((
                 SecureSession {
                     inner: SecureSessionInner::Quic(ExperimentalQuicSession::new(
@@ -832,6 +1196,7 @@ pub fn connect_secure_session_with_profile(
 pub fn connect_secure_session_lab(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
     lab: QuicLabConfig,
@@ -839,6 +1204,7 @@ pub fn connect_secure_session_lab(
     connect_secure_session_lab_with_profile(
         peer,
         local_identity,
+        policy,
         timeout_secs,
         mode,
         lab,
@@ -849,13 +1215,20 @@ pub fn connect_secure_session_lab(
 pub fn connect_secure_session_lab_with_profile(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
     lab: QuicLabConfig,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let (session, state) =
-        connect_secure_session_with_profile(peer, local_identity, timeout_secs, mode, profile)?;
+    let (session, state) = connect_secure_session_with_profile(
+        peer,
+        local_identity,
+        policy,
+        timeout_secs,
+        mode,
+        profile,
+    )?;
     if let (TransportMode::Quic, Some(profile)) = (mode, lab.shroud_profile) {
         return Ok((session.with_quic_profile(profile)?, state));
     }
@@ -865,12 +1238,14 @@ pub fn connect_secure_session_lab_with_profile(
 pub fn accept_secure_session(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
 ) -> Result<(SecureSession, HandshakeState)> {
     accept_secure_session_with_profile(
         bind_addr,
         local_identity,
+        policy,
         timeout_secs,
         mode,
         HandshakeProfile::SecureDefault,
@@ -880,6 +1255,7 @@ pub fn accept_secure_session(
 pub fn accept_secure_session_with_profile(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
@@ -889,6 +1265,7 @@ pub fn accept_secure_session_with_profile(
             let (stream, state) = tcp_accept_and_handshake_with_profile(
                 bind_addr,
                 local_identity,
+                policy,
                 timeout_secs,
                 profile,
             )?;
@@ -907,6 +1284,7 @@ pub fn accept_secure_session_with_profile(
             let (socket, peer_addr, state) = quic_handshake_server_with_profile(
                 bind_addr,
                 local_identity,
+                policy,
                 timeout_secs,
                 profile,
             )?;
@@ -934,6 +1312,7 @@ pub fn accept_secure_session_with_profile(
 pub fn accept_secure_session_lab(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
     lab: QuicLabConfig,
@@ -941,6 +1320,7 @@ pub fn accept_secure_session_lab(
     accept_secure_session_lab_with_profile(
         bind_addr,
         local_identity,
+        policy,
         timeout_secs,
         mode,
         lab,
@@ -951,13 +1331,20 @@ pub fn accept_secure_session_lab(
 pub fn accept_secure_session_lab_with_profile(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     mode: TransportMode,
     lab: QuicLabConfig,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let (session, state) =
-        accept_secure_session_with_profile(bind_addr, local_identity, timeout_secs, mode, profile)?;
+    let (session, state) = accept_secure_session_with_profile(
+        bind_addr,
+        local_identity,
+        policy,
+        timeout_secs,
+        mode,
+        profile,
+    )?;
     if let (TransportMode::Quic, Some(profile)) = (mode, lab.shroud_profile) {
         return Ok((session.with_quic_profile(profile)?, state));
     }
@@ -1051,6 +1438,28 @@ impl SecureSender {
 }
 
 impl SecureReceiver {
+    pub fn set_poll_timeout(&mut self, timeout: Duration) -> Result<()> {
+        let timeout = timeout.max(Duration::from_millis(1));
+        match &mut self.inner {
+            SecureReceiverInner::Tcp(receiver) => receiver
+                .stream
+                .set_read_timeout(Some(timeout))
+                .map_err(map_io_error),
+            SecureReceiverInner::Quic(receiver) => receiver
+                .socket
+                .set_read_timeout(Some(timeout))
+                .map_err(map_io_error),
+            SecureReceiverInner::OfflineMesh(receiver) => {
+                receiver.timeout = timeout;
+                Ok(())
+            }
+            SecureReceiverInner::DataMule(receiver) => {
+                receiver.timeout = timeout;
+                Ok(())
+            }
+        }
+    }
+
     pub fn recv_frame(&mut self) -> Result<Vec<u8>> {
         match &mut self.inner {
             SecureReceiverInner::Tcp(receiver) => receiver.recv_frame(),
@@ -1065,11 +1474,13 @@ impl SecureReceiver {
 pub fn tcp_handshake_client(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
     tcp_handshake_client_with_profile(
         peer,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -1078,6 +1489,7 @@ pub fn tcp_handshake_client(
 pub fn tcp_handshake_client_with_profile(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
@@ -1086,22 +1498,24 @@ pub fn tcp_handshake_client_with_profile(
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
     let peer_hello = read_tcp_hello(&mut stream)?;
-    shph_core::verify_hello_signature(local_identity, &material, &peer_hello)?;
+    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
         write_tcp_pq_ct(&mut stream, &ct)?;
     }
-    verify_and_derive(local_identity, &material, &peer_hello, true)
+    verify_and_derive(local_identity, &material, &peer_hello, true, policy)
 }
 
 pub fn tcp_handshake_server(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<HandshakeState> {
     tcp_handshake_server_with_profile(
         bind_addr,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -1110,21 +1524,24 @@ pub fn tcp_handshake_server(
 pub fn tcp_handshake_server_with_profile(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
-    tcp_accept_and_handshake_with_profile(bind_addr, local_identity, timeout_secs, profile)
+    tcp_accept_and_handshake_with_profile(bind_addr, local_identity, policy, timeout_secs, profile)
         .map(|(_, state)| state)
 }
 
 pub fn tcp_connect_and_handshake(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(TcpStream, HandshakeState)> {
     tcp_connect_and_handshake_with_profile(
         peer,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -1133,6 +1550,7 @@ pub fn tcp_connect_and_handshake(
 pub fn tcp_connect_and_handshake_with_profile(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(TcpStream, HandshakeState)> {
@@ -1141,11 +1559,12 @@ pub fn tcp_connect_and_handshake_with_profile(
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
     let peer_hello = read_tcp_hello(&mut stream)?;
+    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     if profile.uses_pqc() {
-        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
+        let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
         write_tcp_pq_ct(&mut stream, &ct)?;
     }
-    let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
+    let state = verify_and_derive(local_identity, &material, &peer_hello, true, policy)?;
     Ok((stream, state))
 }
 
@@ -1211,9 +1630,14 @@ impl PeerRateLimiter {
             !entries.is_empty()
         });
         if !self.seen.contains_key(&key) && self.seen.len() >= MAX_QUIC_TRACKED_PEERS {
-            return Err(ShphError::ResourceExhausted(
-                "peer rate-limit table is full".into(),
-            ));
+            if let Some(oldest_key) = self
+                .seen
+                .iter()
+                .min_by_key(|(_, entries)| entries.first().copied())
+                .map(|(key, _)| key.clone())
+            {
+                self.seen.remove(&oldest_key);
+            }
         }
         let entries = self.seen.entry(key).or_default();
         entries.retain(|t| *t > cutoff);
@@ -1233,11 +1657,13 @@ impl PeerRateLimiter {
 pub fn tcp_accept_and_handshake(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(TcpStream, HandshakeState)> {
     tcp_accept_and_handshake_with_profile(
         bind_addr,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -1246,6 +1672,7 @@ pub fn tcp_accept_and_handshake(
 pub fn tcp_accept_and_handshake_with_profile(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(TcpStream, HandshakeState)> {
@@ -1291,9 +1718,12 @@ pub fn tcp_accept_and_handshake_with_profile(
         match read_tcp_hello(&mut stream) {
             Ok(peer_hello) => {
                 let mut material = build_hello_with_profile(local_identity, profile)?;
-                if let Err(err) =
-                    shph_core::verify_hello_signature(local_identity, &material, &peer_hello)
-                {
+                if let Err(err) = shph_core::verify_hello_signature(
+                    local_identity,
+                    &material,
+                    &peer_hello,
+                    policy,
+                ) {
                     last_err = Some(err);
                     continue;
                 }
@@ -1307,12 +1737,14 @@ pub fn tcp_accept_and_handshake_with_profile(
                         }
                         Err(err) => return Err(err),
                     };
-                    if absorb_responder_pq(&mut material, &ct).is_err() {
+                    if absorb_responder_pq(local_identity, &mut material, &peer_hello, &ct, policy)
+                        .is_err()
+                    {
                         last_err = Some(ShphError::Handshake("pq decapsulation failed".into()));
                         continue;
                     }
                 }
-                match verify_and_derive(local_identity, &material, &peer_hello, false) {
+                match verify_and_derive(local_identity, &material, &peer_hello, false, policy) {
                     Ok(state) => return Ok((stream, state)),
                     Err(err) => {
                         // Signature/protocol failure: hostile or wrong-key peer.
@@ -1461,9 +1893,10 @@ fn apply_timeout_duration(stream: &TcpStream, timeout: Duration) -> Result<()> {
 pub fn tcp_connect_secure_session(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(SecureTcpSession, HandshakeState)> {
-    let (stream, state) = tcp_connect_and_handshake(peer, local_identity, timeout_secs)?;
+    let (stream, state) = tcp_connect_and_handshake(peer, local_identity, policy, timeout_secs)?;
     let session = SecureTcpSession::new(
         stream,
         state.session_keys.send_key,
@@ -1475,9 +1908,11 @@ pub fn tcp_connect_secure_session(
 pub fn tcp_accept_secure_session(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(SecureTcpSession, HandshakeState)> {
-    let (stream, state) = tcp_accept_and_handshake(bind_addr, local_identity, timeout_secs)?;
+    let (stream, state) =
+        tcp_accept_and_handshake(bind_addr, local_identity, policy, timeout_secs)?;
     let session = SecureTcpSession::new(
         stream,
         state.session_keys.send_key,
@@ -1549,25 +1984,41 @@ impl SecureTcpReceiver {
     }
 }
 
-pub fn tcp_secure_send(stream: &mut TcpStream, send_key: [u8; 32], payload: &[u8]) -> Result<()> {
-    let mut cipher = SendCipher::new(send_key);
-    write_encrypted_tcp_frame(stream, &mut cipher, payload)
+/// Send one encrypted TCP frame using the caller-owned, stateful AEAD cipher.
+///
+/// The cipher must be retained for the lifetime of the session so its nonce
+/// counter advances for every frame. Constructing a new cipher per send would
+/// restart the counter and risk nonce reuse under the same key.
+pub fn tcp_secure_send(
+    stream: &mut TcpStream,
+    send_cipher: &mut SendCipher,
+    payload: &[u8],
+) -> Result<()> {
+    write_encrypted_tcp_frame(stream, send_cipher, payload)
 }
 
-pub fn tcp_secure_receive(stream: &mut TcpStream, recv_key: [u8; 32]) -> Result<Vec<u8>> {
-    let mut cipher = ReceiveCipher::new(recv_key);
-    read_encrypted_tcp_frame(stream, &mut cipher)
+/// Receive one encrypted TCP frame using the caller-owned, stateful AEAD cipher.
+///
+/// The cipher must be retained for the lifetime of the session so replay
+/// protection remembers every authenticated frame received on the connection.
+pub fn tcp_secure_receive(
+    stream: &mut TcpStream,
+    recv_cipher: &mut ReceiveCipher,
+) -> Result<Vec<u8>> {
+    read_encrypted_tcp_frame(stream, recv_cipher)
 }
 
 // Experimental QUIC-like shim.
 pub fn quic_handshake_client(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
     quic_handshake_client_with_profile(
         peer,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -1576,6 +2027,7 @@ pub fn quic_handshake_client(
 pub fn quic_handshake_client_with_profile(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
@@ -1607,9 +2059,10 @@ pub fn quic_handshake_client_with_profile(
         match peer_hello {
             Ok((peer_hello, addr)) if addr == peer_addr => {
                 let mut material = material;
-                shph_core::verify_hello_signature(local_identity, &material, &peer_hello)?;
+                shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
                 if profile.uses_pqc() {
-                    let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
+                    let ct =
+                        finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(ShphError::Timeout);
@@ -1619,7 +2072,8 @@ pub fn quic_handshake_client_with_profile(
                         .map_err(ShphError::Io)?;
                     write_quic_pq_ct(&socket, peer_addr, &ct)?;
                 }
-                let state = verify_and_derive(local_identity, &material, &peer_hello, true)?;
+                let state =
+                    verify_and_derive(local_identity, &material, &peer_hello, true, policy)?;
                 return Ok((socket, peer_addr, state));
             }
             Ok((_, _)) => {
@@ -1637,11 +2091,13 @@ pub fn quic_handshake_client_with_profile(
 pub fn quic_handshake_server(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
     quic_handshake_server_with_profile(
         bind_addr,
         local_identity,
+        policy,
         timeout_secs,
         HandshakeProfile::SecureDefault,
     )
@@ -1650,10 +2106,33 @@ pub fn quic_handshake_server(
 pub fn quic_handshake_server_with_profile(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
     let socket = UdpSocket::bind(bind_addr).map_err(|e| ShphError::Transport(e.to_string()))?;
+    quic_handshake_server_on_socket_with_profile(
+        socket,
+        local_identity,
+        policy,
+        timeout_secs,
+        profile,
+    )
+}
+
+/// Complete the experimental QUIC-like UDP handshake on an already-bound
+/// socket.
+///
+/// Keeping socket creation separate lets callers reserve a port before
+/// starting a server thread, avoiding a bind/send startup race in local
+/// integration and benchmark harnesses.
+pub fn quic_handshake_server_on_socket_with_profile(
+    socket: UdpSocket,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
     let timeout_secs = bounded_quic_timeout_secs(timeout_secs);
     socket
         .set_read_timeout(Some(Duration::from_secs(timeout_secs)))
@@ -1681,8 +2160,13 @@ pub fn quic_handshake_server_with_profile(
                 }
                 match decode_quic_hello(len, &line[..len], peer_addr) {
                     Ok(hello) => {
-                        if shph_core::verify_hello_signature(local_identity, &material, &hello.0)
-                            .is_err()
+                        if shph_core::verify_hello_signature(
+                            local_identity,
+                            &material,
+                            &hello.0,
+                            policy,
+                        )
+                        .is_err()
                         {
                             continue;
                         }
@@ -1709,29 +2193,31 @@ pub fn quic_handshake_server_with_profile(
         .map_err(ShphError::Io)?;
     write_tcp_hello_to_peer(&socket, peer_addr, &material.local_hello)?;
     let mut material = material;
-    shph_core::verify_hello_signature(local_identity, &material, &peer_hello)?;
+    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     if profile.uses_pqc() {
         let ct = read_quic_pq_ct(&socket, peer_addr)?;
-        absorb_responder_pq(&mut material, &ct)?;
+        absorb_responder_pq(local_identity, &mut material, &peer_hello, &ct, policy)?;
     }
-    let state = verify_and_derive(local_identity, &material, &peer_hello, false)?;
+    let state = verify_and_derive(local_identity, &material, &peer_hello, false, policy)?;
     Ok((socket, peer_addr, state))
 }
 
 pub fn quic_connect_and_handshake(
     peer: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
-    quic_handshake_client(peer, local_identity, timeout_secs)
+    quic_handshake_client(peer, local_identity, policy, timeout_secs)
 }
 
 pub fn quic_accept_and_handshake(
     bind_addr: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     timeout_secs: u64,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
-    quic_handshake_server(bind_addr, local_identity, timeout_secs)
+    quic_handshake_server(bind_addr, local_identity, policy, timeout_secs)
 }
 
 fn write_and_wait_quic_hello(
@@ -2142,13 +2628,8 @@ impl OfflineMeshSession {
     }
 
     fn recv_frame(&mut self) -> Result<Vec<u8>> {
-        let (ciphertext, path, sequence) = self
-            .recv_state
-            .receive_raw_payload(self.recv_state.poll_interval)?;
-        let plaintext = self.recv_cipher.decrypt(&ciphertext)?;
-        self.recv_state.commit_payload(sequence);
-        let _ = fs::remove_file(path);
-        Ok(plaintext)
+        self.recv_state
+            .receive_decrypted_frame(&mut self.recv_cipher, self.recv_state.poll_interval)
     }
 
     fn into_split(self) -> Result<(OfflineMeshSender, OfflineMeshReceiver)> {
@@ -2187,11 +2668,8 @@ struct OfflineMeshReceiver {
 
 impl OfflineMeshReceiver {
     fn recv_frame(&mut self) -> Result<Vec<u8>> {
-        let (ciphertext, path, sequence) = self.state.receive_raw_payload(self.timeout)?;
-        let plaintext = self.cipher.decrypt(&ciphertext)?;
-        self.state.commit_payload(sequence);
-        let _ = fs::remove_file(path);
-        Ok(plaintext)
+        self.state
+            .receive_decrypted_frame(&mut self.cipher, self.timeout)
     }
 }
 
@@ -2282,13 +2760,13 @@ impl OfflineMeshReadState {
     }
 
     fn receive_payload(&mut self, timeout: Duration) -> Result<Vec<u8>> {
-        let (payload, path, sequence) = self.receive_raw_payload(timeout)?;
-        self.commit_payload(sequence);
-        let _ = fs::remove_file(path);
-        Ok(payload)
+        let frame = self.receive_raw_payload(timeout)?;
+        self.commit_payload(frame.sequence);
+        let _ = fs::remove_file(frame.claimed.path);
+        Ok(frame.payload)
     }
 
-    fn receive_raw_payload(&mut self, timeout: Duration) -> Result<(Vec<u8>, PathBuf, u64)> {
+    fn receive_raw_payload(&mut self, timeout: Duration) -> Result<OfflineMeshFrame> {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(frame) = self.poll_inbound()? {
@@ -2303,70 +2781,157 @@ impl OfflineMeshReadState {
         }
     }
 
-    fn poll_inbound(&mut self) -> Result<Option<(Vec<u8>, PathBuf, u64)>> {
-        let queue_dir = self.inbound_queue_dir();
-        let mut candidates: Vec<(PathBuf, OfflineMeshEnvelope)> = Vec::new();
-
-        if queue_dir.exists() {
-            let mut scanned = 0usize;
-            for entry in fs::read_dir(&queue_dir).map_err(ShphError::Io)? {
-                scanned = scanned.saturating_add(1);
-                if scanned > MAX_QUEUE_SCAN_ENTRIES {
-                    return Err(ShphError::ResourceExhausted(
-                        "offline-mesh queue contains too many entries to scan safely".into(),
-                    ));
+    fn receive_decrypted_frame(
+        &mut self,
+        cipher: &mut ReceiveCipher,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let frame = self.receive_raw_payload(remaining)?;
+            match cipher.decrypt(&frame.payload) {
+                Ok(plaintext) => {
+                    self.commit_payload(frame.sequence);
+                    let _ = fs::remove_file(frame.claimed.path);
+                    return Ok(plaintext);
                 }
-                let entry = entry.map_err(ShphError::Io)?;
-                let path = entry.path();
-                let metadata = fs::symlink_metadata(&path).map_err(ShphError::Io)?;
-                if !metadata.file_type().is_file() {
-                    continue;
-                }
-
-                let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-                if ext != "json" {
-                    continue;
-                }
-
-                let bytes = match read_file_bytes(&path, self.max_file_bytes) {
-                    Ok(bytes) => bytes,
-                    Err(ShphError::Protocol(_)) => {
-                        quarantine_file(&path);
-                        continue;
+                Err(error) => {
+                    quarantine_claimed_file(frame.claimed);
+                    if Instant::now() >= deadline {
+                        return Err(error);
                     }
-                    Err(err) => return Err(err),
-                };
-                let envelope: OfflineMeshEnvelope = match serde_json::from_slice(&bytes) {
-                    Ok(e) => e,
-                    Err(_) => {
-                        quarantine_file(&path);
-                        continue;
-                    }
-                };
-
-                if envelope.session_id != offline_session_id(&self.local_node, &self.peer_node)
-                    || envelope.from != self.peer_node
-                    || envelope.to != self.local_node
-                    || self.seen_sequences.contains(&envelope.sequence)
-                {
-                    continue;
                 }
-
-                candidates.push((path, envelope));
             }
         }
+    }
 
+    fn poll_inbound(&mut self) -> Result<Option<OfflineMeshFrame>> {
+        let queue_dir = self.inbound_queue_dir();
+        ensure_no_reparse_components(&queue_dir).map_err(ShphError::Io)?;
+        let queue_metadata = match fs::symlink_metadata(&queue_dir) {
+            Ok(metadata) if metadata.is_dir() => Some(metadata),
+            Ok(_) => {
+                return Err(ShphError::Protocol(
+                    "offline-mesh queue path is not a directory".into(),
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(ShphError::Io(error)),
+        };
+        if queue_metadata.is_none() {
+            return Ok(None);
+        }
+
+        let expected_session = offline_session_id(&self.local_node, &self.peer_node);
+        let mut candidates = Vec::new();
+        let mut scanned = 0usize;
+        let mut scanned_bytes = 0u64;
+        let mut candidate_memory = 0usize;
+        for entry in fs::read_dir(&queue_dir).map_err(ShphError::Io)? {
+            account_scan_entry(&mut scanned)?;
+            let entry = entry.map_err(ShphError::Io)?;
+            let path = entry.path();
+            ensure_no_reparse_components(&path).map_err(ShphError::Io)?;
+            let metadata = fs::symlink_metadata(&path).map_err(ShphError::Io)?;
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+
+            let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+            if ext != "json" {
+                continue;
+            }
+            if metadata.len() > self.max_file_bytes {
+                quarantine_file(&path);
+                continue;
+            }
+            account_scan_bytes(&mut scanned_bytes, metadata.len())?;
+
+            let bytes = match read_file_bytes(&path, self.max_file_bytes) {
+                Ok(bytes) => bytes,
+                Err(ShphError::Protocol(_)) => {
+                    quarantine_file(&path);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let envelope: OfflineMeshEnvelope = match serde_json::from_slice(&bytes) {
+                Ok(e) => e,
+                Err(_) => {
+                    quarantine_file(&path);
+                    continue;
+                }
+            };
+            if envelope.session_id != expected_session
+                || envelope.from != self.peer_node
+                || envelope.to != self.local_node
+                || self.seen_sequences.contains(&envelope.sequence)
+            {
+                continue;
+            }
+            match account_candidate_memory(
+                &mut candidate_memory,
+                &path,
+                &[&envelope.session_id, &envelope.from, &envelope.to],
+            ) {
+                Ok(()) => {}
+                Err(ShphError::Protocol(_)) => {
+                    quarantine_file(&path);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            candidates.push(OfflineMeshCandidate {
+                path,
+                sequence: envelope.sequence,
+            });
+        }
         if candidates.is_empty() {
             return Ok(None);
         }
 
-        candidates.sort_by_key(|a| a.1.sequence);
-        for (path, envelope) in candidates {
+        candidates.sort_by_key(|candidate| candidate.sequence);
+        for candidate in candidates {
+            let Some(claimed) = claim_file(&candidate.path).map_err(ShphError::Io)? else {
+                continue;
+            };
+            let bytes = match read_file_bytes(&claimed.path, self.max_file_bytes) {
+                Ok(bytes) => bytes,
+                Err(ShphError::Protocol(_)) => {
+                    quarantine_claimed_file(claimed);
+                    continue;
+                }
+                Err(ShphError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            let envelope: OfflineMeshEnvelope = match serde_json::from_slice(&bytes) {
+                Ok(envelope) => envelope,
+                Err(_) => {
+                    quarantine_claimed_file(claimed);
+                    continue;
+                }
+            };
+            if envelope.session_id != expected_session
+                || envelope.from != self.peer_node
+                || envelope.to != self.local_node
+                || envelope.sequence != candidate.sequence
+                || self.seen_sequences.contains(&envelope.sequence)
+            {
+                quarantine_claimed_file(claimed);
+                continue;
+            }
             match base64::engine::general_purpose::STANDARD
                 .decode(envelope.ciphertext_b64.as_bytes())
             {
-                Ok(payload) => return Ok(Some((payload, path, envelope.sequence))),
-                Err(_) => quarantine_file(&path),
+                Ok(payload) => {
+                    return Ok(Some(OfflineMeshFrame {
+                        payload,
+                        claimed,
+                        sequence: envelope.sequence,
+                    }))
+                }
+                Err(_) => quarantine_claimed_file(claimed),
             }
         }
         Ok(None)
@@ -2386,6 +2951,12 @@ impl OfflineMeshReadState {
             }
         }
     }
+}
+
+struct OfflineMeshFrame {
+    payload: Vec<u8>,
+    claimed: ClaimedFile,
+    sequence: u64,
 }
 
 struct DataMuleSession {
@@ -2460,17 +3031,15 @@ struct DataMuleReceiver {
 
 impl DataMuleReceiver {
     fn recv_frame(&mut self) -> Result<Vec<u8>> {
-        let frame = self.state.receive_envelope(self.timeout)?;
-        let plaintext = self.cipher.decrypt(&frame.payload)?;
-        self.state.commit_envelope(&frame)?;
-        Ok(plaintext)
+        self.state
+            .receive_decrypted_frame(&mut self.cipher, self.timeout)
     }
 }
 
 struct DataMuleEnvelopeFrame {
     payload: Vec<u8>,
     envelope: DataMuleEnvelope,
-    path: PathBuf,
+    claimed: ClaimedFile,
 }
 
 struct DataMuleWriteState {
@@ -2488,7 +3057,7 @@ impl DataMuleWriteState {
             local_node: local_node.to_string(),
             peer_node: peer_node.to_string(),
             next_sequence: 0,
-            max_file_bytes: cfg.max_file_bytes,
+            max_file_bytes: cfg.max_file_bytes.clamp(1, MAX_FILE_ADAPTER_BYTES),
         }
     }
 
@@ -2535,7 +3104,7 @@ impl DataMuleReadState {
             seen_envelopes: HashSet::new(),
             seen_order: VecDeque::new(),
             max_seen: 1024,
-            max_file_bytes: cfg.max_file_bytes,
+            max_file_bytes: cfg.max_file_bytes.clamp(1, MAX_FILE_ADAPTER_BYTES),
         }
     }
 
@@ -2544,10 +3113,12 @@ impl DataMuleReadState {
         loop {
             if let Some(frame) = self.poll_envelope()? {
                 if frame.envelope.to_node != self.local_node {
+                    quarantine_claimed_file(frame.claimed);
                     continue;
                 }
                 if let Some(peer) = self.peer_filter.as_ref() {
                     if peer != &frame.envelope.from_node {
+                        quarantine_claimed_file(frame.claimed);
                         continue;
                     }
                 }
@@ -2570,37 +3141,78 @@ impl DataMuleReadState {
         Ok(payload)
     }
 
+    fn receive_decrypted_frame(
+        &mut self,
+        cipher: &mut ReceiveCipher,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let frame = self.receive_envelope(remaining)?;
+            match cipher.decrypt(&frame.payload) {
+                Ok(plaintext) => {
+                    self.commit_envelope(&frame)?;
+                    return Ok(plaintext);
+                }
+                Err(error) => {
+                    quarantine_claimed_file(frame.claimed);
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
     fn commit_envelope(&mut self, frame: &DataMuleEnvelopeFrame) -> Result<()> {
         self.mark_seen(&frame.envelope)?;
-        let _ = fs::remove_file(&frame.path);
+        let _ = fs::remove_file(&frame.claimed.path);
         Ok(())
     }
 
     fn poll_envelope(&mut self) -> Result<Option<DataMuleEnvelopeFrame>> {
         let root = Path::new(&self.inbox_dir);
-        let mut candidates: Vec<(PathBuf, DataMuleEnvelope)> = Vec::new();
+        let mut candidates = Vec::new();
         let mut scanned = 0;
-        collect_shph_files(root, &mut candidates, self.max_file_bytes, 0, &mut scanned)?;
+        let mut scanned_bytes = 0u64;
+        let mut candidate_memory = 0usize;
+        collect_shph_files(
+            root,
+            &mut candidates,
+            self.max_file_bytes,
+            0,
+            &mut scanned,
+            &mut scanned_bytes,
+            &mut candidate_memory,
+        )?;
 
-        candidates.retain(|(_, envelope)| {
-            envelope.to_node == self.local_node
+        candidates.retain(|candidate: &DataMuleCandidate| {
+            candidate.to_node == self.local_node
                 && self
                     .peer_filter
                     .as_ref()
-                    .is_none_or(|peer| peer == &envelope.from_node)
-                && !self.seen_envelopes.contains(&Self::replay_key(envelope))
+                    .is_none_or(|peer| peer == &candidate.from_node)
+                && !self.seen_envelopes.contains(&format!(
+                    "{}\0{}",
+                    candidate.from_node, candidate.envelope_id
+                ))
         });
 
         if candidates.is_empty() {
             return Ok(None);
         }
 
-        candidates.sort_by_key(|a| (a.1.created_at_unix_ms, a.1.envelope_id.clone()));
-        for (path, _) in candidates {
-            let bytes = match read_file_bytes(&path, self.max_file_bytes) {
+        candidates
+            .sort_by_key(|candidate| (candidate.created_at_unix_ms, candidate.envelope_id.clone()));
+        for candidate in candidates {
+            let Some(claimed) = claim_file(&candidate.path).map_err(ShphError::Io)? else {
+                continue;
+            };
+            let bytes = match read_file_bytes(&claimed.path, self.max_file_bytes) {
                 Ok(bytes) => bytes,
                 Err(ShphError::Protocol(_)) => {
-                    quarantine_file(&path);
+                    quarantine_claimed_file(claimed);
                     continue;
                 }
                 Err(ShphError::Io(err)) if err.kind() == io::ErrorKind::NotFound => continue,
@@ -2609,7 +3221,7 @@ impl DataMuleReadState {
             let envelope: DataMuleEnvelope = match serde_json::from_slice(&bytes) {
                 Ok(envelope) => envelope,
                 Err(_) => {
-                    quarantine_file(&path);
+                    quarantine_claimed_file(claimed);
                     continue;
                 }
             };
@@ -2619,7 +3231,12 @@ impl DataMuleReadState {
                     .as_ref()
                     .is_some_and(|peer| peer != &envelope.from_node)
                 || self.seen_envelopes.contains(&Self::replay_key(&envelope))
+                || envelope.created_at_unix_ms != candidate.created_at_unix_ms
+                || envelope.envelope_id != candidate.envelope_id
+                || envelope.from_node != candidate.from_node
+                || envelope.to_node != candidate.to_node
             {
+                quarantine_claimed_file(claimed);
                 continue;
             }
             let payload = match base64::engine::general_purpose::STANDARD
@@ -2627,7 +3244,7 @@ impl DataMuleReadState {
             {
                 Ok(payload) => payload,
                 Err(_) => {
-                    quarantine_file(&path);
+                    quarantine_claimed_file(claimed);
                     continue;
                 }
             };
@@ -2635,7 +3252,7 @@ impl DataMuleReadState {
             return Ok(Some(DataMuleEnvelopeFrame {
                 payload,
                 envelope,
-                path,
+                claimed,
             }));
         }
         Ok(None)
@@ -2661,13 +3278,23 @@ impl DataMuleReadState {
 
 fn collect_shph_files(
     root: &Path,
-    out: &mut Vec<(PathBuf, DataMuleEnvelope)>,
+    out: &mut Vec<DataMuleCandidate>,
     max_file_bytes: u64,
     depth: usize,
     scanned: &mut usize,
+    scanned_bytes: &mut u64,
+    candidate_memory: &mut usize,
 ) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
+    ensure_no_reparse_components(root).map_err(ShphError::Io)?;
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ShphError::Io(error)),
+    };
+    if !root_metadata.is_dir() {
+        return Err(ShphError::Protocol(
+            "data-mule inbox root is not a directory".into(),
+        ));
     }
     if depth > MAX_QUEUE_SCAN_DEPTH {
         return Err(ShphError::ResourceExhausted(
@@ -2676,20 +3303,24 @@ fn collect_shph_files(
     }
 
     for entry in fs::read_dir(root).map_err(ShphError::Io)? {
-        *scanned = scanned.saturating_add(1);
-        if *scanned > MAX_QUEUE_SCAN_ENTRIES {
-            return Err(ShphError::ResourceExhausted(
-                "data-mule inbox contains too many entries to scan safely".into(),
-            ));
-        }
+        account_scan_entry(scanned)?;
         let entry = entry.map_err(ShphError::Io)?;
         let path = entry.path();
+        ensure_no_reparse_components(&path).map_err(ShphError::Io)?;
         let metadata = fs::symlink_metadata(&path).map_err(ShphError::Io)?;
         if metadata.file_type().is_symlink() {
             continue;
         }
         if metadata.is_dir() {
-            collect_shph_files(&path, out, max_file_bytes, depth + 1, scanned)?;
+            collect_shph_files(
+                &path,
+                out,
+                max_file_bytes,
+                depth + 1,
+                scanned,
+                scanned_bytes,
+                candidate_memory,
+            )?;
             continue;
         }
 
@@ -2697,6 +3328,11 @@ fn collect_shph_files(
         if ext != "shph" {
             continue;
         }
+        if metadata.len() > max_file_bytes {
+            quarantine_file(&path);
+            continue;
+        }
+        account_scan_bytes(scanned_bytes, metadata.len())?;
 
         let bytes = match read_file_bytes(&path, max_file_bytes) {
             Ok(bytes) => bytes,
@@ -2707,7 +3343,31 @@ fn collect_shph_files(
             Err(err) => return Err(err),
         };
         match serde_json::from_slice::<DataMuleEnvelope>(&bytes) {
-            Ok(envelope) => out.push((path, envelope)),
+            Ok(envelope) => {
+                match account_candidate_memory(
+                    candidate_memory,
+                    &path,
+                    &[
+                        &envelope.envelope_id,
+                        &envelope.from_node,
+                        &envelope.to_node,
+                    ],
+                ) {
+                    Ok(()) => {}
+                    Err(ShphError::Protocol(_)) => {
+                        quarantine_file(&path);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+                out.push(DataMuleCandidate {
+                    path,
+                    created_at_unix_ms: envelope.created_at_unix_ms,
+                    envelope_id: envelope.envelope_id,
+                    from_node: envelope.from_node,
+                    to_node: envelope.to_node,
+                });
+            }
             Err(_) => {
                 quarantine_file(&path);
             }
@@ -2720,20 +3380,47 @@ fn collect_shph_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_secure_session_lab, connect_secure_session_lab, DataMuleConfig, QuicLabConfig,
+        accept_secure_session_lab, connect_secure_session_lab, tcp_secure_receive, tcp_secure_send,
+        DataMuleConfig, QuicLabConfig,
     };
     use super::{collect_shph_files, TEMP_FILE_COUNTER};
     use super::{
         decode_encrypted_quic_frame, PeerRateLimiter, TransportMode,
         MAX_CONNECTS_PER_PEER_PER_WINDOW, MAX_QUIC_TRACKED_PEERS,
     };
-    use shph_core::{HandshakeProfile, IdentityKeyPair};
+    use shph_core::{
+        HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy, ReceiveCipher, SendCipher,
+    };
     use std::fs;
     use std::io::Write;
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn tcp_secure_helpers_preserve_aead_nonce_state_between_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let mut receiver = ReceiveCipher::new([0x41; 32]);
+            assert_eq!(
+                tcp_secure_receive(&mut stream, &mut receiver).expect("receive first frame"),
+                b"first"
+            );
+            assert_eq!(
+                tcp_secure_receive(&mut stream, &mut receiver).expect("receive second frame"),
+                b"second"
+            );
+        });
+
+        let mut stream = TcpStream::connect(address).expect("connect TCP listener");
+        let mut sender = SendCipher::new([0x41; 32]);
+        tcp_secure_send(&mut stream, &mut sender, b"first").expect("send first frame");
+        tcp_secure_send(&mut stream, &mut sender, b"second").expect("send second frame");
+        server.join().expect("server thread");
+    }
 
     #[test]
     fn transport_mode_parses_supported_values() {
@@ -2800,12 +3487,16 @@ mod tests {
 
         let server_identity = IdentityKeyPair::generate().expect("server identity");
         let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
         let server_identity_for_thread = server_identity.clone();
+        let server_policy_for_thread = server_policy.clone();
         let server_address = address.to_string();
         let server = thread::spawn(move || {
             super::tcp_accept_and_handshake_with_profile(
                 &server_address,
                 &server_identity_for_thread,
+                &server_policy_for_thread,
                 5,
                 HandshakeProfile::ClassicalLab,
             )
@@ -2824,6 +3515,7 @@ mod tests {
             super::tcp_handshake_client_with_profile(
                 &client_address,
                 &client_identity,
+                &client_policy,
                 5,
                 HandshakeProfile::ClassicalLab,
             )
@@ -2843,7 +3535,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_rate_limiter_bounds_source_table() {
+    fn peer_rate_limiter_evicts_oldest_source() {
         let mut rl = PeerRateLimiter::new();
         for octet in 0..MAX_QUIC_TRACKED_PEERS {
             let addr: SocketAddr = format!("10.{}.{}.1:1", octet / 256, octet % 256)
@@ -2851,9 +3543,11 @@ mod tests {
                 .unwrap();
             assert!(rl.check_and_record(addr).is_ok());
         }
-        let rejected: SocketAddr = "11.0.0.1:1".parse().unwrap();
-        assert!(rl.check_and_record(rejected).is_err());
+        let admitted: SocketAddr = "11.0.0.1:1".parse().unwrap();
+        assert!(rl.check_and_record(admitted).is_ok());
         assert!(rl.seen.len() <= MAX_QUIC_TRACKED_PEERS);
+        assert!(!rl.seen.contains_key("10.0.0.1"));
+        assert!(rl.seen.contains_key("11.0.0.1"));
     }
 
     #[test]
@@ -3022,6 +3716,8 @@ mod tests {
 
         let server_id = IdentityKeyPair::generate().unwrap();
         let client_id = IdentityKeyPair::generate().unwrap();
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_id));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_id));
         // Reserve a real loopback port, then release it so the server can bind.
         let probe = match UdpSocket::bind("127.0.0.1:0") {
             Ok(socket) => socket,
@@ -3037,13 +3733,21 @@ mod tests {
         // Run the server (accept) on the main thread so its bound socket is the
         // injection target; the client connects from a background thread.
         let client_id2 = client_id.clone();
+        let client_policy2 = client_policy.clone();
         let peer = server_addr.to_string();
         let client_handle = thread::spawn(move || {
-            super::connect_secure_session(&peer, &client_id2, 5, super::TransportMode::Quic)
+            super::connect_secure_session(
+                &peer,
+                &client_id2,
+                &client_policy2,
+                5,
+                super::TransportMode::Quic,
+            )
         });
         let (mut server_sess, _state) = super::accept_secure_session(
             &server_addr.to_string(),
             &server_id,
+            &server_policy,
             5,
             super::TransportMode::Quic,
         )
@@ -3091,14 +3795,18 @@ mod tests {
         }
         let server_id = IdentityKeyPair::generate().unwrap();
         let client_id = IdentityKeyPair::generate().unwrap();
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_id));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_id));
         let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server_addr = probe.local_addr().unwrap();
         drop(probe);
         let peer = server_addr.to_string();
+        let client_policy2 = client_policy.clone();
         let client_handle = thread::spawn(move || {
             let (mut session, _) = connect_secure_session_lab(
                 &peer,
                 &client_id,
+                &client_policy2,
                 5,
                 TransportMode::Quic,
                 QuicLabConfig {
@@ -3111,6 +3819,7 @@ mod tests {
         let (mut session, _) = accept_secure_session_lab(
             &server_addr.to_string(),
             &server_id,
+            &server_policy,
             5,
             TransportMode::Quic,
             QuicLabConfig {
@@ -3139,14 +3848,18 @@ mod tests {
         }
         let server_id = IdentityKeyPair::generate().unwrap();
         let client_id = IdentityKeyPair::generate().unwrap();
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_id));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_id));
         let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server_addr = probe.local_addr().unwrap();
         drop(probe);
         let peer = server_addr.to_string();
+        let client_policy2 = client_policy.clone();
         let client_handle = thread::spawn(move || {
             let (mut session, _) = connect_secure_session_lab(
                 &peer,
                 &client_id,
+                &client_policy2,
                 5,
                 TransportMode::Quic,
                 QuicLabConfig {
@@ -3159,6 +3872,7 @@ mod tests {
         let (mut session, _) = accept_secure_session_lab(
             &server_addr.to_string(),
             &server_id,
+            &server_policy,
             5,
             TransportMode::Quic,
             QuicLabConfig {
@@ -3183,7 +3897,18 @@ mod tests {
 
         let mut out = Vec::new();
         let mut scanned = 0;
-        collect_shph_files(&root, &mut out, 4096, 0, &mut scanned).unwrap();
+        let mut scanned_bytes = 0;
+        let mut candidate_memory = 0;
+        collect_shph_files(
+            &root,
+            &mut out,
+            4096,
+            0,
+            &mut scanned,
+            &mut scanned_bytes,
+            &mut candidate_memory,
+        )
+        .unwrap();
 
         assert!(out.is_empty());
         assert!(!bad.exists());
@@ -3206,7 +3931,18 @@ mod tests {
 
         let mut out = Vec::new();
         let mut scanned = 0;
-        collect_shph_files(&root, &mut out, 4096, 0, &mut scanned).unwrap();
+        let mut scanned_bytes = 0;
+        let mut candidate_memory = 0;
+        collect_shph_files(
+            &root,
+            &mut out,
+            4096,
+            0,
+            &mut scanned,
+            &mut scanned_bytes,
+            &mut candidate_memory,
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(existing).unwrap(), "previous evidence");
         assert!(root

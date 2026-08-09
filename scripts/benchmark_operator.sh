@@ -11,6 +11,7 @@
 #   scripts/benchmark_operator.sh --mode control-plane --config /path/config.toml
 #   scripts/benchmark_operator.sh --mode reconnect --config /path/config.toml
 #   scripts/benchmark_operator.sh --mode tun --config /path/config.toml
+#   scripts/benchmark_operator.sh --mode tun-namespace
 #   scripts/benchmark_operator.sh --mode all --config /path/config.toml
 #
 # For two-host work, run the same prepared configuration on both machines and
@@ -37,7 +38,7 @@ usage() {
   cat <<'USAGE'
 
 Options:
-  --mode MODE             local|lifecycle|control-plane|reconnect|tun|all
+  --mode MODE             local|lifecycle|control-plane|reconnect|tun|tun-namespace|all
   --config PATH           Existing operator configuration for non-local modes
   --output PATH           Append measurements to this file
   --frames N              Sustained frame count for local benchmark
@@ -181,7 +182,7 @@ run_tun() {
     return 0
   fi
   if [[ "$(uname -s)" != "Linux" ]]; then
-    skip tun "native TUN benchmark is Linux-only; Windows requires provisioned signed Wintun"
+    skip tun "native TUN benchmark is Linux-only; Windows requires a provisioned hash-pinned Wintun runtime and elevated validator"
     return 0
   fi
   if [[ ! -r /dev/net/tun || ! -w /dev/net/tun ]]; then
@@ -209,17 +210,24 @@ run_tun() {
     "$BIN" --config "$CONFIG" up
 }
 
+run_tun_namespace() {
+  metadata
+  "$ROOT/scripts/native_tun_namespace_test.sh"
+}
+
 case "$MODE" in
   local) run_local ;;
   lifecycle) run_lifecycle ;;
   control-plane|control_plane) run_control_plane ;;
   reconnect) run_reconnect ;;
   tun) run_tun ;;
+  tun-namespace|tun_namespace) run_tun_namespace ;;
   all)
     run_local
     run_lifecycle
     run_control_plane
     run_reconnect
+    run_tun_namespace
     run_tun
     ;;
   *) echo "invalid mode: $MODE" >&2; usage >&2; exit 2 ;;

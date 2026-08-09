@@ -7,9 +7,11 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-07-30)
+## Current Status (2026-08-09)
 
-SHPH is **functional for controlled lab environments**, but still **not production-hardened** for hostile-network claims.
+Workspace version `0.6.0-dev.0`. SHPH is **functional for controlled lab
+environments**, but still **not production-hardened** for hostile-network
+claims.
 
 ### Working today
 
@@ -22,9 +24,25 @@ SHPH is **functional for controlled lab environments**, but still **not producti
   - continuous secure loop mode (`connect`/`listen`).
 - Linux native TUN path available behind opt-in flag:
   - set `SHPH_TUN_NATIVE=1` to enable packet read/write via `/dev/net/tun`.
-- Windows native TUN is not yet provisioned; setting `SHPH_TUN_NATIVE=1`
-  fails explicitly until a signed Wintun runtime is integrated, rather than
-  silently using the developer stub.
+  - Linux `up` uses the Tokio `AsyncFd` bridge with bounded packet queues and
+    blocking transport workers; shutdown and transport failures propagate
+    without silently falling back.
+  - the `up` path keeps the validated device open through control-plane setup
+    and reconnect attempts.
+  - malformed/oversized IP packets and short kernel writes fail closed; bridge
+    packet buffers are zeroized on drop.
+- Windows includes a wired Wintun backend with application-local loading,
+  elevation checks, pinned SHA-256 provenance, bounded rings, packet
+  validation, shared-session cloning, bounded event waits, and RAII teardown.
+  The operator validator additionally requires a valid Authenticode signature.
+  `SHPH_TUN_NATIVE=1` remains host-gated until a real elevated Windows host
+  verifies the runtime, adapter lifecycle, and packet path.
+- Native Windows validation passes formatting, locked checks, strict Clippy,
+  **180 workspace tests**, release builds, Windows-only Wintun unit tests,
+  Windows ACL coverage, and both benchmark profiles. The post-loader smoke
+  reached a real Wintun adapter/session and left no residue; a clean elevated
+  rerun after the route-rollback fix remains the final confirmation. See
+  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`.
 - Lab-only controls:
   - set `SHPH_KEYSTORE_PASSWORD` before `init` to encrypt the keystore at rest.
   - set `SHPH_SHROUD_PROFILE=off|low|medium|high|extreme-lab` with
@@ -37,14 +55,21 @@ SHPH is **functional for controlled lab environments**, but still **not producti
     (opt-in RFC QUIC for `listen`/`connect`/one-shot commands),
     `offline-mesh` (experimental), `data-mule` (experimental).
   - `quic-standard` requires `--quic-cert` and trusted out-of-band
-    certificate distribution. `up --transport quic-standard` is rejected until
-    the async TUN bridge is implemented; native TUN is not part of this path.
+    certificate distribution. On Linux, `up --transport quic-standard` uses
+    the async standards-QUIC/native-TUN bridge and requires
+    `SHPH_TUN_NATIVE=1`; reconnect is intentionally rejected until persistent
+    server certificate/key support is implemented. Other platforms remain
+    host-gated.
 - Standalone fuzzing harnesses for Shroud-cell framing, TOML configuration,
   audit-record JSON, and replay-window state transitions live under `fuzz/`.
 - Explicit benchmark profiles are available:
   - `secure-default` keeps authenticated Ed25519 + X25519 + mandatory ML-KEM-768.
   - `classical-lab` is a visible benchmark-only X25519 mode and requires both
     peers to opt in; it is rejected by secure-default peers.
+- Optional passive JA4-compatible observability is available through the
+  `shph-transport` standards-QUIC API. It is disabled by default, records
+  bounded public rustls ClientHello metadata, and does not spoof fingerprints
+  or claim stealth. See `docs/JA4_OBSERVABILITY.md`.
 - Native Linux benchmark runner:
   `cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile secure-default --suite all --iterations 10000 --frames 100000`
   It reports p50/p95/p99/p99.9 latency, in-memory goodput/wire rate, CPU,
@@ -52,7 +77,8 @@ SHPH is **functional for controlled lab environments**, but still **not producti
   measurements; it does not replace live TUN/two-host testing.
 - Operator benchmark wrapper: `scripts/benchmark_operator.sh` measures real
   lifecycle, control-plane, reconnect, and native-TUN prerequisites without
-  fabricating unsupported results.
+  fabricating unsupported results. `scripts/benchmark_native_tun.sh` measures
+  only isolated open/hold/close lifecycle latency.
 
 ### Not done yet
 
@@ -63,6 +89,9 @@ SHPH is **functional for controlled lab environments**, but still **not producti
   primitives, but are not production defaults or claims of live hardware/
   transport integrations. Hybrid PQC is shipped in v0.4.0.
 - Full production anti-observation claims are explicitly out of scope at this stage.
+- Elevated live Wintun adapter/packet I/O, route/DNS rollback, reconnect,
+  Ctrl+C teardown, two-node Windows forwarding, and native Linux two-host
+  evidence remain release gates.
 
 For the delivery/funding roadmap, see `ROADMAP_OSS_AND_DELIVERY.md`.
 The active sequence is Shroud lab completion, hardening and optimization,
@@ -75,21 +104,24 @@ SHPH inherits core concepts from the Shroud lineage (adaptive framing and profil
 ```text
 shph/
 ├── Cargo.toml
+├── benchmarks/        # standalone Linux-first benchmark harness
+├── fuzz/              # standalone cargo-fuzz workspace and targets
 ├── shph-core/         # crypto, handshake, shared types
 ├── shph-config/       # TOML config schema + IO
 ├── shph-tun/          # TUN abstraction
 ├── shph-transport/    # transport mode/parsing support
-├── shph-obfuscation/  # profile surface (early)
+├── shph-obfuscation/  # profile surface
 ├── shph-cli/          # shph binary + integration tests
 ├── shph-tui/          # optional terminal UI
-├── docs/              # testing/control-plane/TUI/path docs
-└── src/               # shared root helpers
+├── scripts/            # evidence, demo, benchmark, and mirror helpers
+└── docs/              # operator, roadmap, audit, and evidence docs
 ```
 
-## Current Verified Artifact Paths
+## Reproducibility
 
-- Primary working copy: `/home/mori/SHPH_working_copy`
-- Clean funded mirror: `D:\FUNDING NEEDED\snap-shroud-rs`
+Run validation commands from the repository root. Generated benchmark and
+evidence artifacts are written beneath `benchmark-runs/` and `docs/evidence/`
+as described in the testing documentation.
 
 ## Quick Start
 
@@ -176,7 +208,7 @@ Behavior:
 
 ```text
 shph init --new
-shph up --config <path> [--transport tcp|quic|offline-mesh|data-mule]
+shph up --config <path> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
 shph down
 shph apply
 shph reconcile
@@ -189,10 +221,10 @@ shph list-peers
 shph add-peer <alias> <host> <port> <pubkey> --sign-pubkey <ed25519-pubkey>
 shph show-config
 shph handshake-sim --peer-pubkey-b64 <key>
-shph listen --bind <addr> [--transport tcp|quic|offline-mesh|data-mule]
-shph connect --peer <addr> [--transport tcp|quic|offline-mesh|data-mule]
-shph send-once --peer <addr> --text <msg> [--transport tcp|quic|offline-mesh|data-mule]
-shph recv-once --bind <addr> [--transport tcp|quic|offline-mesh|data-mule]
+shph listen --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
+shph connect --peer <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
+shph send-once --peer <addr> --text <msg> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
+shph recv-once --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
 cargo run -p shph-tui
 ```
 
@@ -207,13 +239,15 @@ cargo test --workspace
 
 Additional docs:
 
+- `WHY_SHPH.md` (project rationale, transport focus, and funding case)
+- `FIVE_MINUTE_QUICKSTART.md` (local authenticated encrypted exchange)
 - `docs/TESTING.md`
 - `docs/CONTROL_PLANE.md`
 - `docs/TUI.md`
 - `fuzz/README.md`
 - `docs/DIRECTORY_GUIDE.md`
 - `docs/REPRODUCIBILITY.md`
-- `docs/SYNC.md` (mirroring working copy <-> Windows tree)
+- `docs/SYNC.md` (optional synchronization for multiple checkouts)
 - `docs/FUNDERS.md` (what SHPH is/is-not, for grant reviewers)
 - `docs/CRYPTO_FUNDING_BOOTSTRAP.md` (crypto-only bootstrap campaign draft)
 - `docs/RISK_MATRIX.md` (current limits + explicit exclusions)
@@ -227,16 +261,20 @@ Additional docs:
 - `docs/SUPPLY_CHAIN_SCAN.md` (cargo-audit scanner + advisory triage)
 - `docs/HARDENING.md` (post-funding security-hardening summary + threat impact)
 - `docs/BENCHMARKING.md` (Linux-first benchmark methodology and profile plan)
-- `docs/BENCHMARK_RESULTS_2026-07-28.md` (latest versioned benchmark scores and evidence limits)
+- `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md` (latest Shroud 2.0 morphology report)
+- `docs/BENCHMARK_RESULTS_2026-07-28.md` (historical WSL2 benchmark scores and evidence limits)
 - `docs/LAB_PROTOTYPES.md` (operational guide for QUIC-shim, offline-mesh, and data-mule labs)
 - `docs/QUIC_STANDARDS.md` (RFC QUIC architecture, usage, and verification)
 - `docs/evidence/CARGO_AUDIT.txt` (regenerable advisory-scan output)
-- `docs/DESCRIBE_PROJECT_SONNET5.md` (independent external description + threat model)
-- `docs/EXTERNAL_AUDIT_SONNET5.md` (independent external gate-verification audit)
+- `docs/INTERNAL_PROJECT_ASSESSMENT_2026-07-06.md` (historical internal
+  project assessment)
+- `docs/INTERNAL_RELEASE_READINESS_REVIEW_2026-07-06.md` (historical internal
+  gate-verification review)
 - `CHANGELOG.md` (phase-anchored changelog)
 - `SECURITY.md` (vulnerability reporting, threat model, non-claims matrix)
 - `CONTRIBUTING.md` (build/test, release checklist, governance)
 - `.github/workflows/ci.yml` (Linux + Windows CI template)
+- `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` (latest native Windows evidence)
 
 ## Security Note
 

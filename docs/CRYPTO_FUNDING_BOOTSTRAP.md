@@ -44,7 +44,7 @@ Acceptance:
 - `cargo test --workspace` passes with zero failures.
 - `cargo build --workspace --locked` passes.
 - `scripts/capture_evidence.sh` is refreshed.
-- Linux/Windows mirror parity is verified.
+- Linux/Windows checkout parity is verified.
 - A signed or otherwise independently verifiable release artifact is published.
 
 ### M2 — Automated security testing — $2,000
@@ -62,8 +62,9 @@ Acceptance:
 Acceptance:
 
 - A real Windows host validates the documented build and CLI smoke tests.
-- Native TUN behavior is either validated with a signed Wintun runtime or
-  remains explicitly fail-closed with an operator-facing explanation.
+- Native TUN behavior is either validated with an operator-approved Wintun
+  runtime (hash-pinned by the loader and Authenticode-checked by the validator)
+  or remains explicitly fail-closed with an operator-facing explanation.
 - Windows route/DNS behavior is tested in dry-run mode and, where privileged
   access is available, in a controlled apply/rollback test.
 - Platform limitations are recorded in the evidence log.

@@ -18,10 +18,11 @@ SHPH now contains an opt-in, standards-compliant QUIC transport in
 The existing `TransportMode::Quic` API is intentionally still the legacy
 experimental UDP shim. It is not silently redefined, because changing its wire
 format would break existing lab users and invalidate historical measurements.
-Use the explicit `quic-standard` CLI mode for one-shot and handshake
-commands. Continuous `up` mode still rejects this transport because its
-async TUN bridge is not implemented; native TUN remains a separate later
-phase.
+Use the explicit `quic-standard` CLI mode for one-shot, handshake, and Linux
+native-TUN session commands. Continuous `up` requires a real native TUN device
+and an operator-managed certificate path; the default stub TUN is rejected.
+The bridge is Linux-only for now because the asynchronous TUN implementation
+uses Tokio `AsyncFd`. Windows Wintun remains a separate host-validation gate.
 
 ## Architecture Decision
 
@@ -49,6 +50,28 @@ The module provides:
 4. `send_control`/`recv_control`, which use bounded reliable stream messages.
 5. `send_datagram`/`recv_datagram`, which use bounded unreliable QUIC
    datagrams.
+6. `shph_transport::standards_tun::run` on Linux, which connects two cloned
+   `AsyncTunDevice` handles to the QUIC DATAGRAM data plane.
+
+### Optional passive JA4 observability
+
+The standards server path has an explicit opt-in observer constructor:
+
+```text
+server_endpoint_with_ja4_observer(...)
+```
+
+It observes real rustls ClientHello metadata through the certificate resolver.
+The default `server_endpoint(...)` constructor remains observer-free. The
+plugin is passive and does not alter ClientHello bytes, certificate policy,
+QUIC behavior, or the SHPH application handshake. See
+`docs/JA4_OBSERVABILITY.md` for the API and resource/privacy boundaries.
+
+Live observations are deliberately marked as a public-rustls subset rather
+than exact JA4: the public hook does not expose the complete ordered extension
+list and supported-version details needed for a wire-level claim. Complete
+metadata supplied through `Ja4ClientHello` can still be rendered using the
+canonical hashed or raw-list form for offline lab analysis.
 
 The certificate helper is for controlled lab deployments. Production
 deployment still needs an operator-managed certificate and trust distribution
@@ -73,6 +96,10 @@ shph recv-once --bind 127.0.0.1:7220 \
   --transport quic-standard --quic-cert /path/server.der
 shph send-once --peer 127.0.0.1:7220 --text "hello" \
   --transport quic-standard --quic-cert /path/server.der
+
+# continuous Linux native-TUN session
+SHPH_TUN_NATIVE=1 shph up --config /path/client.toml \
+  --transport quic-standard --quic-cert /path/server.der
 ```
 
 The client trusts exactly the certificate file supplied with `--quic-cert`;
@@ -81,9 +108,16 @@ without following final-component symlinks, and server replacement refuses an
 existing symlink destination. Peer identity and signing-key pinning are still
 required by the SHPH application policy.
 
-`up --transport quic-standard` is intentionally rejected until an async
-standards-QUIC-to-TUN bridge is implemented and separately tested. Do not
-interpret the one-shot CLI support as a native TUN or production VPN claim.
+`up --transport quic-standard` fails closed unless native TUN is active and
+`--quic-cert` is supplied. The bridge uses unreliable QUIC DATAGRAM frames for
+IP packets, validates every received packet before TUN injection, drops
+oversized packets, and closes after a bounded number of malformed datagrams.
+This is Linux lab/controlled-deployment support, not a production VPN claim.
+The session reconnect option is intentionally rejected for this mode: a
+listener currently creates a self-signed certificate per process invocation,
+so automatic listener recreation would invalidate the connector's trusted DER
+certificate. Persistent server certificate/key support is required before
+standards-QUIC reconnect can be enabled safely.
 
 ## Hardening
 
@@ -95,6 +129,10 @@ The standards path:
   negotiated QUIC datagram limit.
 - Bounds the QUIC datagram buffer to 1 MiB and concurrent stream limits to 1024.
 - Uses a finite 30-second default idle timeout.
+- Disables TLS 1.3 early data (0-RTT) on both endpoints. The SHPH application
+  handshake and datagram data plane are only admitted after the normal
+  authenticated handshake, avoiding replayable pre-handshake application
+  input.
 - Applies the configured peer allowlist before one-shot payload send/receive.
 - Uses the awaited datagram send path for one-shot delivery so local
   congestion-buffer exhaustion is reported instead of silently dropping the
@@ -103,7 +141,13 @@ The standards path:
   reliable control stream; the receive side keeps the connection alive until
   the sender closes, so success reflects peer receipt rather than only local
   queueing.
-- Keeps the legacy shim and native TUN work separate.
+- Native-TUN bridge packet buffers are bounded and zeroized on drop.
+- The native-TUN bridge rejects oversized datagrams before copying them into a
+  zeroizing packet buffer, and its malformed-datagram close budget is bounded.
+- The bridge does not use `send_datagram_wait` for IP data, avoiding an
+  unbounded reliable-style wait under saturation; Quinn's lossy datagram
+  queue remains the backpressure policy.
+- Keeps the legacy shim and standards/native-TUN paths separate.
 
 ## Verification
 
@@ -117,7 +161,7 @@ proves, on Linux loopback, that:
 - a QUIC DATAGRAM reaches the peer; and
 - an oversized tunnel datagram is rejected.
 
-This is transport interoperability evidence, not a claim that the legacy shim
-or native TUN integration is complete. The CLI coverage currently proves
-one-shot and handshake operations only; continuous `up` support remains
-pending the async TUN bridge.
+This is transport interoperability evidence, not a claim that the legacy shim,
+two-host routing, or production VPN integration is complete. Continuous
+standards-QUIC `up` is implemented for Linux native TUN, but it still requires
+privileged host validation and live two-host throughput/latency evidence.

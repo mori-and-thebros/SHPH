@@ -33,10 +33,11 @@ prevents silent dependency upgrades.
   ```bash
   cargo tree --workspace
   ```
-- For a vulnerability audit of the locked dependency set:
+- For a vulnerability audit of the locked dependency set, use the pinned CI
+  version where possible:
   ```bash
-  cargo install cargo-audit
-  cargo audit
+  cargo install cargo-audit --version 0.22.2 --locked
+  cargo audit --no-fetch
   ```
   Run this before tagging a release and record the result.
 
@@ -60,7 +61,8 @@ prevents silent dependency upgrades.
   distribution artifacts and document the build host if byte-identical binaries
   are required.
 
-## Cargo audit integration (recommended next step)
+## Cargo audit integration
 
-A `cargo audit` step can be added to `.github/workflows/ci.yml` once a release
-cadence is established, to fail CI on known advisories in the dependency tree.
+The CI workflow already runs `cargo audit` and explicitly ignores only the two
+accepted optional-TUI advisories documented in `docs/SUPPLY_CHAIN_SCAN.md`.
+New warnings or vulnerabilities fail the advisory job.

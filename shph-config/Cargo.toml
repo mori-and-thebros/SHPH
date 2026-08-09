@@ -15,3 +15,4 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
 home = "0.5"
+windows-sys = { workspace = true }

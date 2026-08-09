@@ -21,9 +21,9 @@ cargo audit 2>&1 | tee docs/evidence/CARGO_AUDIT.txt
 `cargo-audit` is a one-time `cargo install cargo-audit --locked` (not bundled,
 to avoid adding a build-time dependency).
 
-## 3. Triage (as of checkpoint-phaseB-1.0.0)
+## 3. Triage (current replay: 2026-08-05)
 
-Scanned **200 crate dependencies**. Result: **0 vulnerabilities**, 2
+The current lockfile scan covers **237 crate dependencies**. Result: **0 vulnerabilities**, 2
 advisory **warnings**, both transitive and isolated to the optional TUI.
 
 | Advisory | Crate | Severity | Path | Disposition |

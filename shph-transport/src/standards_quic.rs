@@ -7,15 +7,18 @@
 //! experimental UDP shim for compatibility; callers must opt into this module
 //! explicitly.
 
+use crate::ja4::{self, Ja4Observer, Ja4ObserverConfig};
+use crate::shroud2::{decode_datagram, encode_datagram, MorphologyEngine};
 use bytes::Bytes;
+use quinn::rustls::server::ResolvesServerCert;
 use quinn::{
     ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
     VarInt,
 };
 use shph_core::{
     absorb_responder_pq, build_hello_with_profile, finalize_initiator_pq, verify_and_derive,
-    verify_hello_signature, HandshakeProfile, HandshakeState, Hello, IdentityKeyPair, Result,
-    ShphError,
+    verify_hello_signature, HandshakeProfile, HandshakeState, Hello, IdentityKeyPair, PeerPolicy,
+    Result, ShphError,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,6 +32,8 @@ const MAX_DATAGRAM_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_CONCURRENT_STREAMS: u64 = 1024;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DATAGRAM_BUFFER_BYTES: usize = 256 * 1024;
+const MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A bounded transport configuration for the standards QUIC path.
 #[derive(Debug, Clone)]
@@ -64,6 +69,13 @@ impl StandardsQuicConfig {
         {
             return Err(ShphError::Config(format!(
                 "QUIC stream limits cannot exceed {MAX_CONCURRENT_STREAMS}"
+            )));
+        }
+        if self.idle_timeout < MIN_IDLE_TIMEOUT || self.idle_timeout > MAX_IDLE_TIMEOUT {
+            return Err(ShphError::Config(format!(
+                "QUIC idle timeout must be between {} and {} seconds",
+                MIN_IDLE_TIMEOUT.as_secs(),
+                MAX_IDLE_TIMEOUT.as_secs()
             )));
         }
         let idle_timeout = self
@@ -110,15 +122,39 @@ pub fn server_endpoint(
     bind_addr: SocketAddr,
     config: StandardsQuicConfig,
 ) -> Result<StandardsQuicServer> {
+    build_server_endpoint(bind_addr, config, None)
+}
+
+/// Create a standards QUIC server with an optional passive JA4 observer.
+///
+/// The observer receives bounded metadata from the real rustls ClientHello.
+/// It does not rewrite the handshake or affect certificate selection. Because
+/// rustls does not expose the complete extension list through this hook, live
+/// observations are explicitly marked as partial in [`ja4::Ja4Observation`].
+pub fn server_endpoint_with_ja4_observer(
+    bind_addr: SocketAddr,
+    config: StandardsQuicConfig,
+    observer: Arc<dyn Ja4Observer>,
+    observer_config: Ja4ObserverConfig,
+) -> Result<StandardsQuicServer> {
+    build_server_endpoint(bind_addr, config, Some((observer, observer_config)))
+}
+
+fn build_server_endpoint(
+    bind_addr: SocketAddr,
+    config: StandardsQuicConfig,
+    observer: Option<(Arc<dyn Ja4Observer>, Ja4ObserverConfig)>,
+) -> Result<StandardsQuicServer> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .map_err(|err| ShphError::Config(format!("generate QUIC certificate: {err}")))?;
     let certificate_der = cert.cert.der().to_vec();
     let certificate = quinn::rustls::pki_types::CertificateDer::from(certificate_der.clone());
     let private_key =
         quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let mut server_config =
-        ServerConfig::with_single_cert(vec![certificate], private_key.into())
-            .map_err(|err| ShphError::Config(format!("configure QUIC server TLS: {err}")))?;
+    let tls_config = build_server_tls_config(certificate, private_key.into(), observer)?;
+    let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls_config))
+        .map_err(|err| ShphError::Config(format!("configure QUIC TLS provider: {err}")))?;
+    let mut server_config = ServerConfig::with_crypto(Arc::new(quic_config));
     server_config
         .max_incoming(256)
         .incoming_buffer_size(256 * 1024)
@@ -138,18 +174,58 @@ pub fn client_endpoint(
     server_certificate_der: &[u8],
     config: StandardsQuicConfig,
 ) -> Result<Endpoint> {
+    let tls_config = build_client_tls_config(server_certificate_der)?;
+    let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls_config))
+        .map_err(|err| ShphError::Config(format!("configure QUIC client TLS provider: {err}")))?;
+    let mut client_config = ClientConfig::new(Arc::new(quic_config));
+    client_config.transport_config(config.transport_config()?);
+    let mut endpoint = Endpoint::client(bind_addr).map_err(ShphError::Io)?;
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
+fn build_server_tls_config(
+    certificate: quinn::rustls::pki_types::CertificateDer<'static>,
+    private_key: quinn::rustls::pki_types::PrivateKeyDer<'static>,
+    observer: Option<(Arc<dyn Ja4Observer>, Ja4ObserverConfig)>,
+) -> Result<quinn::rustls::ServerConfig> {
+    let provider = Arc::new(quinn::rustls::crypto::ring::default_provider());
+    let certified_key =
+        quinn::rustls::sign::CertifiedKey::from_der(vec![certificate], private_key, &provider)
+            .map_err(|err| {
+                ShphError::Config(format!("configure QUIC server certificate: {err}"))
+            })?;
+    let resolver: Arc<dyn ResolvesServerCert> = match observer {
+        None => Arc::new(quinn::rustls::sign::SingleCertAndKey::from(certified_key)),
+        Some((observer, observer_config)) => {
+            let resolver = Arc::new(quinn::rustls::sign::SingleCertAndKey::from(certified_key));
+            ja4::wrap_server_cert_resolver(resolver, observer, observer_config)
+        }
+    };
+    let mut tls_config = quinn::rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
+        .map_err(|err| ShphError::Config(format!("configure QUIC TLS versions: {err}")))?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    tls_config.max_early_data_size = 0;
+    Ok(tls_config)
+}
+
+fn build_client_tls_config(server_certificate_der: &[u8]) -> Result<quinn::rustls::ClientConfig> {
+    let provider = Arc::new(quinn::rustls::crypto::ring::default_provider());
     let mut roots = quinn::rustls::RootCertStore::empty();
     roots
         .add(quinn::rustls::pki_types::CertificateDer::from(
             server_certificate_der.to_vec(),
         ))
         .map_err(|err| ShphError::Config(format!("load QUIC server certificate: {err}")))?;
-    let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))
-        .map_err(|err| ShphError::Config(format!("configure QUIC client TLS: {err}")))?;
-    client_config.transport_config(config.transport_config()?);
-    let mut endpoint = Endpoint::client(bind_addr).map_err(ShphError::Io)?;
-    endpoint.set_default_client_config(client_config);
-    Ok(endpoint)
+    let mut tls_config = quinn::rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
+        .map_err(|err| ShphError::Config(format!("configure QUIC TLS versions: {err}")))?
+        .with_root_certificates(Arc::new(roots))
+        .with_no_client_auth();
+    tls_config.enable_early_data = false;
+    Ok(tls_config)
 }
 
 /// Establish a standards QUIC connection and run the SHPH application
@@ -159,12 +235,20 @@ pub async fn connect(
     peer_addr: SocketAddr,
     server_name: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     profile: HandshakeProfile,
     handshake_timeout: Duration,
 ) -> Result<StandardsQuicConnection> {
     timeout(
         handshake_timeout,
-        connect_inner(endpoint, peer_addr, server_name, local_identity, profile),
+        connect_inner(
+            endpoint,
+            peer_addr,
+            server_name,
+            local_identity,
+            policy,
+            profile,
+        ),
     )
     .await
     .map_err(|_| ShphError::Timeout)?
@@ -175,6 +259,7 @@ async fn connect_inner(
     peer_addr: SocketAddr,
     server_name: &str,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     profile: HandshakeProfile,
 ) -> Result<StandardsQuicConnection> {
     let connection = endpoint
@@ -194,9 +279,9 @@ async fn connect_inner(
     )
     .await?;
     let peer_hello = read_hello(&mut control_recv).await?;
-    verify_hello_signature(local_identity, &material, &peer_hello)?;
+    verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     if profile.uses_pqc() {
-        let ciphertext = finalize_initiator_pq(local_identity, &mut material, &peer_hello)?;
+        let ciphertext = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
         write_message(
             &mut control_send,
             &ciphertext,
@@ -204,7 +289,7 @@ async fn connect_inner(
         )
         .await?;
     }
-    let handshake = verify_and_derive(local_identity, &material, &peer_hello, true)?;
+    let handshake = verify_and_derive(local_identity, &material, &peer_hello, true, policy)?;
     Ok(StandardsQuicConnection {
         connection,
         handshake,
@@ -218,12 +303,13 @@ async fn connect_inner(
 pub async fn accept(
     server: &StandardsQuicServer,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     profile: HandshakeProfile,
     handshake_timeout: Duration,
 ) -> Result<StandardsQuicConnection> {
     timeout(
         handshake_timeout,
-        accept_inner(server, local_identity, profile),
+        accept_inner(server, local_identity, policy, profile),
     )
     .await
     .map_err(|_| ShphError::Timeout)?
@@ -232,6 +318,7 @@ pub async fn accept(
 async fn accept_inner(
     server: &StandardsQuicServer,
     local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
     profile: HandshakeProfile,
 ) -> Result<StandardsQuicConnection> {
     let incoming = loop {
@@ -257,7 +344,7 @@ async fn accept_inner(
         .map_err(|err| ShphError::Transport(err.to_string()))?;
     let peer_hello = read_hello(&mut control_recv).await?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
-    verify_hello_signature(local_identity, &material, &peer_hello)?;
+    verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     write_message(
         &mut control_send,
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
@@ -267,9 +354,15 @@ async fn accept_inner(
     if profile.uses_pqc() {
         let ciphertext =
             read_message(&mut control_recv, shph_core::ML_KEM_768_CIPHERTEXT_BYTES).await?;
-        absorb_responder_pq(&mut material, &ciphertext)?;
+        absorb_responder_pq(
+            local_identity,
+            &mut material,
+            &peer_hello,
+            &ciphertext,
+            policy,
+        )?;
     }
-    let handshake = verify_and_derive(local_identity, &material, &peer_hello, false)?;
+    let handshake = verify_and_derive(local_identity, &material, &peer_hello, false, policy)?;
     Ok(StandardsQuicConnection {
         connection,
         handshake,
@@ -332,6 +425,45 @@ impl StandardsQuicConnection {
             .map_err(|err| ShphError::Transport(err.to_string()))
     }
 
+    /// Send an explicitly opt-in Shroud 2.0 lab envelope over QUIC DATAGRAM.
+    ///
+    /// This is a bounded morphology experiment. It does not alter the QUIC
+    /// handshake, TLS fingerprint, congestion control, or loss recovery.
+    pub async fn send_morphology_datagram(
+        &self,
+        morphology: &mut MorphologyEngine,
+        payload: &[u8],
+    ) -> Result<()> {
+        let path_mtu = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let target_size = morphology.target_size(payload.len(), path_mtu)?;
+        let datagram = encode_datagram(payload, target_size, path_mtu)?;
+        let delay = morphology.next_delay();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        self.connection
+            .send_datagram_wait(Bytes::from(datagram))
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))
+    }
+
+    /// Receive and decode one explicitly opt-in Shroud 2.0 lab envelope.
+    pub async fn recv_morphology_datagram(&self) -> Result<Vec<u8>> {
+        let path_mtu = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let datagram = self
+            .connection
+            .read_datagram()
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))?;
+        decode_datagram(&datagram, path_mtu)
+    }
+
     /// Receive one QUIC DATAGRAM, rejecting impossible IP-packet sizes.
     pub async fn recv_datagram(&self) -> Result<Bytes> {
         let datagram = self
@@ -346,6 +478,21 @@ impl StandardsQuicConnection {
         }
         Ok(datagram)
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn send_datagram_lossy(
+    connection: &Connection,
+    payload: &[u8],
+) -> std::result::Result<(), quinn::SendDatagramError> {
+    if payload.len() > MAX_TUN_DATAGRAM_BYTES
+        || connection
+            .max_datagram_size()
+            .is_some_and(|max| payload.len() > max)
+    {
+        return Err(quinn::SendDatagramError::TooLarge);
+    }
+    connection.send_datagram(Bytes::copy_from_slice(payload))
 }
 
 async fn write_message(stream: &mut SendStream, payload: &[u8], max: usize) -> Result<()> {
@@ -395,11 +542,13 @@ async fn read_hello(stream: &mut RecvStream) -> Result<Hello> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept, client_endpoint, connect, server_endpoint, StandardsQuicConfig,
-        MAX_TUN_DATAGRAM_BYTES,
+        accept, client_endpoint, connect, server_endpoint, server_endpoint_with_ja4_observer,
+        StandardsQuicConfig, MAX_TUN_DATAGRAM_BYTES,
     };
-    use shph_core::{HandshakeProfile, IdentityKeyPair};
+    use crate::ja4::{Ja4ObserverConfig, RecordingJa4Observer};
+    use shph_core::{HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -410,10 +559,56 @@ mod tests {
         assert_eq!(MAX_TUN_DATAGRAM_BYTES, 65_535);
     }
 
+    #[test]
+    fn standards_config_rejects_unbounded_idle_timeout() {
+        assert!(StandardsQuicConfig {
+            idle_timeout: Duration::ZERO,
+            ..Default::default()
+        }
+        .transport_config()
+        .is_err());
+        assert!(StandardsQuicConfig {
+            idle_timeout: Duration::from_millis(999),
+            ..Default::default()
+        }
+        .transport_config()
+        .is_err());
+        assert!(StandardsQuicConfig {
+            idle_timeout: Duration::from_secs(24 * 60 * 60 + 1),
+            ..Default::default()
+        }
+        .transport_config()
+        .is_err());
+        assert!(StandardsQuicConfig {
+            idle_timeout: Duration::from_secs(1),
+            ..Default::default()
+        }
+        .transport_config()
+        .is_ok());
+    }
+
+    #[test]
+    fn standards_tls_disables_replayable_early_data() {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate");
+        let certificate = quinn::rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let private_key =
+            quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let server_tls = super::build_server_tls_config(certificate, private_key.into(), None)
+            .expect("server TLS config");
+        assert_eq!(server_tls.max_early_data_size, 0);
+
+        let client_tls =
+            super::build_client_tls_config(cert.cert.der().as_ref()).expect("client TLS config");
+        assert!(!client_tls.enable_early_data);
+    }
+
     #[tokio::test]
     async fn loopback_handshake_control_and_datagram_roundtrip() {
         let server_identity = IdentityKeyPair::generate().expect("server identity");
         let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
         let server = server_endpoint(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             StandardsQuicConfig::default(),
@@ -431,6 +626,7 @@ mod tests {
             accept(
                 &server,
                 &server_identity,
+                &server_policy,
                 HandshakeProfile::SecureDefault,
                 Duration::from_secs(10),
             )
@@ -441,6 +637,7 @@ mod tests {
             server_addr,
             "localhost",
             &client_identity,
+            &client_policy,
             HandshakeProfile::SecureDefault,
             Duration::from_secs(10),
         )
@@ -478,6 +675,146 @@ mod tests {
             .is_err());
         client.close(0u32.into(), b"test complete");
         server_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn loopback_morphology_datagram_roundtrip() {
+        let server_identity = IdentityKeyPair::generate().expect("server identity");
+        let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
+        let server = server_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            StandardsQuicConfig::default(),
+        )
+        .expect("server endpoint");
+        let server_addr = server.endpoint.local_addr().expect("server address");
+        let client = client_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &server.certificate_der,
+            StandardsQuicConfig::default(),
+        )
+        .expect("client endpoint");
+
+        let server_task = tokio::spawn(async move {
+            accept(
+                &server,
+                &server_identity,
+                &server_policy,
+                HandshakeProfile::ClassicalLab,
+                Duration::from_secs(10),
+            )
+            .await
+        });
+        let client_connection = connect(
+            &client,
+            server_addr,
+            "localhost",
+            &client_identity,
+            &client_policy,
+            HandshakeProfile::ClassicalLab,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("client QUIC/SHPH handshake");
+        let server_connection = server_task
+            .await
+            .expect("server task")
+            .expect("server QUIC/SHPH handshake");
+
+        let mut morphology = crate::shroud2::MorphologyEngine::from_seed(
+            crate::shroud2::MorphologyProfile::WebBrowsingLab,
+            42,
+        );
+        client_connection
+            .send_morphology_datagram(&mut morphology, b"morphology-lab")
+            .await
+            .expect("morphology datagram send");
+        let payload = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_connection.recv_morphology_datagram(),
+        )
+        .await
+        .expect("morphology datagram timeout")
+        .expect("morphology datagram receive");
+        assert_eq!(payload, b"morphology-lab");
+
+        client_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        server_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn optional_ja4_observer_records_real_client_hello() {
+        let server_identity = IdentityKeyPair::generate().expect("server identity");
+        let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
+        let observer = Arc::new(RecordingJa4Observer::new(4).expect("observer"));
+        let server = server_endpoint_with_ja4_observer(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            StandardsQuicConfig::default(),
+            observer.clone(),
+            Ja4ObserverConfig::default(),
+        )
+        .expect("server endpoint");
+        let server_addr = server.endpoint.local_addr().expect("server address");
+        let client = client_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &server.certificate_der,
+            StandardsQuicConfig::default(),
+        )
+        .expect("client endpoint");
+
+        let server_task = tokio::spawn(async move {
+            accept(
+                &server,
+                &server_identity,
+                &server_policy,
+                HandshakeProfile::ClassicalLab,
+                Duration::from_secs(10),
+            )
+            .await
+        });
+        let client_connection = connect(
+            &client,
+            server_addr,
+            "localhost",
+            &client_identity,
+            &client_policy,
+            HandshakeProfile::ClassicalLab,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("client QUIC/SHPH handshake");
+        server_task
+            .await
+            .expect("server task")
+            .expect("server QUIC/SHPH handshake");
+
+        let observations = observer.snapshot();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(observation.transport, crate::ja4::Ja4Transport::Quic);
+        assert_eq!(
+            observation.coverage,
+            crate::ja4::Ja4ObservationCoverage::PublicRustlsSubset
+        );
+        assert!(observation.certificate_resolved);
+        assert!(observation.sni_present);
+        assert!(observation.server_name.is_none());
+        assert!(observation.exact_fingerprint.is_none());
+        assert!(observation.partial_fingerprint.starts_with("q13d"));
+        assert_eq!(observation.metadata_sha256.len(), 64);
+
+        client_connection
             .connection
             .close(0u32.into(), b"test complete");
         client.wait_idle().await;

@@ -527,21 +527,21 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "futures-core"
-version = "0.3.32"
+version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+checksum = "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
 
 [[package]]
 name = "futures-task"
-version = "0.3.32"
+version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
+checksum = "b231ed28831efb4a61a08580c4bc233ec56bc009f4cd8f52da2c3cb97df0c109"
 
 [[package]]
 name = "futures-util"
-version = "0.3.32"
+version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
+checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
 dependencies = [
  "futures-core",
  "futures-task",
@@ -1373,7 +1373,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shph-cli"
-version = "0.5.0-dev.0"
+version = "0.6.0-dev.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "shph-config"
-version = "0.5.0-dev.0"
+version = "0.6.0-dev.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1408,11 +1408,12 @@ dependencies = [
  "shph-core",
  "thiserror 1.0.69",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "shph-core"
-version = "0.5.0-dev.0"
+version = "0.6.0-dev.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1437,14 +1438,14 @@ dependencies = [
 
 [[package]]
 name = "shph-obfuscation"
-version = "0.5.0-dev.0"
+version = "0.6.0-dev.0"
 dependencies = [
  "shph-core",
 ]
 
 [[package]]
 name = "shph-transport"
-version = "0.5.0-dev.0"
+version = "0.6.0-dev.0"
 dependencies = [
  "base64 0.21.7",
  "bytes",
@@ -1453,13 +1454,17 @@ dependencies = [
  "rand 0.8.7",
  "rcgen",
  "serde_json",
+ "sha2",
  "shph-core",
+ "shph-tun",
  "tokio",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
 name = "shph-tui"
-version = "0.5.0-dev.0"
+version = "0.6.0-dev.0"
 dependencies = [
  "crossterm 0.27.0",
  "ratatui",
@@ -1469,10 +1474,14 @@ dependencies = [
 
 [[package]]
 name = "shph-tun"
-version = "0.5.0-dev.0"
+version = "0.6.0-dev.0"
 dependencies = [
  "libc",
+ "sha2",
  "shph-core",
+ "tokio",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

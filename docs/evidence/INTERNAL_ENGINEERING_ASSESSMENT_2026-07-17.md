@@ -1,10 +1,10 @@
-# SHPH Independent Engineering and Security Audit
+# SHPH Internal Engineering and Security Assessment
 
-**Document name requested:** `audit by gpt 5.6 sol.md`
+**Review type:** Internal engineering and security assessment; not an
+independent audit
 **Audit date:** 2026-07-17
-**Audited path:** `D:\FUNDING NEEDED\snap-shroud-rs`
-**WSL path used for inspection:** `/mnt/d/FUNDING NEEDED/snap-shroud-rs`
-**Audited state:** current `master` working tree at commit `7de572eddb236469f1aa42c5ee069858c99d9de3`, including the pre-existing uncommitted changes
+**Scope:** SHPH source tree at the review commit
+**Review state:** development tree, including changes present at review time
 **Latest SemVer tag observed:** `v0.4.0`
 
 ## 1. Executive Summary
@@ -24,7 +24,7 @@ current code. The live Linux/WSL validation gates passed:
 - clippy passed with warnings denied;
 - 116 tests passed, 0 failed, 0 ignored;
 - the locked workspace build passed;
-- Linux/Windows mirror parity passed;
+- parity between the configured Linux and Windows checkouts passed;
 - `cargo audit` reported 0 known vulnerabilities and 2 accepted warnings.
 
 However, I do **not** consider the current working tree release-ready or suitable
@@ -46,7 +46,7 @@ four findings would sharply improve external-review credibility.
 
 ## 2. Scope and Method
 
-The audit covered:
+The assessment covered:
 
 - workspace and dependency configuration;
 - Git tags, branch state, dirty-tree state, and release documentation;
@@ -78,7 +78,7 @@ verification items.
 | `cargo build --workspace --locked` | PASS | Lockfile-respecting build succeeded |
 | `git diff --check` | PASS | No whitespace-error findings |
 | `cargo audit` | PASS WITH WARNINGS | 0 vulnerabilities; `paste` unmaintained and `lru` unsound warning |
-| `scripts/sync_mirror.sh --verify` | PASS | Linux and Windows mirrors matched, excluding documented exclusions |
+| `scripts/sync_mirror.sh --verify` | PASS | Configured Linux and Windows checkouts matched, excluding documented exclusions |
 | `scripts/demo.sh bad-cidr` | PASS | Invalid CIDR failed closed |
 | `scripts/demo.sh unreachable` | PASS | Bounded reconnect behavior reproduced |
 | `scripts/demo.sh all` | **FAIL** | Happy-path demo stops at `add-peer` argument validation |
@@ -94,7 +94,7 @@ are isolated to `shph-tui`, and SHPH does not appear to call the affected
 
 ## 4. Prioritized Findings
 
-### GPT-01 — Mandatory release demo is broken
+### REV-01 — Mandatory release demo is broken
 
 **Severity:** Critical release blocker
 **Type:** Release integrity / regression
@@ -129,7 +129,7 @@ the current CLI.
    `grep ... || true`;
 4. add a CI job that runs `scripts/demo.sh all`.
 
-### GPT-02 — CI targets a branch that does not exist in this repository
+### REV-02 — CI targets a branch that does not exist in this repository
 
 **Severity:** High
 **Type:** Continuous-integration coverage
@@ -149,7 +149,7 @@ requests. A funder may see a CI file and assume protection that is not active.
 For immediate safety, trigger on both `main` and `master` until migration is
 complete.
 
-### GPT-03 — Acceptance evidence is not attributable to an immutable source tree
+### REV-03 — Acceptance evidence is not attributable to an immutable source tree
 
 **Severity:** High
 **Type:** Reproducibility / audit evidence
@@ -190,7 +190,7 @@ record for a grant checkpoint, tagged release, or third-party rebuild.
    checkpoint manifest;
 5. include demo, audit, and mirror-parity results in the same evidence bundle.
 
-### GPT-04 — Large unreleased behavior changes still identify as `0.4.0`
+### REV-04 — Large unreleased behavior changes still identify as `0.4.0`
 
 **Severity:** High
 **Type:** Version and artifact identity
@@ -219,7 +219,7 @@ version or embed `0.4.0+<commit>`/dirty build metadata. Add a CLI version comman
 that prints package version, commit, and dirty marker. Do not cut a new checkpoint
 until the tree is committed, tagged, and evidence-bound.
 
-### GPT-05 — Native Windows keystore persistence lacks Unix-equivalent guarantees
+### REV-05 — Native Windows keystore persistence lacks Unix-equivalent guarantees
 
 **Severity:** High for native Windows deployment; Medium for the current lab scope
 **Type:** Secret-at-rest / crash consistency
@@ -242,7 +242,7 @@ inherits filesystem ACL behavior rather than enforcing a user-only DACL.
 
 **Impact:** native Windows users may have weaker confidentiality and crash
 recovery for identity keys than Unix users. This is especially important because
-the audited repository is maintained as a Windows funding mirror.
+the audited repository is also maintained in a Windows checkout.
 
 **Recommendation:** implement a Windows-specific secure replacement using Windows
 file APIs, set an explicit current-user-only DACL, flush the file, and use an
@@ -250,7 +250,7 @@ atomic replace primitive where supported. Add native Windows tests for ACLs,
 replacement failure, interruption, and preservation of the previous valid
 keystore.
 
-### GPT-06 — Shamir secrets are exposed through command arguments and stdout
+### REV-06 — Shamir secrets are exposed through command arguments and stdout
 
 **Severity:** High if used for real secrets; Medium under the documented lab-only scope
 **Type:** Secret handling
@@ -273,7 +273,7 @@ file; require an explicit unsafe flag to print secrets; zeroize recovered secret
 buffers after use. Continue labeling this feature as a primitive, not production
 key management.
 
-### GPT-07 — CI is weaker than the documented release gate
+### REV-07 — CI is weaker than the documented release gate
 
 **Severity:** Medium
 **Type:** CI/release-policy mismatch
@@ -294,7 +294,7 @@ be visually present without blocking a merge or release.
 policy: allow only documented warning IDs, but fail on vulnerabilities and new
 unreviewed warnings.
 
-### GPT-08 — Documented sliding replay window is not used by live receivers
+### REV-08 — Documented sliding replay window is not used by live receivers
 
 **Severity:** Medium
 **Type:** Documentation correctness / UDP reliability
@@ -320,7 +320,7 @@ path while retaining strict monotonic behavior for TCP, or correct all claims to
 state that live sessions intentionally reject out-of-order frames. Add a UDP
 reordering regression test.
 
-### GPT-09 — Password-keystore temporary secret buffers are not zeroized
+### REV-09 — Password-keystore temporary secret buffers are not zeroized
 
 **Severity:** Medium
 **Type:** Defense in depth / secret lifetime
@@ -343,7 +343,7 @@ own, but it weakens the stated in-memory hygiene posture.
 combined shared secrets in `zeroize::Zeroizing`; zeroize password copies where
 ownership allows; avoid cloning `KeyStore`/`IdentityKeyPair` unless required.
 
-### GPT-10 — Evidence and documentation contain stale or incomplete details
+### REV-10 — Evidence and documentation contain stale or incomplete details
 
 **Severity:** Medium
 **Type:** External-review usability
@@ -369,7 +369,7 @@ confidence in otherwise strong engineering work.
 or remove the requirement, fix the path, and run a documentation link/check
 script in CI.
 
-### GPT-11 — Security reporting lacks a direct, verified contact in the checkout
+### REV-11 — Security reporting lacks a direct, verified contact in the checkout
 
 **Severity:** Medium governance risk
 **Type:** Vulnerability intake
@@ -386,7 +386,7 @@ the five-business-day acknowledgement commitment may be impossible to exercise.
 **Recommendation:** publish a monitored security address or verified advisory
 URL, document the responsible owner, and periodically test the intake path.
 
-### GPT-12 — Optional TUI retains accepted supply-chain warnings
+### REV-12 — Optional TUI retains accepted supply-chain warnings
 
 **Severity:** Low
 **Type:** Dependency hygiene
@@ -535,7 +535,7 @@ external review rather than adding more experimental transports.
 2. implement crash-safe/atomic Windows replacement;
 3. run native MSVC build, clippy, tests, demos, Ctrl+C teardown, and
    route/DNS dry-run validation;
-4. record native Windows evidence separately from WSL mirror evidence.
+4. record native Windows evidence separately from WSL-based evidence.
 
 ### Before real secret-management use
 
@@ -661,7 +661,7 @@ scripts/sync_mirror.sh --verify                    PASS
 
 The generated evidence artifact records the working-tree state as
 `tree=dirty`, commit `7de572eddb236469f1aa42c5ee069858c99d9de3`, branch
-`master`, and `PASSED=117  FAILED=0  IGNORED=0`. The Windows mirror was synced
+`master`, and `PASSED=117  FAILED=0  IGNORED=0`. The Windows checkout was synchronized
 after the final changes and parity verification passed.
 
 ### Revised verdict

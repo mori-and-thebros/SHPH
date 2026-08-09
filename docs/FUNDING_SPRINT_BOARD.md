@@ -21,7 +21,7 @@
    `startup_payload` exchange (`up` listen/connect) transfers an encrypted
    payload end-to-end; loop mode streams stdin lines as encrypted frames.
    Windows toolchain builds cleanly (`cargo check --workspace`); Windows live
-   runs must be re-verified on the funded mirror by the operator.
+   runs must be re-verified in the native Windows environment by the operator.
 2. TUN lifecycle / clean teardown: added graceful SIGINT/SIGTERM handling
    (`shph-cli/src/shutdown.rs`) plus poll-driven stdin reads so the connect loop
    observes a shutdown request within ~200ms. Live test: SIGINT to a running
@@ -52,18 +52,18 @@ Validation commands executed and passing in this environment:
 
 #### Definition of Done
 
-Phase A.1 is complete only when **all four tasks and all evidence items** are fully satisfied and test logs are mirrored across working and Windows copies.
+Phase A.1 is complete only when **all four tasks and all evidence items** are fully satisfied and test logs are mirrored across supported checkouts.
 
-> All four tasks and evidence items are satisfied in the working copy. Run the
-> supported mirror sync and verification commands below after each change.
+> All four tasks and evidence items are satisfied in the repository checkout.
+> Run the supported synchronization and verification commands below after each
+> change.
 
 #### Sync Notes
 
-- Primary working copy: `/home/mori/SHPH_working_copy`
-- Windows mirror: `D:\FUNDING NEEDED\snap-shroud-rs`
-- The Windows mirror is mounted at `/mnt/d/FUNDING NEEDED/snap-shroud-rs` in
-  the supported WSL workflow. Run `./scripts/sync_mirror.sh --to-windows`
-  followed by `./scripts/sync_mirror.sh --verify`.
+- Set `SHPH_SYNC_LINUX_DIR` and `SHPH_SYNC_WINDOWS_DIR` before using the
+  optional synchronization helper.
+- Run `./scripts/sync_mirror.sh --to-windows` followed by
+  `./scripts/sync_mirror.sh --verify`.
 
 ## Later Phases
 
@@ -91,7 +91,7 @@ hardening (2026-07-15)
 3. `ControlPlaneGuard::cleanup` rolls back DNS then routes, collecting all
    errors rather than aborting on the first, maximizing partial rollback.
 4. Windows graceful-shutdown via `SetConsoleCtrlHandler` is wired through
-   `windows-sys`; the Windows mirror still needs native-toolchain validation.
+   `windows-sys`; the Windows checkout still needs native-toolchain validation.
    Unix SIGINT/SIGTERM parity from A.1 remains in place.
 5. Persistent `apply`, `reconcile`, `undo`, and `down` lifecycle commands now
    record exact live-applied state beside the config and are covered by
@@ -130,11 +130,10 @@ See `docs/CONTROL_PLANE.md` for updated behavior.
    nonce and rejects any replayed or stale/out-of-order nonce (fail-closed)
    before AEAD decryption. `crypto::tests::replayed_frame_is_rejected_fail_closed`
    and `out_of_order_nonce_is_rejected` prove it.
-2. Connection/handshake limits: `tcp_accept_and_handshake` now runs a bounded
-   handshake loop (`TCP_HANDSHAKE_ATTEMPTS = 5`) that drops malformed/
-   early-closing/wrong-key peers and keeps listening for a legitimate one,
-   failing closed once the budget is exhausted. Genuine listener failures and
-   timeouts propagate immediately.
+2. Connection/handshake limits: `tcp_accept_and_handshake` now runs a
+   deadline-bounded handshake loop that drops malformed/early-closing/wrong-key
+   peers and keeps listening for a legitimate one until the operator timeout.
+   Genuine listener failures propagate immediately.
 3. Read/write loop hardening: `map_io_error` already maps EOF/broken-pipe/
    abort/reset to `ConnectionClosed` and timeouts to `Timeout`; CLI loops
    (A.1) break cleanly on both. Verified fail-closed; no avoidable unwrap on
@@ -192,12 +191,12 @@ Validation commands executed and passing in this environment:
 Also added: `LICENSE-MIT` and `LICENSE-APACHE` (matching `Cargo.toml`'s
 `license = "MIT OR Apache-2.0"` declaration), and README links to the new docs.
 
-Mirror tooling (replaces ad-hoc rsync):
-- `scripts/sync_mirror.sh`: mirrors working copy <-> Windows mirror via rsync,
-  auto-verifies checksum parity after every real sync, supports `--to-windows`,
-  `--to-linux`, `--verify`, `--dry-run`.
-- `docs/SYNC.md`: documents the two-tree layout, what is excluded from mirroring,
-  and the canonical-direction policy.
+Checkout synchronization (replaces ad-hoc rsync):
+- `scripts/sync_mirror.sh`: mirrors two configured checkouts via rsync,
+  auto-verifies checksum parity after every real sync, and supports
+  `--to-windows`, `--to-linux`, `--verify`, and `--dry-run`.
+- `docs/SYNC.md`: documents the two-checkout layout, exclusions, and
+  synchronization direction.
 
 #### Exit Criteria Check
 
@@ -206,7 +205,7 @@ Mirror tooling (replaces ad-hoc rsync):
 - Public process for disclosure and maintenance is in place: yes
   (`SECURITY.md` + `CONTRIBUTING.md` governance).
 
-Validation commands executed and passing in this environment:
+Validation commands executed and passing in the recorded run:
 - `cargo fmt --all` (clean)
 - `cargo clippy --workspace --all-targets -- -D warnings` (clean)
 - `cargo test --workspace` (52 passed, 0 failed) — A.4 is docs/CI-only; no code
@@ -313,7 +312,7 @@ Validation commands executed and passing in this environment:
 
 ## Phase B.1 — COMPLETE
 
-All four B.1 tasks and evidence items are satisfied in the working copy.
+All four B.1 tasks and evidence items are satisfied in the repository checkout.
 
 ### Phase B.2 — Stability Before Feature Expansion (Complete)
 

@@ -7,7 +7,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::PublicKey;
 
-use crate::crypto::{hkdf_sha256_into, IdentityKeyPair, SessionKeys};
+use crate::crypto::{constant_time_eq, hkdf_sha256_into, IdentityKeyPair, SessionKeys};
 use crate::error::{Result, ShphError};
 use crate::keystore::compute_fingerprint_hex;
 
@@ -99,6 +99,10 @@ pub struct HandshakeMaterial {
     /// (initiator) or [`absorb_responder_pq`] (responder) before key derivation.
     /// `None` here blocks derivation, preventing a silent classical downgrade.
     pub pq_shared: Option<[u8; 32]>,
+    /// The exact ML-KEM ciphertext that produced `pq_shared`. This public
+    /// handshake value is included in the KDF transcript so both sides bind
+    /// their derived keys to the same encapsulation exchange.
+    pub pq_ciphertext: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +111,54 @@ pub struct HandshakeState {
     pub peer_signing_pubkey_b64: String,
     pub session_keys: SessionKeys,
     pub transcript_hash_hex: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerPin {
+    pub identity_public: [u8; 32],
+    pub signing_public: [u8; 32],
+}
+
+impl PeerPin {
+    pub const fn new(identity_public: [u8; 32], signing_public: [u8; 32]) -> Self {
+        Self {
+            identity_public,
+            signing_public,
+        }
+    }
+
+    pub fn for_identity(identity: &IdentityKeyPair) -> Self {
+        Self::new(identity.public_key_bytes(), identity.signing_public_bytes())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerPolicy {
+    pins: Vec<PeerPin>,
+}
+
+impl PeerPolicy {
+    pub fn new(pins: Vec<PeerPin>) -> Result<Self> {
+        if pins.is_empty() {
+            return Err(ShphError::Auth("peer policy cannot be empty".into()));
+        }
+        Ok(Self { pins })
+    }
+
+    pub fn single(pin: PeerPin) -> Self {
+        Self { pins: vec![pin] }
+    }
+
+    pub fn pins(&self) -> &[PeerPin] {
+        &self.pins
+    }
+
+    fn allows(&self, identity_public: &[u8; 32], signing_public: &[u8; 32]) -> bool {
+        self.pins.iter().any(|pin| {
+            constant_time_eq(&pin.identity_public, identity_public)
+                && constant_time_eq(&pin.signing_public, signing_public)
+        })
+    }
 }
 
 pub fn build_hello(local_identity: &IdentityKeyPair) -> Result<HandshakeMaterial> {
@@ -190,6 +242,7 @@ pub fn build_hello_with_profile(
         local_pqc,
         local_hello,
         pq_shared: None,
+        pq_ciphertext: None,
     })
 }
 
@@ -198,14 +251,16 @@ pub fn verify_and_derive(
     material: &HandshakeMaterial,
     peer_hello: &Hello,
     initiator: bool,
+    policy: &PeerPolicy,
 ) -> Result<HandshakeState> {
-    verify_and_derive_with_profile(local_identity, material, peer_hello, initiator)
+    verify_and_derive_with_profile(local_identity, material, peer_hello, initiator, policy)
 }
 
 pub fn verify_hello_signature(
     local_identity: &IdentityKeyPair,
     material: &HandshakeMaterial,
     peer_hello: &Hello,
+    policy: &PeerPolicy,
 ) -> Result<()> {
     let profile = material.profile;
     if peer_hello.profile != profile || peer_hello.proto != profile.protocol_tag() {
@@ -265,7 +320,13 @@ pub fn verify_hello_signature(
         &signed_payload[..signed_len],
         &peer_hello.sig,
         &peer_sign_public,
-    )
+    )?;
+    if !policy.allows(&peer_identity_raw, &peer_sign_public) {
+        return Err(ShphError::Auth(
+            "peer identity and signing key are not pinned".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn verify_and_derive_with_profile(
@@ -273,8 +334,9 @@ pub fn verify_and_derive_with_profile(
     material: &HandshakeMaterial,
     peer_hello: &Hello,
     initiator: bool,
+    policy: &PeerPolicy,
 ) -> Result<HandshakeState> {
-    verify_hello_signature(local_identity, material, peer_hello)?;
+    verify_hello_signature(local_identity, material, peer_hello, policy)?;
     let profile = material.profile;
     if peer_hello.profile != profile || peer_hello.proto != profile.protocol_tag() {
         return Err(ShphError::Handshake("protocol mismatch".into()));
@@ -366,6 +428,22 @@ pub fn verify_and_derive_with_profile(
     };
     let _ = initiator;
 
+    let pq_ciphertext = if profile.uses_pqc() {
+        let ciphertext = material.pq_ciphertext.as_deref().ok_or_else(|| {
+            ShphError::Handshake(
+                "missing post-quantum ciphertext binding (downgrade blocked)".into(),
+            )
+        })?;
+        if ciphertext.len() != crate::ML_KEM_768_CIPHERTEXT_BYTES {
+            return Err(ShphError::Handshake(
+                "invalid post-quantum ciphertext binding length".into(),
+            ));
+        }
+        Some(ciphertext)
+    } else {
+        None
+    };
+
     let mut shared = zeroize::Zeroizing::new([0u8; 64]);
     shared[..32].copy_from_slice(&ecdh_shared);
     if let Some(pq_shared) = pq_shared {
@@ -382,12 +460,23 @@ pub fn verify_and_derive_with_profile(
     transcript_hasher.update(profile.as_str().as_bytes());
     transcript_hasher.update(first.identity_pub_b64.as_bytes());
     transcript_hasher.update(second.identity_pub_b64.as_bytes());
+    transcript_hasher.update(first.sign_pub_b64.as_bytes());
+    transcript_hasher.update(second.sign_pub_b64.as_bytes());
+    if let Some(pqc_pub) = &first.pqc_pub_b64 {
+        transcript_hasher.update(pqc_pub.as_bytes());
+    }
+    if let Some(pqc_pub) = &second.pqc_pub_b64 {
+        transcript_hasher.update(pqc_pub.as_bytes());
+    }
     transcript_hasher.update(first.ephemeral_pub_b64.as_bytes());
     transcript_hasher.update(second.ephemeral_pub_b64.as_bytes());
     transcript_hasher.update(first.nonce_b64.as_bytes());
     transcript_hasher.update(second.nonce_b64.as_bytes());
     transcript_hasher.update(first.timestamp_secs.to_be_bytes());
     transcript_hasher.update(second.timestamp_secs.to_be_bytes());
+    if let Some(pq_ciphertext) = pq_ciphertext {
+        transcript_hasher.update(pq_ciphertext);
+    }
     let transcript_hash = transcript_hasher.finalize();
 
     let direction = if initiator {
@@ -464,13 +553,14 @@ pub fn finalize_initiator_pq(
     local_identity: &IdentityKeyPair,
     material: &mut HandshakeMaterial,
     peer_hello: &Hello,
+    policy: &PeerPolicy,
 ) -> Result<Vec<u8>> {
     if !material.profile.uses_pqc() {
         return Err(ShphError::Handshake(
             "classical lab profile does not use post-quantum exchange".into(),
         ));
     }
-    verify_hello_signature(local_identity, material, peer_hello)?;
+    verify_hello_signature(local_identity, material, peer_hello, policy)?;
     let peer_pqc_pub = b64_decode(
         peer_hello
             .pqc_pub_b64
@@ -483,15 +573,28 @@ pub fn finalize_initiator_pq(
     // consistent, and remember the shared secret for verify_and_derive_with_pq.
     material.local_hello.pqc_ct_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&ct));
     material.pq_shared = Some(ss);
+    material.pq_ciphertext = Some(ct.clone());
     Ok(ct)
 }
 
 /// Responder half of the hybrid PQ exchange.
 ///
 /// The responder receives the initiator's PQ ciphertext (delivered by the
-/// transport as a follow-up message), decapsulates it against her own PQ key,
-/// and stashes the resulting shared secret onto `material`.
-pub fn absorb_responder_pq(material: &mut HandshakeMaterial, peer_ct: &[u8]) -> Result<()> {
+/// transport as a follow-up message). The peer hello signature and configured
+/// identity/signing-key policy are checked before decapsulation, so callers
+/// cannot accidentally spend ML-KEM work on an unauthorized peer.
+pub fn absorb_responder_pq(
+    local_identity: &IdentityKeyPair,
+    material: &mut HandshakeMaterial,
+    peer_hello: &Hello,
+    peer_ct: &[u8],
+    policy: &PeerPolicy,
+) -> Result<()> {
+    verify_hello_signature(local_identity, material, peer_hello, policy)?;
+    absorb_responder_pq_unverified(material, peer_ct)
+}
+
+fn absorb_responder_pq_unverified(material: &mut HandshakeMaterial, peer_ct: &[u8]) -> Result<()> {
     if !material.profile.uses_pqc() {
         return Err(ShphError::Handshake(
             "classical lab profile does not use post-quantum exchange".into(),
@@ -503,6 +606,7 @@ pub fn absorb_responder_pq(material: &mut HandshakeMaterial, peer_ct: &[u8]) -> 
         .ok_or_else(|| ShphError::Handshake("missing local PQ keypair".into()))?
         .decapsulate(peer_ct)?;
     material.pq_shared = Some(ss);
+    material.pq_ciphertext = Some(peer_ct.to_vec());
     Ok(())
 }
 

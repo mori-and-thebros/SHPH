@@ -21,6 +21,7 @@ const MAX_CONFIG_BYTES: u64 = 1 << 20;
 pub mod error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub interface_name: String,
     pub local_endpoint: String,
@@ -33,6 +34,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerConfig {
     pub alias: String,
     pub endpoint: String,
@@ -42,6 +44,7 @@ pub struct PeerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObfuscationConfig {
     pub mode: ObfuscationMode,
     pub shadowsocks: Option<ShadowsocksConfig>,
@@ -58,6 +61,7 @@ pub enum ObfuscationMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShadowsocksConfig {
     pub server: String,
     pub method: String,
@@ -65,6 +69,7 @@ pub struct ShadowsocksConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub server_name: String,
     pub ca_cert: Option<String>,
@@ -72,12 +77,14 @@ pub struct TlsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StealthConfig {
     pub profile: String,
     pub shroud_profile: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlPlaneConfig {
     pub apply_routes: Option<bool>,
     pub route_cidrs: Option<Vec<String>>,
@@ -87,6 +94,7 @@ pub struct ControlPlaneConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     pub role: SessionRole,
     pub bind: Option<String>,
@@ -99,6 +107,7 @@ pub struct SessionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconnectConfig {
     pub enabled: Option<bool>,
     pub max_attempts: Option<u32>,
@@ -204,13 +213,37 @@ fn open_config_readonly(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+            .open(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file.metadata()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "configuration file is group/other accessible (mode {mode:o}); refusing to load"
+                ),
+            ));
+        }
+        Ok(file)
     }
     #[cfg(not(unix))]
     {
+        shph_core::ensure_not_reparse_point(path).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to load a symlinked configuration",
+            ));
+        }
+        shph_core::enforce_owner_only_file_permissions(path).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+        })?;
         std::fs::File::open(path)
     }
 }
@@ -255,8 +288,7 @@ fn persist_config_over(tmp: &Path, path: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = fs::remove_file(path);
-        fs::rename(tmp, path)
+        persist_config_over_windows(tmp, path)
     }
 }
 
@@ -284,7 +316,69 @@ fn restrict_config_perms(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        shph_core::enforce_owner_only_file_permissions(path).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configuration path contains an embedded NUL",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn persist_config_over_windows(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        REPLACEFILE_WRITE_THROUGH,
+    };
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to replace a symlinked configuration",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let tmp_w = wide_path(tmp)?;
+    let path_w = wide_path(path)?;
+    let result = if path.exists() {
+        unsafe {
+            ReplaceFileW(
+                path_w.as_ptr(),
+                tmp_w.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        }
+    } else {
+        unsafe {
+            MoveFileExW(
+                tmp_w.as_ptr(),
+                path_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -383,6 +477,28 @@ handshake_profile = "classical-lab"
         );
     }
 
+    #[test]
+    fn parse_rejects_unknown_top_level_and_privileged_control_plane_fields() {
+        let top_level = r#"
+interface_name = "shph0"
+local_endpoint = "127.0.0.1:1"
+peers = []
+interafce_name = "typo"
+"#;
+        assert!(Config::parse(top_level).is_err());
+
+        let control_plane = r#"
+interface_name = "shph0"
+local_endpoint = "127.0.0.1:1"
+peers = []
+
+[control_plane]
+apply_routes = true
+route_cidrss = ["10.0.0.0/24"]
+"#;
+        assert!(Config::parse(control_plane).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn save_does_not_follow_predictable_temp_symlink() {
@@ -452,6 +568,41 @@ handshake_profile = "classical-lab"
         symlink(&target, &link).expect("symlink");
 
         assert!(Config::load(&link).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_requires_owner_only_permissions() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "shph-config-perms-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "interface_name = \"shph0\"\nlocal_endpoint = \"127.0.0.1:1\"\npeers = []\n",
+        )
+        .expect("write config");
+
+        for mode in [0o644, 0o640] {
+            fs::set_permissions(&path, Permissions::from_mode(mode)).expect("set leaky mode");
+            assert!(
+                Config::load(&path).is_err(),
+                "mode {mode:o} must be rejected"
+            );
+        }
+
+        fs::set_permissions(&path, Permissions::from_mode(0o600)).expect("set owner-only mode");
+        assert!(Config::load(&path).is_ok(), "0600 must be accepted");
         fs::remove_dir_all(root).ok();
     }
 }

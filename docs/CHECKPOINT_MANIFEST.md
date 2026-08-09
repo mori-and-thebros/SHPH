@@ -1,24 +1,23 @@
 # SHPH Checkpoint Manifest
 
-This file is the human-readable companion to a funding-checkpoint tag. It is
-updated only when a checkpoint is actually cut; development-tree evidence is
-kept separate and marked dirty.
+This file is the human-readable companion to a release checkpoint tag. It is
+updated only when a checkpoint is actually cut; development evidence is kept
+separate and clearly labeled.
 
 ## Current Development Snapshot
 
 ```text
-Workspace version : 0.5.0-dev.0
+Workspace version : 0.6.0-dev.0
 Status            : unreleased development line
-Canonical tree    : /home/mori/SHPH_working_copy
-Windows mirror    : D:\FUNDING NEEDED\snap-shroud-rs
-Evidence mode     : capture_evidence.sh --allow-dirty until a clean commit exists
+Repository        : current checkout
+Evidence mode     : development evidence; clean release capture required
 ```
 
 ## Latest Tagged Checkpoint
 
 ```text
 Checkpoint : checkpoint-phaseB-1.0.0
-Status     : historical funding checkpoint; do not infer current source state
+Status     : historical checkpoint; do not infer current source state
 Tag        : checkpoint-phaseB-1.0.0
 Evidence   : docs/evidence/GATE_EVIDENCE.md and docs/evidence/CARGO_AUDIT.txt
 ```

@@ -1,19 +1,34 @@
-# SHPH Context Summary (for next AI handoff)
+# SHPH Project Context Summary
 
 ## Date
-2026-06-24
+2026-08-09
 
-## Scope completed so far
+## Current milestone state
 - **Phase A.1 (Delivery-Critical Networking): COMPLETE**
 - **Phase A.2 (Control-Plane Reliability): COMPLETE**
 - **Phase A.3 (Security Baseline for Deployment): COMPLETE**
 - **Phase A.4 (Ops, Packaging, and Trust): COMPLETE**
 - **Phase A.5 (Documentation for Funders): COMPLETE**
 - **Phase A is COMPLETE (5/5).**
-- Main branch used: `/home/mori/SHPH_working_copy`
-- Funded mirror: `D:\FUNDING NEEDED\snap-shroud-rs` (synced via `/mnt/d`).
+- **Phase B is COMPLETE (2/2).**
+- **Phase C is COMPLETE (6/6) for the controlled Shroud lab scope.**
+- **Phase D local implementation and validation are complete, but the delivery
+  gate remains open** for native Linux two-host TUN evidence and privileged
+  Windows Wintun packet-path evidence.
+- **Phase D-A audit remediation is COMPLETE** for the documented non-native-TUN
+  audit scope.
+- **Phase E is not complete:** the paired benchmark/evidence bundle exists,
+  but final release claims, snapshot, and tag remain gated on host-level TUN
+  evidence.
+- **Phase F is host-gated:** the Windows Wintun backend is wired and the
+  post-loader elevated validator reached adapter/session teardown; packet I/O,
+  two-host evidence, and a clean rerun after the route-rollback fix remain.
+- Workspace version: `0.6.0-dev.0`.
+- Paired benchmark report: `docs/BENCHMARK_RESULTS_2026-08-05.md`.
+- Latest Windows validation evidence:
+  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`.
 
-## Phase A.3 completion (this session) — Security Baseline
+## Phase A.3 completion — Security Baseline
 
 1. Anti-replay (crypto)
 - `ReceiveCipher` (`shph-core/src/crypto.rs`) now tracks the highest accepted
@@ -46,22 +61,52 @@
   invalid cell size.
 - net: endpoint parse, socket-addr validation, no-panic `From`.
 
-## Prior phases (A.1, A.2) — see git/file history in this doc's prior versions.
+## Prior phases (A.1, A.2)
 - A.1: graceful SIGINT/SIGTERM shutdown, poll-driven stdin, session lifecycle
   trail on all `up` paths, metrics wiring.
 - A.2: atomic control-plane preflight, error-preserving rollback, robust cleanup.
 
-## Validation done (all passing)
+## Historical validation done (all passing)
 - `cargo fmt --all` (clean)
 - `cargo clippy --workspace --all-targets -- -D warnings` (clean)
 - `cargo test --workspace` (52 passed, 0 failed)
 
-## Known caveats / follow-ups
+## Current known caveats / follow-ups
 - Windows graceful shutdown via `SetConsoleCtrlHandler` is wired through
-  `windows-sys`; native Windows verification remains.
-- `ring` cross-compile to Windows needs `x86_64-w64-mingw32-gcc` (not present
-  here); Windows target not `cargo check`-able in this sandbox.
-- This sandbox sometimes denies loopback; transport tests have skip-guards.
+  `windows-sys`; native Windows workspace and benchmark execution now pass
+  (**180 tests, 0 failures**). The post-loader elevated attempt reached the
+  real Wintun adapter/session and left no residue; a clean elevated rerun after
+  the route-rollback fix remains pending.
+- The paired benchmark data is local authenticated operation evidence:
+  in-memory goodput is not TUN/VPN throughput, and the UDP lab shim is not
+  standards-compliant QUIC performance evidence.
+- The WSL2 native-TUN namespace result is a 20/20 open/hold/close lifecycle
+  smoke test; it does not establish packet forwarding, two-host RTT/jitter,
+  CPU/RSS saturation, or reconnect performance.
+- Native Linux two-host TUN forwarding and privileged Windows Wintun packet
+  I/O remain the next release-blocking validation gates.
+
+## Current validation evidence (2026-08-09)
+- WSL2/Linux: the `0.6.0-dev.0` release-polish pass completed format, strict
+  Clippy, workspace tests (**196 passed**), locked release builds, benchmark
+  build, demo, dependency audit, and bounded fuzz smoke runs. This is
+  intermediate dirty-tree development evidence, not a tagged release snapshot.
+  The earlier native-TUN lifecycle probe (**20/20**) remains separate,
+  capability-gated evidence.
+- Native Windows: format, workspace check, strict Clippy, workspace tests
+  (**180 passed**), release build, Windows-only focused tests, signed-runtime
+  inspection, benchmark capture, and the post-loader native-TUN attempt pass
+  through adapter/session teardown. The route rollback command was corrected
+  afterward; rerun the elevated validator before treating the updated cleanup
+  path as final evidence.
+- Pinned fuzz smoke: five targets completed bounded runs without crash
+  artifacts; this does not replace longer sanitizer-enabled campaigns.
+- Dependency audit: `cargo audit --no-fetch` exits cleanly with two accepted
+  optional-TUI advisories documented in `docs/evidence/CARGO_AUDIT.txt`.
+- Full benchmark tables, commands, environment metadata, and remaining
+  host-level work are in `docs/BENCHMARK_RESULTS_2026-08-05.md`; the latest
+  Windows gate record is
+  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`.
 
 ## Phase B.2 completion (2026-06-29) — Stability Before Feature Expansion
 - `docs/API_STABILITY.md`: API tiers + validation-window freeze rules.
@@ -72,9 +117,12 @@
 - `ratatui` 0.27->0.28.1; `frame.size()`->`frame.area()`; `cargo audit` in CI.
 
 ## Next
-- **Phase B is COMPLETE (B.1 + B.2).** Next roadmap item is the Optional /
-  Research Track (transport fingerprint shaping, QUIC hardening) — explicitly
-  NOT part of mandatory funding readiness.
+- Run native Linux two-host TUN forwarding and performance measurements on a
+  host with the required privileges and traffic tools.
+- Run privileged native Windows Wintun adapter, packet-I/O, route/DNS,
+  reconnect, Ctrl+C teardown, and two-node validation.
+- After those gates, freeze the release claims/version/commit and complete
+  Phase E without converting lab-only measurements into production claims.
 
 ## Phase B.1 completion (2026-06-29) — External Review Readiness
 - `scripts/demo.sh`: reproducible loopback demos (happy / bad-cidr / unreachable).
@@ -86,9 +134,9 @@
   (commit `e0a5949`) is cut.
 - `docs/LEGAL_COMPLIANCE.md`: OSS artifact legal/compliance checklist.
 - `CHANGELOG.md`: phase-anchored changelog.
-- README doc index, `docs/FUNDING_SPRINT_BOARD.md`, `agents.md` updated.
+- README documentation index and maintainer notes updated.
 
-## Phase A.4 completion (this session) — Ops, Packaging, and Trust
+## Phase A.4 completion — Ops, Packaging, and Trust
 - Added `LICENSE-MIT`, `LICENSE-APACHE` (match `license = "MIT OR Apache-2.0"`).
 - `SECURITY.md`: disclosure process, threat model, non-claims matrix, crypto deps.
 - `CONTRIBUTING.md`: build/test, style, phase-gating, release checklist, governance.
@@ -107,4 +155,9 @@
 - Control plane: `shph-cli/src/main.rs` (`apply_control_plane`,
   `build_control_plane_plan`, `ControlPlaneGuard`).
 - Sprint board: `docs/FUNDING_SPRINT_BOARD.md`; control-plane: `docs/CONTROL_PLANE.md`.
-- Mirror sync: source/doc files only, never `target/`.
+- Source/documentation synchronization excludes build and generated artifacts.
+- Current benchmark evidence: `docs/BENCHMARK_RESULTS_2026-08-05.md`;
+  Windows runner: `scripts/benchmark_windows.ps1`; latest gate record:
+  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`.
+- Current native-TUN evidence: `docs/NATIVE_TUN_STATUS_2026-08-04.md` and
+  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`.

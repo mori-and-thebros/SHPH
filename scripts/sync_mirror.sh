@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# scripts/sync_mirror.sh — keep the SHPH working copy and the Windows mirror in sync.
+# scripts/sync_mirror.sh — keep two configured platform checkouts synchronized.
 #
-# The project has two trees:
-#   - Linux working copy: /home/mori/SHPH_working_copy   (this WSL home)
-#   - Windows mirror:     D:\FUNDING NEEDED\snap-shroud-rs  (mounted at /mnt/d)
+# Configure the two checkout paths with SHPH_SYNC_LINUX_DIR and
+# SHPH_SYNC_WINDOWS_DIR before running the script.
 #
 # Both trees are git repositories; .git/ is mirrored so tag/history/HEAD
 # are identical on both sides (a true mirror).
 #
 # Usage:
 #   scripts/sync_mirror.sh                 # auto-detect side, mirror source<->dest
-#   scripts/sync_mirror.sh --to-windows    # force: working copy  ->  Windows mirror
-#   scripts/sync_mirror.sh --to-linux      # force: Windows mirror ->  working copy
+#   scripts/sync_mirror.sh --to-windows    # force: Linux checkout -> Windows checkout
+#   scripts/sync_mirror.sh --to-linux      # force: Windows checkout -> Linux checkout
 #   scripts/sync_mirror.sh --verify        # checksum-only: report differences, change nothing
 #   scripts/sync_mirror.sh --dry-run       # show what would change, write nothing
 #
@@ -20,16 +19,20 @@
 
 set -euo pipefail
 
-LINUX_DIR="/home/mori/SHPH_working_copy"
-WINDOWS_MIRROR="/mnt/d/FUNDING NEEDED/snap-shroud-rs"
+LINUX_DIR="${SHPH_SYNC_LINUX_DIR:-}"
+WINDOWS_MIRROR="${SHPH_SYNC_WINDOWS_DIR:-}"
 
-# Paths never mirrored: build output, lockfiles, fuzz data, and local-only dirs.
-# NOTE: .git/ IS mirrored so both trees share tag/history/HEAD (true mirror).
+# Paths never mirrored: build output, generated benchmark/fuzz data, the root
+# application lockfile, and local-only dirs. The standalone benchmark/fuzz
+# lockfiles are mirrored. .git/ is mirrored so both trees share tag/history/HEAD.
 EXCLUDES=(
   --exclude='target/'
+  --exclude='benchmark-runs/'
   --exclude='fuzz/corpus/'
   --exclude='fuzz/artifacts/'
   --exclude='/Cargo.lock'
+  --exclude='/wintun.dll'
+  --exclude='/wintun.h'
   --exclude='THE WORKING ONE/'
   --exclude='.agents/'
   --exclude='.codex/'
@@ -38,6 +41,12 @@ EXCLUDES=(
 
 MODE="auto"
 DRY_RUN=0
+
+if [ -z "$LINUX_DIR" ] || [ -z "$WINDOWS_MIRROR" ]; then
+  echo "ERROR: set SHPH_SYNC_LINUX_DIR and SHPH_SYNC_WINDOWS_DIR first." >&2
+  echo "Example: SHPH_SYNC_LINUX_DIR=/path/to/linux SHPH_SYNC_WINDOWS_DIR=/path/to/windows" >&2
+  exit 1
+fi
 
 usage() {
   sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
@@ -60,7 +69,7 @@ self_dir="$(cd "$(dirname "$0")/.." && pwd)"
 if [ "$self_dir" = "$LINUX_DIR" ]; then
   HERE="linux"
 else
-  # Could be running from the Windows mirror mount; confirm.
+  # If running from the configured Windows checkout, confirm the side.
   case "$self_dir" in
     "$WINDOWS_MIRROR") HERE="windows" ;;
     *) HERE="linux" ;;  # default assumption
@@ -68,11 +77,10 @@ else
 fi
 
 if [ ! -d "$LINUX_DIR" ]; then
-  echo "ERROR: Linux working copy not found: $LINUX_DIR" >&2; exit 1
+  echo "ERROR: configured Linux checkout not found: $LINUX_DIR" >&2; exit 1
 fi
 if [ ! -d "$WINDOWS_MIRROR" ]; then
-  echo "ERROR: Windows mirror not found: $WINDOWS_MIRROR" >&2
-  echo "Is the D: drive mounted in WSL? (it normally appears at /mnt/d)" >&2
+  echo "ERROR: configured Windows checkout not found: $WINDOWS_MIRROR" >&2
   exit 1
 fi
 
@@ -101,13 +109,17 @@ verify() {
   # shellcheck disable=SC2164
   ( cd "$a" && find . -type f \
       -not -path '*/target/*' -not -path './.git/*' \
+      -not -path './benchmark-runs/*' \
       -not -path './fuzz/corpus/*' -not -path './fuzz/artifacts/*' \
+      -not -path './wintun.dll' -not -path './wintun.h' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
       -not -path './Cargo.lock' -exec md5sum {} \; ) | sort -k2 > "$tmpa"
   ( cd "$b" && find . -type f \
       -not -path '*/target/*' -not -path './.git/*' \
+      -not -path './benchmark-runs/*' \
       -not -path './fuzz/corpus/*' -not -path './fuzz/artifacts/*' \
+      -not -path './wintun.dll' -not -path './wintun.h' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
       -not -path './Cargo.lock' -exec md5sum {} \; ) | sort -k2 > "$tmpb"
@@ -133,9 +145,8 @@ case "$MODE" in
     run_rsync "$WINDOWS_MIRROR/" "$LINUX_DIR/"
     ;;
   auto)
-    # Default direction: working copy is canonical, mirror to Windows.
-    # (Change HERE-based logic if you want Windows to be canonical.)
-    echo ">> auto mode (running from: $HERE); defaulting to working copy -> Windows mirror"
+    # Default direction: the configured Linux checkout is the source.
+    echo ">> auto mode (running from: $HERE); defaulting to Linux -> Windows"
     run_rsync "$LINUX_DIR/" "$WINDOWS_MIRROR/"
     ;;
 esac

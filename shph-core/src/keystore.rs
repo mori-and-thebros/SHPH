@@ -21,7 +21,8 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 /// huge allocation by pointing the loader at a giant file.
 const MAX_KEYSTORE_BYTES: u64 = 1 << 20; // 1 MiB
 const KEYSTORE_FORMAT_VERSION: u8 = 1;
-const KEYSTORE_PBKDF2_ITERATIONS: u32 = 100_000;
+const KEYSTORE_PBKDF2_ITERATIONS: u32 = 600_000;
+const KEYSTORE_MIN_PBKDF2_ITERATIONS: u32 = 100_000;
 const KEYSTORE_MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
 const KEYSTORE_SALT_BYTES: usize = 16;
 const KEYSTORE_NONCE_BYTES: usize = 12;
@@ -40,7 +41,9 @@ pub struct Contact {
     pub sign_pubkey_b64: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, Default, zeroize::Zeroize, zeroize::ZeroizeOnDrop,
+)]
 pub struct KeyStoreConfig {
     /// Reserved for a future encrypted keystore format. It is intentionally
     /// not serialized because the current format does not encrypt secrets.
@@ -48,7 +51,7 @@ pub struct KeyStoreConfig {
     pub password: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct StoredKeyStore {
     identity_private_b64: String,
     identity_public_b64: String,
@@ -57,11 +60,12 @@ struct StoredKeyStore {
     /// peers but should be re-`init`ed to obtain a distinct signing key.
     #[serde(default)]
     sign_seed_b64: Option<String>,
+    #[zeroize(skip)]
     contacts: HashMap<String, Contact>,
     config: KeyStoreConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct StoredEncryptedKeyStore {
     format: String,
     version: u8,
@@ -175,11 +179,13 @@ impl KeyStore {
             serde_json::from_value(value)?
         };
 
-        let mut config = stored.config;
+        let mut stored = stored;
+        let mut config = std::mem::take(&mut stored.config);
+        let stored_password = config.password.take();
         config.password = password
             .map(ToOwned::to_owned)
             .or_else(|| std::env::var("SHPH_KEYSTORE_PASSWORD").ok())
-            .or(config.password);
+            .or(stored_password);
         let identity = match &stored.sign_seed_b64 {
             Some(seed_b64) => {
                 let dh_seed = base64_decode_32(&stored.identity_private_b64, "identity private")?;
@@ -199,9 +205,10 @@ impl KeyStore {
                 Some(&stored.identity_public_b64),
             )?,
         };
+        let contacts = std::mem::take(&mut stored.contacts);
         Ok(Self {
             identity,
-            contacts: stored.contacts,
+            contacts,
             config,
         })
     }
@@ -241,7 +248,7 @@ fn decrypt_keystore(encrypted: &StoredEncryptedKeyStore, password: &str) -> Resu
     if encrypted.version != KEYSTORE_FORMAT_VERSION
         || encrypted.format != "shph-encrypted-keystore"
         || encrypted.kdf != "pbkdf2-hmac-sha256"
-        || encrypted.iterations < KEYSTORE_PBKDF2_ITERATIONS
+        || encrypted.iterations < KEYSTORE_MIN_PBKDF2_ITERATIONS
         || encrypted.iterations > KEYSTORE_MAX_PBKDF2_ITERATIONS
     {
         return Err(ShphError::KeyStore(
@@ -367,6 +374,7 @@ fn open_keystore_readonly(path: &Path) -> Result<File> {
     }
     #[cfg(not(unix))]
     {
+        ensure_not_reparse_point(path)?;
         let metadata = std::fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() {
             return Err(ShphError::InvalidArgument(
@@ -468,22 +476,22 @@ fn wide_path(path: &Path) -> Result<Vec<u16>> {
 #[cfg(windows)]
 fn windows_error(operation: &str) -> ShphError {
     use windows_sys::Win32::Foundation::GetLastError;
-    ShphError::Io(io::Error::new(
-        io::ErrorKind::Other,
-        format!("{operation} failed with Win32 error {}", unsafe {
-            GetLastError()
-        }),
-    ))
+    ShphError::Io(io::Error::other(format!(
+        "{operation} failed with Win32 error {}",
+        unsafe { GetLastError() }
+    )))
 }
 
 #[cfg(windows)]
 fn restrict_secret_perms_windows(path: &Path) -> Result<()> {
+    use windows_sys::core::BOOL;
     use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     };
 
     let path = wide_path(path)?;
@@ -503,6 +511,23 @@ fn restrict_secret_perms_windows(path: &Path) -> Result<()> {
             "ConvertStringSecurityDescriptorToSecurityDescriptorW",
         ));
     }
+    let mut dacl_present: BOOL = 0;
+    let mut dacl_defaulted: BOOL = 0;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let extracted = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    };
+    if extracted == 0 || dacl_present == 0 || dacl.is_null() {
+        unsafe {
+            LocalFree(descriptor as _);
+        }
+        return Err(windows_error("GetSecurityDescriptorDacl"));
+    }
     let result = unsafe {
         SetNamedSecurityInfoW(
             path.as_ptr(),
@@ -510,7 +535,7 @@ fn restrict_secret_perms_windows(path: &Path) -> Result<()> {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            (*(descriptor as *const windows_sys::Win32::Security::SECURITY_DESCRIPTOR)).Dacl,
+            dacl,
             std::ptr::null(),
         )
     };
@@ -607,6 +632,23 @@ mod tests {
             loaded.identity.public_key_b64()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_acl_protected_keystore_roundtrips() {
+        let dir =
+            std::env::temp_dir().join(format!("shph-keystore-windows-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keystore.json");
+        let keystore = KeyStore::new(KeyStoreConfig::default()).unwrap();
+        keystore.save(&path).unwrap();
+        let loaded = KeyStore::load(&path, None).unwrap();
+        assert_eq!(
+            keystore.identity.public_key_b64(),
+            loaded.identity.public_key_b64()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

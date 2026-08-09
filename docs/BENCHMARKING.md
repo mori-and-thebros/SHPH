@@ -5,6 +5,15 @@ handshake profiles used by the benchmark harness. Native operation remains
 `secure-default`; benchmark-only classical operation requires an explicit
 profile on both peers.
 
+The latest paired platform score report is
+`docs/BENCHMARK_RESULTS_2026-08-05.md`. The focused Shroud morphology report
+`docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md` and the earlier
+`docs/BENCHMARK_RESULTS_2026-07-28.md` and
+`docs/BENCHMARK_RESULTS_2026-07-22.md` reports remain available as historical
+WSL2 regression records. All reports identify their platform and distinguish
+local-runner results from measurements that still require native Linux, live
+TUN, or two-host execution.
+
 ## Default Environment
 
 The primary baseline is a **native Linux host**. Record:
@@ -66,6 +75,7 @@ The runner emits CSV rows with:
 | `p50_ns` | Median sample |
 | `p95_ns` | 95th-percentile sample |
 | `p99_ns` | 99th-percentile sample |
+| `p99_9_ns` | 99.9th-percentile sample |
 | `max_ns` | Slowest observed sample |
 | `mean_ns` | Arithmetic mean |
 
@@ -74,10 +84,21 @@ construction, signatures, X25519, ML-KEM when enabled, and key derivation.
 It does not measure socket transfer or network round-trip time. Framing and
 AEAD rows cover payload sizes of 64, 256, 1024, and 4096 bytes; framing is
 capped by the selected cell capacity.
+Handshake rows also report allocation calls and allocated bytes. Treat these
+as process-local regression signals; allocator counts include all work inside
+the measured setup and are not a substitute for a heap profiler.
 
 For latency work, report at least p50 and p95, keep p99 when the sample count
 supports it, and do not treat a single short smoke run as a stable estimate.
 Use separate runs for each profile and payload size.
+
+For Shroud analysis, the runner emits one row per explicit named profile,
+including `extreme-lab`, and three distinct measurements:
+`shroud_framing` for raw cell encode/decode, `shroud_aead` for fixed-cell
+AEAD encrypt/decrypt, and `shroud_profile` for the combined in-memory cell
+path. It also emits `shroud_decode_owned` and `shroud_decode_borrowed` rows to
+measure the allocation cost of an owned payload copy versus a borrowed
+validated view. These are diagnostic layers, not live-network throughput.
 
 ## Obstacles and Controls
 
@@ -123,7 +144,7 @@ removes ML-KEM and therefore provides a different security contract.
 
 ## Expanded benchmark coverage
 
-The standalone runner now supports `--suite all|core|dataplane|resource|shroud|quic|scalability`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, Shroud profiles, QUIC-shim loopback handshake timing, and long-session replay/nonce behavior.
+The standalone runner now supports `--suite all|core|dataplane|resource|shroud|quic|scalability`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2.0 morphology profiles, QUIC-shim loopback handshake timing, and long-session replay/nonce behavior.
 
 These are local measurements, not proof of live VPN throughput, TUN performance, network RTT, reconnect recovery, or control-plane cost. Use `scripts/benchmark_operator.sh` for real-process lifecycle, reconnect, control-plane, and native-TUN prerequisite/timing checks. It emits explicit `SKIP` records when a host, privilege, peer, or tool is unavailable.
 
@@ -131,11 +152,63 @@ Recommended commands:
 
 ```bash
 cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite all --iterations 10000 --frames 100000
+cargo build --release --manifest-path benchmarks/Cargo.toml --locked
+./benchmarks/target/release/shph-benchmarks --profile secure-default --suite all --iterations 5000 --frames 1000000
 scripts/benchmark_operator.sh --mode lifecycle --config /path/to/config.toml
 scripts/benchmark_operator.sh --mode control-plane --config /path/to/config.toml
 scripts/benchmark_operator.sh --mode reconnect --config /path/to/config.toml
 SHPH_TUN_NATIVE=1 scripts/benchmark_operator.sh --mode tun --tun-native 1 --config /path/to/config.toml
+scripts/benchmark_operator.sh --mode tun-namespace
+scripts/benchmark_native_tun.sh --iterations 20 --hold-ms 0
 ```
+
+For a native Windows host, build the standalone runner and execute the
+PowerShell capture script from the repository root:
+
+```powershell
+cargo build --release --manifest-path benchmarks/Cargo.toml --locked
+.\scripts\benchmark_windows.ps1 `
+  -Suite all -Iterations 5000 -Frames 100000 `
+  -OutputDirectory .\benchmark-runs\windows-YYYY-MM-DD
+```
+
+The PowerShell runner records separate `secure-default.csv` and
+`classical-lab.csv` files. It runs only the local benchmark suite; native
+Wintun packet I/O, route/DNS changes, two-machine throughput, and RTT still
+require a provisioned elevated Windows host and a prepared peer configuration.
+Do not treat a Windows GNU cross-build as native Windows execution evidence.
+The latest native Windows validation record is
+`docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`; its raw
+captures are ignored local artifacts under `benchmark-runs/`.
+
+The namespace scripts run the Linux `AsyncTunDevice` probe inside an isolated
+user/network namespace. The lifecycle benchmark reports open/hold/close
+latency only. It must not be labeled as data-plane throughput, goodput, CPU
+saturation, packet forwarding, or two-host VPN evidence.
+
+Linux native `up` now uses the validated asynchronous `AsyncFd` bridge with
+bounded queues and blocking transport workers. The lifecycle script measures
+the standalone async probe, not end-to-end packet forwarding. Benchmark results
+must identify whether they measure the probe, the Linux CLI bridge, or a
+privileged two-host tunnel.
+
+The `shroud` suite additionally measures the Shroud 2.0 lab envelope for
+`low-latency`, `web-browsing-lab`, `video-streaming-lab`, and `bulk-lab` using a
+1,450-byte datagram budget and a 1,024-byte payload. It reports latency for
+target selection, randomized padding, encode, and decode together, plus the
+observed target-size range. These rows are morphology overhead measurements,
+not network throughput or traffic-analysis evidence.
+
+The same suite now includes:
+
+- sampled morphology delay distributions without scheduler sleeps;
+- a 100,000-frame local morphology session with goodput, wire rate, RSS, and
+  allocation counters; and
+- a deterministic bounded-queue impairment stress test covering injected loss,
+  reordering, queue drops, and decode failures.
+
+The impairment test is a local queue-pressure model only. It must not be
+reported as QUIC congestion control or Internet loss-recovery evidence.
 
 For native Linux two-host evidence, run authenticated listener/connector configs with `SHPH_TUN_NATIVE=1`, generate traffic through the tunnel with `iperf3`/`ping`, capture CPU and RSS during saturation, record packet size/MTU, then repeat after a controlled disconnect. Keep native Linux, WSL2, Windows, containers, VMs, and two-host results in separate evidence tables. `randomized-lab` and the QUIC-like UDP shim remain lab experiments, not stealth or standards-compliant QUIC claims.
 

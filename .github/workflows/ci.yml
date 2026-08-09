@@ -11,17 +11,19 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --no-self-update
       - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+        run: cargo +1.96.0 fmt --all -- --check
 
   clippy:
     name: Clippy (${{ matrix.os }})
@@ -31,13 +33,11 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy --no-self-update
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings
 
   build-and-test:
     name: Build & Test (${{ matrix.os }})
@@ -47,13 +47,13 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
       - name: cargo build
-        run: cargo build --workspace --all-targets --locked
+        run: cargo +1.96.0 build --workspace --all-targets --locked
       - name: cargo test
-        run: cargo test --workspace --all-targets --locked
+        run: cargo +1.96.0 test --workspace --all-targets --locked
         env:
           # Loopback integration tests self-skip on PermissionDenied.
           RUST_BACKTRACE: 1
@@ -63,11 +63,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-test
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
       - name: cargo build --locked
-        run: cargo build -p shph-cli --locked
+        run: cargo +1.96.0 build -p shph-cli --locked
       - name: run all demos
         run: ./scripts/demo.sh all
 
@@ -75,16 +75,16 @@ jobs:
     name: Fuzz harness smoke tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned fuzz toolchain
+        run: rustup toolchain install nightly-2026-07-16 --profile minimal --no-self-update
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +1.96.0 install cargo-fuzz --version 0.13.2 --locked
       - name: Run one fuzzing iteration per target
         working-directory: fuzz
         run: |
-          for target in frame_decode config_parse audit_record replay_window; do
-            cargo fuzz run "$target" -- -runs=1
+          for target in frame_decode config_parse audit_record replay_window shroud2_datagram; do
+            cargo +nightly-2026-07-16 fuzz run "$target" -- -runs=1
           done
 
   # Separate, clearly-scoped job for the experimental native TUN path on Linux.
@@ -94,13 +94,15 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
       - name: build with native TUN path
-        run: cargo build -p shph-cli --locked
+        run: cargo +1.96.0 build -p shph-cli --locked
       - name: smoke (requires CAP_NET_ADMIN; may be skipped by host policy)
         run: SHPH_TUN_NATIVE=1 cargo test -p shph-tun
+      - name: isolated namespace smoke (optional)
+        run: ./scripts/native_tun_namespace_test.sh
 
   # Supply-chain advisory scan. The two currently accepted transitive TUI
   # advisories are ignored explicitly; any new warning or vulnerability fails.
@@ -108,10 +110,11 @@ jobs:
     name: cargo audit (advisory scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo +1.96.0 install cargo-audit --version 0.22.2 --locked
       - name: cargo audit
         run: >
           cargo audit

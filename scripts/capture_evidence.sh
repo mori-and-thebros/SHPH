@@ -61,6 +61,12 @@ record_status() {
   fi
 }
 
+sanitize_output() {
+  sed \
+    -e "s|$ROOT|<repository>|g" \
+    -e "s|$HOME|<home>|g"
+}
+
 run_compact_gate() {
   local title="$1"
   shift
@@ -73,9 +79,9 @@ run_compact_gate() {
   echo
   echo '```'
   if [ "$rc" -eq 0 ]; then
-    tail -3 "$log"
+    tail -3 "$log" | sanitize_output
   else
-    cat "$log"
+    sanitize_output <"$log"
   fi
   echo "[exit $rc]"
   echo '```'
@@ -91,11 +97,11 @@ run_test_gate() {
   echo "## test (workspace)"
   echo
   echo '```'
-  grep -E "test result:|Running" "$TEST_LOG" || true
+  grep -E "test result:|Running" "$TEST_LOG" | sanitize_output || true
   if [ "$rc" -ne 0 ]; then
     echo
     echo "--- failing test command output ---"
-    cat "$TEST_LOG"
+    sanitize_output <"$TEST_LOG"
   fi
   echo "[exit $rc]"
   echo '```'
@@ -113,7 +119,7 @@ run_demo_gate() {
   if [ "$rc" -eq 0 ]; then
     grep -E "DEMO|EXPECT|demo complete|Payload:|Sent bytes:|exit code:" "$DEMO_LOG" || true
   else
-    cat "$DEMO_LOG"
+    sanitize_output <"$DEMO_LOG"
   fi
   echo "[exit $rc]"
   echo '```'

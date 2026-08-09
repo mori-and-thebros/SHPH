@@ -29,7 +29,9 @@ This list is binding for any funder-facing or marketing material:
 - **Not** production-hardened or censorship-resistant transport.
 - **Not** a DPI/TLS/QUIC fingerprint-parity or anti-observation tool (planned,
   not shipped).
-- **Not** a full QUIC stack (the QUIC path is an experimental UDP shim).
+- **Not** a production VPN or production QUIC deployment: the legacy QUIC
+  mode is an experimental UDP shim, while the separate Quinn-backed standards
+  path remains controlled-lab/host-evidence gated.
 - **Not** a key-management/HSM/TPM/YubiKey/Shamir solution; hybrid PQ key
   exchange is shipped, while hardware-backed key storage and quorum sharing
   remain planned.

@@ -18,8 +18,20 @@ hold:
 - `scripts/capture_evidence.sh` has been re-run and `docs/evidence/GATE_EVIDENCE.md`
   reflects the current tree (non-stale timestamp).
 - `scripts/demo.sh all` reproduces all demos (happy / bad-cidr / unreachable).
-- The two trees (Linux working copy and Windows mirror) are in parity, verified
-  with `scripts/sync_mirror.sh --verify`.
+- Any configured platform checkouts used for the release are in parity,
+  verified with `scripts/sync_mirror.sh --verify`.
+- The pre-completion internal security-assessment/remediation gate in
+  `ROADMAP_OSS_AND_DELIVERY.md` is closed, with findings remediated or
+  explicitly dispositioned. This does not represent an independent audit.
+- For a public GitHub release, `docs/GITHUB_PUBLICATION_CHECKLIST.md` is
+  complete, including a monitored private vulnerability-reporting channel and
+  a review that native host evidence is not overstated.
+- Native-host evidence is accurately scoped: Windows Wintun evidence uses the
+  hash-pinned application-local loader and a validator that checks the staged
+  DLL's Authenticode signature, while Linux two-host reports are captured on
+  native Linux rather than WSL, containers, or namespace-only probes.
+- A final publication review confirms no private keystores, credentials,
+  unredacted host data, or generated build artifacts are staged.
 
 > See `docs/MILESTONE_SCORECARD.md` for the binding definition of "complete" and
 > the per-phase scorecard.
@@ -29,13 +41,13 @@ hold:
 Tags follow a phase-anchored scheme so checkpoints map directly to the roadmap:
 
 ```
-checkpoint-phaseA-1.0.0      # end of Phase A (A.1–A.5), first external review
+checkpoint-phaseA-1.0.0      # end of Phase A (A.1–A.5), review-readiness checkpoint
 checkpoint-phaseB-1.0.0      # end of Phase B (B.1–B.2), funding validation
 vX.Y.Z                       # semantic-version point releases once a release line is live
 ```
 
 A versioned release line is live through **`v0.4.0`**. The current workspace is
-an unreleased development line, **`0.5.0-dev.0`**, and must not be described as
+an unreleased development line, **`0.6.0-dev.0`**, and must not be described as
 `v0.4.0`. Going forward, SemVer releases (`vX.Y.Z`) are the authoritative tags;
 funding checkpoints remain roadmap-anchored milestones. Each checkpoint tag
 carries the roadmap phase it closes.
@@ -60,11 +72,21 @@ carries the roadmap phase it closes.
    ./scripts/capture_evidence.sh      # regenerates docs/evidence/GATE_EVIDENCE.md
    ./scripts/demo.sh all              # confirm demos still reproduce
    ```
-3. **Sync and verify parity.**
+3. **Synchronize and verify any second checkout.**
    ```bash
+   export SHPH_SYNC_LINUX_DIR=/path/to/linux-checkout
+   export SHPH_SYNC_WINDOWS_DIR=/path/to/windows-checkout
    ./scripts/sync_mirror.sh --to-windows
    ./scripts/sync_mirror.sh --verify
    ```
+   The root `Cargo.lock` is intentionally platform-specific and excluded from
+   synchronization. After any workspace-version or dependency change, refresh
+   it natively in every supported checkout before using `--locked`:
+   ```powershell
+   cargo check --workspace
+   cargo check --workspace --locked
+   ```
+   Do not copy a WSL-generated root lockfile into the Windows checkout.
 4. **Update changelog.** Add a `## [checkpoint-phaseX-Y.Y.Z] - <date>` entry to
    `CHANGELOG.md` summarizing what the checkpoint closes.
 5. **Tag** (once under git):
@@ -76,11 +98,24 @@ carries the roadmap phase it closes.
    ```
 6. **Record the manifest.** Fill in `docs/CHECKPOINT_MANIFEST.md` (section 4)
    with the tag, timestamp, evidence hash, and gate totals.
+7. **Prepare GitHub publication.**
+   ```bash
+   git diff --check
+   git status --ignored
+   if git ls-files | grep -Eiq '(^|/)(keystore\.json|[^/]+\.(pem|key|p12|pfx)|wintun\.dll|benchmark-runs)(/|$)'; then
+     echo "Refusing publication: review tracked private or generated artifacts." >&2
+     exit 1
+   fi
+   ```
+   Review the staged diff manually, ensure `SECURITY.md`, `README.md`, and
+   `CHANGELOG.md` describe only validated capabilities, and attach release
+   checksums generated from the final clean checkout.
 
 ## 4. Funding-checkpoint manifest
 
 The manifest is the human-readable counterpart to the git tag. Until the tree
-tag is the authoritative artifact. Current latest:
+is tagged, the manifest is planning evidence; after tagging, the git tag is the
+authoritative artifact. Current latest:
 
 ```text
 Checkpoint : checkpoint-phaseB-1.0.0  (Phase A + Phase B complete)  [LATEST]
@@ -88,8 +123,7 @@ Status     : Phase A COMPLETE (5/5); Phase B (B.1+B.2) COMPLETE
 Date (UTC) : 2026-06-29
 Tag        : checkpoint-phaseB-1.0.0  (annotated)
 Points at  : the commit this manifest lives in (git rev-parse checkpoint-phaseB-1.0.0)
-Trees      : /home/mori/SHPH_working_copy  (canonical Linux)
-            D:\FUNDING NEEDED\snap-shroud-rs  (Windows mirror)
+Checkouts  : configured platform-specific directories
 Parity     : verified via scripts/sync_mirror.sh --verify
 Gates      : fmt clean · clippy clean (0 warnings) · test 0 failed · build --locked OK · cargo audit 0 vulns
 Evidence   : docs/evidence/GATE_EVIDENCE.md, docs/evidence/CARGO_AUDIT.txt
@@ -108,7 +142,10 @@ A reviewer receiving a checkpoint should be able to do, with no extra context:
 2. Follow `docs/REPRODUCIBILITY.md` to build `--locked`.
 3. Run `scripts/capture_evidence.sh` and diff against the committed
    `docs/evidence/GATE_EVIDENCE.md` (gate totals must match).
-4. Run `scripts/demo.sh all` and confirm the expected fail-closed behavior.
-5. Cross-check `docs/MILESTONE_SCORECARD.md` phase status.
+4. Review the internal assessment disposition and confirm every finding has a
+   documented disposition and regression evidence. Treat an independent audit
+   as a separate requirement until an actual external engagement is published.
+5. Run `scripts/demo.sh all` and confirm the expected fail-closed behavior.
+6. Cross-check `docs/MILESTONE_SCORECARD.md` phase status.
 
 If any step diverges, the checkpoint is invalid and must be re-cut.

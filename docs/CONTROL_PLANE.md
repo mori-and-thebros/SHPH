@@ -40,7 +40,7 @@ dry_run = true
 ## Current Command Backends
 
 - Linux:
-  - routes: `ip route replace` / `ip route del`
+  - routes: `ip route add` / `ip route del` (avoids deleting a pre-existing route during rollback)
   - DNS: `resolvectl dns` / `resolvectl revert`
 - Windows:
   - routes: `netsh interface {ipv4|ipv6} add|delete route prefix=<cidr> interface=<name> [nexthop=<ip>]`
@@ -49,6 +49,8 @@ dry_run = true
 ## Operational Constraints
 
 - Live apply requires appropriate privileges.
+- Linux route apply uses `ip route add`, so an existing route is not silently
+  replaced and later deleted by SHPH rollback.
 - Missing host tools are reported as unsupported operations.
 - Full platform parity and richer rollback ergonomics remain an ongoing hardening task.
 

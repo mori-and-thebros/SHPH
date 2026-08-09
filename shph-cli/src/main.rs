@@ -11,9 +11,11 @@ use shph_core::{
     recover_secret_from_shares,
     roadmap::{DataMuleConfig, OfflineMeshConfig, RoadmapConfig},
     split_secret, validate_identity_provider, validate_roadmap, verify_and_derive, Contact,
-    Endpoint, HandshakeProfile, HandshakeState, KeyStore, KeyStoreConfig, MetricsCollector, Result,
-    ShamirShare, ShphError,
+    Endpoint, HandshakeProfile, HandshakeState, KeyStore, KeyStoreConfig, MetricsCollector,
+    PeerPin, PeerPolicy, Result, ShamirShare, ShphError,
 };
+#[cfg(target_os = "linux")]
+use shph_transport::standards_tun;
 use shph_transport::{
     accept_secure_session_lab_with_profile, connect_secure_session_lab_with_profile,
     data_mule_accept_and_handshake_with_profile, data_mule_accept_secure_session_with_profile,
@@ -26,6 +28,8 @@ use shph_transport::{
     tcp_handshake_server_with_profile, QuicLabConfig, SecureReceiver, SecureSender, SecureSession,
     TransportMode,
 };
+#[cfg(target_os = "linux")]
+use shph_tun::AsyncTunDevice;
 use shph_tun::{TunDevice, TUN_READ_BUFFER_BYTES};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -254,17 +258,12 @@ fn main() -> Result<()> {
         Commands::Up {
             config,
             transport,
-            quic_cert: _,
+            quic_cert,
             handshake_profile,
         } => {
             let path = config.unwrap_or(config_path);
             let config = load_config(&path)?;
             let mode = resolve_transport_mode(transport.as_deref(), config.roadmap.as_ref())?;
-            if mode == TransportMode::QuicStandard {
-                return Err(ShphError::Unsupported(
-                    "quic-standard is available for listen/connect/send-once/recv-once; the async TUN bridge is not enabled in up yet".into(),
-                ));
-            }
             let profile = resolve_handshake_profile(
                 handshake_profile.as_deref(),
                 config
@@ -280,6 +279,7 @@ fn main() -> Result<()> {
                 mode,
                 profile,
                 config.roadmap.as_ref(),
+                quic_cert.as_deref(),
             )?
         }
         Commands::Down => handle_down(&config_path)?,
@@ -459,10 +459,28 @@ fn handle_up(
     transport: TransportMode,
     profile: HandshakeProfile,
     _roadmap: Option<&RoadmapConfig>,
+    quic_cert_path: Option<&Path>,
 ) -> Result<()> {
     validate_config_roadmap(config)?;
+    if transport == TransportMode::QuicStandard
+        && config
+            .session
+            .as_ref()
+            .and_then(|session| session.reconnect.as_ref())
+            .and_then(|reconnect| reconnect.enabled)
+            .unwrap_or(false)
+    {
+        return Err(ShphError::Config(
+            "quic-standard native TUN reconnect is not supported yet: the listener certificate must remain stable across reconnects".into(),
+        ));
+    }
     announce_handshake_profile(profile);
     let tun = TunDevice::open(&config.interface_name)?;
+    if transport == TransportMode::QuicStandard && !tun.is_native() {
+        return Err(ShphError::Unsupported(
+            "quic-standard up requires native TUN; set SHPH_TUN_NATIVE=1".into(),
+        ));
+    }
     println!("SHPH up");
     println!("  Interface: {}", tun.name());
     println!("  Local endpoint: {}", config.local_endpoint);
@@ -487,11 +505,6 @@ fn handle_up(
             };
         }
     }
-    // Drop the probe handle before the session loops open the same-named TUN
-    // interface again; keeping both open causes ioctl(TUNSETIFF) to fail with
-    // EBUSY ("Device or resource busy") since the kernel ties interface state
-    // to the already-open fd.
-    drop(tun);
     let session_result = if let Some(session) = &config.session {
         let timeout_secs = session.timeout_secs.unwrap_or(5);
         let reconnect_enabled = session
@@ -528,7 +541,7 @@ fn handle_up(
                         bind,
                         timeout_secs,
                         Some(transport_mode_to_str(transport).to_string()),
-                        None,
+                        quic_cert_path,
                         profile,
                         roadmap,
                     )?;
@@ -541,12 +554,13 @@ fn handle_up(
                         || {
                             run_listen_loop(
                                 keystore_path,
-                                &interface_name,
+                                &tun,
                                 bind,
                                 timeout_secs,
                                 transport,
                                 profile,
                                 config.roadmap.as_ref(),
+                                quic_cert_path,
                             )
                         },
                     )?;
@@ -565,7 +579,7 @@ fn handle_up(
                         payload,
                         timeout_secs,
                         Some(transport_mode_to_str(transport).to_string()),
-                        None,
+                        quic_cert_path,
                         profile,
                         roadmap,
                     )?;
@@ -578,12 +592,13 @@ fn handle_up(
                         || {
                             run_connect_loop(
                                 keystore_path,
-                                &interface_name,
+                                &tun,
                                 peer,
                                 timeout_secs,
                                 transport,
                                 profile,
                                 config.roadmap.as_ref(),
+                                quic_cert_path,
                             )
                         },
                     )?;
@@ -653,7 +668,7 @@ fn read_quic_certificate(path: &Path) -> Result<Vec<u8>> {
             .map_err(ShphError::Io)?
     };
     #[cfg(not(unix))]
-    let mut file = {
+    let file = {
         let metadata = fs::symlink_metadata(path).map_err(ShphError::Io)?;
         if metadata.file_type().is_symlink() {
             return Err(ShphError::InvalidArgument(
@@ -783,13 +798,35 @@ fn open_control_plane_state_readonly(path: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
+        use std::os::unix::fs::PermissionsExt;
+        let file = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+            .open(path)?;
+        let mode = file.metadata()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "control-plane state is group/other accessible (mode {mode:o}); refusing to load"
+                ),
+            ));
+        }
+        Ok(file)
     }
     #[cfg(not(unix))]
     {
+        shph_core::ensure_not_reparse_point(path)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to load a symlinked control-plane state",
+            ));
+        }
+        shph_core::enforce_owner_only_file_permissions(path)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
         fs::File::open(path)
     }
 }
@@ -866,14 +903,22 @@ fn restrict_state_file_perms(path: &Path) -> Result<()> {
 fn state_from_guard(interface_name: &str, guard: &ControlPlaneGuard) -> PersistedControlPlaneState {
     PersistedControlPlaneState {
         interface_name: interface_name.to_string(),
-        routes: guard.added_routes.clone(),
+        routes: guard
+            .added_routes
+            .iter()
+            .map(|(route, _)| route.clone())
+            .collect(),
         dns_servers: guard.applied_dns_servers.clone(),
     }
 }
 
 fn guard_from_state(state: &PersistedControlPlaneState) -> ControlPlaneGuard {
     ControlPlaneGuard {
-        added_routes: state.routes.clone(),
+        added_routes: state
+            .routes
+            .iter()
+            .map(|route| (route.clone(), state.interface_name.clone()))
+            .collect(),
         applied_dns_servers: state.dns_servers.clone(),
         dns_interface_name: (!state.dns_servers.is_empty()).then(|| state.interface_name.clone()),
         dry_run: false,
@@ -1036,17 +1081,64 @@ fn handle_add_peer(
 }
 
 fn handle_show_config(config_path: &Path, show_secrets: bool) -> Result<()> {
-    let mut config = load_config(config_path)?;
-    if !show_secrets {
-        if let Some(obfuscation) = config.obfuscation.as_mut() {
-            if let Some(shadowsocks) = obfuscation.shadowsocks.as_mut() {
-                shadowsocks.password = "<redacted>".into();
-            }
-        }
+    let config = load_config(config_path)?;
+    if show_secrets {
+        eprintln!(
+            "WARNING: --show-secrets prints credential-like configuration fields; protect the terminal and any redirected output."
+        );
     }
-    let rendered = toml::to_string_pretty(&config).map_err(|e| ShphError::Config(e.to_string()))?;
+    let rendered = render_config_for_display(&config, show_secrets)?;
     println!("{rendered}");
     Ok(())
+}
+
+fn render_config_for_display(config: &Config, show_secrets: bool) -> Result<String> {
+    let mut value =
+        toml::Value::try_from(config).map_err(|error| ShphError::Config(error.to_string()))?;
+    if !show_secrets {
+        redact_config_value(&mut value);
+    }
+    toml::to_string_pretty(&value).map_err(|error| ShphError::Config(error.to_string()))
+}
+
+fn redact_config_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::Array(values) => {
+            for value in values {
+                redact_config_value(value);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (key, value) in table {
+                if is_sensitive_config_key(key) {
+                    *value = toml::Value::String("<redacted>".into());
+                } else {
+                    redact_config_value(value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_config_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "password"
+            | "pin"
+            | "secret"
+            | "private_key"
+            | "private_key_b64"
+            | "signing_seed"
+            | "signing_seed_b64"
+            | "sign_seed"
+            | "sign_seed_b64"
+            | "token"
+    ) || key.ends_with("_password")
+        || key.ends_with("_secret")
+        || key.ends_with("_private_key")
+        || key.ends_with("_token")
 }
 
 fn handle_validate_roadmap(config_path: &Path) -> Result<()> {
@@ -1339,11 +1431,13 @@ fn handle_handshake_sim(keystore_path: &Path, peer_pubkey_b64: &str) -> Result<(
         None,
     )?;
     let peer_material = build_hello(&peer_identity)?;
+    let policy = PeerPolicy::single(PeerPin::for_identity(&peer_identity));
     let state: HandshakeState = verify_and_derive(
         &keystore.identity,
         &material,
         &peer_material.local_hello,
         true,
+        &policy,
     )?;
     let out = HandshakeSimOut {
         peer_fingerprint_hex: state.peer_fingerprint_hex,
@@ -1370,6 +1464,7 @@ fn handle_listen(
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
+    let policy = peer_policy_for_endpoint(&keystore, bind, false)?;
     if mode == TransportMode::QuicStandard {
         let cert_path = quic_cert_path.ok_or_else(|| {
             ShphError::Config(
@@ -1386,7 +1481,8 @@ fn handle_listen(
             write_quic_certificate(cert_path, &server.certificate_der)?;
             println!("  Standards QUIC certificate: {}", cert_path.display());
             let connection =
-                standards_quic::accept(&server, &keystore.identity, profile, timeout).await?;
+                standards_quic::accept(&server, &keystore.identity, &policy, profile, timeout)
+                    .await?;
             Ok(connection.handshake)
         })?;
         enforce_peer_policy(keystore_path, bind, &state, false)?;
@@ -1395,13 +1491,18 @@ fn handle_listen(
         return Ok(());
     }
     let state = match mode {
-        TransportMode::Tcp => {
-            tcp_handshake_server_with_profile(bind, &keystore.identity, timeout_secs, profile)?
-        }
+        TransportMode::Tcp => tcp_handshake_server_with_profile(
+            bind,
+            &keystore.identity,
+            &policy,
+            timeout_secs,
+            profile,
+        )?,
         TransportMode::Quic => {
             let (_socket, _peer, state) = quic_handshake_server_with_profile(
                 bind,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?;
@@ -1412,6 +1513,7 @@ fn handle_listen(
             offline_mesh_accept_and_handshake_with_profile(
                 &cfg,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -1421,6 +1523,7 @@ fn handle_listen(
             data_mule_accept_and_handshake_with_profile(
                 &cfg,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -1453,6 +1556,7 @@ fn handle_connect(
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
+    let policy = peer_policy_for_endpoint(&keystore, peer, true)?;
     if mode == TransportMode::QuicStandard {
         let cert_path = quic_cert_path.ok_or_else(|| {
             ShphError::Config(
@@ -1473,6 +1577,7 @@ fn handle_connect(
                 peer_addr,
                 "localhost",
                 &keystore.identity,
+                &policy,
                 profile,
                 timeout_duration,
             )
@@ -1488,13 +1593,18 @@ fn handle_connect(
         return Ok(());
     }
     let state = match mode {
-        TransportMode::Tcp => {
-            tcp_handshake_client_with_profile(peer, &keystore.identity, timeout_secs, profile)?
-        }
+        TransportMode::Tcp => tcp_handshake_client_with_profile(
+            peer,
+            &keystore.identity,
+            &policy,
+            timeout_secs,
+            profile,
+        )?,
         TransportMode::Quic => {
             let (_socket, _peer_addr, state) = quic_handshake_client_with_profile(
                 peer,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?;
@@ -1505,6 +1615,7 @@ fn handle_connect(
             offline_mesh_connect_and_handshake_with_profile(
                 &cfg,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -1515,6 +1626,7 @@ fn handle_connect(
                 &cfg,
                 &keystore.identity,
                 peer,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -1555,6 +1667,8 @@ fn handle_send_once(
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     let lab = quic_lab_config()?;
     announce_handshake_profile(profile);
+    let keystore = KeyStore::load(keystore_path, None)?;
+    let policy = peer_policy_for_endpoint(&keystore, peer, true)?;
     if mode == TransportMode::QuicStandard {
         let cert_path = quic_cert_path.ok_or_else(|| {
             ShphError::Config(
@@ -1563,7 +1677,6 @@ fn handle_send_once(
         })?;
         let certificate = read_quic_certificate(cert_path)?;
         let peer_addr = parse_socket_addr(peer)?;
-        let keystore = KeyStore::load(keystore_path, None)?;
         let state = run_async(async {
             let endpoint = standards_quic::client_endpoint(
                 "0.0.0.0:0".parse().expect("valid ephemeral endpoint"),
@@ -1575,6 +1688,7 @@ fn handle_send_once(
                 peer_addr,
                 "localhost",
                 &keystore.identity,
+                &policy,
                 profile,
                 bounded_cli_timeout(timeout_secs),
             )
@@ -1605,45 +1719,41 @@ fn handle_send_once(
         return Ok(());
     }
     let (mut session, state) = match mode {
-        TransportMode::Tcp => {
-            let keystore = KeyStore::load(keystore_path, None)?;
-            connect_secure_session_lab_with_profile(
-                peer,
-                &keystore.identity,
-                timeout_secs,
-                mode,
-                lab,
-                profile,
-            )?
-        }
-        TransportMode::Quic => {
-            let keystore = KeyStore::load(keystore_path, None)?;
-            connect_secure_session_lab_with_profile(
-                peer,
-                &keystore.identity,
-                timeout_secs,
-                mode,
-                lab,
-                profile,
-            )?
-        }
+        TransportMode::Tcp => connect_secure_session_lab_with_profile(
+            peer,
+            &keystore.identity,
+            &policy,
+            timeout_secs,
+            mode,
+            lab,
+            profile,
+        )?,
+        TransportMode::Quic => connect_secure_session_lab_with_profile(
+            peer,
+            &keystore.identity,
+            &policy,
+            timeout_secs,
+            mode,
+            lab,
+            profile,
+        )?,
         TransportMode::OfflineMesh => {
-            let keystore = KeyStore::load(keystore_path, None)?;
             let cfg = roadmap_offline_mesh_config(roadmap)?;
             offline_mesh_connect_secure_session_with_profile(
                 &cfg,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?
         }
         TransportMode::DataMule => {
-            let keystore = KeyStore::load(keystore_path, None)?;
             let cfg = roadmap_data_mule_config(roadmap)?;
             data_mule_connect_secure_session_with_profile(
                 &cfg,
                 &keystore.identity,
                 peer,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -1689,13 +1799,14 @@ fn handle_recv_once(
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
     let lab = quic_lab_config()?;
     announce_handshake_profile(profile);
+    let keystore = KeyStore::load(keystore_path, None)?;
+    let policy = peer_policy_for_endpoint(&keystore, bind, false)?;
     if mode == TransportMode::QuicStandard {
         let cert_path = quic_cert_path.ok_or_else(|| {
             ShphError::Config(
                 "--quic-cert is required with --transport quic-standard on recv-once".into(),
             )
         })?;
-        let keystore = KeyStore::load(keystore_path, None)?;
         let bind_addr = parse_socket_addr(bind)?;
         let result = run_async(async {
             let server = standards_quic::server_endpoint(
@@ -1707,6 +1818,7 @@ fn handle_recv_once(
             let mut connection = standards_quic::accept(
                 &server,
                 &keystore.identity,
+                &policy,
                 profile,
                 bounded_cli_timeout(timeout_secs),
             )
@@ -1733,44 +1845,40 @@ fn handle_recv_once(
         return Ok(());
     }
     let (mut session, state) = match mode {
-        TransportMode::Tcp => {
-            let keystore = KeyStore::load(keystore_path, None)?;
-            accept_secure_session_lab_with_profile(
-                bind,
-                &keystore.identity,
-                timeout_secs,
-                mode,
-                lab,
-                profile,
-            )?
-        }
-        TransportMode::Quic => {
-            let keystore = KeyStore::load(keystore_path, None)?;
-            accept_secure_session_lab_with_profile(
-                bind,
-                &keystore.identity,
-                timeout_secs,
-                mode,
-                lab,
-                profile,
-            )?
-        }
+        TransportMode::Tcp => accept_secure_session_lab_with_profile(
+            bind,
+            &keystore.identity,
+            &policy,
+            timeout_secs,
+            mode,
+            lab,
+            profile,
+        )?,
+        TransportMode::Quic => accept_secure_session_lab_with_profile(
+            bind,
+            &keystore.identity,
+            &policy,
+            timeout_secs,
+            mode,
+            lab,
+            profile,
+        )?,
         TransportMode::OfflineMesh => {
-            let keystore = KeyStore::load(keystore_path, None)?;
             let cfg = roadmap_offline_mesh_config(roadmap)?;
             offline_mesh_accept_secure_session_with_profile(
                 &cfg,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?
         }
         TransportMode::DataMule => {
-            let keystore = KeyStore::load(keystore_path, None)?;
             let cfg = roadmap_data_mule_config(roadmap)?;
             data_mule_accept_secure_session_with_profile(
                 &cfg,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -1949,6 +2057,57 @@ fn format_endpoint(host: &str, port: u16) -> String {
     }
 }
 
+fn decode_peer_key(value: &str, label: &str) -> Result<[u8; 32]> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(value.as_bytes())
+        .map_err(|_| ShphError::Auth(format!("{label} is not valid base64")))?;
+    raw.try_into()
+        .map_err(|_| ShphError::Auth(format!("{label} must decode to 32 bytes")))
+}
+
+fn contact_peer_pin(contact: &Contact) -> Result<PeerPin> {
+    let identity_public = decode_peer_key(&contact.pubkey_b64, "configured peer identity")?;
+    let signing_public = contact
+        .sign_pubkey_b64
+        .as_deref()
+        .ok_or_else(|| {
+            ShphError::Auth(format!(
+                "configured contact '{}' has no pinned signing key",
+                contact.alias
+            ))
+        })
+        .and_then(|value| decode_peer_key(value, "configured peer signing key"))?;
+    Ok(PeerPin::new(identity_public, signing_public))
+}
+
+fn peer_policy_for_endpoint(
+    keystore: &KeyStore,
+    endpoint: &str,
+    outbound: bool,
+) -> Result<PeerPolicy> {
+    let contacts: Vec<&Contact> = if outbound {
+        keystore
+            .contacts
+            .values()
+            .filter(|contact| {
+                let configured_endpoint =
+                    format_endpoint(&contact.endpoint.host, contact.endpoint.port);
+                configured_endpoint == endpoint
+                    || contact.alias == endpoint
+                    || contact.pubkey_b64 == endpoint
+            })
+            .collect()
+    } else {
+        keystore.contacts.values().collect()
+    };
+
+    let pins = contacts
+        .into_iter()
+        .map(contact_peer_pin)
+        .collect::<Result<Vec<_>>>()?;
+    PeerPolicy::new(pins)
+}
+
 fn enforce_peer_policy(
     keystore_path: &Path,
     endpoint: &str,
@@ -2055,7 +2214,9 @@ fn apply_control_plane(config: &Config, interface_name: &str) -> Result<ControlP
                 println!("  [dry-run] route add {route}");
             } else {
                 add_route(route, interface_name)?;
-                guard.added_routes.push(route.clone());
+                guard
+                    .added_routes
+                    .push((route.clone(), interface_name.to_string()));
                 println!("  route add {route}");
             }
         }
@@ -2164,7 +2325,7 @@ fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8)> {
 /// apply failure. `dry_run` is recorded for diagnostics only.
 #[derive(Default)]
 struct ControlPlaneGuard {
-    added_routes: Vec<String>,
+    added_routes: Vec<(String, String)>,
     applied_dns_servers: Vec<String>,
     dns_interface_name: Option<String>,
     /// Recorded for diagnostics/tests; not used by the live apply path.
@@ -2189,8 +2350,8 @@ impl ControlPlaneGuard {
             self.dns_interface_name = None;
         }
 
-        while let Some(route) = self.added_routes.pop() {
-            if let Err(err) = delete_route(&route) {
+        while let Some((route, interface_name)) = self.added_routes.pop() {
+            if let Err(err) = delete_route(&route, &interface_name) {
                 rollback_errors.push(err);
             } else {
                 println!("  route del {route}");
@@ -2209,8 +2370,8 @@ fn add_route(cidr: &str, interface_name: &str) -> Result<()> {
     run_shell_command(&command)
 }
 
-fn delete_route(cidr: &str) -> Result<()> {
-    let command = build_route_delete_command(cidr)?;
+fn delete_route(cidr: &str, interface_name: &str) -> Result<()> {
+    let command = build_route_delete_command(cidr, interface_name)?;
     run_shell_command(&command)
 }
 
@@ -2363,7 +2524,7 @@ fn build_route_add_command(cidr: &str, interface_name: &str) -> Result<Vec<Strin
     }
 }
 
-fn build_route_delete_command(cidr: &str) -> Result<Vec<String>> {
+fn build_route_delete_command(cidr: &str, interface_name: &str) -> Result<Vec<String>> {
     validate_cidr(cidr)?;
     if cfg!(target_os = "linux") {
         Ok(vec![
@@ -2382,6 +2543,7 @@ fn build_route_delete_command(cidr: &str) -> Result<Vec<String>> {
             "delete".to_string(),
             "route".to_string(),
             format!("prefix={cidr}"),
+            format!("interface={interface_name}"),
             "store=active".to_string(),
         ])
     } else {
@@ -2506,23 +2668,245 @@ where
     }
 }
 
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_standards_quic_listen_loop(
+    keystore_path: &Path,
+    keystore: &KeyStore,
+    tun: &TunDevice,
+    bind: &str,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+    roadmap: Option<&RoadmapConfig>,
+    quic_cert_path: Option<&Path>,
+    start_ms: u64,
+) -> Result<()> {
+    let cert_path = quic_cert_path.ok_or_else(|| {
+        ShphError::Config(
+            "--quic-cert is required with --transport quic-standard on up listen".into(),
+        )
+    })?;
+    let bind_addr = parse_socket_addr(bind)?;
+    let timeout_duration = bounded_cli_timeout(timeout_secs);
+    let policy = peer_policy_for_endpoint(keystore, bind, false)?;
+    run_async(async {
+        let server = standards_quic::server_endpoint(
+            bind_addr,
+            standards_quic::StandardsQuicConfig::default(),
+        )?;
+        write_quic_certificate(cert_path, &server.certificate_der)?;
+        println!("  Standards QUIC certificate: {}", cert_path.display());
+        loop {
+            let connection = tokio::select! {
+                result = standards_quic::accept(
+                    &server,
+                    &keystore.identity,
+                    &policy,
+                    profile,
+                    timeout_duration,
+                ) => match result {
+                    Ok(connection) => connection,
+                    Err(ShphError::Timeout) => continue,
+                    Err(error) => return Err(error),
+                },
+                _ = wait_for_native_shutdown() => {
+                    server.endpoint.close(0u32.into(), b"bridge closed");
+                    server.endpoint.wait_idle().await;
+                    return Ok(());
+                }
+            };
+            let state = connection.handshake.clone();
+            enforce_peer_policy(keystore_path, bind, &state, false)?;
+            append_handshake_audit(
+                roadmap,
+                &keystore.identity,
+                bind,
+                &state,
+                "listen-loop",
+                TransportMode::QuicStandard,
+            )?;
+            print_handshake_state("listen-loop", bind, &state);
+            let tun_to_quic: AsyncTunDevice = tun.try_clone()?.into_async()?;
+            let quic_to_tun: AsyncTunDevice = tun.try_clone()?.into_async()?;
+            let bridge = standards_tun::run(
+                connection,
+                tun_to_quic,
+                quic_to_tun,
+                standards_tun::StandardsTunBridgeConfig::default(),
+            );
+            match tokio::select! {
+                result = bridge => result,
+                _ = wait_for_native_shutdown() => {
+                    Ok(standards_tun::StandardsTunBridgeStats::default())
+                }
+            } {
+                Ok(stats) => {
+                    print_standards_tun_stats(start_ms, &stats);
+                    if shutdown::shutdown_requested() {
+                        server.endpoint.close(0u32.into(), b"bridge closed");
+                        server.endpoint.wait_idle().await;
+                        return Ok(());
+                    }
+                }
+                Err(ShphError::ConnectionClosed) if !shutdown::shutdown_requested() => {
+                    println!("  Standards QUIC peer disconnected; awaiting reconnect");
+                }
+                Err(error) => {
+                    server.endpoint.close(0u32.into(), b"bridge closed");
+                    server.endpoint.wait_idle().await;
+                    return Err(error);
+                }
+            }
+        }
+    })?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_standards_quic_connect_loop(
+    keystore_path: &Path,
+    keystore: &KeyStore,
+    tun: &TunDevice,
+    peer: &str,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+    roadmap: Option<&RoadmapConfig>,
+    quic_cert_path: Option<&Path>,
+    start_ms: u64,
+) -> Result<()> {
+    let cert_path = quic_cert_path.ok_or_else(|| {
+        ShphError::Config(
+            "--quic-cert is required with --transport quic-standard on up connect".into(),
+        )
+    })?;
+    let peer_addr = parse_socket_addr(peer)?;
+    let tun_tx = tun.try_clone()?;
+    let tun_rx = tun.try_clone()?;
+    let timeout_duration = bounded_cli_timeout(timeout_secs);
+    let certificate = read_quic_certificate(cert_path)?;
+    let policy = peer_policy_for_endpoint(keystore, peer, true)?;
+    let (state, stats) = run_async(async {
+        let endpoint = standards_quic::client_endpoint(
+            "0.0.0.0:0"
+                .parse()
+                .map_err(|_| ShphError::Internal("invalid ephemeral endpoint".into()))?,
+            &certificate,
+            standards_quic::StandardsQuicConfig::default(),
+        )?;
+        let connection = standards_quic::connect(
+            &endpoint,
+            peer_addr,
+            "localhost",
+            &keystore.identity,
+            &policy,
+            profile,
+            timeout_duration,
+        )
+        .await?;
+        let state = connection.handshake.clone();
+        enforce_peer_policy(keystore_path, peer, &state, true)?;
+        append_handshake_audit(
+            roadmap,
+            &keystore.identity,
+            peer,
+            &state,
+            "connect-loop",
+            TransportMode::QuicStandard,
+        )?;
+        print_handshake_state("connect-loop", peer, &state);
+        let tun_to_quic: AsyncTunDevice = tun_tx.into_async()?;
+        let quic_to_tun: AsyncTunDevice = tun_rx.into_async()?;
+        let bridge = standards_tun::run(
+            connection,
+            tun_to_quic,
+            quic_to_tun,
+            standards_tun::StandardsTunBridgeConfig::default(),
+        );
+        let bridge_result = tokio::select! {
+            result = bridge => result,
+            _ = wait_for_native_shutdown() => {
+                Ok(standards_tun::StandardsTunBridgeStats::default())
+            }
+        };
+        endpoint.close(0u32.into(), b"bridge closed");
+        endpoint.wait_idle().await;
+        let stats = bridge_result?;
+        Ok((state, stats))
+    })?;
+    print_standards_tun_stats(start_ms, &stats);
+    let _ = state;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn print_standards_tun_stats(start_ms: u64, stats: &standards_tun::StandardsTunBridgeStats) {
+    println!("  Transport loop: closed");
+    println!("  Session start: {start_ms}ms");
+    println!(
+        "  Standards QUIC TUN stats: tx_packets={}, tx_bytes={}, rx_packets={}, rx_bytes={}, oversized_drops={}, invalid_drops={}",
+        stats.tun_to_quic_packets,
+        stats.tun_to_quic_bytes,
+        stats.quic_to_tun_packets,
+        stats.quic_to_tun_bytes,
+        stats.dropped_oversized_packets,
+        stats.dropped_invalid_datagrams,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_listen_loop(
     keystore_path: &Path,
-    interface_name: &str,
+    tun: &TunDevice,
     bind: &str,
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
+    quic_cert_path: Option<&Path>,
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
+    let policy = peer_policy_for_endpoint(&keystore, bind, false)?;
     announce_handshake_profile(profile);
+    if mode == TransportMode::QuicStandard {
+        #[cfg(target_os = "linux")]
+        {
+            return run_standards_quic_listen_loop(
+                keystore_path,
+                &keystore,
+                tun,
+                bind,
+                timeout_secs,
+                profile,
+                roadmap,
+                quic_cert_path,
+                start_ms,
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                keystore_path,
+                tun,
+                bind,
+                timeout_secs,
+                profile,
+                roadmap,
+                quic_cert_path,
+                start_ms,
+            );
+            return Err(ShphError::Unsupported(
+                "standards-QUIC native-TUN bridge currently requires Linux".into(),
+            ));
+        }
+    }
     let (mut session, state) = match mode {
         TransportMode::Tcp | TransportMode::Quic => accept_secure_session_lab_with_profile(
             bind,
             &keystore.identity,
+            &policy,
             timeout_secs,
             mode,
             lab,
@@ -2533,6 +2917,7 @@ fn run_listen_loop(
             offline_mesh_accept_secure_session_with_profile(
                 &cfg,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -2542,6 +2927,7 @@ fn run_listen_loop(
             data_mule_accept_secure_session_with_profile(
                 &cfg,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -2567,8 +2953,6 @@ fn run_listen_loop(
     println!("  Session id: {session_id}");
     println!("  Session start: {start_ms}ms");
     println!("  Initial metrics: {:?}", metrics.snapshot());
-    let tun = TunDevice::open(interface_name)?;
-
     if tun.is_native() {
         println!("  Transport loop: active (bidirectional TUN <-> transport)");
         run_bidirectional_native_loop(session, tun, metrics.clone())?;
@@ -2607,23 +2991,59 @@ fn run_listen_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_connect_loop(
     keystore_path: &Path,
-    interface_name: &str,
+    tun: &TunDevice,
     peer: &str,
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
+    quic_cert_path: Option<&Path>,
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
+    let policy = peer_policy_for_endpoint(&keystore, peer, true)?;
     announce_handshake_profile(profile);
+    if mode == TransportMode::QuicStandard {
+        #[cfg(target_os = "linux")]
+        {
+            return run_standards_quic_connect_loop(
+                keystore_path,
+                &keystore,
+                tun,
+                peer,
+                timeout_secs,
+                profile,
+                roadmap,
+                quic_cert_path,
+                start_ms,
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                keystore_path,
+                tun,
+                peer,
+                timeout_secs,
+                profile,
+                roadmap,
+                quic_cert_path,
+                start_ms,
+            );
+            return Err(ShphError::Unsupported(
+                "standards-QUIC native-TUN bridge currently requires Linux".into(),
+            ));
+        }
+    }
     let (mut session, state) = match mode {
         TransportMode::Tcp | TransportMode::Quic => connect_secure_session_lab_with_profile(
             peer,
             &keystore.identity,
+            &policy,
             timeout_secs,
             mode,
             lab,
@@ -2634,6 +3054,7 @@ fn run_connect_loop(
             offline_mesh_connect_secure_session_with_profile(
                 &cfg,
                 &keystore.identity,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -2644,6 +3065,7 @@ fn run_connect_loop(
                 &cfg,
                 &keystore.identity,
                 peer,
+                &policy,
                 timeout_secs,
                 profile,
             )?
@@ -2669,8 +3091,6 @@ fn run_connect_loop(
     println!("  Session id: {session_id}");
     println!("  Session start: {start_ms}ms");
     println!("  Initial metrics: {:?}", metrics.snapshot());
-    let tun = TunDevice::open(interface_name)?;
-
     if tun.is_native() {
         println!("  Transport loop: active (bidirectional TUN <-> transport)");
         run_bidirectional_native_loop(session, tun, metrics.clone())?;
@@ -2833,75 +3253,214 @@ fn read_stdin_line_unix(
 
 fn run_bidirectional_native_loop(
     session: SecureSession,
-    tun: TunDevice,
+    tun: &TunDevice,
     metrics: MetricsCollector,
 ) -> Result<()> {
-    let shutdown = Arc::new(AtomicBool::new(false));
+    #[cfg(target_os = "linux")]
+    {
+        let tun_tx = tun.try_clone()?;
+        let tun_rx = tun.try_clone()?;
+        run_async(run_bidirectional_native_async(
+            session, tun_tx, tun_rx, metrics,
+        ))
+    }
 
-    let tun_tx = tun.try_clone()?;
-    let tun_rx = tun;
-    let (sender, receiver) = session.into_split()?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        #[cfg(target_os = "windows")]
+        {
+            let tun_tx = tun.try_clone()?;
+            let tun_rx = tun.try_clone()?;
+            run_bidirectional_native_sync(session, tun_tx, tun_rx, metrics)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (session, tun, metrics);
+            Err(ShphError::Unsupported(
+                "the native TUN bridge is not implemented on this platform".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+type NativePacket = zeroize::Zeroizing<Vec<u8>>;
+
+#[cfg(target_os = "linux")]
+async fn run_bidirectional_native_async(
+    session: SecureSession,
+    tun_tx: TunDevice,
+    tun_rx: TunDevice,
+    metrics: MetricsCollector,
+) -> Result<()> {
+    const BRIDGE_QUEUE_CAPACITY: usize = 32;
+
+    let tun_tx = tun_tx.into_async()?;
+    let tun_rx = tun_rx.into_async()?;
+    let (sender, mut receiver) = session.into_split()?;
+    receiver.set_poll_timeout(Duration::from_millis(100))?;
+    let (to_transport_tx, to_transport_rx) =
+        tokio::sync::mpsc::channel::<NativePacket>(BRIDGE_QUEUE_CAPACITY);
+    let (to_tun_tx, to_tun_rx) = tokio::sync::mpsc::channel::<NativePacket>(BRIDGE_QUEUE_CAPACITY);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (task_done_tx, mut task_done_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+
+    let sender_metrics = metrics.clone();
+    let sender_done_tx = task_done_tx.clone();
+    let sender_task = tokio::task::spawn_blocking(move || {
+        let result = native_transport_sender_loop(to_transport_rx, sender, sender_metrics);
+        let _ = sender_done_tx.send("transport sender");
+        result
+    });
+    let receiver_metrics = metrics.clone();
+    let receiver_shutdown = Arc::clone(&shutdown);
+    let receiver_done_tx = task_done_tx;
+    let receiver_task = tokio::task::spawn_blocking(move || {
+        let result = native_transport_receiver_loop(
+            to_tun_tx,
+            receiver,
+            receiver_shutdown,
+            receiver_metrics,
+        );
+        let _ = receiver_done_tx.send("transport receiver");
+        result
+    });
 
     let tx_shutdown = Arc::clone(&shutdown);
     let tx_metrics = metrics.clone();
-    let tx_handle =
-        thread::spawn(move || tun_to_transport_loop(tun_tx, sender, tx_shutdown, tx_metrics));
+    let mut tun_reader = Box::pin(async move {
+        native_async_tun_to_transport_loop(tun_tx, to_transport_tx, tx_shutdown, tx_metrics).await
+    });
+    let rx_shutdown = Arc::clone(&shutdown);
+    let rx_metrics = metrics.clone();
+    let mut tun_writer = Box::pin(native_async_transport_to_tun_loop(
+        tun_rx,
+        to_tun_rx,
+        rx_shutdown,
+        rx_metrics,
+    ));
+
+    let (first_result, local_shutdown) = tokio::select! {
+        result = &mut tun_reader => (Some(result), false),
+        result = &mut tun_writer => (Some(result), false),
+        Some(task_name) = task_done_rx.recv() => {
+            tracing::debug!(task = task_name, "native TUN transport worker completed");
+            (None, false)
+        }
+        _ = wait_for_native_shutdown() => (None, true),
+    };
+    shutdown.store(true, Ordering::Relaxed);
+    drop(tun_reader);
+    drop(tun_writer);
+
+    let mut remote_connection_closed = false;
+    if let Some(Err(error)) = first_result {
+        if matches!(error, ShphError::ConnectionClosed) {
+            remote_connection_closed = true;
+        } else {
+            return Err(error);
+        }
+    }
+    for result in [sender_task.await, receiver_task.await] {
+        let result = result
+            .map_err(|err| ShphError::Internal(format!("native TUN worker task failed: {err}")))?;
+        if let Err(error) = result {
+            if matches!(error, ShphError::ConnectionClosed) {
+                remote_connection_closed = true;
+            } else {
+                return Err(error);
+            }
+        }
+    }
+    if remote_connection_closed && !local_shutdown {
+        return Err(ShphError::ConnectionClosed);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_native_shutdown() {
+    while !shutdown::shutdown_requested() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_bidirectional_native_sync(
+    session: SecureSession,
+    tun_tx: TunDevice,
+    tun_rx: TunDevice,
+    metrics: MetricsCollector,
+) -> Result<()> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (sender, mut receiver) = session.into_split()?;
+    receiver.set_poll_timeout(Duration::from_millis(100))?;
+
+    let tx_shutdown = Arc::clone(&shutdown);
+    let tx_metrics = metrics.clone();
+    let tx_handle = thread::spawn(move || {
+        windows_tun_to_transport_loop(tun_tx, sender, tx_shutdown, tx_metrics)
+    });
 
     let rx_shutdown = Arc::clone(&shutdown);
     let rx_metrics = metrics.clone();
-    let rx_handle =
-        thread::spawn(move || transport_to_tun_loop(receiver, tun_rx, rx_shutdown, rx_metrics));
+    let rx_handle = thread::spawn(move || {
+        windows_transport_to_tun_loop(receiver, tun_rx, rx_shutdown, rx_metrics)
+    });
 
     let tx_result = tx_handle
         .join()
-        .map_err(|_| ShphError::Internal("tun_to_transport thread panicked".into()))?;
+        .map_err(|_| ShphError::Internal("Windows TUN sender thread panicked".into()))?;
     let rx_result = rx_handle
         .join()
-        .map_err(|_| ShphError::Internal("transport_to_tun thread panicked".into()))?;
+        .map_err(|_| ShphError::Internal("Windows TUN receiver thread panicked".into()))?;
 
     match (tx_result, rx_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(ShphError::ConnectionClosed), Ok(()))
         | (Ok(()), Err(ShphError::ConnectionClosed))
-        | (Err(ShphError::ConnectionClosed), Err(ShphError::ConnectionClosed)) => Ok(()),
+        | (Err(ShphError::ConnectionClosed), Err(ShphError::ConnectionClosed)) => {
+            if shutdown::shutdown_requested() {
+                Ok(())
+            } else {
+                Err(ShphError::ConnectionClosed)
+            }
+        }
         (Err(left), Ok(())) => Err(left),
         (Ok(()), Err(right)) => Err(right),
         (Err(left), Err(_right)) => Err(left),
     }
 }
 
-fn tun_to_transport_loop(
+#[cfg(target_os = "windows")]
+fn windows_tun_to_transport_loop(
     mut tun: TunDevice,
     mut sender: SecureSender,
     shutdown: Arc<AtomicBool>,
     metrics: MetricsCollector,
 ) -> Result<()> {
-    let mut packet = vec![0u8; TUN_READ_BUFFER_BYTES];
+    let mut packet = zeroize::Zeroizing::new(vec![0u8; TUN_READ_BUFFER_BYTES]);
     while !shutdown.load(Ordering::Relaxed) && !shutdown::shutdown_requested() {
         match tun.recv_packet(&mut packet) {
-            Ok(0) => thread::sleep(Duration::from_millis(5)),
             Ok(n) => {
                 sender.send_frame(&packet[..n])?;
                 metrics.inc_bytes_sent(n);
+                packet[..n].zeroize();
             }
-            Err(ShphError::Timeout) => {
-                metrics.inc_timeout();
-                thread::sleep(Duration::from_millis(5))
-            }
-            Err(ShphError::Unsupported(_)) => break,
-            Err(ShphError::ConnectionClosed) => break,
+            Err(ShphError::Timeout) => metrics.inc_timeout(),
+            Err(ShphError::ConnectionClosed) | Err(ShphError::Unsupported(_)) => break,
             Err(ShphError::Tun(message)) => {
                 if message.contains("exceeds") {
                     metrics.inc_oversized_packet();
                 } else {
                     metrics.inc_malformed_packet();
                 }
-                continue;
             }
-            Err(err) => {
+            Err(error) => {
+                record_data_plane_error(&metrics, &error);
                 shutdown.store(true, Ordering::Relaxed);
-                record_data_plane_error(&metrics, &err);
-                return Err(err);
+                return Err(error);
             }
         }
     }
@@ -2909,7 +3468,8 @@ fn tun_to_transport_loop(
     Ok(())
 }
 
-fn transport_to_tun_loop(
+#[cfg(target_os = "windows")]
+fn windows_transport_to_tun_loop(
     mut receiver: SecureReceiver,
     mut tun: TunDevice,
     shutdown: Arc<AtomicBool>,
@@ -2918,48 +3478,168 @@ fn transport_to_tun_loop(
     while !shutdown.load(Ordering::Relaxed) && !shutdown::shutdown_requested() {
         match receiver.recv_frame() {
             Ok(payload) => {
+                let payload = zeroize::Zeroizing::new(payload);
                 if payload.is_empty() {
                     continue;
                 }
                 match tun.send_packet(&payload) {
-                    Ok(()) => {}
-                    Err(ShphError::Timeout) => {
-                        metrics.inc_timeout();
-                        thread::sleep(Duration::from_millis(5))
-                    }
-                    Err(ShphError::Unsupported(_)) => break,
+                    Ok(()) => metrics.inc_bytes_recv(payload.len()),
+                    Err(ShphError::Timeout) => metrics.inc_timeout(),
+                    Err(ShphError::ConnectionClosed) | Err(ShphError::Unsupported(_)) => break,
                     Err(ShphError::Tun(message)) => {
                         if message.contains("exceeds") {
                             metrics.inc_oversized_packet();
                         } else {
                             metrics.inc_malformed_packet();
                         }
-                        continue;
                     }
-                    Err(err) => {
+                    Err(error) => {
+                        record_data_plane_error(&metrics, &error);
                         shutdown.store(true, Ordering::Relaxed);
-                        record_data_plane_error(&metrics, &err);
-                        return Err(err);
+                        return Err(error);
                     }
                 }
-                metrics.inc_bytes_recv(payload.len());
             }
-            Err(ShphError::Timeout) => {
-                metrics.inc_timeout();
-                thread::sleep(Duration::from_millis(5))
-            }
+            Err(ShphError::Timeout) => metrics.inc_timeout(),
             Err(ShphError::ConnectionClosed) => {
                 shutdown.store(true, Ordering::Relaxed);
                 return Err(ShphError::ConnectionClosed);
             }
-            Err(err) => {
+            Err(error) => {
+                record_data_plane_error(&metrics, &error);
                 shutdown.store(true, Ordering::Relaxed);
-                record_data_plane_error(&metrics, &err);
-                return Err(err);
+                return Err(error);
             }
         }
     }
     shutdown.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn native_transport_sender_loop(
+    mut payloads: tokio::sync::mpsc::Receiver<NativePacket>,
+    mut sender: SecureSender,
+    metrics: MetricsCollector,
+) -> Result<()> {
+    while let Some(payload) = payloads.blocking_recv() {
+        let payload = zeroize::Zeroizing::new(payload);
+        sender.send_frame(&payload)?;
+        metrics.inc_bytes_sent(payload.len());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn native_transport_receiver_loop(
+    payloads: tokio::sync::mpsc::Sender<NativePacket>,
+    mut receiver: SecureReceiver,
+    shutdown: Arc<AtomicBool>,
+    metrics: MetricsCollector,
+) -> Result<()> {
+    while !shutdown.load(Ordering::Relaxed) && !shutdown::shutdown_requested() {
+        match receiver.recv_frame() {
+            Ok(payload) => {
+                let payload = zeroize::Zeroizing::new(payload);
+                if payload.is_empty() {
+                    continue;
+                }
+                let mut payload = payload;
+                loop {
+                    match payloads.try_send(payload) {
+                        Ok(()) => break,
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                            if shutdown.load(Ordering::Relaxed) || shutdown::shutdown_requested() {
+                                return Ok(());
+                            }
+                            payload = returned;
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+            }
+            Err(ShphError::Timeout) => {
+                metrics.inc_timeout();
+                if shutdown.load(Ordering::Relaxed) || shutdown::shutdown_requested() {
+                    return Ok(());
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn native_async_tun_to_transport_loop(
+    mut tun: AsyncTunDevice,
+    payloads: tokio::sync::mpsc::Sender<NativePacket>,
+    shutdown: Arc<AtomicBool>,
+    metrics: MetricsCollector,
+) -> Result<()> {
+    let mut packet = zeroize::Zeroizing::new(vec![0u8; TUN_READ_BUFFER_BYTES]);
+    while !shutdown.load(Ordering::Relaxed) && !shutdown::shutdown_requested() {
+        match tun.recv_packet(&mut packet).await {
+            Ok(0) => return Err(ShphError::ConnectionClosed),
+            Ok(length) => {
+                let payload = zeroize::Zeroizing::new(packet[..length].to_vec());
+                payloads
+                    .send(payload)
+                    .await
+                    .map_err(|_| ShphError::ConnectionClosed)?;
+                packet[..length].zeroize();
+            }
+            Err(ShphError::Tun(message)) => {
+                if message.contains("exceeds") {
+                    metrics.inc_oversized_packet();
+                } else {
+                    metrics.inc_malformed_packet();
+                }
+            }
+            Err(ShphError::ConnectionClosed) => return Ok(()),
+            Err(error) => {
+                record_data_plane_error(&metrics, &error);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn native_async_transport_to_tun_loop(
+    mut tun: AsyncTunDevice,
+    mut payloads: tokio::sync::mpsc::Receiver<NativePacket>,
+    shutdown: Arc<AtomicBool>,
+    metrics: MetricsCollector,
+) -> Result<()> {
+    while !shutdown.load(Ordering::Relaxed) && !shutdown::shutdown_requested() {
+        let Some(payload) = payloads.recv().await else {
+            return Ok(());
+        };
+        let payload = zeroize::Zeroizing::new(payload);
+        if payload.is_empty() {
+            continue;
+        }
+        match tun.send_packet(&payload).await {
+            Ok(()) => metrics.inc_bytes_recv(payload.len()),
+            Err(ShphError::Tun(message)) => {
+                if message.contains("exceeds") {
+                    metrics.inc_oversized_packet();
+                } else if message.contains("short TUN packet write") {
+                    record_data_plane_error(&metrics, &ShphError::Tun(message.clone()));
+                    return Err(ShphError::Tun(message));
+                } else {
+                    metrics.inc_malformed_packet();
+                }
+            }
+            Err(error) => {
+                record_data_plane_error(&metrics, &error);
+                return Err(error);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2983,17 +3663,56 @@ mod tests {
     use super::{
         apply_control_plane, build_control_plane_plan, build_dns_apply_command,
         build_dns_apply_commands, build_dns_restore_command, build_route_add_command,
-        build_route_delete_command, control_plane_state_path, enforce_peer_policy,
-        load_control_plane_state, parse_shroud_profile_name, phase_a1_now_ms, run_with_reconnect,
-        transport_mode_to_str, validate_cidr, ControlPlaneGuard, ControlPlanePlan, HandshakeState,
-        KeyStore, KeyStoreConfig, TransportMode, MAX_CONTROL_PLANE_STATE_BYTES,
+        build_route_delete_command, control_plane_state_path, enforce_peer_policy, handle_up,
+        load_control_plane_state, parse_shroud_profile_name, phase_a1_now_ms,
+        render_config_for_display, run_with_reconnect, transport_mode_to_str, validate_cidr,
+        ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore, KeyStoreConfig,
+        TransportMode, MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
-    use shph_config::{Config, ControlPlaneConfig};
-    use shph_core::roadmap::TransportAdapterConfig;
+    use shph_config::{Config, ControlPlaneConfig, ReconnectConfig, SessionConfig, SessionRole};
+    use shph_core::roadmap::{IdentityProviderConfig, TransportAdapterConfig};
     use shph_core::{Result, ShphError};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn show_config_redacts_all_known_credential_fields_by_default() {
+        let config = Config {
+            interface_name: "shph0".into(),
+            local_endpoint: "127.0.0.1:51820".into(),
+            peers: Vec::new(),
+            obfuscation: Some(shph_config::ObfuscationConfig {
+                mode: shph_config::ObfuscationMode::Shadowsocks,
+                shadowsocks: Some(shph_config::ShadowsocksConfig {
+                    server: "127.0.0.1:8388".into(),
+                    method: "2022-blake3-aes-256-gcm".into(),
+                    password: "ss-secret".into(),
+                }),
+                tls: None,
+            }),
+            stealth: None,
+            roadmap: Some(RoadmapConfig {
+                identity: IdentityProviderConfig::YubikeyPiv {
+                    slot: "9a".into(),
+                    pin: Some("123456".into()),
+                },
+                ..RoadmapConfig::default()
+            }),
+            control_plane: None,
+            session: None,
+        };
+
+        let redacted = render_config_for_display(&config, false).expect("render redacted config");
+        assert!(redacted.contains("password = \"<redacted>\""));
+        assert!(redacted.contains("pin = \"<redacted>\""));
+        assert!(!redacted.contains("ss-secret"));
+        assert!(!redacted.contains("123456"));
+
+        let visible = render_config_for_display(&config, true).expect("render full config");
+        assert!(visible.contains("ss-secret"));
+        assert!(visible.contains("123456"));
+    }
 
     #[test]
     fn reconnect_retries_then_succeeds() {
@@ -3009,6 +3728,53 @@ mod tests {
         });
         assert!(out.is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn reconnect_retries_after_connection_closed() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let out = run_with_reconnect(true, 3, 1, 1, move || -> Result<()> {
+            if calls_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(ShphError::ConnectionClosed)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(out.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn quic_standard_up_rejects_reconnect_before_opening_tun() {
+        let config = Config {
+            session: Some(SessionConfig {
+                role: SessionRole::Connect,
+                bind: None,
+                peer: Some("127.0.0.1:7231".into()),
+                timeout_secs: Some(5),
+                startup_payload: None,
+                handshake_profile: None,
+                reconnect: Some(ReconnectConfig {
+                    enabled: Some(true),
+                    max_attempts: Some(2),
+                    initial_delay_ms: Some(1),
+                    max_delay_ms: Some(1),
+                }),
+            }),
+            ..Config::default()
+        };
+        let error = handle_up(
+            std::path::Path::new("/tmp/shph-config.toml"),
+            std::path::Path::new("/tmp/shph-keystore.json"),
+            &config,
+            TransportMode::QuicStandard,
+            shph_core::HandshakeProfile::SecureDefault,
+            None,
+            Some(std::path::Path::new("/tmp/server.der")),
+        )
+        .expect_err("standards QUIC reconnect must fail before native TUN setup");
+        assert!(matches!(error, ShphError::Config(message) if message.contains("reconnect")));
     }
 
     #[test]
@@ -3160,8 +3926,12 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert_eq!(add_cmd[2], "add");
         }
-        let del_cmd = build_route_delete_command("10.12.0.0/16").expect("route del command");
+        let del_cmd =
+            build_route_delete_command("10.12.0.0/16", "shph0").expect("route del command");
         assert!(!del_cmd.is_empty());
+        if cfg!(target_os = "windows") {
+            assert!(del_cmd.contains(&"interface=shph0".to_string()));
+        }
         assert!(build_route_add_command("10.12.0.0/64", "shph0").is_err());
     }
 
@@ -3210,6 +3980,33 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn control_plane_state_loader_requires_owner_only_permissions() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "shph-cli-state-permissions-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        let state = control_plane_state_path(&config);
+        std::fs::write(
+            &state,
+            r#"{"interface_name":"shph0","routes":[],"dns_servers":[]}"#,
+        )
+        .unwrap();
+
+        std::fs::set_permissions(&state, Permissions::from_mode(0o644)).unwrap();
+        assert!(load_control_plane_state(&config).is_err());
+        std::fs::set_permissions(&state, Permissions::from_mode(0o600)).unwrap();
+        assert!(load_control_plane_state(&config).is_ok());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn dns_command_builders_validate_inputs() {
         let apply_cmd = build_dns_apply_command("1.1.1.1", "shph0").expect("dns apply command");
@@ -3224,11 +4021,43 @@ mod tests {
         let commands =
             build_dns_apply_commands(&["1.1.1.1".to_string(), "9.9.9.9".to_string()], "shph0")
                 .expect("dns commands");
-        assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0],
-            vec!["resolvectl", "dns", "shph0", "1.1.1.1", "9.9.9.9"]
-        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(commands.len(), 1);
+            assert_eq!(
+                commands[0],
+                vec!["resolvectl", "dns", "shph0", "1.1.1.1", "9.9.9.9"]
+            );
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(commands.len(), 2);
+            assert_eq!(
+                commands[0],
+                vec![
+                    "netsh",
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "dns",
+                    "name=shph0",
+                    "static",
+                    "1.1.1.1"
+                ]
+            );
+            assert_eq!(
+                commands[1],
+                vec![
+                    "netsh",
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "dnsserver",
+                    "name=shph0",
+                    "address=9.9.9.9",
+                    "index=2"
+                ]
+            );
+        } else {
+            assert!(commands.is_empty());
+        }
     }
 
     #[test]

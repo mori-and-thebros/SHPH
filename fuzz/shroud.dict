@@ -1,0 +1,5 @@
+# Shroud framing tokens.
+header="SD"
+data="\x01"
+chaff="\x02"
+zero="\x00"
