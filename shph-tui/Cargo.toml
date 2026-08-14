@@ -12,5 +12,5 @@ path = "src/main.rs"
 [dependencies]
 shph-config = { path = "../shph-config" }
 shph-core = { path = "../shph-core" }
-crossterm = "0.27"
-ratatui = "0.28"
+crossterm = "0.29"
+ratatui = "0.30"
