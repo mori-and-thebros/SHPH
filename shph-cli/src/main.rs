@@ -4126,7 +4126,7 @@ mod tests {
         enforce_peer_policy, handle_up, load_control_plane_state, parse_shroud_profile_name,
         phase_a1_now_ms, render_config_for_display, resolve_killswitch_peers, run_with_reconnect,
         transport_mode_to_str, validate_cidr, ControlPlaneGuard, ControlPlanePlan, HandshakeState,
-        KeyStore, KeyStoreConfig, TransportMode, DEFAULT_TUN_MTU_BYTES,
+        KeyStore, KeyStoreConfig, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES,
         MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
@@ -4291,13 +4291,14 @@ mod tests {
             std::path::Path::new("/tmp/shph-config.toml"),
             std::path::Path::new("/tmp/shph-keystore.json"),
             &config,
-            TransportMode::Tcp,
-            shph_core::HandshakeProfile::SecureDefault,
-            None,
-            None,
-            true,
-            true,
-            false,
+            UpOptions {
+                transport: TransportMode::Tcp,
+                profile: shph_core::HandshakeProfile::SecureDefault,
+                quic_cert_path: None,
+                killswitch: true,
+                killswitch_dry_run: true,
+                mss_clamp: false,
+            },
         )
         .expect("killswitch dry-run should preview without native TUN");
     }
@@ -4325,13 +4326,14 @@ mod tests {
             std::path::Path::new("/tmp/shph-config.toml"),
             std::path::Path::new("/tmp/shph-keystore.json"),
             &config,
-            TransportMode::QuicStandard,
-            shph_core::HandshakeProfile::SecureDefault,
-            None,
-            Some(std::path::Path::new("/tmp/server.der")),
-            false,
-            false,
-            false,
+            UpOptions {
+                transport: TransportMode::QuicStandard,
+                profile: shph_core::HandshakeProfile::SecureDefault,
+                quic_cert_path: Some(std::path::Path::new("/tmp/server.der")),
+                killswitch: false,
+                killswitch_dry_run: false,
+                mss_clamp: false,
+            },
         )
         .expect_err("standards QUIC reconnect must fail before native TUN setup");
         assert!(matches!(error, ShphError::Config(message) if message.contains("reconnect")));
