@@ -297,13 +297,14 @@ fn main() -> Result<()> {
                 &path,
                 &path_keystore,
                 &config,
-                mode,
-                profile,
-                config.roadmap.as_ref(),
-                quic_cert.as_deref(),
-                killswitch,
-                killswitch_dry_run,
-                mss_clamp,
+                UpOptions {
+                    transport: mode,
+                    profile,
+                    quic_cert_path: quic_cert.as_deref(),
+                    killswitch,
+                    killswitch_dry_run,
+                    mss_clamp,
+                },
             )?
         }
         Commands::Down => handle_down(&config_path)?,
@@ -476,18 +477,29 @@ fn handle_init(config_path: &Path, keystore_path: &Path, force_new: bool) -> Res
     Ok(())
 }
 
+struct UpOptions<'a> {
+    transport: TransportMode,
+    profile: HandshakeProfile,
+    quic_cert_path: Option<&'a Path>,
+    killswitch: bool,
+    killswitch_dry_run: bool,
+    mss_clamp: bool,
+}
+
 fn handle_up(
     config_path: &Path,
     keystore_path: &Path,
     config: &Config,
-    transport: TransportMode,
-    profile: HandshakeProfile,
-    _roadmap: Option<&RoadmapConfig>,
-    quic_cert_path: Option<&Path>,
-    killswitch: bool,
-    killswitch_dry_run: bool,
-    mss_clamp: bool,
+    options: UpOptions<'_>,
 ) -> Result<()> {
+    let UpOptions {
+        transport,
+        profile,
+        quic_cert_path,
+        killswitch,
+        killswitch_dry_run,
+        mss_clamp,
+    } = options;
     validate_config_roadmap(config)?;
     if transport == TransportMode::QuicStandard
         && config
@@ -2429,12 +2441,12 @@ fn apply_killswitch(
     {
         let commands =
             build_linux_killswitch_commands(&config.interface_name, &peers, firewall_transport)?;
-        return apply_linux_firewall_plan(
+        apply_linux_firewall_plan(
             "killswitch",
             commands,
             build_linux_killswitch_cleanup_commands(),
             dry_run,
-        );
+        )
     }
 
     #[cfg(target_os = "windows")]
@@ -2454,11 +2466,11 @@ fn apply_killswitch(
                 windows_transport,
                 peers.len()
             );
-            return Ok(guard);
+        } else {
+            guard.windows = Some(WindowsKillswitchGuard::apply(&peers, windows_transport)?);
+            println!("  killswitch: persistent Windows WFP policy active");
         }
-        guard.windows = Some(WindowsKillswitchGuard::apply(&peers, windows_transport)?);
-        println!("  killswitch: persistent Windows WFP policy active");
-        return Ok(guard);
+        Ok(guard)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -2607,12 +2619,12 @@ fn cleanup_firewall_state() -> Result<()> {
     {
         cleanup_nft_table(KILLSWITCH_TABLE_NAME)?;
         cleanup_nft_table(MSS_CLAMP_TABLE_NAME)?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
-        return WindowsKillswitchGuard::clear_stale();
+        WindowsKillswitchGuard::clear_stale()
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
