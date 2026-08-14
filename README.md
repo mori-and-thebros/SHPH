@@ -31,7 +31,7 @@ claims.
     and reconnect attempts.
   - malformed/oversized IP packets and short kernel writes fail closed; bridge
     packet buffers are zeroized on drop.
-- Optional host leak containment for native `up`:
+- Optional host leak containment controls:
   - `--killswitch` installs a dedicated Linux nftables policy or elevated
     Windows WFP policy before TUN activation.
   - `--killswitch-dry-run` prints the bounded Linux plan (or Windows policy
@@ -213,12 +213,19 @@ Behavior:
 - with `dry_run=false`: SHPH attempts live route/DNS apply and rollback on shutdown/error.
 - `apply`, `reconcile`, `undo`, and `down` provide persistent control-plane
   lifecycle management outside a session process.
+- `up --killswitch` and `up --mss-clamp` require native TUN mode for live
+  mutation. `--killswitch-dry-run` is preview-only: it prints the bounded
+  policy without requiring native TUN, elevation, or firewall mutation.
+- `down` attempts to remove SHPH-owned firewall tables/filters as well as
+  recorded control-plane state; cleanup failures are reported rather than
+  silently ignored.
 
 ## Main Commands
 
 ```text
 shph init --new
-shph up --config <path> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>] [--killswitch] [--killswitch-dry-run] [--mss-clamp]
+shph up --config <path> [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
+  [--quic-cert <server.der>] [--killswitch] [--killswitch-dry-run] [--mss-clamp]
 shph down
 shph apply
 shph reconcile
@@ -276,10 +283,6 @@ Additional docs:
 - `docs/LAB_PROTOTYPES.md` (operational guide for QUIC-shim, offline-mesh, and data-mule labs)
 - `docs/QUIC_STANDARDS.md` (RFC QUIC architecture, usage, and verification)
 - `docs/evidence/CARGO_AUDIT.txt` (regenerable advisory-scan output)
-- `docs/INTERNAL_PROJECT_ASSESSMENT_2026-07-06.md` (historical internal
-  project assessment)
-- `docs/INTERNAL_RELEASE_READINESS_REVIEW_2026-07-06.md` (historical internal
-  gate-verification review)
 - `CHANGELOG.md` (phase-anchored changelog)
 - `SECURITY.md` (vulnerability reporting, threat model, non-claims matrix)
 - `CONTRIBUTING.md` (build/test, release checklist, governance)

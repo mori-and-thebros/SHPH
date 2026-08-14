@@ -54,8 +54,9 @@ This file maps the repository layout and the main public validation artifacts.
   are labeled by date; they are not the current score source.
 - Current generated gate evidence lives under `docs/evidence/` and is refreshed
   by `scripts/capture_evidence.sh`.
-- Review and project-context records are retained under `docs/evidence/` and
-  named by review type and date.
+- Public evidence records are retained under `docs/evidence/` and named by
+  validation type and date. Internal assessment and project-context records
+  are kept outside the publishable checkout.
 
 ## Excluded or Local-Only Artifacts
 
@@ -76,12 +77,11 @@ cross-platform lock drift.
 - Test command guidance lives in `docs/TESTING.md`.
 - Current code-status is tracked in `README.md`.
 
-## Internal Assessments
+## Review boundaries
 
-- `docs/INTERNAL_PROJECT_ASSESSMENT_2026-07-06.md`: historical internal
-  project assessment and threat-model review, read from the code rather than
-  copied from the project's own documentation.
-- `docs/INTERNAL_RELEASE_READINESS_REVIEW_2026-07-06.md`: historical internal
-  gate-verification assessment (fmt/clippy/build/test/audit checks,
-  checkout-parity check, findings). These documents are not independent audits.
+Internal assessments, maintainer context notes, and audit dispositions are
+not part of the public documentation set. Public reviewers should use
+`SECURITY.md`, `docs/RISK_MATRIX.md`, `docs/TESTING.md`, and the reviewed
+evidence artifacts instead; none of those documents represents an independent
+third-party audit.
 - `fuzz/README.md`: fuzzing setup, targets, and bounded run commands.

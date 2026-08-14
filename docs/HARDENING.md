@@ -5,12 +5,11 @@ funding-readiness track (Phases A + B). It is the Optional/Research hardening
 track from `ROADMAP_OSS_AND_DELIVERY.md`: concrete, tested, verifiable
 defenses rather than research-grade features.
 
-Every change here:
-- fixes a real weakness found by audit (not theoretical),
-- ships with regression tests,
-- keeps all gates green (`fmt` / `clippy -D warnings` / `test 0 failed` /
-  `--locked` build),
-- is captured in `CHANGELOG.md` and tagged (`hardening-N`).
+Every increment here:
+- addresses a concrete weakness or boundary,
+- records focused regression coverage where practical,
+- states its validation and host-evidence limits explicitly,
+- is captured in `CHANGELOG.md`.
 
 ## Increment 1 — Crypto data-plane (`hardening-1`)
 
@@ -588,7 +587,7 @@ Files: `shph-cli/src/main.rs`, `shph-tun/src/firewall.rs`,
   requires elevation, allows loopback/TUN/peer tuples, and removes stale
   SHPH-owned filter keys before reinstallation. `shph down` also attempts
   stale-policy cleanup after control-plane rollback.
-- **MSS clamp planning.** `shph up --mss-clamp` installs a separate
+- **MSS clamp lifecycle.** `shph up --mss-clamp` installs a separate
   `inet shph_mss_clamp` nftables table with bidirectional TCP SYN
   `rt mtu` MSS rewriting on Linux. Windows fails explicitly because WFP
   filtering does not provide a safe declarative TCP-option rewrite in this
@@ -603,7 +602,7 @@ Files: `shph-cli/src/main.rs`, `shph-tun/src/firewall.rs`,
   state are unwound together on transport errors and early returns.
 
 The firewall paths are opt-in and command-argument bounded. Dry-run mode only
-prints the Linux plan or Windows policy summary. This source-level change does
-not claim that privileged nftables/WFP mutation, crash-leak testing, Windows
-Wintun packet I/O, or two-host forwarding has been executed on the current
-development host.
+prints the Linux plan or Windows policy summary and does not require native TUN
+or elevation. This source-level change does not claim that privileged
+nftables/WFP mutation, crash-leak testing, Windows Wintun packet I/O, or
+two-host forwarding has been executed on the current development host.

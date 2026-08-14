@@ -37,6 +37,29 @@ dry_run = true
 - `shph down` invokes `undo` before exiting.
 - `shph status` reports whether persisted control-plane state is present.
 
+## Host leak containment
+
+Firewall containment is a separate, explicit `up` option rather than a
+configuration-file default:
+
+- `shph up --killswitch` installs an SHPH-owned policy before native TUN setup.
+  Linux uses a dedicated `inet shph_killswitch` nftables table; Windows uses
+  persistent, elevated WFP outbound authorization filters.
+- Killswitch mode accepts only literal peer IP addresses and non-zero ports.
+  Hostname endpoints are rejected so DNS resolution cannot precede the
+  allowlist.
+- `shph up --killswitch --killswitch-dry-run` prints the bounded plan without
+  requiring native TUN, elevation, or firewall mutation.
+- `shph up --mss-clamp` installs a separate Linux nftables table for
+  bidirectional TCP SYN MSS clamping. Windows reports this option as
+  unsupported in the current build.
+- `shph down` attempts to remove SHPH-owned firewall state in addition to
+  recorded routes and DNS. A cleanup failure is returned to the operator.
+
+These controls remain opt-in and platform-gated. They are source-level
+hardening plus command planning until privileged crash-leak and two-host
+validation is published.
+
 ## Current Command Backends
 
 - Linux:

@@ -52,6 +52,7 @@ See `docs/RISK_MATRIX.md` for the severity-rated version of this list.
 | Anti-replay on the data plane (fail-closed) | done | `cargo test -p shph-core crypto::tests::replayed_frame_is_rejected_fail_closed` |
 | Graceful process shutdown | done | `docs/TESTING.md` and `shph-cli/src/shutdown.rs` |
 | Atomic control-plane apply + rollback | done | `cargo test -p shph-cli --test cli_control_plane`; multi-DNS regression in `shph-cli` unit tests |
+| Opt-in host leak containment | implemented; host-gated | `cargo test -p shph-tun firewall --locked`, `cargo test -p shph-cli killswitch --locked`, and `shph up --killswitch --killswitch-dry-run` |
 | CI template (Linux + Windows) | done | `.github/workflows/ci.yml` |
 | Reproducible, locked builds | done | `cargo build --locked` + `docs/REPRODUCIBILITY.md` |
 | DPI/fingerprint evasion | not done | `docs/RISK_MATRIX.md` |

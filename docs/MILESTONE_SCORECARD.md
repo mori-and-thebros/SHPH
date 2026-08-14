@@ -60,6 +60,7 @@ This is the single source of truth for "how far along is SHPH?"
 | Static and dependency review | **Complete for current checkout** | Strict fmt/Clippy/tests/build, fuzz manifest check, `cargo audit --no-fetch`; two accepted optional-TUI advisories remain |
 | Allocation/RSS optimization pass | **Complete for confirmed lab hotspots** | Borrowed Shroud decode plus stack-backed handshake transcript/HKDF; measured in `docs/PHASE_D_HARDENING_2026-07-28.md` |
 | Native Linux TUN lifecycle implementation | **Hardened; async CLI bridge integrated; capability-gated** | `TunDevice::open_native`, `AsyncTunDevice`, bounded async CLI bridge, 15 `shph-tun` tests, complete-write/zeroizing-buffer hardening, one device remains open through `up` setup/reconnect |
+| Opt-in host leak containment and MTU/MSS hardening | **Implemented; privileged execution and crash-leak evidence pending** | `shph up --killswitch`, `--killswitch-dry-run`, `--mss-clamp`; `shph-tun` firewall planners and Windows WFP backend; focused CLI/TUN tests |
 | Native Linux namespace smoke and lifecycle automation | **Implemented; isolated WSL2 smoke passed** | `scripts/native_tun_namespace_test.sh`; `scripts/benchmark_native_tun.sh`; 20/20 lifecycle samples passed (`min=59.1ms`, `p50=189.0ms`, `p95=348.9ms`, `max=349.6ms`) |
 | Standards-QUIC Linux native-TUN bridge | **Implemented; live forwarding evidence pending** | RFC 9221 DATAGRAM bridge in `shph-transport/src/standards_tun.rs`; Linux `up --transport quic-standard`; malformed/IPv4/IPv6 boundary checks |
 | Windows Wintun backend | **Wired; adapter/session smoke passed; packet and two-host evidence pending** | Application-local SHA-256-pinned loader, elevation check, bounded ring, packet release/commit wrappers, bounded event waits, shared-session cloning, public `TunDevice` integration, RAII teardown, and `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`. The Windows validator separately requires valid Authenticode before staging the DLL. |
@@ -74,11 +75,11 @@ two-host forwarding and privileged Windows Wintun packet evidence exist.
 
 | Gate | Status | Evidence |
 | --- | --- | --- |
-| Internal assessment snapshot and scope | **Complete** | `docs/evidence/INTERNAL_SECURITY_ASSESSMENT_2026-07-29.md`, version `0.5.0-dev.0`, non-native-TUN scope |
-| Finding register and severity dispositions | **Complete** | `docs/AUDIT_DISPOSITION_2026-07-29.md` |
+| Public assessment scope and risk register | **Complete** | `SECURITY.md`, `docs/RISK_MATRIX.md`, and `docs/VALIDATION_FOLLOWUP_2026-08-05.md`; private review material is kept outside the public checkout |
+| Finding remediation and regression evidence | **Complete for documented scope** | `docs/VALIDATION_FOLLOWUP_2026-08-05.md`, `docs/evidence/GATE_EVIDENCE.md`, and focused workspace tests |
 | Remediation and focused regressions | **Complete** | High/Medium/Low fixes plus handshake, malformed-peer, standards-QUIC, JA4, and TUN regressions |
 | Full post-remediation validation and parity | **Complete** | `docs/VALIDATION_FOLLOWUP_2026-08-05.md`, `docs/evidence/GATE_EVIDENCE.md`, Windows GNU cross-target evidence, and `scripts/sync_mirror.sh --verify` |
-| Audit disposition publication | **Complete** | This disposition document; native Windows execution remains an explicit release gate |
+| Public limitations and follow-up publication | **Complete** | `SECURITY.md`, `docs/RISK_MATRIX.md`, and `docs/VALIDATION_FOLLOWUP_2026-08-05.md`; native Windows execution remains an explicit release gate |
 
 ## Phase E — Big Move / Release Readiness (not complete)
 

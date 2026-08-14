@@ -520,13 +520,13 @@ fn handle_up(
             "quic-standard up requires native TUN; set SHPH_TUN_NATIVE=1".into(),
         ));
     }
-    if killswitch && !tun.is_native() {
+    if killswitch && !tun.is_native() && !killswitch_dry_run {
         let _ = killswitch_guard.cleanup();
         return Err(ShphError::Unsupported(
             "the host killswitch requires native TUN; set SHPH_TUN_NATIVE=1".into(),
         ));
     }
-    if mss_clamp && !tun.is_native() {
+    if mss_clamp && !tun.is_native() && !killswitch_dry_run {
         let _ = killswitch_guard.cleanup();
         return Err(ShphError::Unsupported(
             "MSS clamping requires native TUN; set SHPH_TUN_NATIVE=1".into(),
@@ -4262,6 +4262,32 @@ mod tests {
         };
         let peers = resolve_killswitch_peers(&config).expect("selected peer");
         assert_eq!(peers, vec!["203.0.113.20:8443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn killswitch_dry_run_does_not_require_native_tun() {
+        let config = Config {
+            peers: vec![PeerConfig {
+                alias: "preview".into(),
+                endpoint: "198.51.100.10:443".into(),
+                pubkey: "peer-key".into(),
+                sign_pubkey: None,
+            }],
+            ..Config::default()
+        };
+        handle_up(
+            std::path::Path::new("/tmp/shph-config.toml"),
+            std::path::Path::new("/tmp/shph-keystore.json"),
+            &config,
+            TransportMode::Tcp,
+            shph_core::HandshakeProfile::SecureDefault,
+            None,
+            None,
+            true,
+            true,
+            false,
+        )
+        .expect("killswitch dry-run should preview without native TUN");
     }
 
     #[test]

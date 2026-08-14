@@ -8,9 +8,10 @@ This directory contains reproducibility artifacts, not source-of-truth code.
 - `WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` is the latest native
   Windows workspace, Windows-only test, benchmark, and post-loader Wintun
   host-gate record.
-- Dated benchmark and internal-assessment reports elsewhere under `docs/` are
+- Dated benchmark and public validation reports elsewhere under `docs/` are
   retained as historical or phase-specific evidence and identify their own
-  platform and scope. They are not independent audits.
+  platform and scope. Internal assessment material is maintained outside the
+  publishable evidence bundle. None of these records is an independent audit.
 
 Regenerate the current gate record from the repository root:
 

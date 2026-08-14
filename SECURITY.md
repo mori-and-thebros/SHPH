@@ -40,9 +40,11 @@ OSS validation only.**
 ### What works today
 
 - X25519 identity keys for DH **plus** a separate Ed25519 key that produces a
-  real detached signature over the handshake transcript (identity + signing key
-  + PQ public key + ephemeral + nonce + timestamp), followed by transcript-bound
-  HKDF session-key derivation.
+  real detached signature over a canonically ordered, length-prefixed
+  handshake transcript. The transcript binds the protocol/profile, peer
+  identities and signing keys, PQ public keys, ephemeral keys, nonces,
+  timestamps, initiator identity, and exchanged PQ ciphertext before
+  transcript-bound HKDF session-key derivation.
 - **Hybrid post-quantum key exchange (ML-KEM-768, FIPS-203)** layered on X25519:
   every handshake additionally performs an ML-KEM encapsulation/decapsulation
   and the session key is derived from **both** the ECDH and the ML-KEM shared
@@ -69,6 +71,13 @@ OSS validation only.**
   `zeroize`d on drop so live key material does not linger in freed heap memory
   after a session ends (`hardening-5`).
 - Atomic control-plane apply with preflight validation and best-effort rollback.
+- Optional native host leak containment:
+  `up --killswitch` installs a dedicated Linux nftables policy or elevated
+  Windows WFP connection policy before native TUN setup. It is not enabled by
+  default, requires literal peer IP/port allowlists, and still needs
+  privileged crash-leak and two-host validation. `up --mss-clamp` adds Linux
+  TCP SYN MSS clamping for the 1360-byte native TUN MTU; Windows reports this
+  option as unsupported.
 - Graceful SIGINT/SIGTERM shutdown on Unix and console-control shutdown on Windows.
 
 ### Explicitly NOT done / out of scope today
@@ -104,6 +113,12 @@ evidence, and receives appropriate external review:
   session keys and then fail closed when data-plane authentication begins; it
   must not be represented as an immediately detected handshake failure.
 - Hostile-network / adversarial anti-observation posture.
+- A default or universally complete killswitch: firewall containment is
+  opt-in, native-TUN/elevation gated, and platform-specific. The Windows path
+  is an outbound WFP connection policy rather than a claim of arbitrary raw
+  packet filtering.
+- Windows MSS rewriting: the Linux nftables clamp is implemented; Windows
+  does not silently change host-wide TCP settings.
 - Constant-time guarantees beyond what the underlying crates provide.
 - Production key management (HSM/PKCS#11/YubiKey/TPM), Shamir quorum, and
   ratchet audit (planned, not defaults). Hybrid PQ key exchange **is** shipped
@@ -127,6 +142,7 @@ evidence, and receives appropriate external review:
 | Endpoint compromise / key theft | Out of scope: no HSM/TPM binding yet. |
 | Traffic-analysis / DPI | Out of scope: no fingerprint parity yet. |
 | Host privilege escalation via control-plane apply | Mitigated by dry-run default, preflight validation, and OS privilege requirements. |
+| Plaintext route/DNS egress after process crash | Partial: opt-in native killswitch policy exists for Linux nftables and Windows WFP, but privileged crash-leak and two-host evidence remain open. |
 
 ## Cryptographic Dependencies
 

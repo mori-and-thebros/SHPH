@@ -5,7 +5,7 @@ This project uses workspace-wide validation and crate-level tests.
 ## Fast Local Commands
 
 ```bash
-cargo fmt --all
+cargo fmt --all -- --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -47,6 +47,29 @@ The namespace and lifecycle scripts isolate the probe with
 isolated AsyncFd probe opens and closes a real TUN device, and print `SKIP`
 when the host denies the namespace or network capability. They do not measure
 packet throughput, routing, RTT, jitter, or two-node behavior.
+
+### Firewall and MSS hardening checks
+
+The default test suite does not mutate host firewall state. The bounded plan
+builders and CLI peer-selection rules can be checked without elevation:
+
+```bash
+cargo test -p shph-tun firewall --locked
+cargo test -p shph-cli killswitch --locked
+```
+
+For a non-mutating operator preview, provide a configuration containing at
+least one literal peer IP/port and run:
+
+```bash
+shph up --config <path> --killswitch --killswitch-dry-run
+```
+
+Dry-run mode does not require native TUN, administrator/root privileges, or
+`nft`/WFP mutation. Live `--killswitch` and Linux `--mss-clamp` require
+`SHPH_TUN_NATIVE=1`, native host privileges, and platform-specific validation.
+Windows WFP execution, Linux crash-leak behavior, and two-host forwarding are
+not established by these deterministic tests.
 
 ### Fuzzing
 

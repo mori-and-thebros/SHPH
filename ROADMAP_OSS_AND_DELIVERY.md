@@ -11,7 +11,7 @@ Make SHPH a **funding-ready, open-source VPN** with:
 
 Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claims, and optional experimental transports.
 
-## Current State (as of 2026-08-08)
+## Current State (as of 2026-08-14)
 
 ### What is already built
 
@@ -23,6 +23,11 @@ Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claim
 - Reconnect policy with runtime backoff for session mode.
 - Config schema and peer/config workflows.
 - Control-plane routes/DNS apply, reconcile, undo, and persistent rollback state.
+- Opt-in native host leak containment: Linux nftables killswitch planning and
+  application, Windows WFP outbound authorization filters, literal peer
+  allowlists, stale-policy cleanup, and Linux MSS-clamp support.
+- Canonical length-prefixed hybrid handshake transcript framing and
+  exception-safe rollback across control-plane, firewall, and session setup.
 - CLI and docs baseline in place.
 - Roadmap validation, Shamir split/recovery, and ratchet-audit export primitives
   are available behind explicit CLI commands.
@@ -71,6 +76,9 @@ Remaining work is explicitly phase-gated or deployment-specific:
   identity providers remain unimplemented.
 - A lab-grade password-encrypted keystore path now exists; production key
   management remains unimplemented.
+- Firewall containment remains opt-in and host-gated: privileged Linux/WFP
+  mutation, process-crash leak tests, Windows packet-policy coverage, and
+  two-host forwarding are not yet published as release evidence.
 
 ### Phase-gate rule
 

@@ -18,7 +18,9 @@
 - Added opt-in host leak containment: Linux installs a dedicated nftables
   killswitch before native TUN setup, while Windows installs persistent WFP
   outbound authorization filters. Both require literal peer IP/port
-  allowlists, and `down` removes stale SHPH-owned policy.
+  allowlists, and `down` removes stale SHPH-owned policy. The
+  `--killswitch-dry-run` preview does not require native TUN, elevation, or
+  firewall mutation.
 - Added opt-in Linux TCP SYN MSS clamping in a separate nftables table.
   Windows reports an explicit unsupported error because this build does not
   perform unsafe host-wide TCP-option rewriting.
