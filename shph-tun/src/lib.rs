@@ -7,6 +7,11 @@ use shph_core::{Result, ShphError};
 #[cfg(target_os = "linux")]
 use std::io::{ErrorKind, Read, Write};
 use zeroize::Zeroize;
+pub mod firewall;
+#[cfg(target_os = "windows")]
+mod windows_firewall;
+#[cfg(target_os = "windows")]
+pub use windows_firewall::{FirewallTransport as WindowsFirewallTransport, WindowsKillswitchGuard};
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
@@ -16,9 +21,22 @@ pub use windows::{WintunApi, WintunRuntime};
 
 /// Largest IPv4/IPv6 packet representable by the layer-3 TUN interface.
 pub const MAX_TUN_PACKET_BYTES: usize = u16::MAX as usize;
+/// Conservative default virtual-interface MTU for the encrypted transport.
+pub const DEFAULT_TUN_MTU_BYTES: usize = 1_360;
+/// Smallest generally useful IPv4 MTU for the native interface configuration.
+pub const MIN_TUN_MTU_BYTES: usize = 576;
 /// Read one byte beyond the maximum packet size so an oversized frame cannot
 /// be mistaken for a valid maximum-sized packet.
 pub const TUN_READ_BUFFER_BYTES: usize = MAX_TUN_PACKET_BYTES + 1;
+
+pub fn validate_tun_mtu(mtu: usize) -> Result<()> {
+    if !(MIN_TUN_MTU_BYTES..=MAX_TUN_PACKET_BYTES).contains(&mtu) {
+        return Err(ShphError::Config(format!(
+            "TUN MTU must be between {MIN_TUN_MTU_BYTES} and {MAX_TUN_PACKET_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 enum TunBackend {
@@ -600,7 +618,7 @@ fn classify_tun_write_result(result: std::io::Result<usize>, expected: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_ip_packet, TunDevice};
+    use super::{validate_ip_packet, validate_tun_mtu, TunDevice, DEFAULT_TUN_MTU_BYTES};
 
     #[test]
     fn stub_device_clone_and_lifecycle_are_safe() {
@@ -649,6 +667,14 @@ mod tests {
     fn rejects_non_ip_and_oversized_packets() {
         assert!(validate_ip_packet(b"not-an-ip").is_err());
         assert!(validate_ip_packet(&vec![0u8; super::MAX_TUN_PACKET_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn validates_conservative_native_tun_mtu() {
+        assert_eq!(DEFAULT_TUN_MTU_BYTES, 1_360);
+        assert!(validate_tun_mtu(DEFAULT_TUN_MTU_BYTES).is_ok());
+        assert!(validate_tun_mtu(575).is_err());
+        assert!(validate_tun_mtu(super::MAX_TUN_PACKET_BYTES + 1).is_err());
     }
 
     #[test]

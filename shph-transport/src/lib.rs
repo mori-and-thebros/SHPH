@@ -17,7 +17,7 @@ use shph_core::{
     absorb_responder_pq, build_hello_with_profile, finalize_initiator_pq, verify_and_derive,
     DataMuleConfig, DataMuleEnvelope, HandshakeProfile, HandshakeState, Hello, IdentityKeyPair,
     OfflineMeshConfig, OfflineMeshEnvelope, PeerPolicy, ReceiveCipher, Result, SendCipher,
-    ShphError, ShroudProfile, ML_KEM_768_CIPHERTEXT_BYTES,
+    ShphError, ShroudProfile, StatelessCookieAuthority, ML_KEM_768_CIPHERTEXT_BYTES,
 };
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -48,6 +48,10 @@ const TCP_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
 /// covers a single accept loop).
 const PEER_RATE_WINDOW: Duration = Duration::from_secs(10);
 const MAX_CONNECTS_PER_PEER_PER_WINDOW: usize = 8;
+const COOKIE_CHALLENGE_THRESHOLD: usize = MAX_CONNECTS_PER_PEER_PER_WINDOW / 2;
+const COOKIE_CHALLENGE_PREFIX: &[u8] = b"SHPH-COOKIE-CHALLENGE ";
+const COOKIE_RESPONSE_PREFIX: &[u8] = b"SHPH-COOKIE-RESPONSE ";
+const MAX_COOKIE_LINE_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
@@ -1497,7 +1501,7 @@ pub fn tcp_handshake_client_with_profile(
     apply_timeout(&stream, timeout_secs)?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
-    let peer_hello = read_tcp_hello(&mut stream)?;
+    let peer_hello = read_tcp_server_hello(&mut stream)?;
     shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     if profile.uses_pqc() {
         let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
@@ -1558,7 +1562,7 @@ pub fn tcp_connect_and_handshake_with_profile(
     apply_timeout(&stream, timeout_secs)?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello(&mut stream, &material.local_hello)?;
-    let peer_hello = read_tcp_hello(&mut stream)?;
+    let peer_hello = read_tcp_server_hello(&mut stream)?;
     shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     if profile.uses_pqc() {
         let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
@@ -1652,6 +1656,13 @@ impl PeerRateLimiter {
         entries.push(now);
         Ok(())
     }
+
+    fn requires_cookie(&self, addr: SocketAddr) -> bool {
+        let key = addr.ip().to_string();
+        self.seen
+            .get(&key)
+            .is_some_and(|entries| entries.len() >= COOKIE_CHALLENGE_THRESHOLD)
+    }
 }
 
 pub fn tcp_accept_and_handshake(
@@ -1682,6 +1693,7 @@ pub fn tcp_accept_and_handshake_with_profile(
     // unauthenticated peers consume a process-lifetime attempt budget.
     let mut last_err: Option<ShphError> = None;
     let mut rate_limiter = PeerRateLimiter::new();
+    let mut cookie_authority = StatelessCookieAuthority::new()?;
     let deadline = Instant::now()
         + Duration::from_secs(timeout_secs.max(1).min(TCP_HANDSHAKE_DEADLINE.as_secs()));
     while Instant::now() < deadline {
@@ -1717,6 +1729,17 @@ pub fn tcp_accept_and_handshake_with_profile(
 
         match read_tcp_hello(&mut stream) {
             Ok(peer_hello) => {
+                if rate_limiter.requires_cookie(peer_addr) {
+                    let cookie = cookie_authority.issue(peer_addr)?;
+                    write_tcp_cookie_challenge(&mut stream, &cookie)?;
+                    let response = read_tcp_cookie_response(&mut stream)?;
+                    if !cookie_authority.verify(peer_addr, &response)? {
+                        last_err = Some(ShphError::Auth(
+                            "invalid or expired pre-authentication cookie".into(),
+                        ));
+                        continue;
+                    }
+                }
                 let mut material = build_hello_with_profile(local_identity, profile)?;
                 if let Err(err) = shph_core::verify_hello_signature(
                     local_identity,
@@ -1777,6 +1800,76 @@ fn write_tcp_hello(stream: &mut TcpStream, hello: &Hello) -> Result<()> {
 }
 
 fn read_tcp_hello(stream: &mut TcpStream) -> Result<Hello> {
+    let buf = read_tcp_line(stream, MAX_HELLO_BYTES)?;
+    let hello_line =
+        std::str::from_utf8(&buf).map_err(|_| ShphError::Protocol("hello not utf8".into()))?;
+    let hello = serde_json::from_str::<Hello>(hello_line)
+        .map_err(|e| ShphError::Protocol(e.to_string()))?;
+    Ok(hello)
+}
+
+fn read_tcp_server_hello(stream: &mut TcpStream) -> Result<Hello> {
+    let line = read_tcp_line(stream, MAX_HELLO_BYTES)?;
+    if line.starts_with(COOKIE_CHALLENGE_PREFIX) {
+        let encoded = &line[COOKIE_CHALLENGE_PREFIX.len()..];
+        let cookie = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| ShphError::Protocol("invalid cookie challenge encoding".into()))?;
+        if cookie.len() != 32 {
+            return Err(ShphError::Protocol(
+                "cookie challenge has invalid length".into(),
+            ));
+        }
+        write_tcp_cookie_response(stream, &cookie)?;
+        return read_tcp_hello(stream);
+    }
+    let hello_line =
+        std::str::from_utf8(&line).map_err(|_| ShphError::Protocol("hello not utf8".into()))?;
+    serde_json::from_str::<Hello>(hello_line).map_err(|e| ShphError::Protocol(e.to_string()))
+}
+
+fn write_tcp_cookie_challenge(stream: &mut TcpStream, cookie: &[u8; 32]) -> Result<()> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(cookie);
+    write_tcp_all_or_closed(stream, COOKIE_CHALLENGE_PREFIX)?;
+    write_tcp_all_or_closed(stream, encoded.as_bytes())?;
+    write_tcp_all_or_closed(stream, b"\n")?;
+    stream.flush().map_err(map_io_error)?;
+    Ok(())
+}
+
+fn write_tcp_cookie_response(stream: &mut TcpStream, cookie: &[u8]) -> Result<()> {
+    if cookie.len() != 32 {
+        return Err(ShphError::Protocol(
+            "cookie response has invalid length".into(),
+        ));
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(cookie);
+    write_tcp_all_or_closed(stream, COOKIE_RESPONSE_PREFIX)?;
+    write_tcp_all_or_closed(stream, encoded.as_bytes())?;
+    write_tcp_all_or_closed(stream, b"\n")?;
+    stream.flush().map_err(map_io_error)?;
+    Ok(())
+}
+
+fn read_tcp_cookie_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let line = read_tcp_line(stream, MAX_COOKIE_LINE_BYTES)?;
+    if !line.starts_with(COOKIE_RESPONSE_PREFIX) {
+        return Err(ShphError::Protocol(
+            "expected pre-authentication cookie response".into(),
+        ));
+    }
+    let cookie = base64::engine::general_purpose::STANDARD
+        .decode(&line[COOKIE_RESPONSE_PREFIX.len()..])
+        .map_err(|_| ShphError::Protocol("invalid cookie response encoding".into()))?;
+    if cookie.len() != 32 {
+        return Err(ShphError::Protocol(
+            "cookie response has invalid length".into(),
+        ));
+    }
+    Ok(cookie)
+}
+
+fn read_tcp_line(stream: &mut TcpStream, max_bytes: usize) -> Result<Vec<u8>> {
     // Read the newline-terminated hello in chunks into a single bounded buffer
     // rather than one syscall per byte. The buffer is capped at
     // `MAX_HELLO_BYTES` (+1 to detect overshoot), so a slowloris-style peer
@@ -1802,7 +1895,7 @@ fn read_tcp_hello(stream: &mut TcpStream) -> Result<Hello> {
             None => &chunk[..read],
         };
         // Enforce the cap including any data already buffered.
-        if buf.len() + take.len() > MAX_HELLO_BYTES + 1 {
+        if buf.len() + take.len() > max_bytes + 1 {
             return Err(ShphError::Protocol("hello exceeds size limit".into()));
         }
         buf.extend_from_slice(take);
@@ -1818,15 +1911,10 @@ fn read_tcp_hello(stream: &mut TcpStream) -> Result<Hello> {
     {
         buf.pop();
     }
-    if buf.len() > MAX_HELLO_BYTES {
+    if buf.len() > max_bytes {
         return Err(ShphError::Protocol("hello exceeds size limit".into()));
     }
-
-    let hello_line =
-        std::str::from_utf8(&buf).map_err(|_| ShphError::Protocol("hello not utf8".into()))?;
-    let hello = serde_json::from_str::<Hello>(hello_line)
-        .map_err(|e| ShphError::Protocol(e.to_string()))?;
-    Ok(hello)
+    Ok(buf)
 }
 
 /// Write the initiator's ML-KEM ciphertext to the stream as a length-prefixed,
@@ -3385,9 +3473,10 @@ mod tests {
     };
     use super::{collect_shph_files, TEMP_FILE_COUNTER};
     use super::{
-        decode_encrypted_quic_frame, PeerRateLimiter, TransportMode,
+        decode_encrypted_quic_frame, PeerRateLimiter, TransportMode, COOKIE_CHALLENGE_THRESHOLD,
         MAX_CONNECTS_PER_PEER_PER_WINDOW, MAX_QUIC_TRACKED_PEERS,
     };
+    use base64::Engine as _;
     use shph_core::{
         HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy, ReceiveCipher, SendCipher,
     };
@@ -3477,6 +3566,46 @@ mod tests {
             rl.check_and_record(b).is_ok(),
             "a distinct IP has its own budget"
         );
+    }
+
+    #[test]
+    fn peer_rate_limiter_requires_cookie_only_after_threshold() {
+        let mut rl = PeerRateLimiter::new();
+        let addr: SocketAddr = "192.0.2.10:1".parse().unwrap();
+        for _ in 0..COOKIE_CHALLENGE_THRESHOLD.saturating_sub(1) {
+            rl.check_and_record(addr).unwrap();
+        }
+        assert!(!rl.requires_cookie(addr));
+        rl.check_and_record(addr).unwrap();
+        assert!(rl.requires_cookie(addr));
+    }
+
+    #[test]
+    fn cookie_wire_challenge_and_response_are_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let cookie = [0x5au8; 32];
+            super::write_tcp_cookie_challenge(&mut stream, &cookie).expect("challenge");
+            assert_eq!(
+                super::read_tcp_cookie_response(&mut stream).expect("response"),
+                cookie
+            );
+        });
+
+        let mut client = TcpStream::connect(address).expect("connect");
+        let cookie = [0x5au8; 32];
+        let line = super::read_tcp_line(&mut client, super::MAX_COOKIE_LINE_BYTES)
+            .expect("challenge line");
+        assert!(line.starts_with(super::COOKIE_CHALLENGE_PREFIX));
+        let encoded = &line[super::COOKIE_CHALLENGE_PREFIX.len()..];
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("challenge encoding");
+        assert_eq!(decoded, cookie);
+        super::write_tcp_cookie_response(&mut client, &decoded).expect("response");
+        server.join().expect("server");
     }
 
     #[test]

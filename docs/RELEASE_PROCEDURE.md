@@ -20,9 +20,9 @@ hold:
 - `scripts/demo.sh all` reproduces all demos (happy / bad-cidr / unreachable).
 - Any configured platform checkouts used for the release are in parity,
   verified with `scripts/sync_mirror.sh --verify`.
-- The pre-completion internal security-assessment/remediation gate in
+- The pre-completion security-assessment/remediation gate in
   `ROADMAP_OSS_AND_DELIVERY.md` is closed, with findings remediated or
-  explicitly dispositioned. This does not represent an independent audit.
+  explicitly documented. This does not represent an independent audit.
 - For a public GitHub release, `docs/GITHUB_PUBLICATION_CHECKLIST.md` is
   complete, including a monitored private vulnerability-reporting channel and
   a review that native host evidence is not overstated.
@@ -47,7 +47,7 @@ vX.Y.Z                       # semantic-version point releases once a release li
 ```
 
 A versioned release line is live through **`v0.4.0`**. The current workspace is
-an unreleased development line, **`0.6.0-dev.0`**, and must not be described as
+an unreleased prerelease development line, **`0.6.1-dev`**, and must not be described as
 `v0.4.0`. Going forward, SemVer releases (`vX.Y.Z`) are the authoritative tags;
 funding checkpoints remain roadmap-anchored milestones. Each checkpoint tag
 carries the roadmap phase it closes.
@@ -142,9 +142,10 @@ A reviewer receiving a checkpoint should be able to do, with no extra context:
 2. Follow `docs/REPRODUCIBILITY.md` to build `--locked`.
 3. Run `scripts/capture_evidence.sh` and diff against the committed
    `docs/evidence/GATE_EVIDENCE.md` (gate totals must match).
-4. Review the internal assessment disposition and confirm every finding has a
-   documented disposition and regression evidence. Treat an independent audit
-   as a separate requirement until an actual external engagement is published.
+4. Review `SECURITY.md`, `docs/RISK_MATRIX.md`, and the public validation
+   follow-up to confirm every published finding has a documented disposition
+   and regression evidence. Treat an independent audit as a separate
+   requirement until an actual external engagement is published.
 5. Run `scripts/demo.sh all` and confirm the expected fail-closed behavior.
 6. Cross-check `docs/MILESTONE_SCORECARD.md` phase status.
 

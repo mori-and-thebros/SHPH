@@ -1,5 +1,6 @@
 //! SHPH Core - Core types, error handling, and shared utilities for SHPH VPN.
 
+pub mod cookie;
 pub mod crypto;
 pub mod error;
 pub mod framing;
@@ -11,6 +12,7 @@ pub mod pqc;
 pub mod roadmap;
 pub mod stealth;
 
+pub use cookie::{StatelessCookieAuthority, COOKIE_EPOCH_SECS};
 pub use crypto::{
     hkdf_sha256_into, IdentityKeyPair, ReceiveCipher, ReplayWindow, SendCipher, SessionKeys,
 };
@@ -20,9 +22,10 @@ pub use framing::{
     SHROUD_FRAME_CHAFF, SHROUD_FRAME_DATA, SHROUD_FRAME_HEADER,
 };
 pub use handshake::{
-    absorb_responder_pq, build_hello, build_hello_with_profile, finalize_initiator_pq,
-    verify_and_derive, verify_and_derive_with_profile, verify_hello_signature, HandshakeMaterial,
-    HandshakeProfile, HandshakeState, HandshakeVersion, Hello, PeerPin, PeerPolicy,
+    absorb_responder_pq, build_hello, build_hello_with_profile, deterministic_role,
+    finalize_initiator_pq, verify_and_derive, verify_and_derive_with_profile,
+    verify_hello_signature, HandshakeMaterial, HandshakeProfile, HandshakeRole, HandshakeState,
+    HandshakeVersion, Hello, PeerPin, PeerPolicy,
 };
 pub use keystore::{
     compute_fingerprint_hex, enforce_owner_only_file_permissions, ensure_not_reparse_point,

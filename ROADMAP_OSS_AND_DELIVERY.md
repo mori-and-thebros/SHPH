@@ -11,7 +11,7 @@ Make SHPH a **funding-ready, open-source VPN** with:
 
 Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claims, and optional experimental transports.
 
-## Current State (as of 2026-08-08)
+## Current State (as of 2026-08-14)
 
 ### What is already built
 
@@ -23,6 +23,11 @@ Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claim
 - Reconnect policy with runtime backoff for session mode.
 - Config schema and peer/config workflows.
 - Control-plane routes/DNS apply, reconcile, undo, and persistent rollback state.
+- Opt-in native host leak containment: Linux nftables killswitch planning and
+  application, Windows WFP outbound authorization filters, literal peer
+  allowlists, stale-policy cleanup, and Linux MSS-clamp support.
+- Canonical length-prefixed hybrid handshake transcript framing and
+  exception-safe rollback across control-plane, firewall, and session setup.
 - CLI and docs baseline in place.
 - Roadmap validation, Shamir split/recovery, and ratchet-audit export primitives
   are available behind explicit CLI commands.
@@ -30,6 +35,9 @@ Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claim
   Windows, including secure-default/classical-lab handshake, authenticated
   goodput, morphology, allocation, replay, and lab-shim measurements. See
   `docs/BENCHMARK_RESULTS_2026-08-05.md`.
+- A fresh Windows-local `0.6.1-dev` full-suite capture for both benchmark
+  profiles is recorded in `docs/BENCHMARK_RESULTS_2026-08-14.md`; it remains
+  separate from native-TUN and two-host evidence.
 - Native Windows workspace validation was refreshed on August 8, 2026:
   locked build/check, strict Clippy, 180 tests, Windows-only Wintun and ACL
   regressions, release build, and both local benchmark profiles pass. See
@@ -71,15 +79,19 @@ Remaining work is explicitly phase-gated or deployment-specific:
   identity providers remain unimplemented.
 - A lab-grade password-encrypted keystore path now exists; production key
   management remains unimplemented.
+- Firewall containment remains opt-in and host-gated: privileged Linux/WFP
+  mutation, process-crash leak tests, Windows packet-policy coverage, and
+  two-host forwarding are not yet published as release evidence.
 
 ### Phase-gate rule
 
-The current paired benchmark evidence is
-`docs/BENCHMARK_RESULTS_2026-08-05.md`; historical baseline results remain in
-`docs/BENCHMARK_RESULTS_2026-07-28.md` and the Shroud morphology report in
-`docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`. These reports are useful for
-regression tracking, but they are not native-TUN, two-host, or production-VPN
-evidence. Each phase below must preserve that distinction.
+The latest Windows-local benchmark capture is
+`docs/BENCHMARK_RESULTS_2026-08-14.md`. The paired WSL2/native-Windows report
+remains `docs/BENCHMARK_RESULTS_2026-08-05.md`; historical baseline results
+remain in `docs/BENCHMARK_RESULTS_2026-07-28.md` and the Shroud morphology
+report in `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`. These reports are
+useful for regression tracking, but they are not native-TUN, two-host, or
+production-VPN evidence. Each phase below must preserve that distinction.
 
 ---
 
@@ -303,11 +315,12 @@ candidate without overstating platform or network evidence.
   lab-only, or operator-dependent.
 - A reviewer can reproduce the claimed results from the documentation.
 
-**Current status (2026-08-08):** preparation is in progress, but Phase E is
-not complete. The benchmark/evidence bundle is published for
-`0.6.0-dev.0`; the release snapshot, final claims freeze, mirror-parity
-check, final release checklist, and release tag remain gated on the
-outstanding native TUN evidence.
+**Current status (2026-08-14):** preparation is in progress, but Phase E is
+not complete. The benchmark/evidence bundle was captured on the prior
+`0.6.0-dev.0` line; the current `0.6.1-dev` prerelease carries follow-up
+hardening. The release snapshot, final claims freeze, mirror-parity check,
+final release checklist, and release tag remain gated on the outstanding
+native TUN evidence.
 
 ### Phase F — Windows TUN Delivery
 

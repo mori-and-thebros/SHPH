@@ -5,8 +5,10 @@ handshake profiles used by the benchmark harness. Native operation remains
 `secure-default`; benchmark-only classical operation requires an explicit
 profile on both peers.
 
-The latest paired platform score report is
-`docs/BENCHMARK_RESULTS_2026-08-05.md`. The focused Shroud morphology report
+The latest Windows-local prerelease score report is
+`docs/BENCHMARK_RESULTS_2026-08-14.md`. The latest paired platform score
+report remains `docs/BENCHMARK_RESULTS_2026-08-05.md`. The focused Shroud
+morphology report
 `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md` and the earlier
 `docs/BENCHMARK_RESULTS_2026-07-28.md` and
 `docs/BENCHMARK_RESULTS_2026-07-22.md` reports remain available as historical

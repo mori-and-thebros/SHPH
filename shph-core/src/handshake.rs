@@ -114,6 +114,23 @@ pub struct HandshakeState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeRole {
+    Initiator,
+    Responder,
+}
+
+/// Resolve the directional role deterministically from the two authenticated
+/// peer IDs. This keeps both sides on the same send/receive mapping if both
+/// peers initiate at the same time.
+pub fn deterministic_role(local_identity: &[u8; 32], peer_identity: &[u8; 32]) -> HandshakeRole {
+    if local_identity <= peer_identity {
+        HandshakeRole::Initiator
+    } else {
+        HandshakeRole::Responder
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerPin {
     pub identity_public: [u8; 32],
     pub signing_public: [u8; 32],
@@ -426,8 +443,6 @@ pub fn verify_and_derive_with_profile(
         }
         None
     };
-    let _ = initiator;
-
     let pq_ciphertext = if profile.uses_pqc() {
         let ciphertext = material.pq_ciphertext.as_deref().ok_or_else(|| {
             ShphError::Handshake(
@@ -450,35 +465,106 @@ pub fn verify_and_derive_with_profile(
         shared[32..].copy_from_slice(&pq_shared);
     }
 
-    let (first, second) = if material.local_hello.identity_pub_b64 <= peer_hello.identity_pub_b64 {
-        (&material.local_hello, peer_hello)
+    let local_identity_raw = decode_32(&material.local_hello.identity_pub_b64, "local identity")?;
+    let local_sign_public = decode_32(&material.local_hello.sign_pub_b64, "local signing key")?;
+    let local_ephemeral_raw =
+        decode_32(&material.local_hello.ephemeral_pub_b64, "local ephemeral")?;
+    let local_pqc_pub = material
+        .local_hello
+        .pqc_pub_b64
+        .as_deref()
+        .map(|value| b64_decode(value, "local PQ public key"))
+        .transpose()?;
+
+    let (first_identity, second_identity) = if local_identity_raw <= peer_identity_raw {
+        (&local_identity_raw, &peer_identity_raw)
     } else {
-        (peer_hello, &material.local_hello)
+        (&peer_identity_raw, &local_identity_raw)
     };
+    let (first_signing, second_signing) = if local_identity_raw <= peer_identity_raw {
+        (&local_sign_public, &peer_sign_public)
+    } else {
+        (&peer_sign_public, &local_sign_public)
+    };
+    let (first_ephemeral, second_ephemeral) = if local_identity_raw <= peer_identity_raw {
+        (&local_ephemeral_raw, &peer_ephemeral_raw)
+    } else {
+        (&peer_ephemeral_raw, &local_ephemeral_raw)
+    };
+    let (first_nonce, second_nonce) = if local_identity_raw <= peer_identity_raw {
+        (&material.local_nonce, &peer_nonce)
+    } else {
+        (&peer_nonce, &material.local_nonce)
+    };
+    let (first_timestamp, second_timestamp) = if local_identity_raw <= peer_identity_raw {
+        (
+            material.local_hello.timestamp_secs,
+            peer_hello.timestamp_secs,
+        )
+    } else {
+        (
+            peer_hello.timestamp_secs,
+            material.local_hello.timestamp_secs,
+        )
+    };
+    let (first_pqc_pub, second_pqc_pub) = if local_identity_raw <= peer_identity_raw {
+        (local_pqc_pub.as_deref(), peer_pqc_pub.as_deref())
+    } else {
+        (peer_pqc_pub.as_deref(), local_pqc_pub.as_deref())
+    };
+
     let mut transcript_hasher = Sha256::new();
-    transcript_hasher.update(profile.protocol_tag().as_bytes());
-    transcript_hasher.update(profile.as_str().as_bytes());
-    transcript_hasher.update(first.identity_pub_b64.as_bytes());
-    transcript_hasher.update(second.identity_pub_b64.as_bytes());
-    transcript_hasher.update(first.sign_pub_b64.as_bytes());
-    transcript_hasher.update(second.sign_pub_b64.as_bytes());
-    if let Some(pqc_pub) = &first.pqc_pub_b64 {
-        transcript_hasher.update(pqc_pub.as_bytes());
-    }
-    if let Some(pqc_pub) = &second.pqc_pub_b64 {
-        transcript_hasher.update(pqc_pub.as_bytes());
-    }
-    transcript_hasher.update(first.ephemeral_pub_b64.as_bytes());
-    transcript_hasher.update(second.ephemeral_pub_b64.as_bytes());
-    transcript_hasher.update(first.nonce_b64.as_bytes());
-    transcript_hasher.update(second.nonce_b64.as_bytes());
-    transcript_hasher.update(first.timestamp_secs.to_be_bytes());
-    transcript_hasher.update(second.timestamp_secs.to_be_bytes());
-    if let Some(pq_ciphertext) = pq_ciphertext {
-        transcript_hasher.update(pq_ciphertext);
-    }
+    update_transcript_field(
+        &mut transcript_hasher,
+        b"domain",
+        b"shph/handshake-transcript-v2",
+    );
+    update_transcript_field(
+        &mut transcript_hasher,
+        b"protocol",
+        profile.protocol_tag().as_bytes(),
+    );
+    update_transcript_field(
+        &mut transcript_hasher,
+        b"profile",
+        profile.as_str().as_bytes(),
+    );
+    update_transcript_field(
+        &mut transcript_hasher,
+        b"initiator-identity",
+        if initiator {
+            &local_identity_raw
+        } else {
+            &peer_identity_raw
+        },
+    );
+    update_transcript_field(&mut transcript_hasher, b"peer-a-identity", first_identity);
+    update_transcript_field(&mut transcript_hasher, b"peer-a-signing", first_signing);
+    update_transcript_optional_field(&mut transcript_hasher, b"peer-a-pqc", first_pqc_pub);
+    update_transcript_field(&mut transcript_hasher, b"peer-a-ephemeral", first_ephemeral);
+    update_transcript_field(&mut transcript_hasher, b"peer-a-nonce", first_nonce);
+    update_transcript_u64(&mut transcript_hasher, b"peer-a-timestamp", first_timestamp);
+    update_transcript_field(&mut transcript_hasher, b"peer-b-identity", second_identity);
+    update_transcript_field(&mut transcript_hasher, b"peer-b-signing", second_signing);
+    update_transcript_optional_field(&mut transcript_hasher, b"peer-b-pqc", second_pqc_pub);
+    update_transcript_field(
+        &mut transcript_hasher,
+        b"peer-b-ephemeral",
+        second_ephemeral,
+    );
+    update_transcript_field(&mut transcript_hasher, b"peer-b-nonce", second_nonce);
+    update_transcript_u64(
+        &mut transcript_hasher,
+        b"peer-b-timestamp",
+        second_timestamp,
+    );
+    update_transcript_optional_field(&mut transcript_hasher, b"pqc-ciphertext", pq_ciphertext);
     let transcript_hash = transcript_hasher.finalize();
 
+    // The transport role remains authoritative for one-sided client/server
+    // sessions: it determines which cipher is used on the connected socket.
+    // `deterministic_role` is exposed for simultaneous-open orchestration,
+    // where both peers must first agree which connection survives.
     let direction = if initiator {
         [b"initiator".as_slice(), b"responder".as_slice()]
     } else {
@@ -622,4 +708,22 @@ fn b64_decode(input_b64: &str, what: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(input_b64.as_bytes())
         .map_err(|_| ShphError::Handshake(format!("invalid {what} encoding")))
+}
+
+fn update_transcript_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
+    hasher.update((label.len() as u32).to_be_bytes());
+    hasher.update(label);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn update_transcript_optional_field(hasher: &mut Sha256, label: &[u8], value: Option<&[u8]>) {
+    update_transcript_field(hasher, label, &[if value.is_some() { 1u8 } else { 0u8 }]);
+    if let Some(value) = value {
+        update_transcript_field(hasher, label, value);
+    }
+}
+
+fn update_transcript_u64(hasher: &mut Sha256, label: &[u8], value: u64) {
+    update_transcript_field(hasher, label, &value.to_be_bytes());
 }

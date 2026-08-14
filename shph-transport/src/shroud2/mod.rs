@@ -165,6 +165,7 @@ impl MorphologyProfile {
 pub struct MorphologyEngine {
     profile: MorphologyProfile,
     rng: StdRng,
+    size_histogram: Option<EmpiricalHistogram>,
 }
 
 impl MorphologyEngine {
@@ -176,6 +177,25 @@ impl MorphologyEngine {
         Self {
             profile,
             rng: StdRng::seed_from_u64(seed),
+            size_histogram: None,
+        }
+    }
+
+    /// Construct an engine using an explicit empirical CDF for outer sizes.
+    ///
+    /// The histogram is sampled with inverse-CDF selection and every result is
+    /// still clamped to the negotiated path MTU and the current payload's
+    /// minimum envelope size. This is a lab primitive, not a claim of traffic
+    /// fingerprint equivalence.
+    pub fn from_histogram(
+        profile: MorphologyProfile,
+        histogram: EmpiricalHistogram,
+        seed: u64,
+    ) -> Self {
+        Self {
+            profile,
+            rng: StdRng::seed_from_u64(seed),
+            size_histogram: Some(histogram),
         }
     }
 
@@ -199,9 +219,13 @@ impl MorphologyEngine {
             ));
         }
 
-        let classes = self.profile.size_classes();
-        debug_assert!(classes.len() <= MAX_PROFILE_SIZE_CLASSES);
-        let sampled = classes[self.rng.gen_range(0..classes.len())];
+        let sampled = if let Some(histogram) = &self.size_histogram {
+            histogram.sample_bin(&mut self.rng) as usize
+        } else {
+            let classes = self.profile.size_classes();
+            debug_assert!(classes.len() <= MAX_PROFILE_SIZE_CLASSES);
+            classes[self.rng.gen_range(0..classes.len())]
+        };
         Ok(sampled.max(minimum).min(path_mtu))
     }
 
@@ -406,5 +430,18 @@ mod tests {
         let target = EmpiricalHistogram::from_samples(&[0, 0, 20, 20]).expect("target");
         assert!((wasserstein_distance(&current, &target) - 5.0).abs() < f64::EPSILON);
         assert_eq!(wasserstein_distance(&current, &current), 0.0);
+    }
+
+    #[test]
+    fn explicit_empirical_cdf_is_sampled_and_still_respects_bounds() {
+        let histogram =
+            EmpiricalHistogram::new(vec![64, 512, 1_280], vec![1.0, 2.0, 1.0]).expect("histogram");
+        let mut engine =
+            MorphologyEngine::from_histogram(MorphologyProfile::WebBrowsingLab, histogram, 42);
+        for payload_len in [1, 100, 600] {
+            let target = engine.target_size(payload_len, 1_400).expect("target");
+            assert!(target >= payload_len + MORPHOLOGY_HEADER_BYTES);
+            assert!(target <= 1_400);
+        }
     }
 }

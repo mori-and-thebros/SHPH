@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.6.1-dev] — prerelease hardening follow-up (2026-08-14)
+
+### Security and protocol hardening
+
+- Added a rotating, stateless HMAC-SHA256 TCP cookie challenge after the
+  existing per-source pressure threshold. Cookie validation occurs before
+  responder ML-KEM key generation and ciphertext decapsulation.
+- Added a complementary deterministic peer-ID role decision for
+  simultaneous-open orchestration while preserving the connected socket's
+  initiator/responder key direction.
+- Added explicit empirical-CDF size sampling to the opt-in Shroud 2.0 lab
+  morphology engine while retaining negotiated path-MTU and envelope bounds.
+- Configured native TUN interfaces to a validated 1360-byte MTU before route,
+  DNS, and session setup, with Linux and Windows command builders covered by
+  tests.
+- Added opt-in host leak containment: Linux installs a dedicated nftables
+  killswitch before native TUN setup, while Windows installs persistent WFP
+  outbound authorization filters. Both require literal peer IP/port
+  allowlists, and `down` removes stale SHPH-owned policy. The
+  `--killswitch-dry-run` preview does not require native TUN, elevation, or
+  firewall mutation.
+- Added opt-in Linux TCP SYN MSS clamping in a separate nftables table.
+  Windows reports an explicit unsupported error because this build does not
+  perform unsafe host-wide TCP-option rewriting.
+- Replaced ambiguous handshake transcript concatenation with canonical,
+  length-prefixed field framing that binds the negotiated profile, peer
+  ordering, initiator identity, hybrid public values, and optional KEM
+  ciphertext.
+- Made native `up` capture session failures before cleanup so control-plane,
+  MSS-clamp, and killswitch rollback remains consistent on early exits.
+- Captured a fresh Windows-local full benchmark suite for `0.6.1-dev` across
+  `secure-default` and `classical-lab` with 5,000 latency samples and 100,000
+  sustained frames; native TUN and two-host behavior remain outside the run.
+
+These changes do not claim production traffic morphology, DPI resistance,
+privileged firewall execution on every host, or native two-host VPN evidence.
+
 ## [0.6.0-dev.0] — release-polish and native-platform hardening (2026-08-09)
 
 This is a development release. It is not a production-ready transport, an

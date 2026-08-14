@@ -26,6 +26,9 @@ to native TUN, but does not turn morphology into a stealth or fallback router.
   loop.
 - Offline empirical-histogram construction, normalized sampling, and exact
   one-dimensional Wasserstein-1 measurement primitives for reviewed lab data.
+- Explicit histogram-backed empirical-CDF size sampling through
+  `MorphologyEngine::from_histogram`; the negotiated path limit and envelope
+  minimum remain enforced after sampling.
 - Standards-QUIC send/receive helpers using Quinn RFC 9221 DATAGRAM support.
 - Unit, loopback, negative, and fuzz-manifest coverage.
 

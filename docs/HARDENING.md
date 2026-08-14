@@ -5,12 +5,11 @@ funding-readiness track (Phases A + B). It is the Optional/Research hardening
 track from `ROADMAP_OSS_AND_DELIVERY.md`: concrete, tested, verifiable
 defenses rather than research-grade features.
 
-Every change here:
-- fixes a real weakness found by audit (not theoretical),
-- ships with regression tests,
-- keeps all gates green (`fmt` / `clippy -D warnings` / `test 0 failed` /
-  `--locked` build),
-- is captured in `CHANGELOG.md` and tagged (`hardening-N`).
+Every increment here:
+- addresses a concrete weakness or boundary,
+- records focused regression coverage where practical,
+- states its validation and host-evidence limits explicitly,
+- is captured in `CHANGELOG.md`.
 
 ## Increment 1 — Crypto data-plane (`hardening-1`)
 
@@ -548,3 +547,62 @@ Files: `shph-cli/src/main.rs`, `shph-transport/src/lib.rs`,
 Native Windows execution is still required to validate the Wintun DLL hash,
 signed-loader behavior, adapter lifecycle, and packet I/O on a supported
 elevated host.
+
+## Increment 23 — Pre-authentication cookies, deterministic roles, and CDF lab sampling
+
+Files: `shph-core/src/cookie.rs`, `shph-core/src/handshake.rs`,
+`shph-transport/src/lib.rs`, `shph-transport/src/shroud2/mod.rs`.
+
+- **Stateless TCP cookie challenge.** Once a source reaches the existing
+  per-IP handshake pressure threshold, the responder issues a rotating
+  HMAC-SHA256 cookie bound to the observed source IP and port. The cookie must
+  be echoed before the responder generates its ML-KEM keypair or accepts the
+  ciphertext, and no client-specific cookie state is retained.
+- **Deterministic peer-ID tie-break.** `shph-core` exposes a complementary
+  lexicographic role decision from the authenticated X25519 peer IDs for
+  simultaneous-open orchestration. Connected one-sided sessions retain their
+  socket's initiator/responder role as the authoritative key direction.
+- **Explicit empirical-CDF morphology input.** The Shroud 2.0 lab engine can
+  now sample bounded outer sizes from a caller-supplied normalized histogram.
+  The negotiated path limit and payload-envelope minimum remain authoritative;
+  this is a measurement primitive, not a browser-mimicry or DPI-evasion claim.
+
+Regression coverage includes cookie rotation/address binding, bounded TCP
+challenge framing, pressure-threshold selection, deterministic role
+complementarity, histogram-backed morphology bounds, and MTU command
+validation. Native firewall execution and privileged two-host evidence remain
+platform-gated.
+
+## Increment 24 — Opt-in host leak containment and transcript framing
+
+Files: `shph-cli/src/main.rs`, `shph-tun/src/firewall.rs`,
+`shph-tun/src/windows_firewall.rs`, `shph-core/src/handshake.rs`.
+
+- **Linux host killswitch.** `shph up --killswitch` installs a dedicated,
+  persistent `inet shph_killswitch` nftables output policy before native TUN
+  setup. It permits loopback, the named TUN interface, and only literal
+  configured peer IP/port endpoints for the selected TCP/UDP transport.
+- **Windows host killswitch.** The same opt-in path installs persistent
+  Windows Filtering Platform outbound ALE authorization filters. The policy
+  requires elevation, allows loopback/TUN/peer tuples, and removes stale
+  SHPH-owned filter keys before reinstallation. `shph down` also attempts
+  stale-policy cleanup after control-plane rollback.
+- **MSS clamp lifecycle.** `shph up --mss-clamp` installs a separate
+  `inet shph_mss_clamp` nftables table with bidirectional TCP SYN
+  `rt mtu` MSS rewriting on Linux. Windows fails explicitly because WFP
+  filtering does not provide a safe declarative TCP-option rewrite in this
+  implementation.
+- **Canonical transcript framing.** The signed handshake transcript now uses
+  explicit field labels and length prefixes, canonical peer ordering, the
+  negotiated profile, the initiator identity, all hybrid public values, and
+  the optional KEM ciphertext. This prevents concatenation ambiguity while
+  preserving the existing connected socket key-direction contract.
+- **Exception-safe session rollback.** Native `up` session failures are
+  captured before cleanup, so control-plane state, MSS rules, and killswitch
+  state are unwound together on transport errors and early returns.
+
+The firewall paths are opt-in and command-argument bounded. Dry-run mode only
+prints the Linux plan or Windows policy summary and does not require native TUN
+or elevation. This source-level change does not claim that privileged
+nftables/WFP mutation, crash-leak testing, Windows Wintun packet I/O, or
+two-host forwarding has been executed on the current development host.

@@ -28,9 +28,18 @@ use shph_transport::{
     tcp_handshake_server_with_profile, QuicLabConfig, SecureReceiver, SecureSender, SecureSession,
     TransportMode,
 };
+use shph_tun::firewall::FirewallTransport;
+#[cfg(target_os = "linux")]
+use shph_tun::firewall::{
+    build_linux_killswitch_cleanup_commands, build_linux_killswitch_commands,
+    build_linux_mss_clamp_cleanup_commands, build_linux_mss_clamp_commands, KILLSWITCH_TABLE_NAME,
+    MSS_CLAMP_TABLE_NAME,
+};
 #[cfg(target_os = "linux")]
 use shph_tun::AsyncTunDevice;
-use shph_tun::{TunDevice, TUN_READ_BUFFER_BYTES};
+use shph_tun::{validate_tun_mtu, TunDevice, DEFAULT_TUN_MTU_BYTES, TUN_READ_BUFFER_BYTES};
+#[cfg(target_os = "windows")]
+use shph_tun::{WindowsFirewallTransport, WindowsKillswitchGuard};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, ToSocketAddrs};
@@ -102,6 +111,15 @@ enum Commands {
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
+        /// Install a persistent, fail-closed host firewall policy before opening TUN
+        #[arg(long)]
+        killswitch: bool,
+        /// Print killswitch commands without applying them
+        #[arg(long, requires = "killswitch")]
+        killswitch_dry_run: bool,
+        /// Install bidirectional TCP SYN MSS clamping for the native TUN
+        #[arg(long)]
+        mss_clamp: bool,
     },
     /// Bring down the VPN tunnel
     Down,
@@ -260,6 +278,9 @@ fn main() -> Result<()> {
             transport,
             quic_cert,
             handshake_profile,
+            killswitch,
+            killswitch_dry_run,
+            mss_clamp,
         } => {
             let path = config.unwrap_or(config_path);
             let config = load_config(&path)?;
@@ -280,6 +301,9 @@ fn main() -> Result<()> {
                 profile,
                 config.roadmap.as_ref(),
                 quic_cert.as_deref(),
+                killswitch,
+                killswitch_dry_run,
+                mss_clamp,
             )?
         }
         Commands::Down => handle_down(&config_path)?,
@@ -460,6 +484,9 @@ fn handle_up(
     profile: HandshakeProfile,
     _roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
+    killswitch: bool,
+    killswitch_dry_run: bool,
+    mss_clamp: bool,
 ) -> Result<()> {
     validate_config_roadmap(config)?;
     if transport == TransportMode::QuicStandard
@@ -475,12 +502,53 @@ fn handle_up(
         ));
     }
     announce_handshake_profile(profile);
-    let tun = TunDevice::open(&config.interface_name)?;
+    let mut killswitch_guard = if killswitch {
+        apply_killswitch(config, transport, killswitch_dry_run)?
+    } else {
+        FirewallGuard::default()
+    };
+    let tun = match TunDevice::open(&config.interface_name) {
+        Ok(tun) => tun,
+        Err(error) => {
+            let _ = killswitch_guard.cleanup();
+            return Err(error);
+        }
+    };
     if transport == TransportMode::QuicStandard && !tun.is_native() {
+        let _ = killswitch_guard.cleanup();
         return Err(ShphError::Unsupported(
             "quic-standard up requires native TUN; set SHPH_TUN_NATIVE=1".into(),
         ));
     }
+    if killswitch && !tun.is_native() && !killswitch_dry_run {
+        let _ = killswitch_guard.cleanup();
+        return Err(ShphError::Unsupported(
+            "the host killswitch requires native TUN; set SHPH_TUN_NATIVE=1".into(),
+        ));
+    }
+    if mss_clamp && !tun.is_native() && !killswitch_dry_run {
+        let _ = killswitch_guard.cleanup();
+        return Err(ShphError::Unsupported(
+            "MSS clamping requires native TUN; set SHPH_TUN_NATIVE=1".into(),
+        ));
+    }
+    if killswitch {
+        killswitch_guard.allow_interface(tun.name())?;
+    }
+    if tun.is_native() {
+        configure_native_tun_mtu(tun.name(), DEFAULT_TUN_MTU_BYTES)?;
+    }
+    let mut mss_guard = if mss_clamp {
+        match apply_mss_clamp(tun.name(), killswitch_dry_run) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = killswitch_guard.cleanup();
+                return Err(error);
+            }
+        }
+    } else {
+        FirewallGuard::default()
+    };
     println!("SHPH up");
     println!("  Interface: {}", tun.name());
     println!("  Local endpoint: {}", config.local_endpoint);
@@ -505,113 +573,115 @@ fn handle_up(
             };
         }
     }
-    let session_result = if let Some(session) = &config.session {
-        let timeout_secs = session.timeout_secs.unwrap_or(5);
-        let reconnect_enabled = session
-            .reconnect
-            .as_ref()
-            .and_then(|r| r.enabled)
-            .unwrap_or(false);
-        let max_attempts = session
-            .reconnect
-            .as_ref()
-            .and_then(|r| r.max_attempts)
-            .unwrap_or(1)
-            .max(1);
-        let initial_delay = session
-            .reconnect
-            .as_ref()
-            .and_then(|r| r.initial_delay_ms)
-            .unwrap_or(250)
-            .max(1);
-        let max_delay = session
-            .reconnect
-            .as_ref()
-            .and_then(|r| r.max_delay_ms)
-            .unwrap_or(4000)
-            .max(initial_delay);
-        match session.role {
-            SessionRole::Listen => {
-                let bind = session.bind.as_deref().unwrap_or("0.0.0.0:7000");
-                let roadmap = config.roadmap.as_ref();
-                println!("  Session mode: listen ({bind})");
-                if session.startup_payload.is_some() {
-                    handle_recv_once(
-                        keystore_path,
-                        bind,
-                        timeout_secs,
-                        Some(transport_mode_to_str(transport).to_string()),
-                        quic_cert_path,
-                        profile,
-                        roadmap,
-                    )?;
-                } else {
-                    run_with_reconnect(
-                        reconnect_enabled,
-                        max_attempts,
-                        initial_delay,
-                        max_delay,
-                        || {
-                            run_listen_loop(
-                                keystore_path,
-                                &tun,
-                                bind,
-                                timeout_secs,
-                                transport,
-                                profile,
-                                config.roadmap.as_ref(),
-                                quic_cert_path,
-                            )
-                        },
-                    )?;
+    let session_result = (|| -> Result<()> {
+        if let Some(session) = &config.session {
+            let timeout_secs = session.timeout_secs.unwrap_or(5);
+            let reconnect_enabled = session
+                .reconnect
+                .as_ref()
+                .and_then(|r| r.enabled)
+                .unwrap_or(false);
+            let max_attempts = session
+                .reconnect
+                .as_ref()
+                .and_then(|r| r.max_attempts)
+                .unwrap_or(1)
+                .max(1);
+            let initial_delay = session
+                .reconnect
+                .as_ref()
+                .and_then(|r| r.initial_delay_ms)
+                .unwrap_or(250)
+                .max(1);
+            let max_delay = session
+                .reconnect
+                .as_ref()
+                .and_then(|r| r.max_delay_ms)
+                .unwrap_or(4000)
+                .max(initial_delay);
+            match session.role {
+                SessionRole::Listen => {
+                    let bind = session.bind.as_deref().unwrap_or("0.0.0.0:7000");
+                    let roadmap = config.roadmap.as_ref();
+                    println!("  Session mode: listen ({bind})");
+                    if session.startup_payload.is_some() {
+                        handle_recv_once(
+                            keystore_path,
+                            bind,
+                            timeout_secs,
+                            Some(transport_mode_to_str(transport).to_string()),
+                            quic_cert_path,
+                            profile,
+                            roadmap,
+                        )?;
+                    } else {
+                        run_with_reconnect(
+                            reconnect_enabled,
+                            max_attempts,
+                            initial_delay,
+                            max_delay,
+                            || {
+                                run_listen_loop(
+                                    keystore_path,
+                                    &tun,
+                                    bind,
+                                    timeout_secs,
+                                    transport,
+                                    profile,
+                                    config.roadmap.as_ref(),
+                                    quic_cert_path,
+                                )
+                            },
+                        )?;
+                    }
                 }
-            }
-            SessionRole::Connect => {
-                let peer = session.peer.as_deref().ok_or_else(|| {
-                    ShphError::Config("session.peer required for connect mode".into())
-                })?;
-                let roadmap = config.roadmap.as_ref();
-                println!("  Session mode: connect ({peer})");
-                if let Some(payload) = session.startup_payload.as_deref() {
-                    handle_send_once(
-                        keystore_path,
-                        peer,
-                        payload,
-                        timeout_secs,
-                        Some(transport_mode_to_str(transport).to_string()),
-                        quic_cert_path,
-                        profile,
-                        roadmap,
-                    )?;
-                } else {
-                    run_with_reconnect(
-                        reconnect_enabled,
-                        max_attempts,
-                        initial_delay,
-                        max_delay,
-                        || {
-                            run_connect_loop(
-                                keystore_path,
-                                &tun,
-                                peer,
-                                timeout_secs,
-                                transport,
-                                profile,
-                                config.roadmap.as_ref(),
-                                quic_cert_path,
-                            )
-                        },
-                    )?;
+                SessionRole::Connect => {
+                    let peer = session.peer.as_deref().ok_or_else(|| {
+                        ShphError::Config("session.peer required for connect mode".into())
+                    })?;
+                    let roadmap = config.roadmap.as_ref();
+                    println!("  Session mode: connect ({peer})");
+                    if let Some(payload) = session.startup_payload.as_deref() {
+                        handle_send_once(
+                            keystore_path,
+                            peer,
+                            payload,
+                            timeout_secs,
+                            Some(transport_mode_to_str(transport).to_string()),
+                            quic_cert_path,
+                            profile,
+                            roadmap,
+                        )?;
+                    } else {
+                        run_with_reconnect(
+                            reconnect_enabled,
+                            max_attempts,
+                            initial_delay,
+                            max_delay,
+                            || {
+                                run_connect_loop(
+                                    keystore_path,
+                                    &tun,
+                                    peer,
+                                    timeout_secs,
+                                    transport,
+                                    profile,
+                                    config.roadmap.as_ref(),
+                                    quic_cert_path,
+                                )
+                            },
+                        )?;
+                    }
                 }
             }
         }
         Ok(())
-    } else {
-        Ok(())
-    };
+    })();
     match session_result {
         Ok(()) => {
             control_guard.cleanup()?;
+            mss_guard.cleanup()?;
+            killswitch_guard.cleanup()?;
             if control_state_recorded {
                 remove_control_plane_state(config_path)?;
             }
@@ -619,9 +689,21 @@ fn handle_up(
         }
         Err(err) => {
             let cleanup_result = control_guard.cleanup();
+            let mss_cleanup_result = mss_guard.cleanup();
+            let killswitch_cleanup_result = killswitch_guard.cleanup();
             if let Err(clean_err) = cleanup_result {
                 return Err(ShphError::Internal(format!(
                     "session error: {err}; control-plane cleanup error: {clean_err}"
+                )));
+            }
+            if let Err(clean_err) = mss_cleanup_result {
+                return Err(ShphError::Internal(format!(
+                    "session error: {err}; MSS-clamp cleanup error: {clean_err}"
+                )));
+            }
+            if let Err(clean_err) = killswitch_cleanup_result {
+                return Err(ShphError::Internal(format!(
+                    "session error: {err}; killswitch cleanup error: {clean_err}"
                 )));
             }
             if control_state_recorded {
@@ -719,8 +801,16 @@ fn write_quic_certificate(path: &Path, certificate: &[u8]) -> Result<()> {
 
 fn handle_down(config_path: &Path) -> Result<()> {
     println!("SHPH down");
-    handle_control_plane_undo(config_path)?;
-    Ok(())
+    let control_result = handle_control_plane_undo(config_path);
+    let firewall_result = cleanup_firewall_state();
+    match (control_result, firewall_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(control_error), Ok(())) => Err(control_error),
+        (Ok(()), Err(firewall_error)) => Err(firewall_error),
+        (Err(control_error), Err(firewall_error)) => Err(ShphError::Internal(
+            format!("control-plane cleanup error: {control_error}; firewall cleanup error: {firewall_error}"),
+        )),
+    }
 }
 
 fn handle_status(config_path: &Path, keystore_path: &Path) -> Result<()> {
@@ -2253,6 +2343,363 @@ fn apply_control_plane(config: &Config, interface_name: &str) -> Result<ControlP
     Ok(guard)
 }
 
+fn configure_native_tun_mtu(interface_name: &str, mtu: usize) -> Result<()> {
+    let commands = build_tun_mtu_commands(interface_name, mtu)?;
+    for command in &commands {
+        run_shell_command(command)?;
+    }
+    println!("  native TUN MTU: {mtu}");
+    Ok(())
+}
+
+const MAX_KILLSWITCH_PEERS: usize = 64;
+
+#[derive(Default)]
+struct FirewallGuard {
+    dry_run: bool,
+    cleanup_commands: Vec<Vec<String>>,
+    #[cfg(target_os = "windows")]
+    windows: Option<WindowsKillswitchGuard>,
+}
+
+impl FirewallGuard {
+    fn cleanup(&mut self) -> Result<()> {
+        let mut first_error = None;
+
+        #[cfg(target_os = "windows")]
+        if let Some(mut guard) = self.windows.take() {
+            if let Err(error) = guard.cleanup() {
+                first_error = Some(error);
+            }
+        }
+
+        let dry_run = self.dry_run;
+        for command in self.cleanup_commands.drain(..) {
+            if !dry_run {
+                if let Err(error) = run_shell_command(&command) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn allow_interface(&mut self, interface_name: &str) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        if let Some(guard) = self.windows.as_mut() {
+            guard.allow_interface(interface_name)?;
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        let _ = interface_name;
+
+        Ok(())
+    }
+}
+
+impl Drop for FirewallGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+fn apply_killswitch(
+    config: &Config,
+    transport: TransportMode,
+    dry_run: bool,
+) -> Result<FirewallGuard> {
+    let firewall_transport = match transport {
+        TransportMode::Tcp => FirewallTransport::Tcp,
+        TransportMode::Quic | TransportMode::QuicStandard => FirewallTransport::Udp,
+        TransportMode::OfflineMesh | TransportMode::DataMule => {
+            return Err(ShphError::Unsupported(
+                "the host killswitch only supports TCP and UDP transports".into(),
+            ))
+        }
+    };
+    let peers = resolve_killswitch_peers(config)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let commands =
+            build_linux_killswitch_commands(&config.interface_name, &peers, firewall_transport)?;
+        return apply_linux_firewall_plan(
+            "killswitch",
+            commands,
+            build_linux_killswitch_cleanup_commands(),
+            dry_run,
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let windows_transport = match firewall_transport {
+            FirewallTransport::Tcp => WindowsFirewallTransport::Tcp,
+            FirewallTransport::Udp => WindowsFirewallTransport::Udp,
+        };
+        let mut guard = FirewallGuard {
+            dry_run,
+            cleanup_commands: Vec::new(),
+            windows: None,
+        };
+        if dry_run {
+            println!(
+                "  [dry-run] Windows WFP killswitch: {:?} transport, {} literal peer(s)",
+                windows_transport,
+                peers.len()
+            );
+            return Ok(guard);
+        }
+        guard.windows = Some(WindowsKillswitchGuard::apply(&peers, windows_transport)?);
+        println!("  killswitch: persistent Windows WFP policy active");
+        return Ok(guard);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (config, firewall_transport, dry_run, peers);
+        Err(ShphError::Unsupported(
+            "host killswitch unsupported on this platform".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_firewall_plan(
+    label: &str,
+    commands: Vec<Vec<String>>,
+    cleanup_commands: Vec<Vec<String>>,
+    dry_run: bool,
+) -> Result<FirewallGuard> {
+    let mut guard = FirewallGuard {
+        dry_run,
+        cleanup_commands,
+    };
+    if dry_run {
+        println!("  [dry-run] {label}:");
+        for command in &commands {
+            println!("    {command:?}");
+        }
+        return Ok(guard);
+    }
+
+    // Remove a stale SHPH-owned table before applying the new plan. The
+    // cleanup is intentionally best-effort here; the install path below is
+    // authoritative and every successful mutation remains rollback-tracked.
+    let stale_cleanup = guard.cleanup_commands.clone();
+    for command in &stale_cleanup {
+        let _ = run_shell_command(command);
+    }
+
+    for command in &commands {
+        if let Err(error) = run_shell_command(command) {
+            let cleanup_error = guard.cleanup().err();
+            return match cleanup_error {
+                Some(cleanup_error) => Err(ShphError::Internal(format!(
+                    "{label} apply error: {error}; rollback error: {cleanup_error}"
+                ))),
+                None => Err(error),
+            };
+        }
+    }
+    println!("  {label}: active");
+    Ok(guard)
+}
+
+fn apply_mss_clamp(interface_name: &str, dry_run: bool) -> Result<FirewallGuard> {
+    #[cfg(target_os = "linux")]
+    {
+        let commands = build_linux_mss_clamp_commands(interface_name, DEFAULT_TUN_MTU_BYTES)?;
+        return apply_linux_firewall_plan(
+            "MSS clamp",
+            commands,
+            build_linux_mss_clamp_cleanup_commands(),
+            dry_run,
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (interface_name, dry_run);
+        Err(ShphError::Unsupported(
+            "MSS clamping is currently implemented with Linux nftables only; Windows WFP packet rewriting is not available in this build".into(),
+        ))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (interface_name, dry_run);
+        Err(ShphError::Unsupported(
+            "MSS clamping unsupported on this platform".into(),
+        ))
+    }
+}
+
+fn resolve_killswitch_peers(config: &Config) -> Result<Vec<SocketAddr>> {
+    let endpoint_values = match config.session.as_ref() {
+        Some(session) if session.role == SessionRole::Connect => {
+            let selector = session.peer.as_deref().ok_or_else(|| {
+                ShphError::Config(
+                    "killswitch connect mode requires session.peer to select a peer".into(),
+                )
+            })?;
+            if let Some(peer) = config.peers.iter().find(|peer| {
+                peer.alias == selector || peer.endpoint == selector || peer.pubkey == selector
+            }) {
+                vec![peer.endpoint.clone()]
+            } else {
+                vec![selector.to_string()]
+            }
+        }
+        _ => config
+            .peers
+            .iter()
+            .map(|peer| peer.endpoint.clone())
+            .collect(),
+    };
+
+    if endpoint_values.is_empty() {
+        return Err(ShphError::Config(
+            "killswitch requires at least one configured peer endpoint".into(),
+        ));
+    }
+    if endpoint_values.len() > MAX_KILLSWITCH_PEERS {
+        return Err(ShphError::Config(format!(
+            "killswitch supports at most {MAX_KILLSWITCH_PEERS} peer endpoints"
+        )));
+    }
+
+    let mut peers = Vec::with_capacity(endpoint_values.len());
+    for endpoint_value in endpoint_values {
+        let endpoint = Endpoint::parse(&endpoint_value).map_err(|error| {
+            ShphError::Config(format!(
+                "invalid killswitch peer endpoint {endpoint_value:?}: {error}"
+            ))
+        })?;
+        let address = endpoint.host.parse::<IpAddr>().map_err(|_| {
+            ShphError::Config(format!(
+                "killswitch requires literal IP peer endpoints; refusing hostname {:?}",
+                endpoint.host
+            ))
+        })?;
+        let socket = SocketAddr::new(address, endpoint.port);
+        if !peers.contains(&socket) {
+            peers.push(socket);
+        }
+    }
+
+    if peers.is_empty() {
+        return Err(ShphError::Config(
+            "killswitch peer allowlist is empty after normalization".into(),
+        ));
+    }
+    Ok(peers)
+}
+
+fn cleanup_firewall_state() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        cleanup_nft_table(KILLSWITCH_TABLE_NAME)?;
+        cleanup_nft_table(MSS_CLAMP_TABLE_NAME)?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return WindowsKillswitchGuard::clear_stale();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_nft_table(table_name: &str) -> Result<()> {
+    let probe = vec![
+        "nft".to_string(),
+        "list".to_string(),
+        "table".to_string(),
+        "inet".to_string(),
+        table_name.to_string(),
+    ];
+    match run_shell_command(&probe) {
+        Ok(()) => run_shell_command(&vec![
+            "nft".to_string(),
+            "delete".to_string(),
+            "table".to_string(),
+            "inet".to_string(),
+            table_name.to_string(),
+        ]),
+        // A missing SHPH-owned table is already clean. Other command
+        // failures remain visible so permission/tooling problems are not
+        // mistaken for successful recovery.
+        Err(ShphError::Internal(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn build_tun_mtu_commands(interface_name: &str, mtu: usize) -> Result<Vec<Vec<String>>> {
+    if interface_name.trim().is_empty()
+        || interface_name
+            .chars()
+            .any(|character| character.is_control())
+    {
+        return Err(ShphError::InvalidArgument(
+            "TUN interface name is invalid for MTU configuration".into(),
+        ));
+    }
+    validate_tun_mtu(mtu)?;
+
+    if cfg!(target_os = "linux") {
+        return Ok(vec![vec![
+            "ip".to_string(),
+            "link".to_string(),
+            "set".to_string(),
+            "dev".to_string(),
+            interface_name.to_string(),
+            "mtu".to_string(),
+            mtu.to_string(),
+        ]]);
+    }
+
+    if cfg!(target_os = "windows") {
+        return Ok(vec![
+            vec![
+                "netsh".to_string(),
+                "interface".to_string(),
+                "ipv4".to_string(),
+                "set".to_string(),
+                "subinterface".to_string(),
+                format!("name={interface_name}"),
+                format!("mtu={mtu}"),
+                "store=active".to_string(),
+            ],
+            vec![
+                "netsh".to_string(),
+                "interface".to_string(),
+                "ipv6".to_string(),
+                "set".to_string(),
+                "subinterface".to_string(),
+                format!("name={interface_name}"),
+                format!("mtu={mtu}"),
+                "store=active".to_string(),
+            ],
+        ]);
+    }
+
+    Err(ShphError::Unsupported(
+        "native TUN MTU configuration unsupported on this platform".into(),
+    ))
+}
+
 /// Fully-validated, normalized description of what the control plane would do.
 /// Built by preflight validation before any host mutation.
 #[derive(Debug, Clone, Default)]
@@ -3663,14 +4110,17 @@ mod tests {
     use super::{
         apply_control_plane, build_control_plane_plan, build_dns_apply_command,
         build_dns_apply_commands, build_dns_restore_command, build_route_add_command,
-        build_route_delete_command, control_plane_state_path, enforce_peer_policy, handle_up,
-        load_control_plane_state, parse_shroud_profile_name, phase_a1_now_ms,
-        render_config_for_display, run_with_reconnect, transport_mode_to_str, validate_cidr,
-        ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore, KeyStoreConfig,
-        TransportMode, MAX_CONTROL_PLANE_STATE_BYTES,
+        build_route_delete_command, build_tun_mtu_commands, control_plane_state_path,
+        enforce_peer_policy, handle_up, load_control_plane_state, parse_shroud_profile_name,
+        phase_a1_now_ms, render_config_for_display, resolve_killswitch_peers, run_with_reconnect,
+        transport_mode_to_str, validate_cidr, ControlPlaneGuard, ControlPlanePlan, HandshakeState,
+        KeyStore, KeyStoreConfig, TransportMode, DEFAULT_TUN_MTU_BYTES,
+        MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
-    use shph_config::{Config, ControlPlaneConfig, ReconnectConfig, SessionConfig, SessionRole};
+    use shph_config::{
+        Config, ControlPlaneConfig, PeerConfig, ReconnectConfig, SessionConfig, SessionRole,
+    };
     use shph_core::roadmap::{IdentityProviderConfig, TransportAdapterConfig};
     use shph_core::{Result, ShphError};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -3746,6 +4196,101 @@ mod tests {
     }
 
     #[test]
+    fn killswitch_peer_resolution_requires_literal_endpoints_and_deduplicates() {
+        let config = Config {
+            peers: vec![
+                PeerConfig {
+                    alias: "primary".into(),
+                    endpoint: "198.51.100.10:443".into(),
+                    pubkey: "peer-key".into(),
+                    sign_pubkey: None,
+                },
+                PeerConfig {
+                    alias: "duplicate".into(),
+                    endpoint: "198.51.100.10:443".into(),
+                    pubkey: "peer-key-2".into(),
+                    sign_pubkey: None,
+                },
+            ],
+            ..Config::default()
+        };
+        let peers = resolve_killswitch_peers(&config).expect("literal peers");
+        assert_eq!(peers, vec!["198.51.100.10:443".parse().unwrap()]);
+
+        let hostname_config = Config {
+            peers: vec![PeerConfig {
+                alias: "hostname".into(),
+                endpoint: "vpn.example.test:443".into(),
+                pubkey: "peer-key".into(),
+                sign_pubkey: None,
+            }],
+            ..Config::default()
+        };
+        assert!(matches!(
+            resolve_killswitch_peers(&hostname_config),
+            Err(ShphError::Config(message)) if message.contains("literal IP")
+        ));
+    }
+
+    #[test]
+    fn killswitch_connect_selector_uses_selected_configured_peer() {
+        let config = Config {
+            peers: vec![
+                PeerConfig {
+                    alias: "first".into(),
+                    endpoint: "198.51.100.10:443".into(),
+                    pubkey: "peer-a".into(),
+                    sign_pubkey: None,
+                },
+                PeerConfig {
+                    alias: "second".into(),
+                    endpoint: "203.0.113.20:8443".into(),
+                    pubkey: "peer-b".into(),
+                    sign_pubkey: None,
+                },
+            ],
+            session: Some(SessionConfig {
+                role: SessionRole::Connect,
+                bind: None,
+                peer: Some("second".into()),
+                timeout_secs: None,
+                handshake_profile: None,
+                reconnect: None,
+                startup_payload: None,
+            }),
+            ..Config::default()
+        };
+        let peers = resolve_killswitch_peers(&config).expect("selected peer");
+        assert_eq!(peers, vec!["203.0.113.20:8443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn killswitch_dry_run_does_not_require_native_tun() {
+        let config = Config {
+            peers: vec![PeerConfig {
+                alias: "preview".into(),
+                endpoint: "198.51.100.10:443".into(),
+                pubkey: "peer-key".into(),
+                sign_pubkey: None,
+            }],
+            ..Config::default()
+        };
+        handle_up(
+            std::path::Path::new("/tmp/shph-config.toml"),
+            std::path::Path::new("/tmp/shph-keystore.json"),
+            &config,
+            TransportMode::Tcp,
+            shph_core::HandshakeProfile::SecureDefault,
+            None,
+            None,
+            true,
+            true,
+            false,
+        )
+        .expect("killswitch dry-run should preview without native TUN");
+    }
+
+    #[test]
     fn quic_standard_up_rejects_reconnect_before_opening_tun() {
         let config = Config {
             session: Some(SessionConfig {
@@ -3772,6 +4317,9 @@ mod tests {
             shph_core::HandshakeProfile::SecureDefault,
             None,
             Some(std::path::Path::new("/tmp/server.der")),
+            false,
+            false,
+            false,
         )
         .expect_err("standards QUIC reconnect must fail before native TUN setup");
         assert!(matches!(error, ShphError::Config(message) if message.contains("reconnect")));
@@ -3933,6 +4481,18 @@ mod tests {
             assert!(del_cmd.contains(&"interface=shph0".to_string()));
         }
         assert!(build_route_add_command("10.12.0.0/64", "shph0").is_err());
+    }
+
+    #[test]
+    fn tun_mtu_command_builder_is_bounded() {
+        let commands =
+            build_tun_mtu_commands("shph0", DEFAULT_TUN_MTU_BYTES).expect("MTU commands");
+        assert!(!commands.is_empty());
+        assert!(commands.iter().all(|command| command
+            .iter()
+            .any(|part| part.contains(&DEFAULT_TUN_MTU_BYTES.to_string()))));
+        assert!(build_tun_mtu_commands("", DEFAULT_TUN_MTU_BYTES).is_err());
+        assert!(build_tun_mtu_commands("shph0", 575).is_err());
     }
 
     #[cfg(unix)]

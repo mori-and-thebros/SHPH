@@ -1,7 +1,8 @@
 use base64::Engine as _;
 use shph_core::{
-    absorb_responder_pq, build_hello, build_hello_with_profile, finalize_initiator_pq,
-    verify_and_derive, HandshakeMaterial, HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy,
+    absorb_responder_pq, build_hello, build_hello_with_profile, deterministic_role,
+    finalize_initiator_pq, verify_and_derive, HandshakeMaterial, HandshakeProfile, HandshakeRole,
+    IdentityKeyPair, PeerPin, PeerPolicy,
 };
 
 /// Perform the in-memory hybrid PQ exchange exactly as the transports do:
@@ -76,6 +77,20 @@ fn handshake_roundtrip_derives_complementary_keys() {
     );
     assert_eq!(init_state.peer_fingerprint_hex, responder.fingerprint_hex());
     assert_eq!(resp_state.peer_fingerprint_hex, initiator.fingerprint_hex());
+}
+
+#[test]
+fn deterministic_peer_id_tie_breaking_is_complementary() {
+    let lower = [0x10u8; 32];
+    let higher = [0x20u8; 32];
+    assert_eq!(
+        deterministic_role(&lower, &higher),
+        HandshakeRole::Initiator
+    );
+    assert_eq!(
+        deterministic_role(&higher, &lower),
+        HandshakeRole::Responder
+    );
 }
 
 #[test]

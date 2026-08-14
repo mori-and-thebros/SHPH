@@ -7,9 +7,9 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-08-09)
+## Current Status (2026-08-14)
 
-Workspace version `0.6.0-dev.0`. SHPH is **functional for controlled lab
+Workspace version `0.6.1-dev` (pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -31,6 +31,16 @@ claims.
     and reconnect attempts.
   - malformed/oversized IP packets and short kernel writes fail closed; bridge
     packet buffers are zeroized on drop.
+- Optional host leak containment controls:
+  - `--killswitch` installs a dedicated Linux nftables policy or elevated
+    Windows WFP policy before TUN activation.
+  - `--killswitch-dry-run` prints the bounded Linux plan (or Windows policy
+    summary) without changing host firewall state.
+  - peer endpoints must be literal IP addresses with non-zero ports; DNS
+    hostname resolution is intentionally rejected in killswitch mode.
+  - `--mss-clamp` enables Linux TCP SYN MSS clamping for the 1360-byte native
+    TUN MTU. Windows reports unsupported until a safe packet-rewrite backend
+    exists.
 - Windows includes a wired Wintun backend with application-local loading,
   elevation checks, pinned SHA-256 provenance, bounded rings, packet
   validation, shared-session cloning, bounded event waits, and RAII teardown.
@@ -203,12 +213,19 @@ Behavior:
 - with `dry_run=false`: SHPH attempts live route/DNS apply and rollback on shutdown/error.
 - `apply`, `reconcile`, `undo`, and `down` provide persistent control-plane
   lifecycle management outside a session process.
+- `up --killswitch` and `up --mss-clamp` require native TUN mode for live
+  mutation. `--killswitch-dry-run` is preview-only: it prints the bounded
+  policy without requiring native TUN, elevation, or firewall mutation.
+- `down` attempts to remove SHPH-owned firewall tables/filters as well as
+  recorded control-plane state; cleanup failures are reported rather than
+  silently ignored.
 
 ## Main Commands
 
 ```text
 shph init --new
-shph up --config <path> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
+shph up --config <path> [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
+  [--quic-cert <server.der>] [--killswitch] [--killswitch-dry-run] [--mss-clamp]
 shph down
 shph apply
 shph reconcile
@@ -261,15 +278,13 @@ Additional docs:
 - `docs/SUPPLY_CHAIN_SCAN.md` (cargo-audit scanner + advisory triage)
 - `docs/HARDENING.md` (post-funding security-hardening summary + threat impact)
 - `docs/BENCHMARKING.md` (Linux-first benchmark methodology and profile plan)
+- `docs/BENCHMARK_RESULTS_2026-08-14.md` (fresh Windows-local `0.6.1-dev`
+  benchmark capture)
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md` (latest Shroud 2.0 morphology report)
 - `docs/BENCHMARK_RESULTS_2026-07-28.md` (historical WSL2 benchmark scores and evidence limits)
 - `docs/LAB_PROTOTYPES.md` (operational guide for QUIC-shim, offline-mesh, and data-mule labs)
 - `docs/QUIC_STANDARDS.md` (RFC QUIC architecture, usage, and verification)
 - `docs/evidence/CARGO_AUDIT.txt` (regenerable advisory-scan output)
-- `docs/INTERNAL_PROJECT_ASSESSMENT_2026-07-06.md` (historical internal
-  project assessment)
-- `docs/INTERNAL_RELEASE_READINESS_REVIEW_2026-07-06.md` (historical internal
-  gate-verification review)
 - `CHANGELOG.md` (phase-anchored changelog)
 - `SECURITY.md` (vulnerability reporting, threat model, non-claims matrix)
 - `CONTRIBUTING.md` (build/test, release checklist, governance)
