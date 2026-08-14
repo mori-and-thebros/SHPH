@@ -1,0 +1,10 @@
+[package]
+name = "shph-obfuscation"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Obfuscation profile interfaces for SHPH"
+
+[dependencies]
+shph-core = { path = "../shph-core" }
+

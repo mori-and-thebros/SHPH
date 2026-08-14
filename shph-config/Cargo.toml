@@ -1,0 +1,18 @@
+[package]
+name = "shph-config"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Configuration management for SHPH"
+
+[dependencies]
+shph-core = { path = "../shph-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+home = "0.5"
+windows-sys = { workspace = true }

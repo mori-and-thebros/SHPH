@@ -1,0 +1,29 @@
+# Build artifacts
+/target/
+**/target/
+fuzz/corpus/
+fuzz/artifacts/
+/benchmark-runs/
+/wintun.dll
+/wintun.h
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Stray working dirs (kept locally, not versioned)
+/THE WORKING ONE/
+
+# Per-agent local state
+.agents/
+.codex/
+.gapcode/
+
+# Confidential grant-application attachments; never publish these.
+
+# Legacy local state from early two-host validation harness drafts
+/.two-host-validation/
+
+/OTF_PRIVATE/
