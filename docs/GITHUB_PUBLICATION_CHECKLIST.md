@@ -12,7 +12,7 @@ being published by accident.
   `.github/workflows/ci.yml`.
 - [ ] Enable and monitor GitHub private vulnerability reporting; verify the
   security contact flow before opening public issues.
-- [ ] Add repository description, topics, license metadata, and a `0.6.0-dev.0`
+- [ ] Add repository description, topics, license metadata, and a `0.6.1-dev`
   prerelease or clear development status as appropriate.
 - [ ] Confirm `LICENSE-MIT` and `LICENSE-APACHE` are displayed by GitHub.
 

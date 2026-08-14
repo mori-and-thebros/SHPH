@@ -9,7 +9,7 @@ anti-censorship guarantees.
 
 ## Current Status (2026-08-14)
 
-Workspace version `0.6.0-dev.0`. SHPH is **functional for controlled lab
+Workspace version `0.6.1-dev` (pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 

@@ -6,11 +6,12 @@ pre-completion audit**, **Phase E: big move/release readiness**, and
 **Phase F: Windows TUN delivery**. These are sequential gates; local WSL2
 benchmark evidence does not satisfy native-TUN or two-host acceptance criteria.
 
-The August 8-9, 2026 validation refresh adds current native Windows workspace,
+The August 8-9, 2026 validation refresh adds native Windows workspace,
 Windows-only test, benchmark, and post-loader adapter/session smoke evidence
-for version `0.6.0-dev.0`. It verifies the local build and test paths but does
-not promote local in-memory measurements, a single-host smoke, or a failed
-two-node campaign into live TUN/VPN claims.
+from the prior `0.6.0-dev.0` line. The current `0.6.1-dev` prerelease carries
+subsequent hardening, while the scorecard still does not promote local
+in-memory measurements, a single-host smoke, or a failed two-node campaign
+into live TUN/VPN claims.
 
 Measurable, verifiable progress against the funding roadmap. Each row ties a
 milestone to its acceptance evidence and a command you can run to reproduce it.

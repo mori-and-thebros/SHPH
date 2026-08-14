@@ -311,11 +311,12 @@ candidate without overstating platform or network evidence.
   lab-only, or operator-dependent.
 - A reviewer can reproduce the claimed results from the documentation.
 
-**Current status (2026-08-08):** preparation is in progress, but Phase E is
-not complete. The benchmark/evidence bundle is published for
-`0.6.0-dev.0`; the release snapshot, final claims freeze, mirror-parity
-check, final release checklist, and release tag remain gated on the
-outstanding native TUN evidence.
+**Current status (2026-08-14):** preparation is in progress, but Phase E is
+not complete. The benchmark/evidence bundle was captured on the prior
+`0.6.0-dev.0` line; the current `0.6.1-dev` prerelease carries follow-up
+hardening. The release snapshot, final claims freeze, mirror-parity check,
+final release checklist, and release tag remain gated on the outstanding
+native TUN evidence.
 
 ### Phase F — Windows TUN Delivery
 

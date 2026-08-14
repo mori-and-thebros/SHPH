@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — roadmap hardening follow-up (2026-08-14)
+## [0.6.1-dev] — prerelease hardening follow-up (2026-08-14)
 
 ### Security and protocol hardening
 

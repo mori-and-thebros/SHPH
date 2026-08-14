@@ -910,7 +910,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shph-benchmarks"
-version = "0.6.0-dev.0"
+version = "0.6.1-dev"
 dependencies = [
  "libc",
  "shph-core",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "shph-core"
-version = "0.6.0-dev.0"
+version = "0.6.1-dev"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "shph-transport"
-version = "0.6.0-dev.0"
+version = "0.6.1-dev"
 dependencies = [
  "base64 0.21.7",
  "bytes",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "shph-tun"
-version = "0.6.0-dev.0"
+version = "0.6.1-dev"
 dependencies = [
  "libc",
  "sha2",
