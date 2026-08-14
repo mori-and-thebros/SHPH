@@ -37,7 +37,26 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy --no-self-update
       - name: cargo clippy
-        run: cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          log="$(mktemp)"
+          set +e
+          cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### cargo clippy diagnostics"
+              grep -E '^(error|warning|[[:space:]]*-->)' "$log" | tail -n 80 || true
+            } >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error::$line"
+            done < <(grep -E '^(error|warning|[[:space:]]*-->)' "$log" | tail -n 30 || true)
+          fi
+          exit "$status"
 
   build-and-test:
     name: Build & Test (${{ matrix.os }})
