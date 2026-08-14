@@ -2528,12 +2528,12 @@ fn apply_mss_clamp(interface_name: &str, dry_run: bool) -> Result<FirewallGuard>
     #[cfg(target_os = "linux")]
     {
         let commands = build_linux_mss_clamp_commands(interface_name, DEFAULT_TUN_MTU_BYTES)?;
-        return apply_linux_firewall_plan(
+        apply_linux_firewall_plan(
             "MSS clamp",
             commands,
             build_linux_mss_clamp_cleanup_commands(),
             dry_run,
-        );
+        )
     }
 
     #[cfg(target_os = "windows")]
@@ -2643,7 +2643,7 @@ fn cleanup_nft_table(table_name: &str) -> Result<()> {
         table_name.to_string(),
     ];
     match run_shell_command(&probe) {
-        Ok(()) => run_shell_command(&vec![
+        Ok(()) => run_shell_command(&[
             "nft".to_string(),
             "delete".to_string(),
             "table".to_string(),
