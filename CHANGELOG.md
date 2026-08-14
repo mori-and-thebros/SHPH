@@ -30,6 +30,9 @@
   ciphertext.
 - Made native `up` capture session failures before cleanup so control-plane,
   MSS-clamp, and killswitch rollback remains consistent on early exits.
+- Captured a fresh Windows-local full benchmark suite for `0.6.1-dev` across
+  `secure-default` and `classical-lab` with 5,000 latency samples and 100,000
+  sustained frames; native TUN and two-host behavior remain outside the run.
 
 These changes do not claim production traffic morphology, DPI resistance,
 privileged firewall execution on every host, or native two-host VPN evidence.

@@ -24,6 +24,8 @@ This file maps the repository layout and the main public validation artifacts.
 - `scripts/`: reproducible demos, benchmark operators, evidence capture, and
   optional multi-checkout synchronization.
 - `docs/BENCHMARKING.md`: Linux-first benchmark methodology, profiles, and obstacles.
+- `docs/BENCHMARK_RESULTS_2026-08-14.md`: current Windows-local `0.6.1-dev`
+  full-suite benchmark capture with both explicit profiles.
 - `docs/BENCHMARK_RESULTS_2026-08-05.md`: paired WSL2/Linux and native Windows
   benchmark scores captured during the prior `0.5.0-dev.0` development line.
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`: latest
@@ -45,6 +47,8 @@ This file maps the repository layout and the main public validation artifacts.
 ## Evidence and Historical Artifacts
 
 - Current methodology: `docs/BENCHMARKING.md`.
+- Current Windows-local score:
+  `docs/BENCHMARK_RESULTS_2026-08-14.md`.
 - Current paired platform scores:
   `docs/BENCHMARK_RESULTS_2026-08-05.md`.
 - Current native Windows validation:

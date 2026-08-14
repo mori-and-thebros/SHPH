@@ -65,6 +65,7 @@ This is the single source of truth for "how far along is SHPH?"
 | Native Linux namespace smoke and lifecycle automation | **Implemented; isolated WSL2 smoke passed** | `scripts/native_tun_namespace_test.sh`; `scripts/benchmark_native_tun.sh`; 20/20 lifecycle samples passed (`min=59.1ms`, `p50=189.0ms`, `p95=348.9ms`, `max=349.6ms`) |
 | Standards-QUIC Linux native-TUN bridge | **Implemented; live forwarding evidence pending** | RFC 9221 DATAGRAM bridge in `shph-transport/src/standards_tun.rs`; Linux `up --transport quic-standard`; malformed/IPv4/IPv6 boundary checks |
 | Windows Wintun backend | **Wired; adapter/session smoke passed; packet and two-host evidence pending** | Application-local SHA-256-pinned loader, elevation check, bounded ring, packet release/commit wrappers, bounded event waits, shared-session cloning, public `TunDevice` integration, RAII teardown, and `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`. The Windows validator separately requires valid Authenticode before staging the DLL. |
+| Windows-local `0.6.1-dev` benchmark refresh | **Complete for local lab scope** | `docs/BENCHMARK_RESULTS_2026-08-14.md`; both profiles, full suite, 5,000 samples, 100,000 frames; native TUN disabled |
 | Paired WSL2/native-Windows benchmark campaign | **Complete for local lab scope** | `docs/BENCHMARK_RESULTS_2026-08-05.md` plus the latest native Windows gate record `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`; raw captures remain under ignored `benchmark-runs/` paths |
 | Native TUN/two-host operator evidence | **Pending operator host** | `scripts/benchmark_operator.sh` emits explicit prerequisite `SKIP` records |
 
@@ -87,6 +88,7 @@ two-host forwarding and privileged Windows Wintun packet evidence exist.
 | Gate | Status | Evidence |
 | --- | --- | --- |
 | Paired benchmark/evidence bundle | **Complete for the `0.6.0-dev.0` development line** | `docs/BENCHMARK_RESULTS_2026-08-05.md` and `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` |
+| Windows-local `0.6.1-dev` benchmark refresh | **Complete for local lab scope** | `docs/BENCHMARK_RESULTS_2026-08-14.md`; Wintun/TUN and two-host claims remain out of scope |
 | Claims, limitations, and profile labels | **Complete for current lab scope** | `ROADMAP_OSS_AND_DELIVERY.md`, `docs/RISK_MATRIX.md`, benchmark report |
 | Final release snapshot and SemVer tag | **Pending** | Requires completion of the remaining host-gated TUN evidence and final release checklist |
 | Release-candidate reproducibility review | **Pending** | Run after the final claims/version/commit freeze |

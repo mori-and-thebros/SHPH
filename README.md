@@ -278,6 +278,8 @@ Additional docs:
 - `docs/SUPPLY_CHAIN_SCAN.md` (cargo-audit scanner + advisory triage)
 - `docs/HARDENING.md` (post-funding security-hardening summary + threat impact)
 - `docs/BENCHMARKING.md` (Linux-first benchmark methodology and profile plan)
+- `docs/BENCHMARK_RESULTS_2026-08-14.md` (fresh Windows-local `0.6.1-dev`
+  benchmark capture)
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md` (latest Shroud 2.0 morphology report)
 - `docs/BENCHMARK_RESULTS_2026-07-28.md` (historical WSL2 benchmark scores and evidence limits)
 - `docs/LAB_PROTOTYPES.md` (operational guide for QUIC-shim, offline-mesh, and data-mule labs)
