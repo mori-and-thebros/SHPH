@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.2-dev.1] — CI and branch migration follow-up (2026-08-17)
+
+- Fixed the Linux QUIC certificate symlink regression so the full Ubuntu
+  workspace test gate passes.
+- Standardized the public branch, CI triggers, and security documentation on
+  `main`; removed the legacy `master` branch.
+- Preserved the development-only scope of the `0.6.2` release line.
+
 ## [0.6.2-dev] — public release preparation (2026-08-17)
 
 ### Release and publication hygiene
