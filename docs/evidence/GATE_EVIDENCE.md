@@ -7,7 +7,7 @@ re-run the script to refresh. Last captured: **2026-08-05T11:22:21Z** (UTC).
 
 ```
 commit=3fd2e44a81536fd4b90f7ca2881fcffbba5dca56
-branch=master
+branch=main
 tag=none
 tree=dirty
 cargo_lock_sha256=8352257484bcc3d44554f534c3e49ccbf90cc952fa5daf8ec1e7fcc71b0bc82b

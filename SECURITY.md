@@ -6,8 +6,7 @@ to report issues, and the current threat model.
 
 ## Supported Versions
 
-Only the latest `main` or `master` / tagged release receives security attention
-until the hosted default branch is finalized.
+Only the latest `main` or tagged release receives security attention.
 
 | Version | Supported |
 | ------- | --------- |

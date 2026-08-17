@@ -852,7 +852,6 @@ fn write_quic_certificate(path: &Path, certificate: &[u8]) -> Result<()> {
             "generated QUIC certificate has an invalid size".into(),
         ));
     }
-    ensure_no_reparse_components(path)?;
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
             return Err(ShphError::InvalidArgument(
@@ -860,6 +859,7 @@ fn write_quic_certificate(path: &Path, certificate: &[u8]) -> Result<()> {
             ));
         }
     }
+    ensure_no_reparse_components(path)?;
     write_owner_only_file(path, certificate)
 }
 
