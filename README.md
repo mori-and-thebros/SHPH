@@ -103,6 +103,10 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   `shph-transport` standards-QUIC API. It is disabled by default, records
   bounded public rustls ClientHello metadata, and does not spoof fingerprints
   or claim stealth. See `docs/JA4_OBSERVABILITY.md`.
+- `--json` emits structured error objects as well as the existing JSON reports.
+  Error objects contain `ok: false`, a stable sysexits-style `code`, a
+  human-readable `error`, and an optional remediation `hint`; malformed
+  command-line syntax still uses Clap's native usage error.
 - Native Linux benchmark runner:
   `cargo run --manifest-path benchmarks/Cargo.toml --release -- --profile secure-default --suite all --iterations 10000 --frames 100000`
   It reports p50/p95/p99/p99.9 latency, in-memory goodput/wire rate, CPU,
@@ -243,6 +247,8 @@ Behavior:
 - `down` attempts to remove SHPH-owned firewall tables/filters as well as
   recorded control-plane state; cleanup failures are reported rather than
   silently ignored.
+- `up` refuses to overwrite a persisted control-plane state file left by an
+  interrupted session. Run `shph reconcile` or `shph undo` first.
 
 ## Main Commands
 
@@ -272,7 +278,11 @@ cargo run -p shph-tui -- --config <path>
 
 For automation, use `shph status --json`, `shph doctor --strict --json`, and
 `shph list-peers --json`. Human-facing failures include a next-step hint; use
-`shph doctor` when a configuration or identity error is unclear.
+`shph doctor` when a configuration or identity error is unclear. The CLI also
+returns stable sysexits-style values: `2` for invalid arguments, `66` for a
+missing file, `69` for an unavailable/unsupported operation, `75` for a
+transient transport/resource failure, `77` for permission/authentication
+failures, and `78` for configuration or keystore failures.
 
 ## Development
 

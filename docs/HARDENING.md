@@ -783,6 +783,20 @@ Files: `shph-transport/src/lib.rs`, `shph-identity/src/lib.rs`,
   envelope limit, AEAD nonce/tag overhead, and base64 expansion before
   encrypting. The existing serialized-envelope check remains as a final
   defense for lower-level writers.
+- **Data-mule spool containment.** Data-mule configuration now carries bounded
+  aggregate spool and envelope-age limits. Senders reject writes that would
+  exceed the outbox quota; receivers quarantine expired envelopes and trim
+  oldest candidates when an inbox exceeds its configured quota. Existing
+  per-file, scan-depth, entry-count, and candidate-memory limits remain in
+  force.
+- **Automation-safe CLI failures.** Top-level CLI errors now use stable
+  sysexits-style exit codes instead of collapsing every failure to `1`.
+- **Jittered reconnects.** Bounded exponential reconnect delays now use equal
+  jitter, reducing synchronized reconnect bursts without changing the
+  configured minimum and maximum backoff bounds.
+- **Panic-safe TUI teardown.** The TUI owns terminal state through an RAII
+  session guard, catches panics long enough to restore raw mode and the
+  alternate screen, and explicitly redraws after resize events.
 - **Identity pin compatibility is fail-closed.** `IdentityRecord::to_peer_pin`
   now refuses a currently valid operational Ed25519 signing key because the
   current `shph-core` handshake can emit only the root `IdentityKeyPair`
@@ -795,3 +809,17 @@ Files: `shph-transport/src/lib.rs`, `shph-identity/src/lib.rs`,
 Native runtime test execution is covered by the dedicated Windows validation
 campaign. The GNU compatibility path is supplemental compile-only evidence,
 not a runtime or release claim. See `docs/TESTING.md` for the evidence boundary.
+
+## Increment 30 - protocol identity, queue time, and automation boundaries
+
+Date: 2026-08-17
+
+- **Explicit standards-QUIC protocol identity.** Both TLS endpoints now
+  require the `shph/standards-quic/1` ALPN, preventing accidental
+  cross-protocol attachment to a certificate-valid QUIC service.
+- **Future-dated Data-Mule quarantine.** Envelopes whose timestamps are too far
+  ahead of the local clock are quarantined just like stale envelopes, so
+  clock-manipulated files cannot remain eligible indefinitely.
+- **Structured automation errors.** `--json` now emits stable error objects
+  containing `ok`, `error`, `code`, and an optional `hint`; sysexits-style
+  process codes remain available for scripts.

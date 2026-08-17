@@ -170,24 +170,74 @@ impl AppState {
     }
 }
 
+struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+    restored: bool,
+}
+
+impl TerminalSession {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        enable_raw_mode()?;
+        if let Err(error) = crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture
+        ) {
+            let _ = disable_raw_mode();
+            return Err(Box::new(error));
+        }
+        Ok(Self {
+            terminal,
+            restored: false,
+        })
+    }
+
+    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+        &mut self.terminal
+    }
+
+    fn restore(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.restored {
+            restore_terminal(&mut self.terminal)?;
+            self.restored = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let config_path = args.config.unwrap_or_else(Config::default_config_path);
     let mut app = AppState::new(config_path);
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    crossterm::execute!(
-        stdout,
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = TerminalSession::new()?;
+    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_app(terminal.terminal_mut(), &mut app)
+    }));
+    let restore_result = terminal.restore();
 
-    let result = run_app(&mut terminal, &mut app);
-    restore_terminal(&mut terminal)?;
-    result
+    match run_result {
+        Ok(Ok(())) => restore_result,
+        Ok(Err(error)) => {
+            if let Err(restore_error) = restore_result {
+                eprintln!("warning: failed to restore terminal: {restore_error}");
+            }
+            Err(error)
+        }
+        Err(payload) => {
+            if let Err(restore_error) = restore_result {
+                eprintln!("warning: failed to restore terminal after panic: {restore_error}");
+            }
+            std::panic::resume_unwind(payload);
+        }
+    }
 }
 
 fn run_app(
@@ -197,10 +247,14 @@ fn run_app(
     loop {
         terminal.draw(|frame| draw_ui(frame, app))?;
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if !app.handle_key(key.code) {
-                    break;
+            match event::read()? {
+                Event::Key(key) => {
+                    if !app.handle_key(key.code) {
+                        break;
+                    }
                 }
+                Event::Resize(_, _) => terminal.clear()?,
+                _ => {}
             }
         }
     }

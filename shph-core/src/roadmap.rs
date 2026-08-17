@@ -26,6 +26,13 @@ const MAX_SHAMIR_PAYLOAD_B64_BYTES: usize = MAX_SHAMIR_PAYLOAD_BYTES.div_ceil(3)
 /// A public config value must not be able to suspend a handshake for an
 /// effectively unbounded sleep.
 pub const MAX_ADAPTER_POLL_INTERVAL_MS: u64 = 60_000;
+/// Maximum aggregate size of one data-mule inbox or outbox spool.
+///
+/// This deliberately matches the file-adapter scan budget in the transport
+/// crate so quota enforcement never requires an unbounded directory walk.
+pub const MAX_DATA_MULE_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum age accepted for a data-mule envelope.
+pub const MAX_DATA_MULE_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -53,6 +60,10 @@ pub enum TransportAdapterConfig {
         poll_interval_ms: u64,
         #[serde(default = "default_max_file_bytes")]
         max_file_bytes: u64,
+        #[serde(default = "default_max_total_bytes")]
+        max_total_bytes: u64,
+        #[serde(default = "default_max_age_ms")]
+        max_age_ms: u64,
     },
 }
 
@@ -71,6 +82,8 @@ pub struct DataMuleConfig {
     pub outbox_dir: String,
     pub poll_interval_ms: u64,
     pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+    pub max_age_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +101,14 @@ fn default_max_idle_entries() -> u32 {
 
 fn default_max_file_bytes() -> u64 {
     32 * 1024
+}
+
+fn default_max_total_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+
+fn default_max_age_ms() -> u64 {
+    24 * 60 * 60 * 1_000
 }
 
 impl TransportAdapterConfig {
@@ -117,11 +138,15 @@ impl TransportAdapterConfig {
                 outbox_dir,
                 poll_interval_ms,
                 max_file_bytes,
+                max_total_bytes,
+                max_age_ms,
             } => Some(DataMuleConfig {
                 inbox_dir: inbox_dir.clone(),
                 outbox_dir: outbox_dir.clone(),
                 poll_interval_ms: *poll_interval_ms,
                 max_file_bytes: *max_file_bytes,
+                max_total_bytes: *max_total_bytes,
+                max_age_ms: *max_age_ms,
             }),
             _ => None,
         }
@@ -167,7 +192,8 @@ impl TransportAdapterConfig {
                 outbox_dir,
                 poll_interval_ms,
                 max_file_bytes,
-                ..
+                max_total_bytes,
+                max_age_ms,
             } => {
                 if inbox_dir.trim().is_empty() || outbox_dir.trim().is_empty() {
                     return Err(ShphError::Config(
@@ -192,6 +218,26 @@ impl TransportAdapterConfig {
                 if *max_file_bytes > 256 * 1024 {
                     return Err(ShphError::Config(
                         "data-mule max_file_bytes exceeds the 256 KiB safety cap".into(),
+                    ));
+                }
+                if *max_total_bytes < *max_file_bytes {
+                    return Err(ShphError::Config(
+                        "data-mule max_total_bytes must be at least max_file_bytes".into(),
+                    ));
+                }
+                if *max_total_bytes > MAX_DATA_MULE_TOTAL_BYTES {
+                    return Err(ShphError::Config(
+                        "data-mule max_total_bytes exceeds the 8 MiB safety cap".into(),
+                    ));
+                }
+                if *max_age_ms == 0 {
+                    return Err(ShphError::Config(
+                        "data-mule max_age_ms must be greater than zero".into(),
+                    ));
+                }
+                if *max_age_ms > MAX_DATA_MULE_AGE_MS {
+                    return Err(ShphError::Config(
+                        "data-mule max_age_ms exceeds the 30 day safety cap".into(),
                     ));
                 }
                 Ok(())
@@ -1089,6 +1135,8 @@ mod tests {
             outbox_dir: "/tmp/out".to_string(),
             poll_interval_ms: 250,
             max_file_bytes: 4096,
+            max_total_bytes: 8192,
+            max_age_ms: 60_000,
         };
         assert!(data_mule.validate().is_ok());
     }
@@ -1127,8 +1175,33 @@ mod tests {
             outbox_dir: "/tmp/out".to_string(),
             poll_interval_ms: 250,
             max_file_bytes: 256 * 1024 + 1,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: 60_000,
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn data_mule_rejects_unbounded_spool_limits() {
+        let oversized_total = TransportAdapterConfig::DataMule {
+            inbox_dir: "/tmp/in".to_string(),
+            outbox_dir: "/tmp/out".to_string(),
+            poll_interval_ms: 250,
+            max_file_bytes: 4096,
+            max_total_bytes: MAX_DATA_MULE_TOTAL_BYTES + 1,
+            max_age_ms: 60_000,
+        };
+        assert!(oversized_total.validate().is_err());
+
+        let oversized_age = TransportAdapterConfig::DataMule {
+            inbox_dir: "/tmp/in".to_string(),
+            outbox_dir: "/tmp/out".to_string(),
+            poll_interval_ms: 250,
+            max_file_bytes: 4096,
+            max_total_bytes: 8192,
+            max_age_ms: MAX_DATA_MULE_AGE_MS + 1,
+        };
+        assert!(oversized_age.validate().is_err());
     }
 
     #[test]

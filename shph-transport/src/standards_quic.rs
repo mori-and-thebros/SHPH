@@ -34,6 +34,7 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DATAGRAM_BUFFER_BYTES: usize = 256 * 1024;
 const MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const STANDARDS_QUIC_ALPN: &[u8] = b"shph/standards-quic/1";
 
 /// A bounded transport configuration for the standards QUIC path.
 #[derive(Debug, Clone)]
@@ -207,6 +208,7 @@ fn build_server_tls_config(
         .map_err(|err| ShphError::Config(format!("configure QUIC TLS versions: {err}")))?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    tls_config.alpn_protocols = vec![STANDARDS_QUIC_ALPN.to_vec()];
     tls_config.max_early_data_size = 0;
     Ok(tls_config)
 }
@@ -224,6 +226,7 @@ fn build_client_tls_config(server_certificate_der: &[u8]) -> Result<quinn::rustl
         .map_err(|err| ShphError::Config(format!("configure QUIC TLS versions: {err}")))?
         .with_root_certificates(Arc::new(roots))
         .with_no_client_auth();
+    tls_config.alpn_protocols = vec![STANDARDS_QUIC_ALPN.to_vec()];
     tls_config.enable_early_data = false;
     Ok(tls_config)
 }
@@ -597,10 +600,18 @@ mod tests {
         let server_tls = super::build_server_tls_config(certificate, private_key.into(), None)
             .expect("server TLS config");
         assert_eq!(server_tls.max_early_data_size, 0);
+        assert_eq!(
+            server_tls.alpn_protocols,
+            vec![b"shph/standards-quic/1".to_vec()]
+        );
 
         let client_tls =
             super::build_client_tls_config(cert.cert.der().as_ref()).expect("client TLS config");
         assert!(!client_tls.enable_early_data);
+        assert_eq!(
+            client_tls.alpn_protocols,
+            vec![b"shph/standards-quic/1".to_vec()]
+        );
     }
 
     #[tokio::test]

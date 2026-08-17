@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.6.2-dev.2] — hardening follow-up (2026-08-17)
+
+### Security and reliability
+
+- Added bounded aggregate size and age limits for Data-Mule spools.
+- Quarantined stale, malformed, and far-future Data-Mule envelopes before
+  delivery; outbound writes now fail closed when the configured quota is full.
+- Bound standards QUIC to the explicit `shph/standards-quic/1` ALPN and kept
+  replayable TLS early data disabled.
+- Added equal-jitter reconnect backoff, panic-safe TUI terminal restoration,
+  and a fail-closed guard against overwriting persisted control-plane state.
+
+### CLI and validation
+
+- Added stable sysexits-style CLI exit codes for automation.
+- Added structured `--json` error objects with `ok`, `error`, `code`, and
+  optional `hint` fields.
+- Added regression coverage for the new limits, protocol identity, error
+  schema, and cleanup boundaries.
+- Expanded operator, security, lab-prototype, and standards-QUIC
+  documentation.
+
+This is a development snapshot. It does not claim a production VPN,
+anti-censorship capability, native two-host TUN completion, or independent
+security-audit status.
+
 ## [0.6.2-dev.1] — CI and branch migration follow-up (2026-08-17)
 
 - Fixed the Linux QUIC certificate symlink regression so the full Ubuntu

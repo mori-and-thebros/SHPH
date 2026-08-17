@@ -144,12 +144,18 @@ inbox_dir = "/tmp/shph-mule/inbox"
 outbox_dir = "/tmp/shph-mule/outbox"
 poll_interval_ms = 250
 max_file_bytes = 32768
+max_total_bytes = 4194304
+max_age_ms = 86400000
 ```
 
 Operational behavior:
 
 - Envelope paths are confined to sanitized peer and envelope components.
 - File size, scan depth, and scan count are bounded.
+- Each inbox and outbox has an aggregate `max_total_bytes` quota; the default
+  is 4 MiB and the hard cap is 8 MiB.
+- Envelopes older than `max_age_ms` are quarantined during scanning; the
+  default is 24 hours and the hard cap is 30 days.
 - Payloads above `max_file_bytes` are rejected before AEAD encryption, limiting
   caller-controlled allocation and CPU work.
 - Invalid and oversized files are quarantined rather than retried forever.

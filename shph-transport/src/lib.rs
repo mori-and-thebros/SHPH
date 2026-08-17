@@ -14,6 +14,7 @@ use base64::Engine as _;
 use rand::RngCore;
 use shph_core::roadmap::{
     data_mule_inbox_path, offline_session_id, safe_path_component, MAX_ADAPTER_POLL_INTERVAL_MS,
+    MAX_DATA_MULE_AGE_MS, MAX_DATA_MULE_TOTAL_BYTES,
 };
 use shph_core::{
     absorb_responder_pq, build_hello_with_profile, finalize_initiator_pq, verify_and_derive,
@@ -149,6 +150,7 @@ struct DataMuleCandidate {
     envelope_id: String,
     from_node: String,
     to_node: String,
+    file_bytes: u64,
 }
 
 fn account_scan_entry(scanned: &mut usize) -> Result<()> {
@@ -203,6 +205,62 @@ fn now_unix_ms() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ShphError::Internal("system clock before unix epoch".into()))?
         .as_millis() as u64)
+}
+
+fn data_mule_envelope_expired(created_at_unix_ms: u64, now_unix_ms: u64, max_age_ms: u64) -> bool {
+    now_unix_ms.saturating_sub(created_at_unix_ms) > max_age_ms
+        || created_at_unix_ms.saturating_sub(now_unix_ms) > max_age_ms
+}
+
+fn trim_data_mule_candidates_to_quota(
+    candidates: &mut Vec<DataMuleCandidate>,
+    max_total_bytes: u64,
+) {
+    let mut total = candidates
+        .iter()
+        .map(|candidate| candidate.file_bytes)
+        .sum::<u64>();
+    if total <= max_total_bytes {
+        return;
+    }
+
+    candidates
+        .sort_by_key(|candidate| (candidate.created_at_unix_ms, candidate.envelope_id.clone()));
+    while total > max_total_bytes {
+        let Some(_) = candidates.first() else {
+            break;
+        };
+        let candidate = candidates.remove(0);
+        total = total.saturating_sub(candidate.file_bytes);
+        quarantine_file(&candidate.path);
+    }
+}
+
+fn data_mule_spool_usage(
+    root: &Path,
+    max_file_bytes: u64,
+    max_age_ms: u64,
+    now_unix_ms: u64,
+) -> Result<u64> {
+    let mut candidates = Vec::new();
+    let mut scanned = 0;
+    let mut scanned_bytes = 0;
+    let mut candidate_memory = 0;
+    collect_shph_files(
+        root,
+        &mut candidates,
+        max_file_bytes,
+        max_age_ms,
+        now_unix_ms,
+        0,
+        &mut scanned,
+        &mut scanned_bytes,
+        &mut candidate_memory,
+    )?;
+    Ok(candidates
+        .iter()
+        .map(|candidate| candidate.file_bytes)
+        .sum())
 }
 
 fn sanitize_component(input: &str) -> String {
@@ -3514,18 +3572,26 @@ struct DataMuleWriteState {
     peer_node: String,
     next_sequence: u64,
     max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_age_ms: u64,
     max_payload_bytes: usize,
 }
 
 impl DataMuleWriteState {
     fn new(cfg: &DataMuleConfig, local_node: &str, peer_node: &str) -> Self {
         let max_file_bytes = cfg.max_file_bytes.clamp(1, MAX_FILE_ADAPTER_BYTES);
+        let max_total_bytes = cfg
+            .max_total_bytes
+            .clamp(max_file_bytes, MAX_DATA_MULE_TOTAL_BYTES);
+        let max_age_ms = cfg.max_age_ms.clamp(1, MAX_DATA_MULE_AGE_MS);
         Self {
             outbox_dir: cfg.outbox_dir.clone(),
             local_node: local_node.to_string(),
             peer_node: peer_node.to_string(),
             next_sequence: 0,
             max_file_bytes,
+            max_total_bytes,
+            max_age_ms,
             max_payload_bytes: data_mule_payload_capacity(max_file_bytes, local_node, peer_node),
         }
     }
@@ -3548,6 +3614,18 @@ impl DataMuleWriteState {
         if bytes.len() as u64 > self.max_file_bytes {
             return Err(ShphError::Protocol("data-mule envelope too large".into()));
         }
+        let queued_bytes = data_mule_spool_usage(
+            Path::new(&self.outbox_dir),
+            self.max_file_bytes,
+            self.max_age_ms,
+            created_at,
+        )?;
+        if queued_bytes.saturating_add(bytes.len() as u64) > self.max_total_bytes {
+            return Err(ShphError::ResourceExhausted(format!(
+                "data-mule outbox quota exhausted ({} bytes of {} configured)",
+                queued_bytes, self.max_total_bytes
+            )));
+        }
         write_file_atomically(&path, &bytes)
     }
 }
@@ -3561,10 +3639,13 @@ struct DataMuleReadState {
     seen_order: VecDeque<String>,
     max_seen: usize,
     max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_age_ms: u64,
 }
 
 impl DataMuleReadState {
     fn new(cfg: &DataMuleConfig, local_node: &str, peer_filter: Option<&str>) -> Self {
+        let max_file_bytes = cfg.max_file_bytes.clamp(1, MAX_FILE_ADAPTER_BYTES);
         Self {
             inbox_dir: cfg.inbox_dir.clone(),
             local_node: local_node.to_string(),
@@ -3575,7 +3656,11 @@ impl DataMuleReadState {
             seen_envelopes: HashSet::new(),
             seen_order: VecDeque::new(),
             max_seen: 1024,
-            max_file_bytes: cfg.max_file_bytes.clamp(1, MAX_FILE_ADAPTER_BYTES),
+            max_file_bytes,
+            max_total_bytes: cfg
+                .max_total_bytes
+                .clamp(max_file_bytes, MAX_DATA_MULE_TOTAL_BYTES),
+            max_age_ms: cfg.max_age_ms.clamp(1, MAX_DATA_MULE_AGE_MS),
         }
     }
 
@@ -3700,15 +3785,19 @@ impl DataMuleReadState {
         let mut scanned = 0;
         let mut scanned_bytes = 0u64;
         let mut candidate_memory = 0usize;
+        let now = now_unix_ms()?;
         collect_shph_files(
             root,
             &mut candidates,
             self.max_file_bytes,
+            self.max_age_ms,
+            now,
             0,
             &mut scanned,
             &mut scanned_bytes,
             &mut candidate_memory,
         )?;
+        trim_data_mule_candidates_to_quota(&mut candidates, self.max_total_bytes);
 
         candidates.retain(|candidate: &DataMuleCandidate| {
             candidate.to_node == self.local_node
@@ -3803,6 +3892,8 @@ fn collect_shph_files(
     root: &Path,
     out: &mut Vec<DataMuleCandidate>,
     max_file_bytes: u64,
+    max_age_ms: u64,
+    now_unix_ms: u64,
     depth: usize,
     scanned: &mut usize,
     scanned_bytes: &mut u64,
@@ -3839,6 +3930,8 @@ fn collect_shph_files(
                 &path,
                 out,
                 max_file_bytes,
+                max_age_ms,
+                now_unix_ms,
                 depth + 1,
                 scanned,
                 scanned_bytes,
@@ -3867,6 +3960,11 @@ fn collect_shph_files(
         };
         match serde_json::from_slice::<DataMuleEnvelope>(&bytes) {
             Ok(envelope) => {
+                if data_mule_envelope_expired(envelope.created_at_unix_ms, now_unix_ms, max_age_ms)
+                {
+                    quarantine_file(&path);
+                    continue;
+                }
                 match account_candidate_memory(
                     candidate_memory,
                     &path,
@@ -3889,6 +3987,7 @@ fn collect_shph_files(
                     envelope_id: envelope.envelope_id,
                     from_node: envelope.from_node,
                     to_node: envelope.to_node,
+                    file_bytes: metadata.len(),
                 });
             }
             Err(_) => {
@@ -3906,7 +4005,7 @@ mod tests {
         accept_secure_session_lab, connect_secure_session_lab, tcp_secure_receive, tcp_secure_send,
         DataMuleConfig, DataMuleReadState, DataMuleSession, DataMuleWriteState, QuicLabConfig,
     };
-    use super::{collect_shph_files, TEMP_FILE_COUNTER};
+    use super::{collect_shph_files, MAX_DATA_MULE_AGE_MS, TEMP_FILE_COUNTER};
     use super::{
         decode_encrypted_quic_frame, PeerRateLimiter, TransportMode, COOKIE_CHALLENGE_THRESHOLD,
         MAX_CONNECTS_PER_PEER_PER_WINDOW, MAX_QUIC_TRACKED_PEERS,
@@ -3914,6 +4013,7 @@ mod tests {
     use base64::Engine as _;
     use shph_core::{
         HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy, ReceiveCipher, SendCipher,
+        ShphError,
     };
     use std::fs;
     use std::io::{Read, Write};
@@ -4002,6 +4102,8 @@ mod tests {
             outbox_dir: root.to_string_lossy().into_owned(),
             poll_interval_ms: 1,
             max_file_bytes: 4096,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
         };
         let writer = DataMuleWriteState::new(&cfg, "local", "peer");
         let oversized = vec![0u8; writer.max_payload_bytes.saturating_add(1)];
@@ -4567,6 +4669,8 @@ mod tests {
             &root,
             &mut out,
             4096,
+            MAX_DATA_MULE_AGE_MS,
+            super::now_unix_ms().unwrap(),
             0,
             &mut scanned,
             &mut scanned_bytes,
@@ -4601,6 +4705,8 @@ mod tests {
             &root,
             &mut out,
             4096,
+            MAX_DATA_MULE_AGE_MS,
+            super::now_unix_ms().unwrap(),
             0,
             &mut scanned,
             &mut scanned_bytes,
@@ -4633,14 +4739,33 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let bad = root.join("a.shph");
         let good = root.join("b.shph");
-        fs::write(&bad, br#"{"envelope_id":"a","created_at_unix_ms":1,"from_node":"peer","to_node":"local","ciphertext_b64":"%%%","nonce_b64":"AA=="}"#).unwrap();
-        fs::write(&good, br#"{"envelope_id":"b","created_at_unix_ms":2,"from_node":"peer","to_node":"local","ciphertext_b64":"AQ==","nonce_b64":"AQ=="}"#).unwrap();
+        let now = super::now_unix_ms().unwrap();
+        let bad_envelope = serde_json::json!({
+            "envelope_id": "a",
+            "created_at_unix_ms": now,
+            "from_node": "peer",
+            "to_node": "local",
+            "ciphertext_b64": "%%%",
+            "nonce_b64": "AA=="
+        });
+        let good_envelope = serde_json::json!({
+            "envelope_id": "b",
+            "created_at_unix_ms": now,
+            "from_node": "peer",
+            "to_node": "local",
+            "ciphertext_b64": "AQ==",
+            "nonce_b64": "AQ=="
+        });
+        fs::write(&bad, serde_json::to_vec(&bad_envelope).unwrap()).unwrap();
+        fs::write(&good, serde_json::to_vec(&good_envelope).unwrap()).unwrap();
 
         let cfg = DataMuleConfig {
             inbox_dir: root.to_string_lossy().into_owned(),
             outbox_dir: root.join("out").to_string_lossy().into_owned(),
             poll_interval_ms: 1,
             max_file_bytes: 4096,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
         };
         let mut state = super::DataMuleReadState::new(&cfg, "local", Some("peer"));
         let frame = state
@@ -4649,6 +4774,110 @@ mod tests {
             .expect("valid candidate");
         assert_eq!(frame.envelope.envelope_id, "b");
         assert!(bad.with_extension("rejected").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_scan_quarantines_expired_files() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-expiry-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let stale = root.join("stale.shph");
+        let now = super::now_unix_ms().unwrap();
+        let envelope = serde_json::json!({
+            "envelope_id": "stale",
+            "created_at_unix_ms": now.saturating_sub(10_000),
+            "from_node": "peer",
+            "to_node": "local",
+            "ciphertext_b64": "AQ==",
+            "nonce_b64": "AQ=="
+        });
+        fs::write(&stale, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.join("out").to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 4096,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: 1_000,
+        };
+        let mut state = DataMuleReadState::new(&cfg, "local", Some("peer"));
+        assert!(state.poll_envelope().expect("scan").is_none());
+        assert!(!stale.exists());
+        assert!(root.join("stale.rejected").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_scan_quarantines_far_future_files() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-future-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let future = root.join("future.shph");
+        let now = super::now_unix_ms().unwrap();
+        let envelope = serde_json::json!({
+            "envelope_id": "future",
+            "created_at_unix_ms": now.saturating_add(10_000),
+            "from_node": "peer",
+            "to_node": "local",
+            "ciphertext_b64": "AQ==",
+            "nonce_b64": "AQ=="
+        });
+        fs::write(&future, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.join("out").to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 4096,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: 1_000,
+        };
+        let mut state = DataMuleReadState::new(&cfg, "local", Some("peer"));
+        assert!(state.poll_envelope().expect("scan").is_none());
+        assert!(!future.exists());
+        assert!(root.join("future.rejected").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_outbox_enforces_aggregate_quota() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-quota-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cfg = DataMuleConfig {
+            inbox_dir: root.join("in").to_string_lossy().into_owned(),
+            outbox_dir: root.join("out").to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 4096,
+            max_total_bytes: 4096,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
+        };
+        let mut writer = DataMuleWriteState::new(&cfg, "local", "peer");
+        let mut exhausted = false;
+        for _ in 0..64 {
+            match writer.send_payload(&[0x41; 100]) {
+                Ok(()) => {}
+                Err(ShphError::ResourceExhausted(_)) => {
+                    exhausted = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected data-mule write error: {error}"),
+            }
+        }
+        assert!(
+            exhausted,
+            "aggregate quota must stop unbounded outbox growth"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4665,6 +4894,8 @@ mod tests {
             outbox_dir: root.to_string_lossy().into_owned(),
             poll_interval_ms: 1,
             max_file_bytes: 4096,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
         };
 
         let mut writer = DataMuleWriteState::new(&cfg, "peer", "local");
@@ -4709,6 +4940,8 @@ mod tests {
             outbox_dir: root.to_string_lossy().into_owned(),
             poll_interval_ms: 1,
             max_file_bytes: 64 * 1024,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
         };
         let local = IdentityKeyPair::generate().unwrap();
         let attacker = IdentityKeyPair::generate().unwrap();
@@ -4755,6 +4988,8 @@ mod tests {
             outbox_dir: root.to_string_lossy().into_owned(),
             poll_interval_ms: 1,
             max_file_bytes: 64 * 1024,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
         };
         let local = IdentityKeyPair::generate().unwrap();
         let peer = IdentityKeyPair::generate().unwrap();
@@ -4800,6 +5035,8 @@ mod tests {
             outbox_dir: root.to_string_lossy().into_owned(),
             poll_interval_ms: 1,
             max_file_bytes: 64 * 1024,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
         };
         let local = IdentityKeyPair::generate().unwrap();
         let peer = IdentityKeyPair::generate().unwrap();

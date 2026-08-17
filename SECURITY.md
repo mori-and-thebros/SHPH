@@ -122,9 +122,10 @@ evidence, and receives appropriate external review:
   transport and RFC 9221 datagrams, including a Linux native-TUN bridge; its
   production certificate/trust workflow and host evidence are not complete.
 - Offline-mesh and data-mule are filesystem-backed lab adapters. Their
-  hardening bounds reads/scans and defers file removal until authenticated
-  consumption, but does not provide wireless discovery, delivery guarantees,
-  multi-writer coordination, or hostile-filesystem protection.
+  hardening bounds reads/scans, enforces per-spool size and age quotas, and
+  defers file removal until authenticated consumption, but does not provide
+  wireless discovery, delivery guarantees, multi-writer coordination, or
+  hostile-filesystem protection.
 - Lab Shroud cells: `SHPH_SHROUD_PROFILE` applies fixed-size authenticated cells
   to the experimental UDP shim. This changes framing and padding in lab tests;
   it does not provide browser fingerprint parity or censorship resistance.
@@ -144,6 +145,9 @@ evidence, and receives appropriate external review:
   opt-in, native-TUN/elevation gated, and platform-specific. The Windows path
   is an outbound WFP connection policy rather than a claim of arbitrary raw
   packet filtering.
+- Hard-kill cleanup is not automatic. Persisted route/DNS state is retained for
+  explicit `reconcile`/`undo` recovery, and a later `up` refuses to overwrite
+  that state.
 - Windows MSS rewriting: the Linux nftables clamp is implemented; Windows
   does not silently change host-wide TCP settings.
 - Constant-time guarantees beyond what the underlying crates provide.

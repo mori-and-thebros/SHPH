@@ -42,6 +42,7 @@ pub use roadmap::{
     DataMuleEnvelope, IdentityProviderConfig, OfflineMeshConfig, OfflineMeshEnvelope, PqcConfig,
     RatchetAuditPolicy, RatchetAuditRecord, RoadmapConfig, ShamirPolicy, ShamirShare,
     ShamirThresholdError, ShamirWarning, TransportAdapterConfig, MAX_ADAPTER_POLL_INTERVAL_MS,
+    MAX_DATA_MULE_AGE_MS, MAX_DATA_MULE_TOTAL_BYTES,
 };
 pub use stealth::{
     profiles, shroud_profile_by_name, shroud_profile_by_selection, stealth_profile_by_name,

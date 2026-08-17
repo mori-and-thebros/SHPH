@@ -4,6 +4,7 @@ mod shutdown;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use shph_config::{Config, ControlPlaneConfig, PeerConfig, SessionRole};
 use shph_core::{
@@ -64,6 +65,13 @@ const MAX_SHAMIR_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SHAMIR_TOTAL_SHARES: usize = 255;
 const MAX_CONTROL_PLANE_STATE_BYTES: u64 = 64 * 1024;
 const QUIC_PAYLOAD_ACK: &[u8] = b"shph/standards-quic/payload-ack-v1";
+const EXIT_FAILURE: i32 = 1;
+const EXIT_USAGE: i32 = 2;
+const EXIT_NOT_FOUND: i32 = 66;
+const EXIT_UNAVAILABLE: i32 = 69;
+const EXIT_TEMPORARY: i32 = 75;
+const EXIT_PERMISSION: i32 = 77;
+const EXIT_CONFIG: i32 = 78;
 
 fn phase_a1_now_ms() -> Result<u64> {
     Ok(SystemTime::now()
@@ -93,7 +101,7 @@ struct Cli {
     #[arg(short, long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
-    /// Emit machine-readable JSON where supported
+    /// Emit machine-readable JSON reports and errors
     #[arg(long, global = true)]
     json: bool,
 }
@@ -278,18 +286,44 @@ struct HandshakeSimOut {
     transcript_hash_hex: String,
 }
 
+#[derive(Debug, Serialize)]
+struct CliErrorOutput {
+    ok: bool,
+    error: String,
+    code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
+}
+
 fn main() {
-    if let Err(error) = run_cli() {
-        eprintln!("Error: {error}");
-        if let Some(hint) = cli_error_hint(&error) {
-            eprintln!("Hint: {hint}");
+    let cli = Cli::parse();
+    let json = cli.json;
+    if let Err(error) = run_cli(cli) {
+        let code = cli_exit_code(&error);
+        if json {
+            let output = CliErrorOutput {
+                ok: false,
+                error: error.to_string(),
+                code,
+                hint: cli_error_hint(&error),
+            };
+            match serde_json::to_string(&output) {
+                Ok(output) => eprintln!("{output}"),
+                Err(_) => eprintln!(
+                    r#"{{"ok":false,"error":"failed to serialize CLI error","code":{code}}}"#
+                ),
+            }
+        } else {
+            eprintln!("Error: {error}");
+            if let Some(hint) = cli_error_hint(&error) {
+                eprintln!("Hint: {hint}");
+            }
         }
-        std::process::exit(1);
+        std::process::exit(code);
     }
 }
 
-fn run_cli() -> Result<()> {
-    let cli = Cli::parse();
+fn run_cli(cli: Cli) -> Result<()> {
     if cli.verbose && std::env::var_os("RUST_LOG").is_none() {
         std::env::set_var("RUST_LOG", "info");
     }
@@ -503,6 +537,31 @@ fn cli_error_hint(error: &ShphError) -> Option<&'static str> {
     }
 }
 
+/// Map failures to stable sysexits-style values so scripts can distinguish
+/// invalid input, unavailable services, permissions, and transient failures.
+fn cli_exit_code(error: &ShphError) -> i32 {
+    match error {
+        ShphError::InvalidArgument(_) => EXIT_USAGE,
+        ShphError::Config(_) | ShphError::KeyStore(_) => EXIT_CONFIG,
+        ShphError::Io(error) if error.kind() == io::ErrorKind::NotFound => EXIT_NOT_FOUND,
+        ShphError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied => EXIT_PERMISSION,
+        ShphError::Io(_) | ShphError::Serialization(_) | ShphError::Internal(_) => EXIT_FAILURE,
+        ShphError::PermissionDenied(_)
+        | ShphError::Auth(_)
+        | ShphError::Crypto(_)
+        | ShphError::Handshake(_)
+        | ShphError::Tun(_) => EXIT_PERMISSION,
+        ShphError::Unsupported(_) | ShphError::NotConnected | ShphError::AlreadyConnected => {
+            EXIT_UNAVAILABLE
+        }
+        ShphError::Timeout
+        | ShphError::ConnectionClosed
+        | ShphError::Transport(_)
+        | ShphError::ResourceExhausted(_) => EXIT_TEMPORARY,
+        ShphError::Protocol(_) | ShphError::Obfuscation(_) | ShphError::Stealth(_) => EXIT_FAILURE,
+    }
+}
+
 fn handle_init(config_path: &Path, keystore_path: &Path, force_new: bool) -> Result<()> {
     if !force_new && (config_path.exists() || keystore_path.exists()) {
         return Err(ShphError::InvalidArgument(
@@ -551,6 +610,12 @@ fn handle_up(
     } = options;
     validate_config_roadmap(config)?;
     validate_tun_name(&config.interface_name)?;
+    if control_plane_state_path(config_path).exists() {
+        return Err(ShphError::Config(
+            "recorded control-plane state exists; run `shph reconcile` or `shph undo` before `shph up`"
+                .into(),
+        ));
+    }
     if transport == TransportMode::QuicStandard
         && config
             .session
@@ -3629,6 +3694,12 @@ fn run_shell_command(_command: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn reconnect_delay_with_jitter(base_delay_ms: u64) -> u64 {
+    let base_delay_ms = base_delay_ms.max(1);
+    let lower_bound = base_delay_ms.div_ceil(2);
+    rand::thread_rng().gen_range(lower_bound..=base_delay_ms)
+}
+
 fn run_with_reconnect<F>(
     enabled: bool,
     max_attempts: u32,
@@ -3657,11 +3728,12 @@ where
                 if attempts >= max_attempts {
                     return Err(err);
                 }
+                let sleep_ms = reconnect_delay_with_jitter(delay_ms);
                 println!(
                     "  Reconnect: attempt {}/{} failed ({:?}), retrying in {}ms",
-                    attempts, max_attempts, err, delay_ms
+                    attempts, max_attempts, err, sleep_ms
                 );
-                thread::sleep(Duration::from_millis(delay_ms));
+                thread::sleep(Duration::from_millis(sleep_ms));
                 delay_ms = delay_ms
                     .saturating_mul(2)
                     .min(max_delay_ms.max(initial_delay_ms));
@@ -4665,12 +4737,14 @@ mod tests {
     use super::{
         apply_control_plane, build_control_plane_plan, build_dns_apply_command,
         build_dns_apply_commands, build_dns_restore_command, build_route_add_command,
-        build_route_delete_command, build_tun_mtu_commands, control_plane_state_path,
-        enforce_peer_policy, handle_up, load_control_plane_state, parse_shroud_profile_name,
-        phase_a1_now_ms, render_config_for_display, resolve_killswitch_peers, run_with_reconnect,
-        transport_mode_to_str, validate_cidr, ControlPlaneGuard, ControlPlanePlan, HandshakeState,
-        KeyStore, KeyStoreConfig, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES,
-        MAX_CONTROL_PLANE_STATE_BYTES,
+        build_route_delete_command, build_tun_mtu_commands, cli_exit_code,
+        control_plane_state_path, enforce_peer_policy, handle_up, load_control_plane_state,
+        parse_shroud_profile_name, phase_a1_now_ms, reconnect_delay_with_jitter,
+        render_config_for_display, resolve_killswitch_peers, run_with_reconnect,
+        save_control_plane_state, transport_mode_to_str, validate_cidr, CliErrorOutput,
+        ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore, KeyStoreConfig,
+        PersistedControlPlaneState, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES, EXIT_CONFIG,
+        EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
     use shph_config::{
@@ -4678,6 +4752,7 @@ mod tests {
     };
     use shph_core::roadmap::{IdentityProviderConfig, TransportAdapterConfig};
     use shph_core::{Result, ShphError};
+    use std::io;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
@@ -4748,6 +4823,55 @@ mod tests {
         });
         assert!(out.is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reconnect_jitter_stays_within_equal_jitter_bounds() {
+        for base in [1, 2, 5, 100, u64::MAX] {
+            let delay = reconnect_delay_with_jitter(base);
+            let base = base.max(1);
+            assert!(delay >= base.div_ceil(2));
+            assert!(delay <= base);
+        }
+    }
+
+    #[test]
+    fn cli_exit_codes_distinguish_automation_failures() {
+        assert_eq!(
+            cli_exit_code(&ShphError::InvalidArgument("bad".into())),
+            EXIT_USAGE
+        );
+        assert_eq!(
+            cli_exit_code(&ShphError::Config("bad config".into())),
+            EXIT_CONFIG
+        );
+        assert_eq!(
+            cli_exit_code(&ShphError::PermissionDenied("no".into())),
+            EXIT_PERMISSION
+        );
+        assert_eq!(cli_exit_code(&ShphError::Timeout), EXIT_TEMPORARY);
+        assert_eq!(
+            cli_exit_code(&ShphError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "missing"
+            ))),
+            66
+        );
+    }
+
+    #[test]
+    fn cli_json_error_schema_is_stable() {
+        let output = CliErrorOutput {
+            ok: false,
+            error: "bad config".into(),
+            code: EXIT_CONFIG,
+            hint: Some("run doctor"),
+        };
+        let value = serde_json::to_value(output).expect("serialize JSON error");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"], "bad config");
+        assert_eq!(value["code"], EXIT_CONFIG);
+        assert_eq!(value["hint"], "run doctor");
     }
 
     #[test]
@@ -4844,6 +4968,40 @@ mod tests {
             },
         )
         .expect("killswitch dry-run should preview without native TUN");
+    }
+
+    #[test]
+    fn up_refuses_to_overwrite_persisted_control_plane_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-cli-stale-state-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let state = PersistedControlPlaneState {
+            interface_name: "shph0".into(),
+            routes: vec!["10.20.0.0/16".into()],
+            dns_servers: Vec::new(),
+        };
+        save_control_plane_state(&config_path, &state).expect("save stale state");
+
+        let error = handle_up(
+            &config_path,
+            &dir.join("keystore.json"),
+            &Config::default(),
+            UpOptions {
+                transport: TransportMode::Tcp,
+                profile: shph_core::HandshakeProfile::SecureDefault,
+                quic_cert_path: None,
+                killswitch: false,
+                killswitch_dry_run: false,
+                mss_clamp: false,
+            },
+        )
+        .expect_err("stale control-plane state must block up");
+        assert!(matches!(error, ShphError::Config(message) if message.contains("reconcile")));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -5439,6 +5597,8 @@ mod tests {
                 outbox_dir: ".shph/outbox".to_string(),
                 poll_interval_ms: 250,
                 max_file_bytes: 1024,
+                max_total_bytes: 8 * 1024 * 1024,
+                max_age_ms: 24 * 60 * 60 * 1_000,
             },
             ..RoadmapConfig::default()
         };
@@ -5459,6 +5619,8 @@ mod tests {
                 outbox_dir: ".shph/outbox".to_string(),
                 poll_interval_ms: 250,
                 max_file_bytes: 1024,
+                max_total_bytes: 8 * 1024 * 1024,
+                max_age_ms: 24 * 60 * 60 * 1_000,
             },
             ..RoadmapConfig::default()
         };

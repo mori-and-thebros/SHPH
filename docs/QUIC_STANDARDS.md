@@ -14,6 +14,9 @@ SHPH now contains an opt-in, standards-compliant QUIC transport in
 - Hybrid key exchange: the existing ML-KEM-768 plus X25519 exchange is
   performed by the application handshake; the QUIC TLS handshake remains
   standards-compliant.
+- TLS ALPN is explicitly bound to `shph/standards-quic/1` on both endpoints,
+  so a certificate-valid peer using a different application protocol cannot
+  accidentally attach to this transport.
 
 The existing `TransportMode::Quic` API is intentionally still the legacy
 experimental UDP shim. It is not silently redefined, because changing its wire
@@ -133,6 +136,9 @@ The standards path:
   handshake and datagram data plane are only admitted after the normal
   authenticated handshake, avoiding replayable pre-handshake application
   input.
+- Negotiates the explicit `shph/standards-quic/1` ALPN on both sides, keeping
+  this application protocol distinct from other QUIC services on the same
+  certificate or endpoint.
 - Applies the configured peer allowlist before one-shot payload send/receive.
 - Uses the awaited datagram send path for one-shot delivery so local
   congestion-buffer exhaustion is reported instead of silently dropping the
