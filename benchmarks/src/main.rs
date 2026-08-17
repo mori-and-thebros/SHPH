@@ -5,8 +5,8 @@ use shph_core::{
 };
 use shph_identity::{
     DiscoveryProvider, DiscoveryResolver, IdentityEndpoint, IdentityError, IdentityId,
-    IdentityRecord, LocalDirectoryProvider, PublishReceipt, VerificationPolicy,
-    MAX_CAPABILITIES, MAX_ENDPOINTS, MAX_RECORD_BYTES,
+    IdentityRecord, LocalDirectoryProvider, PublishReceipt, VerificationPolicy, MAX_CAPABILITIES,
+    MAX_ENDPOINTS, MAX_RECORD_BYTES,
 };
 use shph_transport::shroud2::{
     decode_datagram, encode_datagram, MorphologyEngine, MorphologyProfile,

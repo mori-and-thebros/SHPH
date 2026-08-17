@@ -626,10 +626,16 @@ fn classify_tun_write_result(result: std::io::Result<usize>, expected: usize) ->
 mod tests {
     use super::{validate_ip_packet, validate_tun_mtu, TunDevice, DEFAULT_TUN_MTU_BYTES};
 
+    fn stub_device(name: &str) -> TunDevice {
+        TunDevice {
+            name: name.to_string(),
+            backend: super::TunBackend::Stub,
+        }
+    }
+
     #[test]
     fn stub_device_clone_and_lifecycle_are_safe() {
-        std::env::remove_var("SHPH_TUN_NATIVE");
-        let device = TunDevice::open("shph-test").expect("stub open");
+        let device = stub_device("shph-test");
         assert_eq!(device.name(), "shph-test");
         assert!(!device.is_native());
         let mut clone = device.try_clone().expect("stub clone");
@@ -640,7 +646,7 @@ mod tests {
 
     #[test]
     fn receive_buffer_is_wiped_when_validation_rejects_it() {
-        let device = TunDevice::open("shph-buf-test").expect("stub open");
+        let device = stub_device("shph-buf-test");
         let mut device = device;
         let mut buffer = vec![0xa5u8; super::TUN_READ_BUFFER_BYTES + 1];
         assert!(device.recv_packet(&mut buffer).is_err());
@@ -866,7 +872,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stub_cannot_be_promoted_to_async_native_backend() {
-        let device = TunDevice::open("shph-async-stub").expect("stub open");
+        let device = stub_device("shph-async-stub");
         assert!(matches!(
             device.into_async(),
             Err(shph_core::ShphError::Unsupported(message))

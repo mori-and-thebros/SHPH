@@ -53,14 +53,8 @@ fn hybrid_exchange(
         &init_policy,
     )
     .expect("init verify");
-    let resp_state = verify_and_derive(
-        responder,
-        &resp_mat,
-        &initiator_hello,
-        false,
-        &resp_policy,
-    )
-    .expect("resp verify");
+    let resp_state = verify_and_derive(responder, &resp_mat, &initiator_hello, false, &resp_policy)
+        .expect("resp verify");
     (init_state, resp_state, init_mat, resp_mat)
 }
 
@@ -197,14 +191,9 @@ fn corrupted_pq_ciphertext_changes_the_bound_kdf_transcript() {
         &init_policy,
     )
     .expect("init verify");
-    let resp_state = verify_and_derive(
-        &responder,
-        &resp_mat,
-        &initiator_hello,
-        false,
-        &resp_policy,
-    )
-    .expect("resp verify");
+    let resp_state =
+        verify_and_derive(&responder, &resp_mat, &initiator_hello, false, &resp_policy)
+            .expect("resp verify");
     assert_ne!(
         init_state.session_keys.send_key, resp_state.session_keys.recv_key,
         "tampered PQ ciphertext must break the shared key"
