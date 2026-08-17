@@ -153,6 +153,28 @@ struct DataMuleCandidate {
     file_bytes: u64,
 }
 
+struct DataMuleScanContext {
+    max_file_bytes: u64,
+    max_age_ms: u64,
+    now_unix_ms: u64,
+    scanned: usize,
+    scanned_bytes: u64,
+    candidate_memory: usize,
+}
+
+impl DataMuleScanContext {
+    fn new(max_file_bytes: u64, max_age_ms: u64, now_unix_ms: u64) -> Self {
+        Self {
+            max_file_bytes,
+            max_age_ms,
+            now_unix_ms,
+            scanned: 0,
+            scanned_bytes: 0,
+            candidate_memory: 0,
+        }
+    }
+}
+
 fn account_scan_entry(scanned: &mut usize) -> Result<()> {
     *scanned = scanned.saturating_add(1);
     if *scanned > MAX_QUEUE_SCAN_ENTRIES {
@@ -243,20 +265,8 @@ fn data_mule_spool_usage(
     now_unix_ms: u64,
 ) -> Result<u64> {
     let mut candidates = Vec::new();
-    let mut scanned = 0;
-    let mut scanned_bytes = 0;
-    let mut candidate_memory = 0;
-    collect_shph_files(
-        root,
-        &mut candidates,
-        max_file_bytes,
-        max_age_ms,
-        now_unix_ms,
-        0,
-        &mut scanned,
-        &mut scanned_bytes,
-        &mut candidate_memory,
-    )?;
+    let mut scan = DataMuleScanContext::new(max_file_bytes, max_age_ms, now_unix_ms);
+    collect_shph_files(root, &mut candidates, 0, &mut scan)?;
     Ok(candidates
         .iter()
         .map(|candidate| candidate.file_bytes)
@@ -3782,21 +3792,9 @@ impl DataMuleReadState {
     fn poll_envelope(&mut self) -> Result<Option<DataMuleEnvelopeFrame>> {
         let root = Path::new(&self.inbox_dir);
         let mut candidates = Vec::new();
-        let mut scanned = 0;
-        let mut scanned_bytes = 0u64;
-        let mut candidate_memory = 0usize;
         let now = now_unix_ms()?;
-        collect_shph_files(
-            root,
-            &mut candidates,
-            self.max_file_bytes,
-            self.max_age_ms,
-            now,
-            0,
-            &mut scanned,
-            &mut scanned_bytes,
-            &mut candidate_memory,
-        )?;
+        let mut scan = DataMuleScanContext::new(self.max_file_bytes, self.max_age_ms, now);
+        collect_shph_files(root, &mut candidates, 0, &mut scan)?;
         trim_data_mule_candidates_to_quota(&mut candidates, self.max_total_bytes);
 
         candidates.retain(|candidate: &DataMuleCandidate| {
@@ -3891,13 +3889,8 @@ impl DataMuleReadState {
 fn collect_shph_files(
     root: &Path,
     out: &mut Vec<DataMuleCandidate>,
-    max_file_bytes: u64,
-    max_age_ms: u64,
-    now_unix_ms: u64,
     depth: usize,
-    scanned: &mut usize,
-    scanned_bytes: &mut u64,
-    candidate_memory: &mut usize,
+    scan: &mut DataMuleScanContext,
 ) -> Result<()> {
     ensure_no_reparse_components(root).map_err(ShphError::Io)?;
     let root_metadata = match fs::symlink_metadata(root) {
@@ -3917,7 +3910,7 @@ fn collect_shph_files(
     }
 
     for entry in fs::read_dir(root).map_err(ShphError::Io)? {
-        account_scan_entry(scanned)?;
+        account_scan_entry(&mut scan.scanned)?;
         let entry = entry.map_err(ShphError::Io)?;
         let path = entry.path();
         ensure_no_reparse_components(&path).map_err(ShphError::Io)?;
@@ -3926,17 +3919,7 @@ fn collect_shph_files(
             continue;
         }
         if metadata.is_dir() {
-            collect_shph_files(
-                &path,
-                out,
-                max_file_bytes,
-                max_age_ms,
-                now_unix_ms,
-                depth + 1,
-                scanned,
-                scanned_bytes,
-                candidate_memory,
-            )?;
+            collect_shph_files(&path, out, depth + 1, scan)?;
             continue;
         }
 
@@ -3944,13 +3927,13 @@ fn collect_shph_files(
         if ext != "shph" {
             continue;
         }
-        if metadata.len() > max_file_bytes {
+        if metadata.len() > scan.max_file_bytes {
             quarantine_file(&path);
             continue;
         }
-        account_scan_bytes(scanned_bytes, metadata.len())?;
+        account_scan_bytes(&mut scan.scanned_bytes, metadata.len())?;
 
-        let bytes = match read_file_bytes(&path, max_file_bytes) {
+        let bytes = match read_file_bytes(&path, scan.max_file_bytes) {
             Ok(bytes) => bytes,
             Err(ShphError::Protocol(_)) => {
                 quarantine_file(&path);
@@ -3960,13 +3943,16 @@ fn collect_shph_files(
         };
         match serde_json::from_slice::<DataMuleEnvelope>(&bytes) {
             Ok(envelope) => {
-                if data_mule_envelope_expired(envelope.created_at_unix_ms, now_unix_ms, max_age_ms)
-                {
+                if data_mule_envelope_expired(
+                    envelope.created_at_unix_ms,
+                    scan.now_unix_ms,
+                    scan.max_age_ms,
+                ) {
                     quarantine_file(&path);
                     continue;
                 }
                 match account_candidate_memory(
-                    candidate_memory,
+                    &mut scan.candidate_memory,
                     &path,
                     &[
                         &envelope.envelope_id,
@@ -4005,7 +3991,7 @@ mod tests {
         accept_secure_session_lab, connect_secure_session_lab, tcp_secure_receive, tcp_secure_send,
         DataMuleConfig, DataMuleReadState, DataMuleSession, DataMuleWriteState, QuicLabConfig,
     };
-    use super::{collect_shph_files, MAX_DATA_MULE_AGE_MS, TEMP_FILE_COUNTER};
+    use super::{collect_shph_files, DataMuleScanContext, MAX_DATA_MULE_AGE_MS, TEMP_FILE_COUNTER};
     use super::{
         decode_encrypted_quic_frame, PeerRateLimiter, TransportMode, COOKIE_CHALLENGE_THRESHOLD,
         MAX_CONNECTS_PER_PEER_PER_WINDOW, MAX_QUIC_TRACKED_PEERS,
@@ -4662,21 +4648,9 @@ mod tests {
         fs::write(&bad, b"not-json").unwrap();
 
         let mut out = Vec::new();
-        let mut scanned = 0;
-        let mut scanned_bytes = 0;
-        let mut candidate_memory = 0;
-        collect_shph_files(
-            &root,
-            &mut out,
-            4096,
-            MAX_DATA_MULE_AGE_MS,
-            super::now_unix_ms().unwrap(),
-            0,
-            &mut scanned,
-            &mut scanned_bytes,
-            &mut candidate_memory,
-        )
-        .unwrap();
+        let mut scan =
+            DataMuleScanContext::new(4096, MAX_DATA_MULE_AGE_MS, super::now_unix_ms().unwrap());
+        collect_shph_files(&root, &mut out, 0, &mut scan).unwrap();
 
         assert!(out.is_empty());
         assert!(!bad.exists());
@@ -4698,21 +4672,9 @@ mod tests {
         fs::write(&existing, b"previous evidence").unwrap();
 
         let mut out = Vec::new();
-        let mut scanned = 0;
-        let mut scanned_bytes = 0;
-        let mut candidate_memory = 0;
-        collect_shph_files(
-            &root,
-            &mut out,
-            4096,
-            MAX_DATA_MULE_AGE_MS,
-            super::now_unix_ms().unwrap(),
-            0,
-            &mut scanned,
-            &mut scanned_bytes,
-            &mut candidate_memory,
-        )
-        .unwrap();
+        let mut scan =
+            DataMuleScanContext::new(4096, MAX_DATA_MULE_AGE_MS, super::now_unix_ms().unwrap());
+        collect_shph_files(&root, &mut out, 0, &mut scan).unwrap();
 
         assert_eq!(fs::read_to_string(existing).unwrap(), "previous evidence");
         assert!(root
