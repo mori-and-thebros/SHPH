@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.2-dev.3] - CI hardening follow-up (2026-08-17)
+
+- Refactored the bounded Data-Mule scanner state so strict Clippy checks pass
+  without lint exceptions.
+- Preserved the existing scan-entry, byte, age, and candidate-memory limits.
+- Verified the complete Ubuntu and Windows CI matrix, including Clippy,
+  build/test, fuzz smoke tests, benchmarks, audit, and the reproducible demo.
+
 ## [0.6.2-dev.2] — hardening follow-up (2026-08-17)
 
 ### Security and reliability
