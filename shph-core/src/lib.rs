@@ -15,6 +15,7 @@ pub mod stealth;
 pub use cookie::{StatelessCookieAuthority, COOKIE_EPOCH_SECS};
 pub use crypto::{
     hkdf_sha256_into, IdentityKeyPair, ReceiveCipher, ReplayWindow, SendCipher, SessionKeys,
+    MAX_HKDF_CONTEXT_BYTES, MAX_HKDF_OUTPUT_BYTES, MAX_REPLAY_WINDOW_SIZE,
 };
 pub use error::{Result, ShphError};
 pub use framing::{
@@ -25,22 +26,22 @@ pub use handshake::{
     absorb_responder_pq, build_hello, build_hello_with_profile, deterministic_role,
     finalize_initiator_pq, verify_and_derive, verify_and_derive_with_profile,
     verify_hello_signature, HandshakeMaterial, HandshakeProfile, HandshakeRole, HandshakeState,
-    HandshakeVersion, Hello, PeerPin, PeerPolicy,
+    HandshakeVersion, Hello, PeerPin, PeerPolicy, MAX_PEER_PINS,
 };
 pub use keystore::{
-    compute_fingerprint_hex, enforce_owner_only_file_permissions, ensure_not_reparse_point,
-    Contact, KeyStore, KeyStoreConfig,
+    compute_fingerprint_hex, enforce_owner_only_file_permissions, ensure_no_reparse_components,
+    ensure_not_reparse_point, Contact, KeyStore, KeyStoreConfig,
 };
 pub use metrics::{MetricsCollector, MetricsSnapshot};
 pub use net::{Endpoint, TransportType, TunnelConfig};
 pub use pqc::{PqcKeypair, ML_KEM_768_CIPHERTEXT_BYTES, ML_KEM_768_PUBLIC_KEY_BYTES};
 pub use roadmap::{
     append_ratchet_audit_event, offline_spool_path, read_ratchet_audit_events,
-    recover_secret_from_shares, serialize_shamir_share, split_secret, validate_identity_provider,
-    validate_roadmap, validate_transport_adapter, DataMuleConfig, DataMuleEnvelope,
-    IdentityProviderConfig, OfflineMeshConfig, OfflineMeshEnvelope, PqcConfig, RatchetAuditPolicy,
-    RatchetAuditRecord, RoadmapConfig, ShamirPolicy, ShamirShare, ShamirThresholdError,
-    ShamirWarning, TransportAdapterConfig,
+    recover_secret_from_shares, safe_path_component, serialize_shamir_share, split_secret,
+    validate_identity_provider, validate_roadmap, validate_transport_adapter, DataMuleConfig,
+    DataMuleEnvelope, IdentityProviderConfig, OfflineMeshConfig, OfflineMeshEnvelope, PqcConfig,
+    RatchetAuditPolicy, RatchetAuditRecord, RoadmapConfig, ShamirPolicy, ShamirShare,
+    ShamirThresholdError, ShamirWarning, TransportAdapterConfig, MAX_ADAPTER_POLL_INTERVAL_MS,
 };
 pub use stealth::{
     profiles, shroud_profile_by_name, shroud_profile_by_selection, stealth_profile_by_name,

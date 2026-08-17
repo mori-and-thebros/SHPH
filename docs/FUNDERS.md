@@ -15,9 +15,15 @@ every claim, and where to find the risk, milestone, and support details.
   encrypted data plane, TUN integration, CLI, and (experimental) alternate
   transports.
 - **Lab-grade functional today**: a two-node encrypted tunnel transfers data
-  end-to-end on Linux; the toolchain builds cleanly on Windows.
+  end-to-end on Linux; dedicated native Windows validation (locked build,
+  strict Clippy, 180 tests, release build, Wintun unit/ACL coverage,
+  benchmark profiles, and adapter/session smoke) is recorded in
+  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`.
 - **Transparent and auditable**: every claim below is backed by a test or a doc
   you can run/read yourself (see "How to verify").
+- Public status is based on date-stamped validation records, not the
+  availability of any single maintainer workstation. Remaining TUN packet,
+  rollback, and two-host gates are called out explicitly below.
 - **Phase-gated**: progress is tracked in `docs/FUNDING_SPRINT_BOARD.md` and a
   phase is only marked complete when its acceptance criteria and evidence are
   met and mirrored.
@@ -46,7 +52,7 @@ See `docs/RISK_MATRIX.md` for the severity-rated version of this list.
 
 | Capability | Status | How to verify |
 | ---------- | ------ | ------------- |
-| Workspace builds, lints, tests clean | done | `cargo build --locked`, `cargo clippy -- -D warnings`, `cargo test --workspace` |
+| Workspace builds, lints, tests | verified on dedicated validation lanes | `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`; `docs/TESTING.md` |
 | Authenticated TCP handshake (transcript-bound keys) | done | `cargo test -p shph-core --test handshake_flow` |
 | Encrypted framed data plane (ChaCha20-Poly1305) | done | `cargo test -p shph-cli --test cli_tcp_data_plane` |
 | Anti-replay on the data plane (fail-closed) | done | `cargo test -p shph-core crypto::tests::replayed_frame_is_rejected_fail_closed` |

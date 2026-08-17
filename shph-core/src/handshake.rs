@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::PublicKey;
+use zeroize::Zeroizing;
 
 use crate::crypto::{constant_time_eq, hkdf_sha256_into, IdentityKeyPair, SessionKeys};
 use crate::error::{Result, ShphError};
@@ -13,6 +14,13 @@ use crate::keystore::compute_fingerprint_hex;
 
 const HANDSHAKE_VERSION: u8 = 5;
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 1_400;
+
+/// Maximum number of configured peer pins accepted by a handshake policy.
+///
+/// Every candidate is checked against an authenticated hello, so leaving this
+/// vector unbounded would make a caller-supplied policy an avoidable CPU/memory
+/// amplification surface.
+pub const MAX_PEER_PINS: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -98,7 +106,7 @@ pub struct HandshakeMaterial {
     /// Hybrid ML-KEM-768 shared secret, populated by [`finalize_initiator_pq`]
     /// (initiator) or [`absorb_responder_pq`] (responder) before key derivation.
     /// `None` here blocks derivation, preventing a silent classical downgrade.
-    pub pq_shared: Option<[u8; 32]>,
+    pub pq_shared: Option<Zeroizing<[u8; 32]>>,
     /// The exact ML-KEM ciphertext that produced `pq_shared`. This public
     /// handshake value is included in the KDF transcript so both sides bind
     /// their derived keys to the same encapsulation exchange.
@@ -158,6 +166,11 @@ impl PeerPolicy {
     pub fn new(pins: Vec<PeerPin>) -> Result<Self> {
         if pins.is_empty() {
             return Err(ShphError::Auth("peer policy cannot be empty".into()));
+        }
+        if pins.len() > MAX_PEER_PINS {
+            return Err(ShphError::Auth(format!(
+                "peer policy exceeds the {MAX_PEER_PINS}-pin safety limit"
+            )));
         }
         Ok(Self { pins })
     }
@@ -279,6 +292,7 @@ pub fn verify_hello_signature(
     peer_hello: &Hello,
     policy: &PeerPolicy,
 ) -> Result<()> {
+    validate_local_material(local_identity, material)?;
     let profile = material.profile;
     if peer_hello.profile != profile || peer_hello.proto != profile.protocol_tag() {
         return Err(ShphError::Handshake("protocol mismatch".into()));
@@ -288,6 +302,11 @@ pub fn verify_hello_signature(
     {
         return Err(ShphError::Handshake(
             "local protocol profile mismatch".into(),
+        ));
+    }
+    if peer_hello.pqc_ct_b64.is_some() {
+        return Err(ShphError::Handshake(
+            "peer PQ ciphertext must be sent as a separate handshake frame".into(),
         ));
     }
 
@@ -312,6 +331,14 @@ pub fn verify_hello_signature(
         return Err(ShphError::Handshake(
             "peer post-quantum profile material mismatch".into(),
         ));
+    }
+    if let Some(peer_pqc_pub) = &peer_pqc_pub {
+        if peer_pqc_pub.len() != crate::ML_KEM_768_PUBLIC_KEY_BYTES {
+            return Err(ShphError::Handshake(format!(
+                "peer PQ public key must be {} bytes",
+                crate::ML_KEM_768_PUBLIC_KEY_BYTES
+            )));
+        }
     }
 
     let mut signed_payload = [0u8; MAX_SIGNED_PAYLOAD_BYTES];
@@ -342,6 +369,120 @@ pub fn verify_hello_signature(
         return Err(ShphError::Auth(
             "peer identity and signing key are not pinned".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_local_material(
+    local_identity: &IdentityKeyPair,
+    material: &HandshakeMaterial,
+) -> Result<()> {
+    let profile = material.profile;
+    if material.local_hello.proto != profile.protocol_tag()
+        || material.local_hello.profile != profile
+    {
+        return Err(ShphError::Handshake(
+            "local protocol profile mismatch".into(),
+        ));
+    }
+
+    let local_identity_raw = decode_32(&material.local_hello.identity_pub_b64, "local identity")?;
+    if !constant_time_eq(&local_identity_raw, &local_identity.public_key_bytes()) {
+        return Err(ShphError::Handshake(
+            "local hello identity does not match the configured identity".into(),
+        ));
+    }
+
+    let local_sign_public = decode_32(&material.local_hello.sign_pub_b64, "local signing key")?;
+    if !constant_time_eq(&local_sign_public, &local_identity.signing_public_bytes()) {
+        return Err(ShphError::Handshake(
+            "local hello signing key does not match the configured identity".into(),
+        ));
+    }
+
+    let local_ephemeral_raw =
+        decode_32(&material.local_hello.ephemeral_pub_b64, "local ephemeral")?;
+    if !constant_time_eq(
+        &local_ephemeral_raw,
+        &material.local_ephemeral.public_key_bytes(),
+    ) {
+        return Err(ShphError::Handshake(
+            "local hello ephemeral key does not match handshake material".into(),
+        ));
+    }
+
+    let local_nonce = decode_32(&material.local_hello.nonce_b64, "local nonce")?;
+    if !constant_time_eq(&local_nonce, &material.local_nonce) {
+        return Err(ShphError::Handshake(
+            "local hello nonce does not match handshake material".into(),
+        ));
+    }
+
+    if profile.uses_pqc() {
+        let local_pqc = material
+            .local_pqc
+            .as_ref()
+            .ok_or_else(|| ShphError::Handshake("missing local PQ keypair".into()))?;
+        let encoded_public = material
+            .local_hello
+            .pqc_pub_b64
+            .as_deref()
+            .ok_or_else(|| ShphError::Handshake("missing local PQ public key".into()))?;
+        let local_pqc_public = b64_decode(encoded_public, "local PQ public key")?;
+        if local_pqc_public != local_pqc.encap_public_bytes() {
+            return Err(ShphError::Handshake(
+                "local hello PQ key does not match handshake material".into(),
+            ));
+        }
+    } else if material.local_pqc.is_some()
+        || material.local_hello.pqc_pub_b64.is_some()
+        || material.pq_shared.is_some()
+        || material.pq_ciphertext.is_some()
+        || material.local_hello.pqc_ct_b64.is_some()
+    {
+        return Err(ShphError::Handshake(
+            "classical profile contains post-quantum material".into(),
+        ));
+    }
+
+    let local_pqc_public = material
+        .local_hello
+        .pqc_pub_b64
+        .as_deref()
+        .map(|encoded| b64_decode(encoded, "local PQ public key"))
+        .transpose()?;
+    let mut signed_payload = [0u8; MAX_SIGNED_PAYLOAD_BYTES];
+    let mut signed_len = 0;
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        profile.protocol_tag().as_bytes(),
+    )?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &local_identity_raw)?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &local_sign_public)?;
+    if let Some(local_pqc_public) = local_pqc_public.as_deref() {
+        append_signed_part(&mut signed_payload, &mut signed_len, local_pqc_public)?;
+    }
+    append_signed_part(&mut signed_payload, &mut signed_len, &local_ephemeral_raw)?;
+    append_signed_part(&mut signed_payload, &mut signed_len, &local_nonce)?;
+    append_signed_part(
+        &mut signed_payload,
+        &mut signed_len,
+        &material.local_hello.timestamp_secs.to_be_bytes(),
+    )?;
+    local_identity.verify_handshake_signature(
+        &signed_payload[..signed_len],
+        &material.local_hello.sig,
+        &local_sign_public,
+    )?;
+
+    if let Some(encoded_ciphertext) = material.local_hello.pqc_ct_b64.as_deref() {
+        let ciphertext = b64_decode(encoded_ciphertext, "local PQ ciphertext")?;
+        if material.pq_ciphertext.as_deref() != Some(ciphertext.as_slice()) {
+            return Err(ShphError::Handshake(
+                "local hello PQ ciphertext does not match handshake material".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -417,6 +558,11 @@ pub fn verify_and_derive_with_profile(
 
     let peer_ephemeral = PublicKey::from(peer_ephemeral_raw);
     let ecdh_shared = material.local_ephemeral.derive_shared(&peer_ephemeral);
+    if ecdh_shared == [0u8; 32] {
+        return Err(ShphError::Handshake(
+            "peer X25519 public key produced an all-zero shared secret".into(),
+        ));
+    }
 
     // Hybrid post-quantum key exchange (ML-KEM-768). The INITIATOR encapsulates
     // against the responder's PQ public key, producing (ciphertext, shared);
@@ -432,7 +578,7 @@ pub fn verify_and_derive_with_profile(
     // PQ ciphertext the handshake fails closed instead of deriving a key that a
     // future quantum adversary could break from a transcript recording.
     let pq_shared = if profile.uses_pqc() {
-        Some(material.pq_shared.ok_or_else(|| {
+        Some(material.pq_shared.as_ref().ok_or_else(|| {
             ShphError::Handshake("missing post-quantum shared secret (downgrade blocked)".into())
         })?)
     } else {
@@ -462,7 +608,7 @@ pub fn verify_and_derive_with_profile(
     let mut shared = zeroize::Zeroizing::new([0u8; 64]);
     shared[..32].copy_from_slice(&ecdh_shared);
     if let Some(pq_shared) = pq_shared {
-        shared[32..].copy_from_slice(&pq_shared);
+        shared[32..].copy_from_slice(pq_shared.as_ref());
     }
 
     let local_identity_raw = decode_32(&material.local_hello.identity_pub_b64, "local identity")?;
@@ -658,7 +804,7 @@ pub fn finalize_initiator_pq(
     // Record the ciphertext we are sending so the transcript/inspection stays
     // consistent, and remember the shared secret for verify_and_derive_with_pq.
     material.local_hello.pqc_ct_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&ct));
-    material.pq_shared = Some(ss);
+    material.pq_shared = Some(Zeroizing::new(ss));
     material.pq_ciphertext = Some(ct.clone());
     Ok(ct)
 }
@@ -691,7 +837,7 @@ fn absorb_responder_pq_unverified(material: &mut HandshakeMaterial, peer_ct: &[u
         .as_ref()
         .ok_or_else(|| ShphError::Handshake("missing local PQ keypair".into()))?
         .decapsulate(peer_ct)?;
-    material.pq_shared = Some(ss);
+    material.pq_shared = Some(Zeroizing::new(ss));
     material.pq_ciphertext = Some(peer_ct.to_vec());
     Ok(())
 }
@@ -726,4 +872,80 @@ fn update_transcript_optional_field(hasher: &mut Sha256, label: &[u8], value: Op
 
 fn update_transcript_u64(hasher: &mut Sha256, label: &[u8], value: u64) {
     update_transcript_field(hasher, label, &value.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_hello_with_profile, verify_hello_signature, HandshakeProfile, PeerPin, PeerPolicy,
+        MAX_PEER_PINS,
+    };
+    use crate::crypto::IdentityKeyPair;
+    use base64::Engine as _;
+
+    #[test]
+    fn peer_policy_bounds_configured_pin_count() {
+        let pin = PeerPin::new([1u8; 32], [2u8; 32]);
+        assert!(PeerPolicy::new(vec![pin; MAX_PEER_PINS]).is_ok());
+        assert!(PeerPolicy::new(vec![pin; MAX_PEER_PINS + 1]).is_err());
+    }
+
+    #[test]
+    fn hello_verification_rejects_mismatched_local_identity_material() {
+        let local = IdentityKeyPair::generate().expect("local identity");
+        let peer = IdentityKeyPair::generate().expect("peer identity");
+        let mut local_material =
+            build_hello_with_profile(&local, HandshakeProfile::ClassicalLab).expect("hello");
+        let peer_material =
+            build_hello_with_profile(&peer, HandshakeProfile::ClassicalLab).expect("peer hello");
+        local_material.local_hello.identity_pub_b64 =
+            peer_material.local_hello.identity_pub_b64.clone();
+        let policy = PeerPolicy::single(PeerPin::for_identity(&peer));
+        assert!(verify_hello_signature(
+            &local,
+            &local_material,
+            &peer_material.local_hello,
+            &policy
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hello_verification_rejects_inline_pq_ciphertext_metadata() {
+        let local = IdentityKeyPair::generate().expect("local identity");
+        let peer = IdentityKeyPair::generate().expect("peer identity");
+        let local_material =
+            build_hello_with_profile(&local, HandshakeProfile::ClassicalLab).expect("hello");
+        let mut peer_material =
+            build_hello_with_profile(&peer, HandshakeProfile::ClassicalLab).expect("peer hello");
+        peer_material.local_hello.pqc_ct_b64 = Some("not-a-frame".into());
+        let policy = PeerPolicy::single(PeerPin::for_identity(&peer));
+        assert!(verify_hello_signature(
+            &local,
+            &local_material,
+            &peer_material.local_hello,
+            &policy
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hello_verification_rejects_malformed_pq_public_key_length() {
+        let local = IdentityKeyPair::generate().expect("local identity");
+        let peer = IdentityKeyPair::generate().expect("peer identity");
+        let local_material =
+            build_hello_with_profile(&local, HandshakeProfile::SecureDefault).expect("hello");
+        let mut peer_material =
+            build_hello_with_profile(&peer, HandshakeProfile::SecureDefault).expect("peer hello");
+        peer_material.local_hello.pqc_pub_b64 =
+            Some(base64::engine::general_purpose::STANDARD.encode([0u8; 1]));
+        let policy = PeerPolicy::single(PeerPin::for_identity(&peer));
+        assert!(verify_hello_signature(
+            &local,
+            &local_material,
+            &peer_material.local_hello,
+            &policy
+        )
+        .is_err());
+    }
 }

@@ -3,6 +3,8 @@
 Severity-rated statement of **current limits** and **explicit exclusions**.
 This is the canonical reference for what SHPH does and does not protect against
 today. It must stay consistent with `SECURITY.md` and the project's non-claims.
+The supported release lanes and evidence vocabulary are defined in
+`docs/SUPPORT_MATRIX.md`.
 
 Severity legend:
 
@@ -22,7 +24,7 @@ Severity legend:
 | Native TUN requires `CAP_NET_ADMIN`/root or elevated Windows runtime | Medium | By design | Linux native backend is opt-in; Windows native backend fails closed when the hash-pinned Wintun runtime, elevation, adapter, or session setup is unavailable. The validator separately checks Authenticode before staging a runtime. | Privilege-separation, runtime provenance, and native-host validation |
 | Plaintext route/DNS egress after process crash | High | **Opt-in containment implemented; evidence pending** | `up --killswitch` installs an SHPH-owned Linux nftables policy or Windows WFP outbound connection policy before native TUN setup; literal peer IP/port allowlists and `down` cleanup are enforced | Privileged crash-leak tests, two-host forwarding, and broader Windows packet-policy review |
 | PMTU blackhole / TCP MSS mismatch | Low | **Partially implemented** | Native MTU defaults to 1360 bytes; Linux `up --mss-clamp` adds bidirectional TCP SYN MSS rewriting; Windows reports unsupported | Privileged host validation and a safe Windows implementation |
-| Dependency advisory automation | Low | **Present and blocking** | `cargo audit` runs in `.github/workflows/ci.yml`; only two documented TUI advisories are ignored | Revisit the allowlist when `ratatui` drops the affected transitive crates |
+| Dependency advisory automation | Low | **Present and blocking** | `cargo audit --deny warnings` runs in `.github/workflows/ci.yml` with no ignored advisory IDs | Regenerate the captured scan after dependency changes |
 | Live control-plane apply needs host privileges/tools | Medium | By design | `dry_run=true` default; preflight validation; rollback guard | Ops hardening phase |
 
 ## Shipped security capabilities (current development line)

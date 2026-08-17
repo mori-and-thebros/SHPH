@@ -12,12 +12,14 @@ pub mod standards_tun;
 
 use base64::Engine as _;
 use rand::RngCore;
-use shph_core::roadmap::{data_mule_inbox_path, offline_session_id};
+use shph_core::roadmap::{
+    data_mule_inbox_path, offline_session_id, safe_path_component, MAX_ADAPTER_POLL_INTERVAL_MS,
+};
 use shph_core::{
     absorb_responder_pq, build_hello_with_profile, finalize_initiator_pq, verify_and_derive,
-    DataMuleConfig, DataMuleEnvelope, HandshakeProfile, HandshakeState, Hello, IdentityKeyPair,
-    OfflineMeshConfig, OfflineMeshEnvelope, PeerPolicy, ReceiveCipher, Result, SendCipher,
-    ShphError, ShroudProfile, StatelessCookieAuthority, ML_KEM_768_CIPHERTEXT_BYTES,
+    DataMuleConfig, DataMuleEnvelope, HandshakeMaterial, HandshakeProfile, HandshakeState, Hello,
+    IdentityKeyPair, OfflineMeshConfig, OfflineMeshEnvelope, PeerPolicy, ReceiveCipher, Result,
+    SendCipher, ShphError, ShroudProfile, StatelessCookieAuthority, ML_KEM_768_CIPHERTEXT_BYTES,
 };
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -25,6 +27,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,12 +36,16 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_QUIC_FRAME_BYTES: usize = 16 * 1024;
 const MAX_QUIC_HELLO_BYTES: usize = 12 * 1024;
 const SHROUD_AEAD_OVERHEAD: usize = 12 + 16;
+const MAX_QUIC_PAYLOAD_BYTES: usize = MAX_QUIC_FRAME_BYTES - 4 - SHROUD_AEAD_OVERHEAD;
+const MAX_TCP_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - SHROUD_AEAD_OVERHEAD;
 const SHROUD_LENGTH_PREFIX: usize = 2;
 const QUIC_HANDSHAKE_ATTEMPTS: usize = 3;
 const MAX_QUIC_INVALID_DATAGRAMS_PER_RECV: usize = 8;
 const MAX_QUIC_TRACKED_PEERS: usize = 1024;
 const MAX_QUIC_IDLE_TIMEOUT_SECS: u64 = 300;
 const TCP_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
+const MAX_DNS_RESOLVER_WORKERS: usize = 4;
+const MAX_DNS_RESOLVER_QUEUE: usize = 32;
 
 /// Per-source connection-rate limiting for the unauthenticated TCP entry path.
 /// A single peer address may open at most `MAX_CONNECTS_PER_PEER_PER_WINDOW`
@@ -199,13 +206,7 @@ fn now_unix_ms() -> Result<u64> {
 }
 
 fn sanitize_component(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => ch,
-        })
-        .collect()
+    safe_path_component(input)
 }
 
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -214,6 +215,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::create_dir_all(parent).map_err(ShphError::Io)?;
         ensure_no_reparse_components(parent).map_err(ShphError::Io)?;
     }
+    ensure_no_reparse_components(path).map_err(ShphError::Io)?;
 
     let filename = path
         .file_name()
@@ -233,6 +235,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     drop(file);
 
+    ensure_no_reparse_components(path).map_err(ShphError::Io)?;
     if let Err(_err) = fs::rename(&tmp, path) {
         #[cfg(windows)]
         {
@@ -272,15 +275,29 @@ fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file adapter path must reference a regular file",
+            ));
+        }
+        Ok(file)
     }
     #[cfg(not(unix))]
     {
         ensure_no_reparse_components(path)?;
-        File::open(path)
+        let file = File::open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file adapter path must reference a regular file",
+            ));
+        }
+        Ok(file)
     }
 }
 
@@ -474,14 +491,14 @@ fn ensure_no_reparse_components(path: &Path) -> io::Result<()> {
                     ),
                 ));
             }
-            Ok(_) => {}
+            Ok(_) => {
+                #[cfg(windows)]
+                shph_core::ensure_not_reparse_point(component).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                })?;
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
-        }
-        #[cfg(windows)]
-        if component.exists() {
-            shph_core::ensure_not_reparse_point(component)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         }
         current = component.parent();
     }
@@ -568,24 +585,120 @@ fn map_io_error(err: io::Error) -> ShphError {
     }
 }
 
-fn parse_socket_addr(addr: &str) -> Result<SocketAddr> {
-    resolve_socket_addrs(addr)?
+struct DnsResolveRequest {
+    addr: String,
+    response: mpsc::SyncSender<Result<Vec<SocketAddr>>>,
+}
+
+struct DnsResolverPool {
+    senders: Vec<mpsc::SyncSender<DnsResolveRequest>>,
+    next: AtomicU64,
+}
+
+static DNS_RESOLVER: OnceLock<DnsResolverPool> = OnceLock::new();
+
+fn dns_resolver_pool() -> &'static DnsResolverPool {
+    DNS_RESOLVER.get_or_init(|| {
+        let mut senders = Vec::with_capacity(MAX_DNS_RESOLVER_WORKERS);
+        for worker_id in 0..MAX_DNS_RESOLVER_WORKERS {
+            let (sender, receiver) =
+                mpsc::sync_channel::<DnsResolveRequest>(MAX_DNS_RESOLVER_QUEUE);
+            if thread::Builder::new()
+                .name(format!("shph-dns-resolver-{worker_id}"))
+                .spawn(move || {
+                    while let Ok(request) = receiver.recv() {
+                        let result = resolve_socket_addrs_unbounded(&request.addr);
+                        let _ = request.response.send(result);
+                    }
+                })
+                .is_ok()
+            {
+                senders.push(sender);
+            }
+        }
+
+        DnsResolverPool {
+            senders,
+            next: AtomicU64::new(0),
+        }
+    })
+}
+
+fn resolve_socket_addrs_unbounded(addr: &str) -> Result<Vec<SocketAddr>> {
+    addr.to_socket_addrs()
+        .map(|addrs| addrs.collect())
+        .map_err(|_| ShphError::Config(format!("invalid peer address: {addr}")))
+}
+
+fn resolve_socket_addrs_with_deadline(addr: &str, deadline: Instant) -> Result<Vec<SocketAddr>> {
+    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        return Ok(vec![socket_addr]);
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ShphError::Timeout);
+    }
+
+    let (response_sender, response_receiver) = mpsc::sync_channel(1);
+    let pool = dns_resolver_pool();
+    if pool.senders.is_empty() {
+        return Err(ShphError::Internal(
+            "DNS resolver workers are unavailable".into(),
+        ));
+    }
+    let mut request = Some(DnsResolveRequest {
+        addr: addr.to_owned(),
+        response: response_sender,
+    });
+    let start = (pool.next.fetch_add(1, Ordering::Relaxed) as usize) % pool.senders.len();
+    let mut disconnected = 0;
+    for offset in 0..pool.senders.len() {
+        let index = (start + offset) % pool.senders.len();
+        match pool.senders[index].try_send(request.take().expect("DNS request available")) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(returned)) => request = Some(returned),
+            Err(mpsc::TrySendError::Disconnected(returned)) => {
+                request = Some(returned);
+                disconnected += 1;
+            }
+        }
+    }
+    if request.is_some() {
+        return if disconnected == pool.senders.len() {
+            Err(ShphError::Internal(
+                "DNS resolver workers are unavailable".into(),
+            ))
+        } else {
+            Err(ShphError::ResourceExhausted(
+                "DNS resolution queues are full".into(),
+            ))
+        };
+    }
+
+    match response_receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(ShphError::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(ShphError::Internal("DNS resolver worker exited".into()))
+        }
+    }
+}
+
+fn parse_socket_addr(addr: &str, deadline: Instant) -> Result<SocketAddr> {
+    resolve_socket_addrs_with_deadline(addr, deadline)?
+        .into_iter()
         .next()
         .ok_or_else(|| ShphError::Config(format!("unable to resolve peer address: {addr}")))
 }
 
-fn resolve_socket_addrs(addr: &str) -> Result<std::vec::IntoIter<SocketAddr>> {
-    let addrs: Vec<_> = addr
-        .to_socket_addrs()
-        .map_err(|_| ShphError::Config(format!("invalid peer address: {addr}")))?
-        .collect();
-    Ok(addrs.into_iter())
+fn tcp_handshake_deadline(timeout_secs: u64) -> Instant {
+    Instant::now() + Duration::from_secs(timeout_secs.max(1).min(TCP_HANDSHAKE_DEADLINE.as_secs()))
 }
 
-fn connect_tcp_with_timeout(peer: &str, timeout_secs: u64) -> Result<TcpStream> {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
+fn connect_tcp_with_deadline(peer: &str, deadline: Instant) -> Result<TcpStream> {
     let mut last_error = None;
-    for addr in resolve_socket_addrs(peer)? {
+    for addr in resolve_socket_addrs_with_deadline(peer, deadline)? {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -731,9 +844,7 @@ pub fn offline_mesh_connect_and_handshake_with_profile(
         serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?;
     writer.send_payload(&local_hello)?;
 
-    let peer_payload = reader.receive_payload(timeout)?;
-    let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
-        .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
+    let peer_hello = reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
 
     let mut material = material;
     if profile.uses_pqc() {
@@ -770,21 +881,17 @@ pub fn offline_mesh_accept_and_handshake_with_profile(
     let mut reader = OfflineMeshReadState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
-    let peer_payload = reader.receive_payload(timeout)?;
-    let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
-        .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
-    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
+    let peer_hello = reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     let local_hello =
         serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?;
     writer.send_payload(&local_hello)?;
     let mut material = material;
     if profile.uses_pqc() {
-        let ct_payload = reader.receive_payload(timeout)?;
-        absorb_responder_pq(
+        reader.receive_verified_responder_pq(
+            timeout,
             local_identity,
             &mut material,
             &peer_hello,
-            &ct_payload,
             policy,
         )?;
     }
@@ -821,9 +928,7 @@ pub fn offline_mesh_connect_secure_session_with_profile(
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
-    let peer_payload = reader.receive_payload(timeout)?;
-    let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
-        .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
+    let peer_hello = reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
 
     let mut material = material;
     if profile.uses_pqc() {
@@ -869,21 +974,17 @@ pub fn offline_mesh_accept_secure_session_with_profile(
     let mut reader = OfflineMeshReadState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
-    let peer_payload = reader.receive_payload(timeout)?;
-    let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
-        .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
-    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
+    let peer_hello = reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
     let mut material = material;
     if profile.uses_pqc() {
-        let ct_payload = reader.receive_payload(timeout)?;
-        absorb_responder_pq(
+        reader.receive_verified_responder_pq(
+            timeout,
             local_identity,
             &mut material,
             &peer_hello,
-            &ct_payload,
             policy,
         )?;
     }
@@ -933,9 +1034,8 @@ pub fn data_mule_connect_and_handshake_with_profile(
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
-    let peer_payload = reader.receive_payload(timeout)?;
-    let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
-        .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
+    let (peer_hello, _) =
+        reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     let mut material = material;
     if profile.uses_pqc() {
         let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
@@ -971,29 +1071,19 @@ pub fn data_mule_accept_and_handshake_with_profile(
     let mut reader = DataMuleReadState::new(cfg, &local_identity.public_key_b64(), None);
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
-    let peer_envelope = reader.receive_envelope(timeout)?;
-    let peer_hello = match serde_json::from_slice::<Hello>(&peer_envelope.payload) {
-        Ok(hello) => hello,
-        Err(err) => {
-            reader.commit_envelope(&peer_envelope)?;
-            return Err(ShphError::Protocol(format!("invalid peer hello: {err}")));
-        }
-    };
-    reader.commit_envelope(&peer_envelope)?;
-    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
-    let peer_node = peer_envelope.envelope.from_node;
+    let (peer_hello, peer_node) =
+        reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     let mut writer = DataMuleWriteState::new(cfg, &local_node, &peer_node);
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
     let mut material = material;
     if profile.uses_pqc() {
-        let ct_payload = reader.receive_payload(timeout)?;
-        absorb_responder_pq(
+        reader.receive_verified_responder_pq(
+            timeout,
             local_identity,
             &mut material,
             &peer_hello,
-            &ct_payload,
             policy,
         )?;
     }
@@ -1034,9 +1124,8 @@ pub fn data_mule_connect_secure_session_with_profile(
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
-    let peer_payload = reader.receive_payload(timeout)?;
-    let peer_hello = serde_json::from_slice::<Hello>(&peer_payload)
-        .map_err(|e| ShphError::Protocol(format!("invalid peer hello: {e}")))?;
+    let (peer_hello, _) =
+        reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     let mut material = material;
     if profile.uses_pqc() {
         let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
@@ -1083,29 +1172,19 @@ pub fn data_mule_accept_secure_session_with_profile(
     let mut reader = DataMuleReadState::new(cfg, &local_node, None);
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
-    let envelope = reader.receive_envelope(timeout)?;
-    let peer_hello = match serde_json::from_slice::<Hello>(&envelope.payload) {
-        Ok(hello) => hello,
-        Err(err) => {
-            reader.commit_envelope(&envelope)?;
-            return Err(ShphError::Protocol(format!("invalid peer hello: {err}")));
-        }
-    };
-    reader.commit_envelope(&envelope)?;
-    shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
-    let peer_node = envelope.envelope.from_node;
+    let (peer_hello, peer_node) =
+        reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     let mut writer = DataMuleWriteState::new(cfg, &local_node, &peer_node);
     writer.send_payload(
         &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
     )?;
     let mut material = material;
     if profile.uses_pqc() {
-        let ct_payload = reader.receive_payload(timeout)?;
-        absorb_responder_pq(
+        reader.receive_verified_responder_pq(
+            timeout,
             local_identity,
             &mut material,
             &peer_hello,
-            &ct_payload,
             policy,
         )?;
     }
@@ -1497,15 +1576,16 @@ pub fn tcp_handshake_client_with_profile(
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
-    let mut stream = connect_tcp_with_timeout(peer, timeout_secs)?;
-    apply_timeout(&stream, timeout_secs)?;
+    let deadline = tcp_handshake_deadline(timeout_secs);
+    let mut stream = connect_tcp_with_deadline(peer, deadline)?;
+    refresh_deadline_timeout(&stream, deadline)?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
-    write_tcp_hello(&mut stream, &material.local_hello)?;
-    let peer_hello = read_tcp_server_hello(&mut stream)?;
+    write_tcp_hello_with_deadline(&mut stream, &material.local_hello, deadline)?;
+    let peer_hello = read_tcp_server_hello_with_deadline(&mut stream, deadline)?;
     shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     if profile.uses_pqc() {
         let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
-        write_tcp_pq_ct(&mut stream, &ct)?;
+        write_tcp_pq_ct_with_deadline(&mut stream, &ct, deadline)?;
     }
     verify_and_derive(local_identity, &material, &peer_hello, true, policy)
 }
@@ -1558,15 +1638,16 @@ pub fn tcp_connect_and_handshake_with_profile(
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(TcpStream, HandshakeState)> {
-    let mut stream = connect_tcp_with_timeout(peer, timeout_secs)?;
-    apply_timeout(&stream, timeout_secs)?;
+    let deadline = tcp_handshake_deadline(timeout_secs);
+    let mut stream = connect_tcp_with_deadline(peer, deadline)?;
+    refresh_deadline_timeout(&stream, deadline)?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
-    write_tcp_hello(&mut stream, &material.local_hello)?;
-    let peer_hello = read_tcp_server_hello(&mut stream)?;
+    write_tcp_hello_with_deadline(&mut stream, &material.local_hello, deadline)?;
+    let peer_hello = read_tcp_server_hello_with_deadline(&mut stream, deadline)?;
     shph_core::verify_hello_signature(local_identity, &material, &peer_hello, policy)?;
     if profile.uses_pqc() {
         let ct = finalize_initiator_pq(local_identity, &mut material, &peer_hello, policy)?;
-        write_tcp_pq_ct(&mut stream, &ct)?;
+        write_tcp_pq_ct_with_deadline(&mut stream, &ct, deadline)?;
     }
     let state = verify_and_derive(local_identity, &material, &peer_hello, true, policy)?;
     Ok((stream, state))
@@ -1694,8 +1775,7 @@ pub fn tcp_accept_and_handshake_with_profile(
     let mut last_err: Option<ShphError> = None;
     let mut rate_limiter = PeerRateLimiter::new();
     let mut cookie_authority = StatelessCookieAuthority::new()?;
-    let deadline = Instant::now()
-        + Duration::from_secs(timeout_secs.max(1).min(TCP_HANDSHAKE_DEADLINE.as_secs()));
+    let deadline = tcp_handshake_deadline(timeout_secs);
     while Instant::now() < deadline {
         let (mut stream, peer_addr) = loop {
             match listener.accept() {
@@ -1721,23 +1801,41 @@ pub fn tcp_accept_and_handshake_with_profile(
             continue;
         }
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        apply_timeout_duration(
-            &stream,
-            remaining.min(Duration::from_secs(timeout_secs.max(1))),
-        )?;
+        if let Err(err) = refresh_deadline_timeout(&stream, deadline) {
+            last_err = Some(err);
+            continue;
+        }
 
-        match read_tcp_hello(&mut stream) {
+        match read_tcp_hello_with_deadline(&mut stream, deadline) {
             Ok(peer_hello) => {
                 if rate_limiter.requires_cookie(peer_addr) {
                     let cookie = cookie_authority.issue(peer_addr)?;
-                    write_tcp_cookie_challenge(&mut stream, &cookie)?;
-                    let response = read_tcp_cookie_response(&mut stream)?;
-                    if !cookie_authority.verify(peer_addr, &response)? {
-                        last_err = Some(ShphError::Auth(
-                            "invalid or expired pre-authentication cookie".into(),
-                        ));
+                    if let Err(err) =
+                        write_tcp_cookie_challenge_with_deadline(&mut stream, &cookie, deadline)
+                    {
+                        last_err = Some(err);
                         continue;
+                    }
+                    let response =
+                        match read_tcp_cookie_response_with_deadline(&mut stream, deadline) {
+                            Ok(response) => response,
+                            Err(err) => {
+                                last_err = Some(err);
+                                continue;
+                            }
+                        };
+                    match cookie_authority.verify(peer_addr, &response) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            last_err = Some(ShphError::Auth(
+                                "invalid or expired pre-authentication cookie".into(),
+                            ));
+                            continue;
+                        }
+                        Err(err) => {
+                            last_err = Some(err);
+                            continue;
+                        }
                     }
                 }
                 let mut material = build_hello_with_profile(local_identity, profile)?;
@@ -1750,20 +1848,24 @@ pub fn tcp_accept_and_handshake_with_profile(
                     last_err = Some(err);
                     continue;
                 }
-                write_tcp_hello(&mut stream, &material.local_hello)?;
+                if let Err(err) =
+                    write_tcp_hello_with_deadline(&mut stream, &material.local_hello, deadline)
+                {
+                    last_err = Some(err);
+                    continue;
+                }
                 if profile.uses_pqc() {
-                    let ct = match read_tcp_pq_ct(&mut stream) {
+                    let ct = match read_tcp_pq_ct_with_deadline(&mut stream, deadline) {
                         Ok(ct) => ct,
-                        Err(ShphError::ConnectionClosed) | Err(ShphError::Protocol(_)) => {
-                            last_err = Some(ShphError::ConnectionClosed);
+                        Err(err) => {
+                            last_err = Some(err);
                             continue;
                         }
-                        Err(err) => return Err(err),
                     };
-                    if absorb_responder_pq(local_identity, &mut material, &peer_hello, &ct, policy)
-                        .is_err()
+                    if let Err(err) =
+                        absorb_responder_pq(local_identity, &mut material, &peer_hello, &ct, policy)
                     {
-                        last_err = Some(ShphError::Handshake("pq decapsulation failed".into()));
+                        last_err = Some(err);
                         continue;
                     }
                 }
@@ -1778,38 +1880,41 @@ pub fn tcp_accept_and_handshake_with_profile(
                     }
                 }
             }
-            Err(ShphError::ConnectionClosed) | Err(ShphError::Protocol(_)) => {
-                // Unauthenticated peer sent a malformed/truncated hello or
-                // closed early; drop and retry without consuming the budget on
-                // a single bad actor beyond the loop bound.
-                last_err = Some(ShphError::ConnectionClosed);
+            Err(err) => {
+                // Any per-connection read failure, including a timeout or an
+                // early close during cookie exchange, belongs to this peer.
+                // Drop it and keep the listener alive until the aggregate
+                // operator deadline expires.
+                last_err = Some(err);
                 continue;
             }
-            Err(err) => return Err(err),
         }
     }
     Err(last_err.unwrap_or(ShphError::Timeout))
 }
 
-fn write_tcp_hello(stream: &mut TcpStream, hello: &Hello) -> Result<()> {
+fn write_tcp_hello_with_deadline(
+    stream: &mut TcpStream,
+    hello: &Hello,
+    deadline: Instant,
+) -> Result<()> {
     let payload = serde_json::to_string(hello).map_err(|e| ShphError::Protocol(e.to_string()))?;
-    write_tcp_all_or_closed(stream, payload.as_bytes())?;
-    write_tcp_all_or_closed(stream, b"\n")?;
+    write_tcp_all_or_closed_with_deadline(stream, payload.as_bytes(), deadline)?;
+    write_tcp_all_or_closed_with_deadline(stream, b"\n", deadline)?;
+    refresh_deadline_timeout(stream, deadline)?;
     stream.flush().map_err(map_io_error)?;
     Ok(())
 }
 
-fn read_tcp_hello(stream: &mut TcpStream) -> Result<Hello> {
-    let buf = read_tcp_line(stream, MAX_HELLO_BYTES)?;
+fn read_tcp_hello_with_deadline(stream: &mut TcpStream, deadline: Instant) -> Result<Hello> {
+    let buf = read_tcp_line_with_deadline(stream, MAX_HELLO_BYTES, deadline)?;
     let hello_line =
         std::str::from_utf8(&buf).map_err(|_| ShphError::Protocol("hello not utf8".into()))?;
-    let hello = serde_json::from_str::<Hello>(hello_line)
-        .map_err(|e| ShphError::Protocol(e.to_string()))?;
-    Ok(hello)
+    serde_json::from_str::<Hello>(hello_line).map_err(|e| ShphError::Protocol(e.to_string()))
 }
 
-fn read_tcp_server_hello(stream: &mut TcpStream) -> Result<Hello> {
-    let line = read_tcp_line(stream, MAX_HELLO_BYTES)?;
+fn read_tcp_server_hello_with_deadline(stream: &mut TcpStream, deadline: Instant) -> Result<Hello> {
+    let line = read_tcp_line_with_deadline(stream, MAX_HELLO_BYTES, deadline)?;
     if line.starts_with(COOKIE_CHALLENGE_PREFIX) {
         let encoded = &line[COOKIE_CHALLENGE_PREFIX.len()..];
         let cookie = base64::engine::general_purpose::STANDARD
@@ -1820,14 +1925,15 @@ fn read_tcp_server_hello(stream: &mut TcpStream) -> Result<Hello> {
                 "cookie challenge has invalid length".into(),
             ));
         }
-        write_tcp_cookie_response(stream, &cookie)?;
-        return read_tcp_hello(stream);
+        write_tcp_cookie_response_with_deadline(stream, &cookie, deadline)?;
+        return read_tcp_hello_with_deadline(stream, deadline);
     }
     let hello_line =
         std::str::from_utf8(&line).map_err(|_| ShphError::Protocol("hello not utf8".into()))?;
     serde_json::from_str::<Hello>(hello_line).map_err(|e| ShphError::Protocol(e.to_string()))
 }
 
+#[cfg(test)]
 fn write_tcp_cookie_challenge(stream: &mut TcpStream, cookie: &[u8; 32]) -> Result<()> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(cookie);
     write_tcp_all_or_closed(stream, COOKIE_CHALLENGE_PREFIX)?;
@@ -1837,6 +1943,21 @@ fn write_tcp_cookie_challenge(stream: &mut TcpStream, cookie: &[u8; 32]) -> Resu
     Ok(())
 }
 
+fn write_tcp_cookie_challenge_with_deadline(
+    stream: &mut TcpStream,
+    cookie: &[u8; 32],
+    deadline: Instant,
+) -> Result<()> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(cookie);
+    write_tcp_all_or_closed_with_deadline(stream, COOKIE_CHALLENGE_PREFIX, deadline)?;
+    write_tcp_all_or_closed_with_deadline(stream, encoded.as_bytes(), deadline)?;
+    write_tcp_all_or_closed_with_deadline(stream, b"\n", deadline)?;
+    refresh_deadline_timeout(stream, deadline)?;
+    stream.flush().map_err(map_io_error)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn write_tcp_cookie_response(stream: &mut TcpStream, cookie: &[u8]) -> Result<()> {
     if cookie.len() != 32 {
         return Err(ShphError::Protocol(
@@ -1851,6 +1972,26 @@ fn write_tcp_cookie_response(stream: &mut TcpStream, cookie: &[u8]) -> Result<()
     Ok(())
 }
 
+fn write_tcp_cookie_response_with_deadline(
+    stream: &mut TcpStream,
+    cookie: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    if cookie.len() != 32 {
+        return Err(ShphError::Protocol(
+            "cookie response has invalid length".into(),
+        ));
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(cookie);
+    write_tcp_all_or_closed_with_deadline(stream, COOKIE_RESPONSE_PREFIX, deadline)?;
+    write_tcp_all_or_closed_with_deadline(stream, encoded.as_bytes(), deadline)?;
+    write_tcp_all_or_closed_with_deadline(stream, b"\n", deadline)?;
+    refresh_deadline_timeout(stream, deadline)?;
+    stream.flush().map_err(map_io_error)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn read_tcp_cookie_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let line = read_tcp_line(stream, MAX_COOKIE_LINE_BYTES)?;
     if !line.starts_with(COOKIE_RESPONSE_PREFIX) {
@@ -1869,16 +2010,57 @@ fn read_tcp_cookie_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(cookie)
 }
 
+fn read_tcp_cookie_response_with_deadline(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    let line = read_tcp_line_with_deadline(stream, MAX_COOKIE_LINE_BYTES, deadline)?;
+    if !line.starts_with(COOKIE_RESPONSE_PREFIX) {
+        return Err(ShphError::Protocol(
+            "expected pre-authentication cookie response".into(),
+        ));
+    }
+    let cookie = base64::engine::general_purpose::STANDARD
+        .decode(&line[COOKIE_RESPONSE_PREFIX.len()..])
+        .map_err(|_| ShphError::Protocol("invalid cookie response encoding".into()))?;
+    if cookie.len() != 32 {
+        return Err(ShphError::Protocol(
+            "cookie response has invalid length".into(),
+        ));
+    }
+    Ok(cookie)
+}
+
+#[cfg(test)]
 fn read_tcp_line(stream: &mut TcpStream, max_bytes: usize) -> Result<Vec<u8>> {
-    // Read the newline-terminated hello in chunks into a single bounded buffer
-    // rather than one syscall per byte. The buffer is capped at
-    // `MAX_HELLO_BYTES` (+1 to detect overshoot), so a slowloris-style peer
-    // cannot hold the connection open with dribbled single bytes beyond the
-    // cap, and the cost per peer is O(1) reads instead of O(len) reads.
+    read_tcp_line_until(stream, max_bytes, None)
+}
+
+fn read_tcp_line_with_deadline(
+    stream: &mut TcpStream,
+    max_bytes: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    read_tcp_line_until(stream, max_bytes, Some(deadline))
+}
+
+fn read_tcp_line_until(
+    stream: &mut TcpStream,
+    max_bytes: usize,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>> {
+    // Read exactly one byte at a time so bytes belonging to the next
+    // length-prefixed handshake message cannot be consumed and discarded when
+    // a peer pipelines its hello and PQ ciphertext. The aggregate deadline
+    // below bounds the deliberately small amount of extra syscall overhead.
     let mut buf = Vec::with_capacity(512);
-    let mut chunk = [0u8; 1024];
+    let mut byte = [0u8; 1];
+    let max_with_newline = max_bytes.saturating_add(1);
     loop {
-        let read = stream.read(&mut chunk).map_err(map_io_error)?;
+        if let Some(deadline) = deadline {
+            refresh_deadline_timeout(stream, deadline)?;
+        }
+        let read = stream.read(&mut byte).map_err(map_io_error)?;
         if read == 0 {
             return if buf.is_empty() {
                 Err(ShphError::ConnectionClosed)
@@ -1886,20 +2068,12 @@ fn read_tcp_line(stream: &mut TcpStream, max_bytes: usize) -> Result<Vec<u8>> {
                 Err(ShphError::Protocol("truncated hello".into()))
             };
         }
-        // Look for the newline within this chunk and append up to (and
-        // including) it; anything after the newline is ignored (the hello is a
-        // single line).
-        let nl = chunk[..read].iter().position(|&b| b == b'\n');
-        let take = match nl {
-            Some(i) => &chunk[..=i],
-            None => &chunk[..read],
-        };
         // Enforce the cap including any data already buffered.
-        if buf.len() + take.len() > max_bytes + 1 {
+        if buf.len() >= max_with_newline {
             return Err(ShphError::Protocol("hello exceeds size limit".into()));
         }
-        buf.extend_from_slice(take);
-        if nl.is_some() {
+        buf.push(byte[0]);
+        if byte[0] == b'\n' {
             break;
         }
     }
@@ -1917,9 +2091,11 @@ fn read_tcp_line(stream: &mut TcpStream, max_bytes: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Write the initiator's ML-KEM ciphertext to the stream as a length-prefixed,
-/// size-bounded frame so the responder can read exactly the expected bytes.
-fn write_tcp_pq_ct(stream: &mut TcpStream, ct: &[u8]) -> Result<()> {
+fn write_tcp_pq_ct_with_deadline(
+    stream: &mut TcpStream,
+    ct: &[u8],
+    deadline: Instant,
+) -> Result<()> {
     if ct.len() != ML_KEM_768_CIPHERTEXT_BYTES {
         return Err(ShphError::Protocol(format!(
             "pq ciphertext size mismatch: expected {}, got {}",
@@ -1927,19 +2103,16 @@ fn write_tcp_pq_ct(stream: &mut TcpStream, ct: &[u8]) -> Result<()> {
             ct.len()
         )));
     }
-    write_tcp_all_or_closed(stream, &(ct.len() as u32).to_be_bytes())?;
-    write_tcp_all_or_closed(stream, ct)?;
+    write_tcp_all_or_closed_with_deadline(stream, &(ct.len() as u32).to_be_bytes(), deadline)?;
+    write_tcp_all_or_closed_with_deadline(stream, ct, deadline)?;
+    refresh_deadline_timeout(stream, deadline)?;
     stream.flush().map_err(map_io_error)?;
     Ok(())
 }
 
-/// Read the initiator's ML-KEM ciphertext frame. The 4-byte length prefix must
-/// announce exactly `ML_KEM_768_CIPHERTEXT_BYTES`; anything else is rejected
-/// before any allocation, and the read is capped so a malicious peer cannot
-/// stream an unbounded payload into the handshake.
-fn read_tcp_pq_ct(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_tcp_pq_ct_with_deadline(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    read_exact_or_closed(stream, &mut len_buf)?;
+    read_exact_or_closed_with_deadline(stream, &mut len_buf, deadline)?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len != ML_KEM_768_CIPHERTEXT_BYTES {
         return Err(ShphError::Protocol(format!(
@@ -1948,16 +2121,18 @@ fn read_tcp_pq_ct(stream: &mut TcpStream) -> Result<Vec<u8>> {
         )));
     }
     let mut ct = vec![0u8; len];
-    read_exact_or_closed(stream, &mut ct)?;
+    read_exact_or_closed_with_deadline(stream, &mut ct, deadline)?;
     Ok(ct)
 }
 
-/// Read exactly `buf.len()` bytes or fail closed on early EOF. Used for the
-/// fixed-size PQ ciphertext frame where a short read means a truncated/attacking
-/// peer.
-fn read_exact_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
+fn read_exact_or_closed_with_deadline(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
+        refresh_deadline_timeout(stream, deadline)?;
         let n = stream.read(&mut buf[filled..]).map_err(map_io_error)?;
         if n == 0 {
             return Err(ShphError::ConnectionClosed);
@@ -1967,14 +2142,13 @@ fn read_exact_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-fn apply_timeout(stream: &TcpStream, timeout_secs: u64) -> Result<()> {
-    apply_timeout_duration(stream, Duration::from_secs(timeout_secs.max(1)))
-}
-
-fn apply_timeout_duration(stream: &TcpStream, timeout: Duration) -> Result<()> {
-    let timeout = timeout.max(Duration::from_millis(1));
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+fn refresh_deadline_timeout(stream: &TcpStream, deadline: Instant) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ShphError::Timeout);
+    }
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))?;
     Ok(())
 }
 
@@ -2119,9 +2293,10 @@ pub fn quic_handshake_client_with_profile(
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
-    let peer_addr = parse_socket_addr(peer)?;
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| ShphError::Transport(e.to_string()))?;
     let timeout_secs = bounded_quic_timeout_secs(timeout_secs);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let peer_addr = parse_socket_addr(peer, deadline)?;
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| ShphError::Transport(e.to_string()))?;
     socket
         .set_read_timeout(Some(Duration::from_secs(timeout_secs)))
         .map_err(ShphError::Io)?;
@@ -2132,7 +2307,6 @@ pub fn quic_handshake_client_with_profile(
     let material = build_hello_with_profile(local_identity, profile)?;
     let mut buf = vec![0u8; MAX_QUIC_HELLO_BYTES];
     let mut last_err: Option<ShphError> = None;
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
     for _ in 0..QUIC_HANDSHAKE_ATTEMPTS {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2142,8 +2316,16 @@ pub fn quic_handshake_client_with_profile(
         socket
             .set_read_timeout(Some(remaining))
             .map_err(ShphError::Io)?;
-        let peer_hello =
-            write_and_wait_quic_hello(&socket, peer_addr, &material.local_hello, &mut buf);
+        socket
+            .set_write_timeout(Some(remaining))
+            .map_err(ShphError::Io)?;
+        let peer_hello = write_and_wait_quic_hello(
+            &socket,
+            peer_addr,
+            &material.local_hello,
+            &mut buf,
+            deadline,
+        );
         match peer_hello {
             Ok((peer_hello, addr)) if addr == peer_addr => {
                 let mut material = material;
@@ -2313,6 +2495,7 @@ fn write_and_wait_quic_hello(
     peer_addr: SocketAddr,
     hello: &Hello,
     buf: &mut [u8],
+    deadline: Instant,
 ) -> Result<(Hello, SocketAddr)> {
     let payload = serde_json::to_string(hello).map_err(|e| ShphError::Protocol(e.to_string()))?;
     if payload.len() + 1 > MAX_QUIC_HELLO_BYTES {
@@ -2321,10 +2504,24 @@ fn write_and_wait_quic_hello(
         ));
     }
 
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ShphError::Timeout);
+    }
+    socket
+        .set_write_timeout(Some(remaining))
+        .map_err(ShphError::Io)?;
     socket
         .send_to(payload.as_bytes(), peer_addr)
         .map_err(map_io_error)?;
 
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ShphError::Timeout);
+    }
+    socket
+        .set_read_timeout(Some(remaining))
+        .map_err(ShphError::Io)?;
     let read = socket.recv_from(buf).map_err(map_io_error)?;
     if read.0 == buf.len() {
         return Err(ShphError::Protocol(
@@ -2505,11 +2702,22 @@ fn write_encrypted_tcp_frame(
     cipher: &mut SendCipher,
     payload: &[u8],
 ) -> Result<()> {
+    validate_tcp_payload(payload)?;
     let encrypted = cipher.encrypt(payload)?;
-    let len = encrypted.len() as u32;
+    let len = u32::try_from(encrypted.len())
+        .map_err(|_| ShphError::Protocol("encrypted frame length overflows u32".into()))?;
     write_tcp_all_or_closed(stream, &len.to_be_bytes())?;
     write_tcp_all_or_closed(stream, &encrypted)?;
     stream.flush().map_err(map_io_error)?;
+    Ok(())
+}
+
+fn validate_tcp_payload(payload: &[u8]) -> Result<()> {
+    if payload.len() > MAX_TCP_PAYLOAD_BYTES {
+        return Err(ShphError::Protocol(format!(
+            "TCP payload exceeds the {MAX_TCP_PAYLOAD_BYTES}-byte frame capacity"
+        )));
+    }
     Ok(())
 }
 
@@ -2557,6 +2765,11 @@ fn write_encrypted_quic_frame(
         }
         cipher.encrypt(&padded)?
     } else {
+        if payload.len() > MAX_QUIC_PAYLOAD_BYTES {
+            return Err(ShphError::Protocol(format!(
+                "QUIC payload exceeds the {MAX_QUIC_PAYLOAD_BYTES}-byte frame capacity"
+            )));
+        }
         cipher.encrypt(payload)?
     };
     let encrypted = if let Some(profile) = shroud_profile {
@@ -2684,6 +2897,23 @@ fn write_tcp_all_or_closed(stream: &mut TcpStream, payload: &[u8]) -> Result<()>
     stream.write_all(payload).map_err(map_io_error)
 }
 
+fn write_tcp_all_or_closed_with_deadline(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    let mut written = 0;
+    while written < payload.len() {
+        refresh_deadline_timeout(stream, deadline)?;
+        let n = stream.write(&payload[written..]).map_err(map_io_error)?;
+        if n == 0 {
+            return Err(ShphError::ConnectionClosed);
+        }
+        written += n;
+    }
+    Ok(())
+}
+
 fn read_tcp_exact_or_closed(stream: &mut TcpStream, payload: &mut [u8]) -> Result<()> {
     stream.read_exact(payload).map_err(map_io_error)
 }
@@ -2711,13 +2941,19 @@ impl OfflineMeshSession {
     }
 
     fn send_frame(&mut self, payload: &[u8]) -> Result<()> {
+        validate_file_adapter_payload(
+            payload,
+            self.send_state.max_payload_bytes,
+            self.send_state.max_file_bytes,
+        )?;
         let ciphertext = self.send_cipher.encrypt(payload)?;
         self.send_state.send_payload(&ciphertext)
     }
 
     fn recv_frame(&mut self) -> Result<Vec<u8>> {
+        let timeout = self.recv_state.poll_interval;
         self.recv_state
-            .receive_decrypted_frame(&mut self.recv_cipher, self.recv_state.poll_interval)
+            .receive_decrypted_frame(&mut self.recv_cipher, timeout)
     }
 
     fn into_split(self) -> Result<(OfflineMeshSender, OfflineMeshReceiver)> {
@@ -2743,6 +2979,11 @@ struct OfflineMeshSender {
 
 impl OfflineMeshSender {
     fn send_frame(&mut self, payload: &[u8]) -> Result<()> {
+        validate_file_adapter_payload(
+            payload,
+            self.state.max_payload_bytes,
+            self.state.max_file_bytes,
+        )?;
         let ciphertext = self.cipher.encrypt(payload)?;
         self.state.send_payload(&ciphertext)
     }
@@ -2767,16 +3008,19 @@ struct OfflineMeshWriteState {
     peer_node: String,
     next_sequence: u64,
     max_file_bytes: u64,
+    max_payload_bytes: usize,
 }
 
 impl OfflineMeshWriteState {
     fn new(cfg: &OfflineMeshConfig, local_node: &str, peer_node: &str) -> Self {
+        let max_file_bytes = MAX_FILE_ADAPTER_BYTES;
         Self {
             spool_dir: cfg.spool_dir.clone(),
             local_node: local_node.to_string(),
             peer_node: peer_node.to_string(),
             next_sequence: 0,
-            max_file_bytes: MAX_FILE_ADAPTER_BYTES,
+            max_file_bytes,
+            max_payload_bytes: offline_mesh_payload_capacity(max_file_bytes, local_node, peer_node),
         }
     }
 
@@ -2798,7 +3042,9 @@ impl OfflineMeshWriteState {
             .join(sanitize_component(&self.local_node))
             .join(sanitize_component(&self.peer_node));
 
+        ensure_no_reparse_components(&out_dir).map_err(ShphError::Io)?;
         fs::create_dir_all(&out_dir).map_err(ShphError::Io)?;
+        ensure_no_reparse_components(&out_dir).map_err(ShphError::Io)?;
 
         let filename = format!("{}-{}.json", envelope.created_at_unix_ms, envelope.sequence);
         let path = out_dir.join(filename);
@@ -2830,10 +3076,12 @@ impl OfflineMeshReadState {
             spool_dir: cfg.spool_dir.clone(),
             local_node: local_node.to_string(),
             peer_node: peer_node.to_string(),
-            poll_interval: Duration::from_millis(cfg.poll_interval_ms.max(1)),
+            poll_interval: Duration::from_millis(
+                cfg.poll_interval_ms.clamp(1, MAX_ADAPTER_POLL_INTERVAL_MS),
+            ),
             seen_sequences: HashSet::new(),
             seen_order: VecDeque::new(),
-            max_seen: cfg.max_idle_entries as usize,
+            max_seen: cfg.max_idle_entries.clamp(1, 65_536) as usize,
             max_file_bytes: MAX_FILE_ADAPTER_BYTES,
         }
     }
@@ -2847,11 +3095,56 @@ impl OfflineMeshReadState {
             .join(sanitize_component(&self.local_node))
     }
 
-    fn receive_payload(&mut self, timeout: Duration) -> Result<Vec<u8>> {
+    fn receive_verified_hello(
+        &mut self,
+        timeout: Duration,
+        local_identity: &IdentityKeyPair,
+        material: &HandshakeMaterial,
+        policy: &PeerPolicy,
+    ) -> Result<Hello> {
         let frame = self.receive_raw_payload(timeout)?;
-        self.commit_payload(frame.sequence);
-        let _ = fs::remove_file(frame.claimed.path);
-        Ok(frame.payload)
+        let peer_hello = match serde_json::from_slice::<Hello>(&frame.payload) {
+            Ok(hello) => hello,
+            Err(error) => {
+                quarantine_claimed_file(frame.claimed);
+                return Err(ShphError::Protocol(format!("invalid peer hello: {error}")));
+            }
+        };
+        if let Err(error) =
+            shph_core::verify_hello_signature(local_identity, material, &peer_hello, policy)
+        {
+            quarantine_claimed_file(frame.claimed);
+            return Err(error);
+        }
+        self.commit_frame(&frame);
+        Ok(peer_hello)
+    }
+
+    fn receive_verified_responder_pq(
+        &mut self,
+        timeout: Duration,
+        local_identity: &IdentityKeyPair,
+        material: &mut HandshakeMaterial,
+        peer_hello: &Hello,
+        policy: &PeerPolicy,
+    ) -> Result<()> {
+        let frame = self.receive_raw_payload(timeout)?;
+        match shph_core::absorb_responder_pq(
+            local_identity,
+            material,
+            peer_hello,
+            &frame.payload,
+            policy,
+        ) {
+            Ok(()) => {
+                self.commit_frame(&frame);
+                Ok(())
+            }
+            Err(error) => {
+                quarantine_claimed_file(frame.claimed);
+                Err(error)
+            }
+        }
     }
 
     fn receive_raw_payload(&mut self, timeout: Duration) -> Result<OfflineMeshFrame> {
@@ -2880,8 +3173,7 @@ impl OfflineMeshReadState {
             let frame = self.receive_raw_payload(remaining)?;
             match cipher.decrypt(&frame.payload) {
                 Ok(plaintext) => {
-                    self.commit_payload(frame.sequence);
-                    let _ = fs::remove_file(frame.claimed.path);
+                    self.commit_frame(&frame);
                     return Ok(plaintext);
                 }
                 Err(error) => {
@@ -3029,6 +3321,11 @@ impl OfflineMeshReadState {
         self.mark_seen(sequence);
     }
 
+    fn commit_frame(&mut self, frame: &OfflineMeshFrame) {
+        self.commit_payload(frame.sequence);
+        let _ = fs::remove_file(&frame.claimed.path);
+    }
+
     fn mark_seen(&mut self, sequence: u64) {
         if self.seen_sequences.insert(sequence) {
             self.seen_order.push_back(sequence);
@@ -3070,17 +3367,19 @@ impl DataMuleSession {
     }
 
     fn send_frame(&mut self, payload: &[u8]) -> Result<()> {
+        validate_file_adapter_payload(
+            payload,
+            self.send_state.max_payload_bytes,
+            self.send_state.max_file_bytes,
+        )?;
         let encrypted = self.send_cipher.encrypt(payload)?;
         self.send_state.send_payload(&encrypted)
     }
 
     fn recv_frame(&mut self) -> Result<Vec<u8>> {
-        let frame = self
-            .recv_state
-            .receive_envelope(self.recv_state.poll_interval)?;
-        let plaintext = self.recv_cipher.decrypt(&frame.payload)?;
-        self.recv_state.commit_envelope(&frame)?;
-        Ok(plaintext)
+        let timeout = self.recv_state.poll_interval;
+        self.recv_state
+            .receive_decrypted_frame(&mut self.recv_cipher, timeout)
     }
 
     fn into_split(self) -> Result<(DataMuleSender, DataMuleReceiver)> {
@@ -3106,6 +3405,11 @@ struct DataMuleSender {
 
 impl DataMuleSender {
     fn send_frame(&mut self, payload: &[u8]) -> Result<()> {
+        validate_file_adapter_payload(
+            payload,
+            self.state.max_payload_bytes,
+            self.state.max_file_bytes,
+        )?;
         let encrypted = self.cipher.encrypt(payload)?;
         self.state.send_payload(&encrypted)
     }
@@ -3130,22 +3434,99 @@ struct DataMuleEnvelopeFrame {
     claimed: ClaimedFile,
 }
 
+fn base64_encoded_len(bytes: usize) -> usize {
+    bytes
+        .checked_add(2)
+        .and_then(|rounded| rounded.checked_div(3))
+        .and_then(|groups| groups.checked_mul(4))
+        .unwrap_or(usize::MAX)
+}
+
+fn max_plaintext_for_file_adapter(max_file_bytes: u64, fixed_envelope_bytes: usize) -> usize {
+    let max_file_bytes = usize::try_from(max_file_bytes).unwrap_or(usize::MAX);
+    if fixed_envelope_bytes > max_file_bytes {
+        return 0;
+    }
+
+    let mut low = 0usize;
+    let mut high = max_file_bytes;
+    while low < high {
+        let candidate = low + (high - low).div_ceil(2);
+        let encrypted_bytes = candidate.saturating_add(SHROUD_AEAD_OVERHEAD);
+        let total_bytes = fixed_envelope_bytes.saturating_add(base64_encoded_len(encrypted_bytes));
+        if total_bytes <= max_file_bytes {
+            low = candidate;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    low
+}
+
+fn offline_mesh_payload_capacity(max_file_bytes: u64, local_node: &str, peer_node: &str) -> usize {
+    let envelope = OfflineMeshEnvelope {
+        session_id: offline_session_id(local_node, peer_node),
+        from: local_node.to_owned(),
+        to: peer_node.to_owned(),
+        created_at_unix_ms: u64::MAX,
+        sequence: u64::MAX,
+        ciphertext_b64: String::new(),
+    };
+    let fixed_bytes = match serde_json::to_vec(&envelope) {
+        Ok(bytes) => bytes.len(),
+        Err(_) => return 0,
+    };
+    max_plaintext_for_file_adapter(max_file_bytes, fixed_bytes)
+}
+
+fn data_mule_payload_capacity(max_file_bytes: u64, local_node: &str, peer_node: &str) -> usize {
+    let envelope = DataMuleEnvelope {
+        envelope_id: format!("{}-{}", u64::MAX, u64::MAX),
+        created_at_unix_ms: u64::MAX,
+        from_node: local_node.to_owned(),
+        to_node: peer_node.to_owned(),
+        ciphertext_b64: String::new(),
+        nonce_b64: base64::engine::general_purpose::STANDARD.encode(u64::MAX.to_le_bytes()),
+    };
+    let fixed_bytes = match serde_json::to_vec(&envelope) {
+        Ok(bytes) => bytes.len(),
+        Err(_) => return 0,
+    };
+    max_plaintext_for_file_adapter(max_file_bytes, fixed_bytes)
+}
+
+fn validate_file_adapter_payload(
+    payload: &[u8],
+    max_payload_bytes: usize,
+    max_file_bytes: u64,
+) -> Result<()> {
+    if payload.len() > max_payload_bytes {
+        return Err(ShphError::Protocol(format!(
+            "file-adapter plaintext payload exceeds the {max_payload_bytes}-byte capacity of the configured {max_file_bytes}-byte envelope bound"
+        )));
+    }
+    Ok(())
+}
+
 struct DataMuleWriteState {
     outbox_dir: String,
     local_node: String,
     peer_node: String,
     next_sequence: u64,
     max_file_bytes: u64,
+    max_payload_bytes: usize,
 }
 
 impl DataMuleWriteState {
     fn new(cfg: &DataMuleConfig, local_node: &str, peer_node: &str) -> Self {
+        let max_file_bytes = cfg.max_file_bytes.clamp(1, MAX_FILE_ADAPTER_BYTES);
         Self {
             outbox_dir: cfg.outbox_dir.clone(),
             local_node: local_node.to_string(),
             peer_node: peer_node.to_string(),
             next_sequence: 0,
-            max_file_bytes: cfg.max_file_bytes.clamp(1, MAX_FILE_ADAPTER_BYTES),
+            max_file_bytes,
+            max_payload_bytes: data_mule_payload_capacity(max_file_bytes, local_node, peer_node),
         }
     }
 
@@ -3188,7 +3569,9 @@ impl DataMuleReadState {
             inbox_dir: cfg.inbox_dir.clone(),
             local_node: local_node.to_string(),
             peer_filter: peer_filter.map(std::string::ToString::to_string),
-            poll_interval: Duration::from_millis(cfg.poll_interval_ms.max(1)),
+            poll_interval: Duration::from_millis(
+                cfg.poll_interval_ms.clamp(1, MAX_ADAPTER_POLL_INTERVAL_MS),
+            ),
             seen_envelopes: HashSet::new(),
             seen_order: VecDeque::new(),
             max_seen: 1024,
@@ -3222,11 +3605,63 @@ impl DataMuleReadState {
         }
     }
 
-    fn receive_payload(&mut self, timeout: Duration) -> Result<Vec<u8>> {
+    fn receive_verified_hello(
+        &mut self,
+        timeout: Duration,
+        local_identity: &IdentityKeyPair,
+        material: &HandshakeMaterial,
+        policy: &PeerPolicy,
+    ) -> Result<(Hello, String)> {
         let frame = self.receive_envelope(timeout)?;
-        let payload = frame.payload.clone();
+        let peer_node = frame.envelope.from_node.clone();
+        let peer_hello = match serde_json::from_slice::<Hello>(&frame.payload) {
+            Ok(hello) => hello,
+            Err(error) => {
+                quarantine_claimed_file(frame.claimed);
+                return Err(ShphError::Protocol(format!("invalid peer hello: {error}")));
+            }
+        };
+        if peer_node != peer_hello.identity_pub_b64 {
+            quarantine_claimed_file(frame.claimed);
+            return Err(ShphError::Auth(
+                "data-mule envelope sender does not match the signed hello identity".into(),
+            ));
+        }
+        if let Err(error) =
+            shph_core::verify_hello_signature(local_identity, material, &peer_hello, policy)
+        {
+            quarantine_claimed_file(frame.claimed);
+            return Err(error);
+        }
         self.commit_envelope(&frame)?;
-        Ok(payload)
+        if self.peer_filter.is_none() {
+            self.peer_filter = Some(peer_node.clone());
+        }
+        Ok((peer_hello, peer_node))
+    }
+
+    fn receive_verified_responder_pq(
+        &mut self,
+        timeout: Duration,
+        local_identity: &IdentityKeyPair,
+        material: &mut HandshakeMaterial,
+        peer_hello: &Hello,
+        policy: &PeerPolicy,
+    ) -> Result<()> {
+        let frame = self.receive_envelope(timeout)?;
+        match shph_core::absorb_responder_pq(
+            local_identity,
+            material,
+            peer_hello,
+            &frame.payload,
+            policy,
+        ) {
+            Ok(()) => self.commit_envelope(&frame),
+            Err(error) => {
+                quarantine_claimed_file(frame.claimed);
+                Err(error)
+            }
+        }
     }
 
     fn receive_decrypted_frame(
@@ -3469,7 +3904,7 @@ fn collect_shph_files(
 mod tests {
     use super::{
         accept_secure_session_lab, connect_secure_session_lab, tcp_secure_receive, tcp_secure_send,
-        DataMuleConfig, QuicLabConfig,
+        DataMuleConfig, DataMuleReadState, DataMuleSession, DataMuleWriteState, QuicLabConfig,
     };
     use super::{collect_shph_files, TEMP_FILE_COUNTER};
     use super::{
@@ -3481,11 +3916,11 @@ mod tests {
         HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy, ReceiveCipher, SendCipher,
     };
     use std::fs;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::Ordering;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn tcp_secure_helpers_preserve_aead_nonce_state_between_frames() {
@@ -3509,6 +3944,86 @@ mod tests {
         tcp_secure_send(&mut stream, &mut sender, b"first").expect("send first frame");
         tcp_secure_send(&mut stream, &mut sender, b"second").expect("send second frame");
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn tcp_sender_rejects_payload_that_would_exceed_frame_limit() {
+        let payload = vec![0u8; super::MAX_TCP_PAYLOAD_BYTES + 1];
+        assert!(super::validate_tcp_payload(&payload).is_err());
+        assert!(super::validate_tcp_payload(&payload[..super::MAX_TCP_PAYLOAD_BYTES]).is_ok());
+    }
+
+    #[test]
+    fn unshrouded_quic_sender_rejects_payload_that_would_exceed_datagram_limit() {
+        use std::net::UdpSocket;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
+        let peer = socket.local_addr().expect("UDP address");
+        let mut cipher = SendCipher::new([0x52; 32]);
+        let payload = vec![0u8; super::MAX_QUIC_PAYLOAD_BYTES + 1];
+        assert!(
+            super::write_encrypted_quic_frame(&socket, peer, &mut cipher, &payload, None).is_err()
+        );
+    }
+
+    #[test]
+    fn file_adapter_sender_rejects_payload_before_encryption_bound() {
+        let payload = vec![0u8; 4097];
+        assert!(super::validate_file_adapter_payload(&payload, 4096, 4096).is_err());
+        assert!(super::validate_file_adapter_payload(&payload[..4096], 4096, 4096).is_ok());
+    }
+
+    #[test]
+    fn file_adapter_capacity_accounts_for_encryption_and_envelope_overhead() {
+        let data_mule = super::data_mule_payload_capacity(4096, "local", "peer");
+        let offline_mesh = super::offline_mesh_payload_capacity(4096, "local", "peer");
+        assert!(data_mule < 4096);
+        assert!(offline_mesh < 4096);
+        assert!(
+            super::validate_file_adapter_payload(&vec![0u8; data_mule], data_mule, 4096).is_ok()
+        );
+        assert!(super::validate_file_adapter_payload(
+            &vec![0u8; data_mule.saturating_add(1)],
+            data_mule,
+            4096
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn file_adapter_session_rejects_before_creating_an_envelope() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-capacity-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 4096,
+        };
+        let writer = DataMuleWriteState::new(&cfg, "local", "peer");
+        let oversized = vec![0u8; writer.max_payload_bytes.saturating_add(1)];
+        let mut session = DataMuleSession::new(
+            writer,
+            DataMuleReadState::new(&cfg, "local", Some("peer")),
+            [0x11; 32],
+            [0x22; 32],
+        );
+        assert!(session.send_frame(&oversized).is_err());
+        assert!(
+            !root.exists(),
+            "pre-encryption rejection must not create an envelope directory"
+        );
+    }
+
+    #[test]
+    fn hostname_resolution_honors_an_expired_aggregate_deadline() {
+        assert!(matches!(
+            super::resolve_socket_addrs_with_deadline("localhost:1", Instant::now()),
+            Err(shph_core::ShphError::Timeout)
+        ));
     }
 
     #[test]
@@ -3605,6 +4120,26 @@ mod tests {
             .expect("challenge encoding");
         assert_eq!(decoded, cookie);
         super::write_tcp_cookie_response(&mut client, &decoded).expect("response");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn tcp_line_reader_preserves_pipelined_followup_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream.write_all(b"hello\nnext").expect("pipelined write");
+        });
+
+        let mut client = TcpStream::connect(address).expect("connect");
+        assert_eq!(
+            super::read_tcp_line(&mut client, 64).expect("line"),
+            b"hello"
+        );
+        let mut followup = [0u8; 4];
+        client.read_exact(&mut followup).expect("follow-up bytes");
+        assert_eq!(&followup, b"next");
         server.join().expect("server");
     }
 
@@ -4114,6 +4649,186 @@ mod tests {
             .expect("valid candidate");
         assert_eq!(frame.envelope.envelope_id, "b");
         assert!(bad.with_extension("rejected").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_session_quarantines_aead_failures() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-aead-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 4096,
+        };
+
+        let mut writer = DataMuleWriteState::new(&cfg, "peer", "local");
+        writer
+            .send_payload(b"not-a-valid-ciphertext")
+            .expect("write malformed encrypted frame");
+
+        let mut session = DataMuleSession::new(
+            DataMuleWriteState::new(&cfg, "local", "peer"),
+            DataMuleReadState::new(&cfg, "local", Some("peer")),
+            [0x11; 32],
+            [0x22; 32],
+        );
+        assert!(session.recv_frame().is_err());
+
+        let local_dir = root.join(super::safe_path_component("local"));
+        let names: Vec<String> = fs::read_dir(local_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains(".rejected")),
+            "failed ciphertext must be quarantined"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".processing")),
+            "failed ciphertext must not remain in processing state"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_verified_hello_quarantines_unauthorized_sender() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-auth-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 64 * 1024,
+        };
+        let local = IdentityKeyPair::generate().unwrap();
+        let attacker = IdentityKeyPair::generate().unwrap();
+        let expected = IdentityKeyPair::generate().unwrap();
+        let material =
+            super::build_hello_with_profile(&local, HandshakeProfile::SecureDefault).unwrap();
+        let attacker_material =
+            super::build_hello_with_profile(&attacker, HandshakeProfile::SecureDefault).unwrap();
+        let mut writer =
+            DataMuleWriteState::new(&cfg, &attacker.public_key_b64(), &local.public_key_b64());
+        writer
+            .send_payload(&serde_json::to_vec(&attacker_material.local_hello).unwrap())
+            .unwrap();
+
+        let mut reader = DataMuleReadState::new(&cfg, &local.public_key_b64(), None);
+        let result = reader.receive_verified_hello(
+            Duration::from_millis(100),
+            &local,
+            &material,
+            &PeerPolicy::single(PeerPin::for_identity(&expected)),
+        );
+        assert!(matches!(result, Err(shph_core::ShphError::Auth(_))));
+
+        let local_dir = root.join(super::safe_path_component(&local.public_key_b64()));
+        let names: Vec<String> = fs::read_dir(local_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.contains(".rejected")));
+        assert!(names.iter().all(|name| !name.contains(".processing")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_verified_hello_binds_envelope_sender_to_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-binding-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 64 * 1024,
+        };
+        let local = IdentityKeyPair::generate().unwrap();
+        let peer = IdentityKeyPair::generate().unwrap();
+        let local_material =
+            super::build_hello_with_profile(&local, HandshakeProfile::SecureDefault).unwrap();
+        let peer_material =
+            super::build_hello_with_profile(&peer, HandshakeProfile::SecureDefault).unwrap();
+        let mut writer =
+            DataMuleWriteState::new(&cfg, "not-the-peer-identity", &local.public_key_b64());
+        writer
+            .send_payload(&serde_json::to_vec(&peer_material.local_hello).unwrap())
+            .unwrap();
+
+        let mut reader = DataMuleReadState::new(&cfg, &local.public_key_b64(), None);
+        let result = reader.receive_verified_hello(
+            Duration::from_millis(100),
+            &local,
+            &local_material,
+            &PeerPolicy::single(PeerPin::for_identity(&peer)),
+        );
+        assert!(matches!(result, Err(shph_core::ShphError::Auth(_))));
+
+        let local_dir = root.join(super::safe_path_component(&local.public_key_b64()));
+        let names: Vec<String> = fs::read_dir(local_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.contains(".rejected")));
+        assert!(names.iter().all(|name| !name.contains(".processing")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_responder_pq_quarantines_invalid_ciphertext() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-pq-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 64 * 1024,
+        };
+        let local = IdentityKeyPair::generate().unwrap();
+        let peer = IdentityKeyPair::generate().unwrap();
+        let mut local_material =
+            super::build_hello_with_profile(&local, HandshakeProfile::SecureDefault).unwrap();
+        let peer_material =
+            super::build_hello_with_profile(&peer, HandshakeProfile::SecureDefault).unwrap();
+        let mut writer =
+            DataMuleWriteState::new(&cfg, &peer.public_key_b64(), &local.public_key_b64());
+        writer.send_payload(b"invalid-pq-ciphertext").unwrap();
+
+        let mut reader =
+            DataMuleReadState::new(&cfg, &local.public_key_b64(), Some(&peer.public_key_b64()));
+        let result = reader.receive_verified_responder_pq(
+            Duration::from_millis(100),
+            &local,
+            &mut local_material,
+            &peer_material.local_hello,
+            &PeerPolicy::single(PeerPin::for_identity(&peer)),
+        );
+        assert!(result.is_err());
+
+        let local_dir = root.join(super::safe_path_component(&local.public_key_b64()));
+        let names: Vec<String> = fs::read_dir(local_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.contains(".rejected")));
+        assert!(names.iter().all(|name| !name.contains(".processing")));
         fs::remove_dir_all(root).unwrap();
     }
 

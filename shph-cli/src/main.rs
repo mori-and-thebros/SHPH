@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use shph_config::{Config, ControlPlaneConfig, PeerConfig, SessionRole};
 use shph_core::{
-    append_ratchet_audit_event, build_hello, compute_fingerprint_hex, read_ratchet_audit_events,
-    recover_secret_from_shares,
+    append_ratchet_audit_event, build_hello, compute_fingerprint_hex, ensure_no_reparse_components,
+    read_ratchet_audit_events, recover_secret_from_shares,
     roadmap::{DataMuleConfig, OfflineMeshConfig, RoadmapConfig},
     split_secret, validate_identity_provider, validate_roadmap, verify_and_derive, Contact,
     Endpoint, HandshakeProfile, HandshakeState, KeyStore, KeyStoreConfig, MetricsCollector,
@@ -37,7 +37,9 @@ use shph_tun::firewall::{
 };
 #[cfg(target_os = "linux")]
 use shph_tun::AsyncTunDevice;
-use shph_tun::{validate_tun_mtu, TunDevice, DEFAULT_TUN_MTU_BYTES, TUN_READ_BUFFER_BYTES};
+use shph_tun::{
+    validate_tun_mtu, validate_tun_name, TunDevice, DEFAULT_TUN_MTU_BYTES, TUN_READ_BUFFER_BYTES,
+};
 #[cfg(target_os = "windows")]
 use shph_tun::{WindowsFirewallTransport, WindowsKillswitchGuard};
 use std::fs;
@@ -71,22 +73,29 @@ fn phase_a1_now_ms() -> Result<u64> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "shph", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SHPH_BUILD_ID"), ")"))]
 #[command(
+    name = "shph",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SHPH_BUILD_ID"), ")"),
     about = "SHPH (Shroud-Phantom): Layer 3 VPN with stealth/shroud features",
-    long_about = None
+    long_about = "SHPH is a testable, VPN-first secure transport for controlled lab environments.",
+    arg_required_else_help = true,
+    after_help = "Examples:\n  shph init\n  shph doctor\n  shph --json status\n  shph up --transport tcp"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Enable verbose output
-    #[arg(short, long)]
+    /// Enable additional diagnostic output
+    #[arg(short, long, global = true)]
     verbose: bool,
 
-    /// Config file path
-    #[arg(short, long)]
+    /// Use a specific configuration file
+    #[arg(short, long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
+
+    /// Emit machine-readable JSON where supported
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -99,9 +108,6 @@ enum Commands {
     },
     /// Bring up the VPN tunnel
     Up {
-        /// Config file to use
-        #[arg(long)]
-        config: Option<PathBuf>,
         /// Optional transport override (tcp|quic|quic-standard|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
@@ -129,15 +135,23 @@ enum Commands {
     Reconcile,
     /// Undo previously applied routes and DNS
     Undo,
-    /// Show VPN status
+    /// Show VPN and configuration status
     Status,
+    /// Check configuration, identity, peers, and host prerequisites
+    Doctor {
+        /// Exit non-zero when any check fails
+        #[arg(long)]
+        strict: bool,
+    },
     /// Show peer fingerprint
+    #[command(alias = "fingerprint")]
     ShowFingerprint,
     /// Show the local identity public key
     ShowPublicKey,
     /// Show the local Ed25519 handshake-signing public key
     ShowSigningPublicKey,
     /// List configured peers
+    #[command(alias = "peers")]
     ListPeers,
     /// Add a new peer
     AddPeer {
@@ -150,6 +164,7 @@ enum Commands {
         sign_pubkey: String,
     },
     /// Show configuration
+    #[command(alias = "config")]
     ShowConfig {
         /// Include plaintext credential fields in the output.
         #[arg(long)]
@@ -263,18 +278,31 @@ struct HandshakeSimOut {
     transcript_hash_hex: String,
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run_cli() {
+        eprintln!("Error: {error}");
+        if let Some(hint) = cli_error_hint(&error) {
+            eprintln!("Hint: {hint}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run_cli() -> Result<()> {
     let cli = Cli::parse();
+    if cli.verbose && std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "info");
+    }
     tracing_subscriber::fmt::init();
     shutdown::install_signal_handlers();
 
     let config_path = cli.config.unwrap_or_else(Config::default_config_path);
     let keystore_path = keystore_path_from_config(&config_path);
+    let json = cli.json;
 
     match cli.command {
         Commands::Init { new } => handle_init(&config_path, &keystore_path, new)?,
         Commands::Up {
-            config,
             transport,
             quic_cert,
             handshake_profile,
@@ -282,8 +310,7 @@ fn main() -> Result<()> {
             killswitch_dry_run,
             mss_clamp,
         } => {
-            let path = config.unwrap_or(config_path);
-            let config = load_config(&path)?;
+            let config = load_config(&config_path)?;
             let mode = resolve_transport_mode(transport.as_deref(), config.roadmap.as_ref())?;
             let profile = resolve_handshake_profile(
                 handshake_profile.as_deref(),
@@ -292,9 +319,9 @@ fn main() -> Result<()> {
                     .as_ref()
                     .and_then(|session| session.handshake_profile),
             )?;
-            let path_keystore = keystore_path_from_config(&path);
+            let path_keystore = keystore_path_from_config(&config_path);
             handle_up(
-                &path,
+                &config_path,
                 &path_keystore,
                 &config,
                 UpOptions {
@@ -311,11 +338,12 @@ fn main() -> Result<()> {
         Commands::Apply => handle_control_plane_apply(&config_path)?,
         Commands::Reconcile => handle_control_plane_reconcile(&config_path)?,
         Commands::Undo => handle_control_plane_undo(&config_path)?,
-        Commands::Status => handle_status(&config_path, &keystore_path)?,
+        Commands::Status => handle_status(&config_path, &keystore_path, json)?,
+        Commands::Doctor { strict } => handle_doctor(&config_path, &keystore_path, json, strict)?,
         Commands::ShowFingerprint => handle_show_fingerprint(&keystore_path)?,
         Commands::ShowPublicKey => handle_show_public_key(&keystore_path)?,
         Commands::ShowSigningPublicKey => handle_show_signing_public_key(&keystore_path)?,
-        Commands::ListPeers => handle_list_peers(&config_path)?,
+        Commands::ListPeers => handle_list_peers(&config_path, json)?,
         Commands::AddPeer {
             alias,
             host,
@@ -454,6 +482,27 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn cli_error_hint(error: &ShphError) -> Option<&'static str> {
+    match error {
+        ShphError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+            Some("Check --config and file paths, or run `shph init` to create a workspace.")
+        }
+        ShphError::Config(_) | ShphError::KeyStore(_) => {
+            Some("Run `shph doctor` for a focused configuration and identity diagnosis.")
+        }
+        ShphError::InvalidArgument(_) => {
+            Some("Run the command with `--help` to review valid arguments and examples.")
+        }
+        ShphError::PermissionDenied(_) | ShphError::Tun(_) => {
+            Some("Check host privileges and native-TUN prerequisites before retrying.")
+        }
+        ShphError::Unsupported(_) => {
+            Some("Review the selected transport and host prerequisites in `docs/TESTING.md`.")
+        }
+        _ => None,
+    }
+}
+
 fn handle_init(config_path: &Path, keystore_path: &Path, force_new: bool) -> Result<()> {
     if !force_new && (config_path.exists() || keystore_path.exists()) {
         return Err(ShphError::InvalidArgument(
@@ -501,6 +550,7 @@ fn handle_up(
         mss_clamp,
     } = options;
     validate_config_roadmap(config)?;
+    validate_tun_name(&config.interface_name)?;
     if transport == TransportMode::QuicStandard
         && config
             .session
@@ -752,12 +802,13 @@ where
 const MAX_QUIC_CERTIFICATE_BYTES: u64 = 64 * 1024;
 
 fn read_quic_certificate(path: &Path) -> Result<Vec<u8>> {
+    ensure_no_reparse_components(path)?;
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(ShphError::Io)?
     };
@@ -801,6 +852,7 @@ fn write_quic_certificate(path: &Path, certificate: &[u8]) -> Result<()> {
             "generated QUIC certificate has an invalid size".into(),
         ));
     }
+    ensure_no_reparse_components(path)?;
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
             return Err(ShphError::InvalidArgument(
@@ -825,38 +877,449 @@ fn handle_down(config_path: &Path) -> Result<()> {
     }
 }
 
-fn handle_status(config_path: &Path, keystore_path: &Path) -> Result<()> {
-    let config_exists = config_path.exists();
-    let keystore_exists = keystore_path.exists();
-    let peer_count = if config_exists {
-        load_config(config_path).map(|c| c.peers.len()).unwrap_or(0)
-    } else {
-        0
+#[derive(Debug, Clone, Serialize)]
+struct StatusItem {
+    state: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusReport {
+    config_path: String,
+    keystore_path: String,
+    config: StatusItem,
+    identity: StatusItem,
+    tunnel: StatusItem,
+    peers: usize,
+    interface_name: Option<String>,
+    local_endpoint: Option<String>,
+    session: Option<String>,
+    control_plane: StatusItem,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorCheck {
+    name: String,
+    status: String,
+    detail: String,
+    hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorReport {
+    ok: bool,
+    config_path: String,
+    keystore_path: String,
+    checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PeerSummary {
+    alias: String,
+    endpoint: String,
+    public_key: String,
+    signing_key: String,
+}
+
+fn status_item(state: &str, detail: impl Into<String>) -> StatusItem {
+    StatusItem {
+        state: state.to_string(),
+        detail: detail.into(),
+    }
+}
+
+fn handle_status(config_path: &Path, keystore_path: &Path, json: bool) -> Result<()> {
+    let config_result = Config::load(config_path);
+    let config = config_result.as_ref().ok();
+    let config_status = match &config_result {
+        Ok(_) => status_item("ready", "configuration loaded"),
+        Err(error) => status_item("error", error.to_string()),
     };
-    let control_state = control_plane_state_path(config_path);
-    println!("SHPH Status");
-    println!(
-        "  Config: {}",
-        if config_exists { "present" } else { "missing" }
-    );
-    println!(
-        "  Identity: {}",
-        if keystore_exists {
-            "present"
-        } else {
-            "missing"
+
+    let identity_status = if !keystore_path.exists() {
+        status_item("missing", "identity keystore not found")
+    } else {
+        match KeyStore::load(keystore_path, None) {
+            Ok(keystore) => status_item(
+                "ready",
+                format!(
+                    "identity loaded; fingerprint {}",
+                    keystore.fingerprint_hex()
+                ),
+            ),
+            Err(error) => status_item("error", error.to_string()),
         }
-    );
-    println!("  Tunnel: inactive");
-    println!("  Peers: {peer_count}");
-    println!(
-        "  Control plane: {}",
-        if control_state.exists() {
-            "active state recorded"
-        } else {
-            "inactive"
+    };
+
+    let control_plane_status = if !control_plane_state_path(config_path).exists() {
+        status_item("inactive", "no persisted route/DNS state")
+    } else {
+        match load_control_plane_state(config_path) {
+            Ok(state) => status_item(
+                "active",
+                format!(
+                    "{} route(s), {} DNS server(s) recorded on {}",
+                    state.routes.len(),
+                    state.dns_servers.len(),
+                    state.interface_name
+                ),
+            ),
+            Err(error) => status_item("error", error.to_string()),
         }
+    };
+
+    let session = config
+        .and_then(|config| config.session.as_ref())
+        .map(|session| match session.role {
+            SessionRole::Listen => format!(
+                "listen ({})",
+                session.bind.as_deref().unwrap_or("0.0.0.0:7000")
+            ),
+            SessionRole::Connect => format!(
+                "connect ({})",
+                session.peer.as_deref().unwrap_or("peer not configured")
+            ),
+        });
+
+    let report = StatusReport {
+        config_path: config_path.display().to_string(),
+        keystore_path: keystore_path.display().to_string(),
+        config: config_status,
+        identity: identity_status,
+        tunnel: status_item(
+            "not_tracked",
+            "live session state is not persisted; use `shph up` to start a session",
+        ),
+        peers: config.map_or(0, |config| config.peers.len()),
+        interface_name: config.map(|config| config.interface_name.clone()),
+        local_endpoint: config.map(|config| config.local_endpoint.clone()),
+        session,
+        control_plane: control_plane_status,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("SHPH status");
+    print_status_item("Config", &report.config);
+    print_status_item("Identity", &report.identity);
+    print_status_item("Tunnel", &report.tunnel);
+    println!("  Peers: {}", report.peers);
+    if let Some(interface_name) = &report.interface_name {
+        println!("  Interface: {interface_name}");
+    }
+    if let Some(local_endpoint) = &report.local_endpoint {
+        println!("  Local endpoint: {local_endpoint}");
+    }
+    if let Some(session) = &report.session {
+        println!("  Session: {session}");
+    }
+    print_status_item("Control plane", &report.control_plane);
+    Ok(())
+}
+
+fn print_status_item(label: &str, item: &StatusItem) {
+    println!("  {label}: {} ({})", item.state, item.detail);
+}
+
+fn doctor_check(
+    checks: &mut Vec<DoctorCheck>,
+    name: impl Into<String>,
+    status: &str,
+    detail: impl Into<String>,
+    hint: Option<String>,
+) {
+    checks.push(DoctorCheck {
+        name: name.into(),
+        status: status.to_string(),
+        detail: detail.into(),
+        hint,
+    });
+}
+
+fn handle_doctor(config_path: &Path, keystore_path: &Path, json: bool, strict: bool) -> Result<()> {
+    let mut checks = Vec::new();
+    let config_result = Config::load(config_path);
+    let config = config_result.as_ref().ok();
+
+    match &config_result {
+        Ok(_) => doctor_check(
+            &mut checks,
+            "config",
+            "pass",
+            format!("loaded {}", config_path.display()),
+            None,
+        ),
+        Err(error) => doctor_check(
+            &mut checks,
+            "config",
+            "fail",
+            error.to_string(),
+            Some(format!(
+                "create it with `shph --config {} init`",
+                config_path.display()
+            )),
+        ),
+    }
+
+    match KeyStore::load(keystore_path, None) {
+        Ok(keystore) => doctor_check(
+            &mut checks,
+            "identity",
+            "pass",
+            format!(
+                "loaded {}; fingerprint {}",
+                keystore_path.display(),
+                keystore.fingerprint_hex()
+            ),
+            None,
+        ),
+        Err(error) => doctor_check(
+            &mut checks,
+            "identity",
+            "fail",
+            error.to_string(),
+            Some(format!(
+                "create a new identity with `shph --config {} init --new`",
+                config_path.display()
+            )),
+        ),
+    }
+
+    if let Some(config) = config {
+        match validate_tun_name(&config.interface_name) {
+            Ok(()) => doctor_check(
+                &mut checks,
+                "interface",
+                "pass",
+                format!("{} is a valid SHPH interface name", config.interface_name),
+                None,
+            ),
+            Err(error) => doctor_check(
+                &mut checks,
+                "interface",
+                "fail",
+                error.to_string(),
+                Some("choose a short alphanumeric interface name such as `shph0`".into()),
+            ),
+        }
+
+        let mut peer_errors = Vec::new();
+        for peer in &config.peers {
+            if let Err(error) = validate_pubkey_b64_named(&peer.pubkey, "peer public key") {
+                peer_errors.push(format!("{}: {error}", peer.alias));
+            }
+            if let Some(sign_pubkey) = &peer.sign_pubkey {
+                if let Err(error) =
+                    validate_pubkey_b64_named(sign_pubkey, "peer signing public key")
+                {
+                    peer_errors.push(format!("{} signing key: {error}", peer.alias));
+                }
+            }
+        }
+        if peer_errors.is_empty() {
+            doctor_check(
+                &mut checks,
+                "peers",
+                "pass",
+                format!(
+                    "{} configured peer(s) have valid key shapes",
+                    config.peers.len()
+                ),
+                None,
+            );
+        } else {
+            doctor_check(
+                &mut checks,
+                "peers",
+                "fail",
+                peer_errors.join("; "),
+                Some("review the peer keys with `shph list-peers`".into()),
+            );
+        }
+
+        match &config.roadmap {
+            Some(_) => match validate_config_roadmap(config) {
+                Ok(()) => doctor_check(
+                    &mut checks,
+                    "roadmap",
+                    "pass",
+                    "optional transport and trust settings are valid",
+                    None,
+                ),
+                Err(error) => doctor_check(
+                    &mut checks,
+                    "roadmap",
+                    "fail",
+                    error.to_string(),
+                    Some("run `shph validate-roadmap` for the detailed roadmap check".into()),
+                ),
+            },
+            None => doctor_check(
+                &mut checks,
+                "roadmap",
+                "info",
+                "no optional roadmap settings configured",
+                None,
+            ),
+        }
+
+        if let Some(control) = &config.control_plane {
+            match build_control_plane_plan(control, &config.interface_name) {
+                Ok(plan) => doctor_check(
+                    &mut checks,
+                    "control-plane",
+                    "pass",
+                    format!(
+                        "{} route(s), {} DNS server(s) pass preflight",
+                        plan.routes.len(),
+                        plan.dns_servers.len()
+                    ),
+                    None,
+                ),
+                Err(error) => doctor_check(
+                    &mut checks,
+                    "control-plane",
+                    "fail",
+                    error.to_string(),
+                    Some("run `shph show-config` and correct the route/DNS settings".into()),
+                ),
+            }
+        } else {
+            doctor_check(
+                &mut checks,
+                "control-plane",
+                "info",
+                "no route/DNS mutation configured",
+                None,
+            );
+        }
+
+        match &config.session {
+            Some(session) => {
+                let session_error = match session.role {
+                    SessionRole::Listen => None,
+                    SessionRole::Connect if session.peer.is_none() => {
+                        Some("session.peer is required for connect mode")
+                    }
+                    SessionRole::Connect => None,
+                };
+                if let Some(error) = session_error {
+                    doctor_check(
+                        &mut checks,
+                        "session",
+                        "fail",
+                        error,
+                        Some("set [session].peer to the remote endpoint".into()),
+                    );
+                } else {
+                    doctor_check(
+                        &mut checks,
+                        "session",
+                        "pass",
+                        format!("{:?} session is configured", session.role),
+                        None,
+                    );
+                }
+            }
+            None => doctor_check(
+                &mut checks,
+                "session",
+                "info",
+                "no persistent session configured",
+                Some("use `shph listen` or `shph connect` for one-shot operations".into()),
+            ),
+        }
+    } else {
+        doctor_check(
+            &mut checks,
+            "config-dependent checks",
+            "info",
+            "skipped until the configuration loads",
+            None,
+        );
+    }
+
+    if control_plane_state_path(config_path).exists() {
+        match load_control_plane_state(config_path) {
+            Ok(state) => doctor_check(
+                &mut checks,
+                "persisted-control-plane",
+                "pass",
+                format!("state recorded for {}", state.interface_name),
+                None,
+            ),
+            Err(error) => doctor_check(
+                &mut checks,
+                "persisted-control-plane",
+                "fail",
+                error.to_string(),
+                Some("run `shph undo` after reviewing the state file".into()),
+            ),
+        }
+    } else {
+        doctor_check(
+            &mut checks,
+            "persisted-control-plane",
+            "info",
+            "no applied route/DNS state recorded",
+            None,
+        );
+    }
+
+    let native_tun = std::env::var("SHPH_TUN_NATIVE").ok().as_deref() == Some("1");
+    doctor_check(
+        &mut checks,
+        "native-tun",
+        "info",
+        if native_tun {
+            "native TUN mode requested by SHPH_TUN_NATIVE=1"
+        } else {
+            "stub/config-only TUN mode; set SHPH_TUN_NATIVE=1 for native packet I/O"
+        },
+        None,
     );
+
+    let ok = !checks.iter().any(|check| check.status == "fail");
+    let report = DoctorReport {
+        ok,
+        config_path: config_path.display().to_string(),
+        keystore_path: keystore_path.display().to_string(),
+        checks,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("SHPH doctor");
+        for check in &report.checks {
+            println!(
+                "  [{:>4}] {:<24} {}",
+                check.status.to_uppercase(),
+                check.name,
+                check.detail
+            );
+            if let Some(hint) = &check.hint {
+                println!("         hint: {hint}");
+            }
+        }
+        println!(
+            "\nResult: {}",
+            if report.ok {
+                "ready for the configured scope"
+            } else {
+                "issues found"
+            }
+        );
+    }
+
+    if strict && !report.ok {
+        return Err(ShphError::Config(
+            "doctor found failing checks; fix the reported issues and rerun `shph doctor`".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -897,14 +1360,22 @@ fn load_control_plane_state(config_path: &Path) -> Result<PersistedControlPlaneS
 }
 
 fn open_control_plane_state_readonly(path: &Path) -> io::Result<fs::File> {
+    shph_core::ensure_no_reparse_components(path)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
         let file = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control-plane state path must reference a regular file",
+            ));
+        }
         let mode = file.metadata()?.permissions().mode();
         if mode & 0o077 != 0 {
             return Err(io::Error::new(
@@ -929,15 +1400,25 @@ fn open_control_plane_state_readonly(path: &Path) -> io::Result<fs::File> {
         }
         shph_core::enforce_owner_only_file_permissions(path)
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
-        fs::File::open(path)
+        let file = fs::File::open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control-plane state path must reference a regular file",
+            ));
+        }
+        Ok(file)
     }
 }
 
 fn save_control_plane_state(config_path: &Path, state: &PersistedControlPlaneState) -> Result<()> {
     let state_path = control_plane_state_path(config_path);
     if let Some(parent) = state_path.parent() {
+        ensure_no_reparse_components(parent)?;
         fs::create_dir_all(parent).map_err(ShphError::Io)?;
+        ensure_no_reparse_components(parent)?;
     }
+    ensure_no_reparse_components(&state_path)?;
     let contents = serde_json::to_vec_pretty(state)?;
     let mut temp_path = state_path.clone();
     let suffix = SystemTime::now()
@@ -954,7 +1435,11 @@ fn save_control_plane_state(config_path: &Path, state: &PersistedControlPlaneSta
         .write(true)
         .open(&temp_path)
         .map_err(ShphError::Io)?;
-    restrict_state_file_perms(&temp_path)?;
+    if let Err(err) = restrict_state_file_perms(&temp_path) {
+        drop(file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
     use std::io::Write as _;
     if let Err(err) = file.write_all(&contents).map_err(ShphError::Io) {
         drop(file);
@@ -967,6 +1452,16 @@ fn save_control_plane_state(config_path: &Path, state: &PersistedControlPlaneSta
         return Err(err);
     }
     drop(file);
+    if let Some(parent) = state_path.parent() {
+        if let Err(err) = ensure_no_reparse_components(parent) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err);
+        }
+    }
+    if let Err(err) = ensure_no_reparse_components(&state_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
     if let Err(err) = fs::rename(&temp_path, &state_path).map_err(ShphError::Io) {
         let _ = fs::remove_file(&temp_path);
         return Err(err);
@@ -982,6 +1477,7 @@ fn save_control_plane_state(config_path: &Path, state: &PersistedControlPlaneSta
 
 fn remove_control_plane_state(config_path: &Path) -> Result<()> {
     let state_path = control_plane_state_path(config_path);
+    ensure_no_reparse_components(&state_path)?;
     match fs::remove_file(state_path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1114,16 +1610,49 @@ fn handle_show_signing_public_key(keystore_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn handle_list_peers(config_path: &Path) -> Result<()> {
+fn handle_list_peers(config_path: &Path, json: bool) -> Result<()> {
     let config = load_config(config_path)?;
-    if config.peers.is_empty() {
-        println!("No peers configured");
+    let peers: Vec<PeerSummary> = config
+        .peers
+        .iter()
+        .map(|peer| PeerSummary {
+            alias: peer.alias.clone(),
+            endpoint: peer.endpoint.clone(),
+            public_key: peer.pubkey.clone(),
+            signing_key: if peer.sign_pubkey.is_some() {
+                "configured".into()
+            } else {
+                "missing".into()
+            },
+        })
+        .collect();
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&peers)?);
         return Ok(());
     }
-    for peer in config.peers {
-        println!("{} {} {}", peer.alias, peer.endpoint, peer.pubkey);
+
+    if config.peers.is_empty() {
+        println!("No peers configured.");
+        println!("Add one with: shph add-peer <alias> <host> <port> <pubkey> --sign-pubkey <key>");
+        return Ok(());
+    }
+
+    println!("Configured peers ({})", peers.len());
+    for peer in peers {
+        println!("  {} -> {}", peer.alias, peer.endpoint);
+        println!("    public key: {}", shorten_key(&peer.public_key));
+        println!("    signing key: {}", peer.signing_key);
     }
     Ok(())
+}
+
+fn shorten_key(value: &str) -> String {
+    const EDGE: usize = 10;
+    if value.len() <= EDGE * 2 + 3 {
+        return value.to_string();
+    }
+    format!("{}...{}", &value[..EDGE], &value[value.len() - EDGE..])
 }
 
 fn handle_add_peer(
@@ -1245,12 +1774,11 @@ fn is_sensitive_config_key(key: &str) -> bool {
 
 fn handle_validate_roadmap(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
-    if config.roadmap.is_none() {
+    let Some(roadmap) = config.roadmap.as_ref() else {
         println!("Roadmap: no optional configuration");
         return Ok(());
-    }
+    };
     validate_config_roadmap(&config)?;
-    let roadmap = config.roadmap.as_ref().expect("checked above");
     println!("Roadmap: valid");
     println!("  Transport: {:?}", roadmap.transport);
     println!("  Identity provider: {:?}", roadmap.identity);
@@ -1344,7 +1872,7 @@ fn handle_shamir_recover(config_path: &Path, paths: &[PathBuf], output_file: &Pa
     let mut shares = Vec::with_capacity(paths.len());
     let mut total_bytes = 0u64;
     for path in paths {
-        let file = fs::File::open(path).map_err(ShphError::Io)?;
+        let file = open_secret_input(path)?;
         let length = file.metadata()?.len();
         if length > MAX_SHAMIR_SHARE_FILE_BYTES
             || total_bytes.saturating_add(length) > MAX_SHAMIR_TOTAL_BYTES
@@ -1417,14 +1945,26 @@ fn read_shamir_secret(
 }
 
 fn open_secret_input(path: &Path) -> Result<fs::File> {
+    ensure_no_reparse_components(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
-            .map_err(ShphError::Io)
+            .map_err(ShphError::Io)?;
+        if !file
+            .metadata()
+            .map_err(ShphError::Io)?
+            .file_type()
+            .is_file()
+        {
+            return Err(ShphError::InvalidArgument(
+                "secret input path must reference a regular file".into(),
+            ));
+        }
+        Ok(file)
     }
     #[cfg(not(unix))]
     {
@@ -1435,12 +1975,25 @@ fn open_secret_input(path: &Path) -> Result<fs::File> {
                 "refusing to read a symlinked secret input".into(),
             ));
         }
-        fs::File::open(path).map_err(ShphError::Io)
+        let file = fs::File::open(path).map_err(ShphError::Io)?;
+        if !file
+            .metadata()
+            .map_err(ShphError::Io)?
+            .file_type()
+            .is_file()
+        {
+            return Err(ShphError::InvalidArgument(
+                "secret input path must reference a regular file".into(),
+            ));
+        }
+        Ok(file)
     }
 }
 
 fn write_shamir_shares(output_dir: &Path, shares: &[ShamirShare]) -> Result<()> {
+    ensure_no_reparse_components(output_dir)?;
     fs::create_dir_all(output_dir)?;
+    ensure_no_reparse_components(output_dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1456,7 +2009,10 @@ fn write_shamir_shares(output_dir: &Path, shares: &[ShamirShare]) -> Result<()> 
 
 fn write_owner_only_file(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    ensure_no_reparse_components(parent)?;
     fs::create_dir_all(parent)?;
+    ensure_no_reparse_components(parent)?;
+    ensure_no_reparse_components(path)?;
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1480,6 +2036,8 @@ fn write_owner_only_file(path: &Path, data: &[u8]) -> Result<()> {
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
+        ensure_no_reparse_components(parent)?;
+        ensure_no_reparse_components(path)?;
         fs::rename(&temp, path)?;
         Ok(())
     })() {
@@ -2182,23 +2740,27 @@ fn contact_peer_pin(contact: &Contact) -> Result<PeerPin> {
     Ok(PeerPin::new(identity_public, signing_public))
 }
 
+fn outbound_contacts<'a>(keystore: &'a KeyStore, selector: &str) -> Vec<&'a Contact> {
+    keystore
+        .contacts
+        .values()
+        .filter(|contact| {
+            let configured_endpoint =
+                format_endpoint(&contact.endpoint.host, contact.endpoint.port);
+            configured_endpoint == selector
+                || contact.alias == selector
+                || contact.pubkey_b64 == selector
+        })
+        .collect()
+}
+
 fn peer_policy_for_endpoint(
     keystore: &KeyStore,
-    endpoint: &str,
+    selector: &str,
     outbound: bool,
 ) -> Result<PeerPolicy> {
     let contacts: Vec<&Contact> = if outbound {
-        keystore
-            .contacts
-            .values()
-            .filter(|contact| {
-                let configured_endpoint =
-                    format_endpoint(&contact.endpoint.host, contact.endpoint.port);
-                configured_endpoint == endpoint
-                    || contact.alias == endpoint
-                    || contact.pubkey_b64 == endpoint
-            })
-            .collect()
+        outbound_contacts(keystore, selector)
     } else {
         keystore.contacts.values().collect()
     };
@@ -2212,24 +2774,16 @@ fn peer_policy_for_endpoint(
 
 fn enforce_peer_policy(
     keystore_path: &Path,
-    endpoint: &str,
+    selector: &str,
     state: &HandshakeState,
     outbound: bool,
 ) -> Result<()> {
     let keystore = KeyStore::load(keystore_path, None)?;
     let peers = if outbound {
-        let matching: Vec<_> = keystore
-            .contacts
-            .iter()
-            .filter(|(_, peer)| {
-                let configured = format_endpoint(&peer.endpoint.host, peer.endpoint.port);
-                configured == endpoint
-            })
-            .map(|(_, peer)| peer)
-            .collect();
+        let matching = outbound_contacts(&keystore, selector);
         if matching.is_empty() {
             return Err(ShphError::Auth(format!(
-                "peer endpoint is not configured: {endpoint}"
+                "peer selector is not configured: {selector}"
             )));
         }
         matching
@@ -2498,30 +3052,30 @@ fn apply_linux_firewall_plan(
         for command in &commands {
             println!("    {command:?}");
         }
-        return Ok(guard);
-    }
-
-    // Remove a stale SHPH-owned table before applying the new plan. The
-    // cleanup is intentionally best-effort here; the install path below is
-    // authoritative and every successful mutation remains rollback-tracked.
-    let stale_cleanup = guard.cleanup_commands.clone();
-    for command in &stale_cleanup {
-        let _ = run_shell_command(command);
-    }
-
-    for command in &commands {
-        if let Err(error) = run_shell_command(command) {
-            let cleanup_error = guard.cleanup().err();
-            return match cleanup_error {
-                Some(cleanup_error) => Err(ShphError::Internal(format!(
-                    "{label} apply error: {error}; rollback error: {cleanup_error}"
-                ))),
-                None => Err(error),
-            };
+        Ok(guard)
+    } else {
+        // Remove a stale SHPH-owned table before applying the new plan. The
+        // cleanup is intentionally best-effort here; the install path below is
+        // authoritative and every successful mutation remains rollback-tracked.
+        let stale_cleanup = guard.cleanup_commands.clone();
+        for command in &stale_cleanup {
+            let _ = run_shell_command(command);
         }
+
+        for command in &commands {
+            if let Err(error) = run_shell_command(command) {
+                let cleanup_error = guard.cleanup().err();
+                return match cleanup_error {
+                    Some(cleanup_error) => Err(ShphError::Internal(format!(
+                        "{label} apply error: {error}; rollback error: {cleanup_error}"
+                    ))),
+                    None => Err(error),
+                };
+            }
+        }
+        println!("  {label}: active");
+        Ok(guard)
     }
-    println!("  {label}: active");
-    Ok(guard)
 }
 
 fn apply_mss_clamp(interface_name: &str, dry_run: bool) -> Result<FirewallGuard> {
@@ -2659,15 +3213,7 @@ fn cleanup_nft_table(table_name: &str) -> Result<()> {
 }
 
 fn build_tun_mtu_commands(interface_name: &str, mtu: usize) -> Result<Vec<Vec<String>>> {
-    if interface_name.trim().is_empty()
-        || interface_name
-            .chars()
-            .any(|character| character.is_control())
-    {
-        return Err(ShphError::InvalidArgument(
-            "TUN interface name is invalid for MTU configuration".into(),
-        ));
-    }
+    validate_tun_name(interface_name)?;
     validate_tun_mtu(mtu)?;
 
     if cfg!(target_os = "linux") {
@@ -2725,11 +3271,7 @@ fn build_control_plane_plan(
     control: &ControlPlaneConfig,
     interface_name: &str,
 ) -> Result<ControlPlanePlan> {
-    if interface_name.trim().is_empty() {
-        return Err(ShphError::InvalidArgument(
-            "interface name required for control-plane apply".into(),
-        ));
-    }
+    validate_tun_name(interface_name)?;
 
     let mut plan = ControlPlanePlan::default();
 
@@ -2849,6 +3391,7 @@ fn build_dns_apply_commands(servers: &[String], interface_name: &str) -> Result<
     if servers.is_empty() {
         return Ok(Vec::new());
     }
+    validate_tun_name(interface_name)?;
     for server in servers {
         server
             .parse::<IpAddr>()
@@ -2952,6 +3495,7 @@ fn restore_dns_family(interface_name: &str, family: &str) -> Result<()> {
 
 fn build_route_add_command(cidr: &str, interface_name: &str) -> Result<Vec<String>> {
     validate_cidr(cidr)?;
+    validate_tun_name(interface_name)?;
     if cfg!(target_os = "linux") {
         Ok(vec![
             "ip".to_string(),
@@ -2985,12 +3529,15 @@ fn build_route_add_command(cidr: &str, interface_name: &str) -> Result<Vec<Strin
 
 fn build_route_delete_command(cidr: &str, interface_name: &str) -> Result<Vec<String>> {
     validate_cidr(cidr)?;
+    validate_tun_name(interface_name)?;
     if cfg!(target_os = "linux") {
         Ok(vec![
             "ip".to_string(),
             "route".to_string(),
             "del".to_string(),
             cidr.to_string(),
+            "dev".to_string(),
+            interface_name.to_string(),
         ])
     } else if cfg!(target_os = "windows") {
         let (ip_addr, _) = parse_cidr(cidr)?;
@@ -3013,11 +3560,7 @@ fn build_route_delete_command(cidr: &str, interface_name: &str) -> Result<Vec<St
 }
 
 fn build_dns_restore_command(interface_name: &str, family: &str) -> Result<Vec<String>> {
-    if interface_name.trim().is_empty() {
-        return Err(ShphError::InvalidArgument(
-            "interface name required for dns restore".into(),
-        ));
-    }
+    validate_tun_name(interface_name)?;
     let family = match family {
         "ipv4" | "ipv6" => family,
         _ => {
@@ -4474,6 +5017,45 @@ mod tests {
     }
 
     #[test]
+    fn peer_policy_accepts_alias_and_public_key_selectors() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-cli-selector-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keystore.json");
+        let mut keystore = KeyStore::new(KeyStoreConfig::default()).unwrap();
+        let peer = KeyStore::new(KeyStoreConfig::default()).unwrap();
+        let peer_pubkey = peer.public_key_b64();
+        keystore.add_contact(shph_core::Contact {
+            alias: "peer".into(),
+            endpoint: shph_core::Endpoint {
+                host: "127.0.0.1".into(),
+                port: 7000,
+            },
+            pubkey_b64: peer_pubkey.clone(),
+            sign_pubkey_b64: Some(peer.identity.signing_public_b64()),
+        });
+        keystore.save(&path).unwrap();
+        let state = HandshakeState {
+            peer_fingerprint_hex: peer.fingerprint_hex(),
+            peer_signing_pubkey_b64: peer.identity.signing_public_b64(),
+            session_keys: shph_core::SessionKeys {
+                send_nonce: 0,
+                recv_nonce: 0,
+                send_key: [0; 32],
+                recv_key: [0; 32],
+            },
+            transcript_hash_hex: String::new(),
+        };
+
+        assert!(enforce_peer_policy(&path, "peer", &state, true).is_ok());
+        assert!(enforce_peer_policy(&path, &peer_pubkey, &state, true).is_ok());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn cidr_validation_checks_prefix() {
         assert!(validate_cidr("10.0.0.0/24").is_ok());
         assert!(validate_cidr("2001:db8::/64").is_ok());
@@ -4493,6 +5075,8 @@ mod tests {
         assert!(!del_cmd.is_empty());
         if cfg!(target_os = "windows") {
             assert!(del_cmd.contains(&"interface=shph0".to_string()));
+        } else if cfg!(target_os = "linux") {
+            assert!(del_cmd.ends_with(&["dev".to_string(), "shph0".to_string()]));
         }
         assert!(build_route_add_command("10.12.0.0/64", "shph0").is_err());
     }
@@ -4802,6 +5386,30 @@ mod tests {
                 if message.contains("symlinked QUIC certificate")
         ));
         assert_eq!(std::fs::read(&target).unwrap(), b"existing");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shamir_share_writer_rejects_symlinked_output_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "shph-cli-shamir-symlink-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        let real = dir.join("real");
+        let link = dir.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, &link).unwrap();
+        let shares = vec![shph_core::ShamirShare {
+            index: 1,
+            payload_b64: "AA==".into(),
+        }];
+
+        assert!(super::write_shamir_shares(&link, &shares).is_err());
+        assert!(!real.join("share-001.json").exists());
         std::fs::remove_dir_all(dir).ok();
     }
 

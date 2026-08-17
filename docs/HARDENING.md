@@ -11,6 +11,11 @@ Every increment here:
 - states its validation and host-evidence limits explicitly,
 - is captured in `CHANGELOG.md`.
 
+The reviewable threat-to-control map and publication checklist are maintained
+in `docs/SECURITY_EVIDENCE.md`. Native host and two-node evidence remains a
+separate release gate; source-level hardening and local tests must not be
+presented as proof of a live VPN deployment.
+
 ## Increment 1 — Crypto data-plane (`hardening-1`)
 
 File: `shph-core/src/crypto.rs`.
@@ -606,3 +611,187 @@ prints the Linux plan or Windows policy summary and does not require native TUN
 or elevation. This source-level change does not claim that privileged
 nftables/WFP mutation, crash-leak testing, Windows Wintun packet I/O, or
 two-host forwarding has been executed on the current development host.
+
+## Increment 25 — bounded untrusted inputs and aggregate handshake deadlines
+
+Date: 2026-08-15
+
+Files: `shph-core/src/crypto.rs`, `shph-core/src/handshake.rs`,
+`shph-core/src/keystore.rs`, `shph-core/src/net.rs`,
+`shph-core/src/roadmap.rs`, `shph-config/src/lib.rs`,
+`shph-transport/src/lib.rs`, `shph-identity/src/lib.rs`, and
+`shph-cli/src/main.rs`.
+
+- **Replay-state resource bound.** `ReplayWindow::new` clamps caller/config
+  input to 64–65,536 nonce positions before allocating or cloning the bitmap.
+  A large untrusted value can no longer create an unbounded receive-side
+  allocation/copy cost.
+- **Special-file refusal.** Keystore, configuration, audit, identity-provider,
+  file-adapter, control-plane, certificate, and secret-input readers now open
+  Unix paths with `O_NOFOLLOW | O_NONBLOCK` where applicable and verify the
+  opened object is a regular file. The equivalent Windows paths perform the
+  regular-file check after reparse-point validation. FIFOs, devices, and other
+  unsupported special files therefore fail closed instead of being accepted as
+  ordinary bounded documents.
+- **Handshake deadline is aggregate.** TCP connect, hello/cookie exchange, and
+  the fixed-size ML-KEM ciphertext frame share one deadline capped at 60
+  seconds. The line reader consumes exactly one byte at a time so a pipelined
+  PQ frame is not accidentally discarded, while the deadline prevents a
+  slowloris from resetting progress one read at a time.
+- **X25519 low-order input rejection.** Key derivation rejects an all-zero
+  X25519 shared secret after the authenticated peer hello is checked.
+- **Crash-durable keystore replacement.** Unix keystore saves now sync the
+  containing directory after the atomic rename, reducing the chance that a
+  completed replacement disappears after a sudden power loss.
+- **Safe infallible endpoint fallback.** The legacy `From<Endpoint>` adapter
+  degrades malformed input to `127.0.0.1:0`, never to an unspecified wildcard
+  address that could accidentally expose a listener.
+- **HKDF context arithmetic.** Public in-place HKDF derivation now rejects
+  aggregate context-length overflow instead of allowing a wrapped allocation or
+  slice boundary.
+
+The source-level hardening is covered by focused regression and static
+validation records. Full workspace check/test/Clippy execution belongs to the
+dedicated native-platform campaigns; see
+`docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` and
+`docs/TESTING.md` for the evidence boundary.
+
+## Increment 26 — canonical wire boundaries, safe adapter paths, and listener resilience
+
+Date: 2026-08-15
+
+Files: `shph-core/src/crypto.rs`, `shph-core/src/handshake.rs`,
+`shph-core/src/lib.rs`, `shph-core/src/roadmap.rs`, and
+`shph-transport/src/lib.rs`.
+
+- **Canonical AEAD nonce encoding.** Receive-side ChaCha20-Poly1305 framing now
+  rejects any non-zero byte in the reserved first four nonce bytes. A frame
+  therefore has one canonical SHPH encoding for each 64-bit counter.
+- **Outbound TCP frame bound.** TCP send helpers reject plaintext larger than
+  the existing 64 KiB encrypted-frame budget before encryption, so callers
+  cannot truncate a length cast or consume a nonce for a frame the receiver
+  would reject.
+- **Collision-resistant adapter paths.** Offline-mesh, data-mule, and shared
+  roadmap path helpers now retain a short readable prefix plus a
+  domain-separated digest of the original component. Distinct values such as
+  `a/b` and `a_b` no longer alias, and the offline session identifier is safe
+  on Windows as well as Unix.
+- **Bounded adapter configuration.** Public adapter validation and constructors
+  cap polling intervals at 60 seconds and offline replay-cache entries at
+  65,536. HKDF contexts are capped at 256 KiB, SHA-256 expansion output is
+  capped at 8,160 bytes, and peer policies accept at most 4,096 pins.
+- **Peer-local TCP failure handling.** Accept-loop timeout, early-close,
+  cookie, hello-write, and PQ-frame failures are recorded and dropped for the
+  current peer. The listener continues accepting until its single aggregate
+  operator deadline expires.
+
+Regression coverage includes non-canonical nonce rejection, oversized HKDF
+contexts and output, peer-policy limits, adapter path collision resistance and
+traversal confinement, bounded polling configuration, TCP send-size validation,
+and the existing malformed-peer listener survival test.
+
+Full Rust test/Clippy/build execution is a platform-campaign gate rather than a
+claim made from an arbitrary workstation. Current native Windows evidence is
+preserved in the dated validation record; see `docs/TESTING.md`.
+
+## Increment 27 — handshake state integrity, continuity, and pre-encryption bounds
+
+Date: 2026-08-15
+
+Files: `shph-core/src/handshake.rs`, `shph-identity/src/lib.rs`,
+`shph-transport/src/lib.rs`, `shph-cli/src/main.rs`,
+`shph-core/src/keystore.rs`, and `shph-config/src/lib.rs`.
+
+- **Local handshake-state binding.** `verify_hello_signature` now validates
+  that the caller-supplied local hello still matches the configured identity,
+  signing key, ephemeral key, nonce, profile, and post-quantum key material.
+  Public handshake APIs therefore cannot derive a session from a locally
+  tampered `HandshakeMaterial` object.
+- **Strict identity-record continuity.** Sequence-one records cannot name a
+  predecessor; every later record must name one, and a resolver update must
+  advance exactly one sequence and reference the previously accepted hash once
+  a predecessor has been accepted. Higher-numbered updates can no longer skip
+  an unseen chain link.
+- **Pre-encryption transport bounds.** Unshrouded QUIC payloads are rejected
+  before AEAD allocation when they cannot fit the 16 KiB datagram budget.
+  Offline-mesh and data-mule senders also reject payloads above their configured
+  file bound before encrypting them.
+- **Safer rollback and file boundaries.** Linux route cleanup now scopes
+  deletion to the SHPH interface. Control-plane temporary files are removed
+  when permission or path revalidation fails, and config, keystore, secret
+  input, and control-plane loads reject symlinked parent components as well as
+  final-component substitutions.
+
+Focused regression coverage was added for local handshake-material mismatch,
+identity continuity, unshrouded QUIC frame capacity, file-adapter payload
+capacity, and interface-scoped Linux route deletion. The complete native
+Windows execution record is maintained separately; see `docs/TESTING.md` and
+the dated validation report.
+
+## Increment 28 - failure-path cleanup, anchored discovery, and privileged-name validation
+
+Date: 2026-08-15
+
+Files: `shph-core/src/crypto.rs`, `shph-core/src/keystore.rs`,
+`shph-core/src/roadmap.rs`, `shph-core/src/handshake.rs`,
+`shph-config/src/lib.rs`,
+`shph-identity/src/lib.rs`, `shph-tun/src/lib.rs`, and
+`shph-cli/src/main.rs`.
+
+- **Secret-file failure cleanup.** Keystore saves now remove their temporary
+  file when permission changes, writes, fsyncs, reparse checks, replacement,
+  or parent-directory synchronization fail. Configuration saves apply the
+  same cleanup to post-write path revalidation failures.
+- **Reduced resident signing-key duplication.** `IdentityKeyPair` retains the
+  Ed25519 seed and public bytes, but no longer keeps a second long-lived
+  `ring::Ed25519KeyPair` private-key copy. A signing object is reconstructed
+  only for the individual signature operation.
+- **Audit replacement cleanup and durability.** Ratchet-audit pruning removes
+  its temporary journal on every failure path and syncs the containing
+  directory after replacement.
+- **Anchored identity discovery.** A resolver with no previously accepted
+  state now accepts only sequence-one records. A signed sequence-two record
+  cannot bootstrap a subject while naming an unseen predecessor hash.
+- **Handshake field separation.** Peer hello verification rejects inline PQ
+  ciphertext metadata because the ciphertext is transported as a separate
+  authenticated frame, and it rejects PQ public keys whose decoded length is
+  not exactly the ML-KEM-768 public-key size.
+- **Privileged interface validation.** The strict TUN interface-name validator
+  is shared with CLI MTU, route, DNS, killswitch, and MSS-clamp paths. `up`
+  validates the name before any optional firewall mutation, preventing an
+  invalid configuration from reaching privileged command construction.
+
+Regression coverage includes unanchored initial identity updates, inline
+PQ-ciphertext rejection, and malformed PQ public-key lengths. The full Rust
+test matrix is a dedicated native-platform release gate and is recorded
+separately from local workstation diagnostics.
+
+## Increment 29 — deadline-aware resolution, envelope-safe adapters, and pin compatibility
+
+Date: 2026-08-15
+
+Files: `shph-transport/src/lib.rs`, `shph-identity/src/lib.rs`,
+`shph-core/src/crypto.rs`, and `shph-core/src/handshake.rs`.
+
+- **Aggregate deadline includes hostname resolution.** TCP and experimental
+  QUIC clients now resolve hostnames through a bounded worker pool and wait
+  only for the remaining handshake deadline. Literal socket addresses retain
+  a fast path, and resolver queues are bounded so stalled system lookups
+  cannot create an unbounded thread or request population.
+- **Envelope-safe file-adapter capacity.** Offline-mesh and data-mule senders
+  calculate a conservative plaintext capacity from the configured serialized
+  envelope limit, AEAD nonce/tag overhead, and base64 expansion before
+  encrypting. The existing serialized-envelope check remains as a final
+  defense for lower-level writers.
+- **Identity pin compatibility is fail-closed.** `IdentityRecord::to_peer_pin`
+  now refuses a currently valid operational Ed25519 signing key because the
+  current `shph-core` handshake can emit only the root `IdentityKeyPair`
+  signing key. Expired operational keys remain ignored and fall back to the
+  root key.
+- **Regression build coverage is complete.** Test-only cookie helpers no
+  longer trigger strict-Clippy dead-code failures, and all workspace test
+  targets compile and link under the available supplemental compatibility path.
+
+Native runtime test execution is covered by the dedicated Windows validation
+campaign. The GNU compatibility path is supplemental compile-only evidence,
+not a runtime or release claim. See `docs/TESTING.md` for the evidence boundary.

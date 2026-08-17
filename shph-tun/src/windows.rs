@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 use shph_core::{Result, ShphError};
 use std::ffi::c_void;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -73,7 +73,11 @@ impl WintunApi {
     pub fn load(path: &Path) -> Result<Self> {
         validate_runtime_path(path)?;
         let application_path = application_local_runtime_path(path)?;
-        verify_runtime_hash(&application_path)?;
+        // Keep the verified DLL open with delete/write sharing disabled while
+        // LoadLibraryExW resolves the same path. This prevents a writable
+        // application directory from swapping the file between hashing and
+        // loading.
+        let verified_runtime = verify_runtime_hash(&application_path)?;
         if !is_process_elevated()? {
             return Err(ShphError::PermissionDenied(
                 "Administrator elevation is required before loading Wintun".into(),
@@ -100,6 +104,7 @@ impl WintunApi {
         // LoadLibraryExW. `from_module` either takes ownership or returns an
         // error, in which case this function frees the handle below.
         let result = unsafe { Self::from_module(module, application_path) };
+        drop(verified_runtime);
         if result.is_err() {
             // SAFETY: `module` was returned by LoadLibraryExW and remains
             // owned by this error path.
@@ -396,12 +401,12 @@ fn application_local_runtime_path(path: &Path) -> Result<PathBuf> {
         ShphError::Unsupported("current executable has no application directory".into())
     })?;
     let runtime = application_dir.join(path);
-    shph_core::ensure_not_reparse_point(application_dir)?;
-    shph_core::ensure_not_reparse_point(&runtime)?;
+    shph_core::ensure_no_reparse_components(application_dir)?;
+    shph_core::ensure_no_reparse_components(&runtime)?;
     Ok(runtime)
 }
 
-fn verify_runtime_hash(path: &Path) -> Result<()> {
+fn verify_runtime_hash(path: &Path) -> Result<File> {
     let expected_text = std::env::var(WINTUN_SHA256_ENV).map_err(|_| {
         ShphError::Config(format!(
             "{WINTUN_SHA256_ENV} must be set to the expected SHA-256 of the application-local {WINTUN_DLL}"
@@ -409,7 +414,14 @@ fn verify_runtime_hash(path: &Path) -> Result<()> {
     })?;
     let expected = parse_sha256_hex(&expected_text)?;
 
-    let file = File::open(path).map_err(ShphError::Io)?;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(ShphError::Io)?;
     let metadata = file.metadata().map_err(ShphError::Io)?;
     if !metadata.file_type().is_file() {
         return Err(ShphError::Unsupported(
@@ -423,7 +435,7 @@ fn verify_runtime_hash(path: &Path) -> Result<()> {
         )));
     }
 
-    let mut reader = file.take(MAX_WINTUN_DLL_BYTES.saturating_add(1));
+    let mut reader = (&file).take(MAX_WINTUN_DLL_BYTES.saturating_add(1));
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut total = 0u64;
@@ -448,7 +460,7 @@ fn verify_runtime_hash(path: &Path) -> Result<()> {
             "application-local Wintun SHA-256 does not match {WINTUN_SHA256_ENV}"
         )));
     }
-    Ok(())
+    Ok(file)
 }
 
 fn parse_sha256_hex(value: &str) -> Result<[u8; 32]> {

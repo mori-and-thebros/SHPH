@@ -11,6 +11,7 @@ use ml_kem::kem::{Decapsulate, Encapsulate, KeyExport};
 use ml_kem::ml_kem_768::{Ciphertext, DecapsulationKey, EncapsulationKey};
 use ml_kem::{FromSeed, Seed};
 use ring::rand::{SecureRandom, SystemRandom};
+use zeroize::Zeroize;
 
 /// ML-KEM-768 ciphertext size in bytes (FIPS-203). Used by transports to bound
 /// the follow-up PQ-ciphertext read so a malicious peer cannot stream an
@@ -31,8 +32,10 @@ impl PqcKeypair {
         let rng = SystemRandom::new();
         let mut seed_bytes = [0u8; 64];
         SecureRandom::fill(&rng, &mut seed_bytes)?;
-        let seed = Seed::from(seed_bytes);
+        let mut seed = Seed::from(seed_bytes);
         let (decap_key, encap_key) = ml_kem::ml_kem_768::MlKem768::from_seed(&seed);
+        seed.zeroize();
+        seed_bytes.zeroize();
         Ok(Self {
             encap_key,
             decap_key,

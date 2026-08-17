@@ -516,6 +516,7 @@ checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "ctutils",
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -650,6 +651,7 @@ dependencies = [
  "pkcs8",
  "rand_core 0.10.1",
  "sha3",
+ "zeroize",
 ]
 
 [[package]]
@@ -661,6 +663,7 @@ dependencies = [
  "ctutils",
  "hybrid-array",
  "num-traits",
+ "zeroize",
 ]
 
 [[package]]
@@ -1092,7 +1095,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shph-config"
-version = "0.6.1-dev"
+version = "0.6.2-dev"
 dependencies = [
  "anyhow",
  "clap",
@@ -1108,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "shph-core"
-version = "0.6.1-dev"
+version = "0.6.2-dev"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1144,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "shph-transport"
-version = "0.6.1-dev"
+version = "0.6.2-dev"
 dependencies = [
  "base64 0.21.7",
  "bytes",
@@ -1163,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "shph-tun"
-version = "0.6.1-dev"
+version = "0.6.2-dev"
 dependencies = [
  "libc",
  "sha2",

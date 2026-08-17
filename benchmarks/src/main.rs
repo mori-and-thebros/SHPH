@@ -1,7 +1,12 @@
 use shph_core::{
     absorb_responder_pq, build_hello_with_profile, decode_cell, decode_cell_payload, encode_cell,
-    finalize_initiator_pq, HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy,
-    ReceiveCipher, ReplayWindow, SendCipher, BALANCED, BULK, LOW_LATENCY, RANDOMIZED_LAB,
+    finalize_initiator_pq, HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy, ReceiveCipher,
+    ReplayWindow, SendCipher, BALANCED, BULK, LOW_LATENCY, RANDOMIZED_LAB,
+};
+use shph_identity::{
+    DiscoveryProvider, DiscoveryResolver, IdentityEndpoint, IdentityError, IdentityId,
+    IdentityRecord, LocalDirectoryProvider, PublishReceipt, VerificationPolicy,
+    MAX_CAPABILITIES, MAX_ENDPOINTS, MAX_RECORD_BYTES,
 };
 use shph_transport::shroud2::{
     decode_datagram, encode_datagram, MorphologyEngine, MorphologyProfile,
@@ -17,7 +22,7 @@ use std::net::UdpSocket;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -26,6 +31,48 @@ struct CountingAllocator;
 
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct StaticIdentityProvider {
+    id: &'static str,
+    records: Vec<IdentityRecord>,
+}
+
+impl DiscoveryProvider for StaticIdentityProvider {
+    fn provider_id(&self) -> &str {
+        self.id
+    }
+
+    fn publish(&self, record: &IdentityRecord) -> shph_identity::Result<PublishReceipt> {
+        Ok(PublishReceipt {
+            record_hash: record.record_hash()?,
+        })
+    }
+
+    fn fetch(&self, _subject: &IdentityId) -> shph_identity::Result<Vec<IdentityRecord>> {
+        Ok(self.records.clone())
+    }
+}
+
+struct FailingIdentityProvider;
+
+impl DiscoveryProvider for FailingIdentityProvider {
+    fn provider_id(&self) -> &str {
+        "failing"
+    }
+
+    fn publish(&self, _record: &IdentityRecord) -> shph_identity::Result<PublishReceipt> {
+        Err(IdentityError::ProviderUnavailable(
+            "benchmark provider unavailable".into(),
+        ))
+    }
+
+    fn fetch(&self, _subject: &IdentityId) -> shph_identity::Result<Vec<IdentityRecord>> {
+        Err(IdentityError::ProviderUnavailable(
+            "benchmark provider unavailable".into(),
+        ))
+    }
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -48,6 +95,8 @@ enum Suite {
     Shroud,
     Quic,
     Scalability,
+    Identity,
+    Wire,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,10 +142,33 @@ struct MeasurementStart {
     cpu_time_ns: Option<u128>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct WireMetrics {
+    wire_bytes_per_packet: Option<f64>,
+    overhead_bytes: Option<f64>,
+    overhead_pct: Option<f64>,
+    packets_per_sec: Option<f64>,
+}
+
+const WIRE_UDP_IPV4_PAYLOAD_MTU: usize = 1_472;
+const WIRE_AEAD_OVERHEAD: usize = 12 + 16;
+const WIRE_MAX_AEAD_PAYLOAD: usize = WIRE_UDP_IPV4_PAYLOAD_MTU - WIRE_AEAD_OVERHEAD;
+const WIRE_PAYLOAD_SIZES: &[usize] = &[
+    64,
+    256,
+    1_024,
+    1_200,
+    1_280,
+    1_400,
+    1_420,
+    WIRE_MAX_AEAD_PAYLOAD,
+];
+const WIRE_PATH_MTU: usize = WIRE_UDP_IPV4_PAYLOAD_MTU;
+
 fn main() {
     let options = parse_options();
     print_metadata(options);
-    println!("measurement,profile,scenario,payload_bytes,samples,min_ns,p50_ns,p95_ns,p99_ns,p99_9_ns,max_ns,mean_ns,elapsed_ms,goodput_mbps,wire_mbps,cpu_pct,alloc_calls,alloc_bytes,rss_kib,peak_rss_kib,notes");
+    println!("measurement,profile,scenario,payload_bytes,samples,min_ns,p50_ns,p95_ns,p99_ns,p99_9_ns,max_ns,mean_ns,elapsed_ms,goodput_mbps,wire_mbps,cpu_pct,alloc_calls,alloc_bytes,rss_kib,peak_rss_kib,wire_bytes_per_packet,overhead_bytes,overhead_pct,packets_per_sec,notes");
 
     if matches!(options.suite, Suite::All | Suite::Core) {
         bench_handshake(options);
@@ -124,6 +196,12 @@ fn main() {
     }
     if matches!(options.suite, Suite::All | Suite::Scalability) {
         bench_long_session(options);
+    }
+    if matches!(options.suite, Suite::All | Suite::Identity) {
+        bench_identity(options);
+    }
+    if matches!(options.suite, Suite::All | Suite::Wire) {
+        bench_wire(options);
     }
 }
 
@@ -168,10 +246,12 @@ fn parse_options() -> Options {
             "--help" | "-h" => {
                 println!("Usage: shph-benchmarks [OPTIONS]");
                 println!("  --profile secure-default|classical-lab");
-                println!("  --suite all|core|dataplane|resource|shroud|quic|scalability");
+                println!(
+                    "  --suite all|core|dataplane|resource|shroud|quic|scalability|identity|wire"
+                );
                 println!("  --iterations N   latency samples (default: 100)");
                 println!("  --frames N       sustained/load frames (default: 10000)");
-                println!("Output includes p50/p95/p99/p99.9 latency, goodput, wire rate, CPU, RSS, and allocations.");
+                println!("Output includes latency, goodput, wire rate, packet overhead, CPU, RSS, and allocations.");
                 std::process::exit(0);
             }
             other => usage(&format!("unknown argument: {other}")),
@@ -210,7 +290,11 @@ fn parse_suite(value: &str) -> Suite {
         "shroud" => Suite::Shroud,
         "quic" => Suite::Quic,
         "scalability" => Suite::Scalability,
-        _ => usage("suite must be all, core, dataplane, resource, shroud, quic, or scalability"),
+        "identity" => Suite::Identity,
+        "wire" => Suite::Wire,
+        _ => usage(
+            "suite must be all, core, dataplane, resource, shroud, quic, scalability, identity, or wire",
+        ),
     }
 }
 
@@ -393,6 +477,29 @@ fn emit_latency(
     runtime: RuntimeStats,
     notes: &str,
 ) {
+    emit_latency_with_wire(
+        name,
+        options,
+        scenario,
+        payload_bytes,
+        samples,
+        runtime,
+        WireMetrics::default(),
+        notes,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_latency_with_wire(
+    name: &str,
+    options: Options,
+    scenario: &str,
+    payload_bytes: usize,
+    samples: &[u128],
+    runtime: RuntimeStats,
+    wire: WireMetrics,
+    notes: &str,
+) {
     let stats = stats_from_samples(samples);
     let cpu_pct = runtime
         .cpu_pct
@@ -403,8 +510,12 @@ fn emit_latency(
     let peak_rss_kib = runtime
         .peak_rss_kib
         .map_or_else(|| "-".to_string(), |value| value.to_string());
+    let wire_bytes = format_wire_metric(wire.wire_bytes_per_packet);
+    let overhead_bytes = format_wire_metric(wire.overhead_bytes);
+    let overhead_pct = format_wire_metric(wire.overhead_pct);
+    let packets_per_sec = format_wire_metric(wire.packets_per_sec);
     println!(
-        "{name},{profile},{scenario},{payload_bytes},{samples},{min},{p50},{p95},{p99},{p999},{max},{mean},{elapsed},-,-,{cpu},{alloc_calls},{alloc_bytes},{rss},{peak},{notes}",
+        "{name},{profile},{scenario},{payload_bytes},{samples},{min},{p50},{p95},{p99},{p999},{max},{mean},{elapsed},-,-,{cpu},{alloc_calls},{alloc_bytes},{rss},{peak},{wire_bytes},{overhead_bytes},{overhead_pct},{packets_per_sec},{notes}",
         name = name,
         profile = options.profile.as_str(),
         scenario = scenario,
@@ -423,6 +534,10 @@ fn emit_latency(
         alloc_bytes = runtime.alloc.bytes,
         rss = rss_kib,
         peak = peak_rss_kib,
+        wire_bytes = wire_bytes,
+        overhead_bytes = overhead_bytes,
+        overhead_pct = overhead_pct,
+        packets_per_sec = packets_per_sec,
         notes = notes,
     );
 }
@@ -436,6 +551,29 @@ fn emit_rate(
     wire_mbps: f64,
     notes: &str,
 ) {
+    emit_rate_with_wire(
+        options,
+        scenario,
+        payload_bytes,
+        runtime,
+        goodput_mbps,
+        wire_mbps,
+        WireMetrics::default(),
+        notes,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_rate_with_wire(
+    options: Options,
+    scenario: &str,
+    payload_bytes: usize,
+    runtime: RuntimeStats,
+    goodput_mbps: f64,
+    wire_mbps: f64,
+    wire_metrics: WireMetrics,
+    notes: &str,
+) {
     let cpu_pct = runtime
         .cpu_pct
         .map_or_else(|| "-".to_string(), |value| format!("{value:.2}"));
@@ -447,8 +585,12 @@ fn emit_rate(
         .map_or_else(|| "-".to_string(), |value| value.to_string());
     let goodput = format!("{goodput_mbps:.3}");
     let wire = format!("{wire_mbps:.3}");
+    let wire_bytes = format_wire_metric(wire_metrics.wire_bytes_per_packet);
+    let overhead_bytes = format_wire_metric(wire_metrics.overhead_bytes);
+    let overhead_pct = format_wire_metric(wire_metrics.overhead_pct);
+    let packets_per_sec = format_wire_metric(wire_metrics.packets_per_sec);
     println!(
-        "rate,{},{},{},1,-,-,-,-,-,-,-,{},{},{},{},{},{},{},{},{}",
+        "rate,{},{},{},1,-,-,-,-,-,-,-,{},{},{},{},{},{},{},{},{},{},{},{},{}",
         options.profile.as_str(),
         scenario,
         payload_bytes,
@@ -460,8 +602,442 @@ fn emit_rate(
         runtime.alloc.bytes,
         rss_kib,
         peak_rss_kib,
+        wire_bytes,
+        overhead_bytes,
+        overhead_pct,
+        packets_per_sec,
         notes
     );
+}
+
+fn format_wire_metric(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| format!("{value:.3}"))
+}
+
+fn wire_latency_metrics(payload_bytes: usize, wire_bytes: usize) -> WireMetrics {
+    let overhead_bytes = wire_bytes.saturating_sub(payload_bytes);
+    WireMetrics {
+        wire_bytes_per_packet: Some(wire_bytes as f64),
+        overhead_bytes: Some(overhead_bytes as f64),
+        overhead_pct: if payload_bytes == 0 {
+            None
+        } else {
+            Some(overhead_bytes as f64 / payload_bytes as f64 * 100.0)
+        },
+        packets_per_sec: None,
+    }
+}
+
+fn wire_rate_metrics(
+    payload_bytes: usize,
+    wire_bytes: usize,
+    packets: usize,
+    elapsed_ns: u128,
+) -> WireMetrics {
+    let seconds = elapsed_ns as f64 / 1_000_000_000.0;
+    let packets_per_sec = packets as f64 / seconds;
+    let wire_bytes_per_packet = wire_bytes as f64 / packets as f64;
+    let overhead_bytes = (wire_bytes as f64 / packets as f64) - payload_bytes as f64;
+    WireMetrics {
+        wire_bytes_per_packet: Some(wire_bytes_per_packet),
+        overhead_bytes: Some(overhead_bytes),
+        overhead_pct: if payload_bytes == 0 {
+            None
+        } else {
+            Some(overhead_bytes / payload_bytes as f64 * 100.0)
+        },
+        packets_per_sec: Some(packets_per_sec),
+    }
+}
+
+fn bench_identity(options: Options) {
+    let now = 1_800_000_000;
+    let identity = IdentityKeyPair::generate().expect("identity benchmark key");
+    let baseline = IdentityRecord::from_current_identity(
+        &identity,
+        1,
+        now - 10,
+        now + 3_600,
+        vec![IdentityEndpoint::new("tcp", "198.51.100.10:51820", 10).expect("benchmark endpoint")],
+        vec!["transport:tcp".into(), "kem:ml-kem-768".into()],
+    )
+    .expect("identity benchmark record");
+    let baseline_json = baseline.to_json_bytes().expect("identity benchmark JSON");
+    let policy = VerificationPolicy::at(now);
+
+    let mut signing_samples = Vec::with_capacity(options.iterations);
+    let signing_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        let signed = IdentityRecord::from_current_identity(
+            &identity,
+            1,
+            now - 10,
+            now + 3_600,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("identity record sign");
+        black_box(signed);
+        signing_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_record_sign",
+        options,
+        "identity_record_sign",
+        baseline_json.len(),
+        &signing_samples,
+        finish_measurement(signing_start),
+        "local_ed25519_record_construction_and_signing",
+    );
+
+    let mut verify_samples = Vec::with_capacity(options.iterations);
+    let verify_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(baseline.verify(policy).expect("identity record verify"));
+        verify_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_record_verify",
+        options,
+        "identity_record_verify",
+        baseline_json.len(),
+        &verify_samples,
+        finish_measurement(verify_start),
+        "local_signature_freshness_and_structure_verification",
+    );
+
+    let mut parse_samples = Vec::with_capacity(options.iterations);
+    let parse_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(IdentityRecord::from_json_bytes(&baseline_json).expect("identity record parse"));
+        parse_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_record_parse",
+        options,
+        "identity_record_parse",
+        baseline_json.len(),
+        &parse_samples,
+        finish_measurement(parse_start),
+        "bounded_json_decode_and_structure_validation",
+    );
+
+    let provider_root = loop {
+        let candidate = std::env::temp_dir().join(format!(
+            "shph-identity-benchmark-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("benchmark clock")
+                .as_nanos(),
+            TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create identity benchmark directory: {error}"),
+        }
+    };
+    let provider =
+        LocalDirectoryProvider::new(&provider_root).expect("identity benchmark provider");
+    provider
+        .publish(&baseline)
+        .expect("identity benchmark publish");
+    let providers: [&dyn DiscoveryProvider; 1] = [&provider];
+    let mut resolver = DiscoveryResolver::new();
+    let mut resolve_samples = Vec::with_capacity(options.iterations);
+    let resolve_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(
+            resolver
+                .resolve(&baseline.subject, &providers, policy)
+                .expect("identity benchmark resolve"),
+        );
+        resolve_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_provider_resolve",
+        options,
+        "identity_provider_resolve",
+        baseline_json.len(),
+        &resolve_samples,
+        finish_measurement(resolve_start),
+        "local_plugin_fetch_verify_and_idempotent_resolve",
+    );
+
+    let mut publish_samples = Vec::with_capacity(options.iterations);
+    let publish_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(
+            provider
+                .publish(&baseline)
+                .expect("identity benchmark publish"),
+        );
+        publish_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_provider_publish",
+        options,
+        "identity_provider_publish_filesystem_idempotent",
+        baseline_json.len(),
+        &publish_samples,
+        finish_measurement(publish_start),
+        "local_plugin_idempotent_publish_and_conflict_check",
+    );
+
+    let memory_provider = StaticIdentityProvider {
+        id: "memory",
+        records: vec![baseline.clone()],
+    };
+    let memory_providers: [&dyn DiscoveryProvider; 1] = [&memory_provider];
+    let mut memory_resolver = DiscoveryResolver::new();
+    let mut memory_samples = Vec::with_capacity(options.iterations);
+    let memory_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(
+            memory_resolver
+                .resolve(&baseline.subject, &memory_providers, policy)
+                .expect("in-memory identity resolution"),
+        );
+        memory_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_provider_resolve",
+        options,
+        "identity_provider_resolve_in_memory",
+        baseline_json.len(),
+        &memory_samples,
+        finish_measurement(memory_start),
+        "in_memory_plugin_fetch_verify_and_idempotent_resolve",
+    );
+
+    let failing_provider = FailingIdentityProvider;
+    let fanout_providers: [&dyn DiscoveryProvider; 2] = [&memory_provider, &failing_provider];
+    let mut fanout_resolver = DiscoveryResolver::new();
+    let mut fanout_samples = Vec::with_capacity(options.iterations);
+    let fanout_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(
+            fanout_resolver
+                .resolve(&baseline.subject, &fanout_providers, policy)
+                .expect("healthy provider should survive one failed provider"),
+        );
+        fanout_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_provider_resolve",
+        options,
+        "identity_provider_resolve_fanout_one_failure",
+        baseline_json.len(),
+        &fanout_samples,
+        finish_measurement(fanout_start),
+        "two_plugin_fanout_with_one_provider_failure",
+    );
+
+    let descriptor = memory_provider.descriptor();
+    let mut descriptor_samples = Vec::with_capacity(options.iterations);
+    let descriptor_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(descriptor.validate().is_ok());
+        descriptor_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_plugin_descriptor_validate",
+        options,
+        "identity_plugin_descriptor_validate",
+        0,
+        &descriptor_samples,
+        finish_measurement(descriptor_start),
+        "bounded_plugin_api_and_capability_metadata_validation",
+    );
+
+    let malformed_json = br#"{"version":1,"keys":"invalid"}"#;
+    let mut malformed_samples = Vec::with_capacity(options.iterations);
+    let malformed_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(IdentityRecord::from_json_bytes(malformed_json).is_err());
+        malformed_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_record_reject",
+        options,
+        "identity_record_reject_malformed",
+        malformed_json.len(),
+        &malformed_samples,
+        finish_measurement(malformed_start),
+        "malformed_record_fail_closed",
+    );
+
+    let oversized_json = vec![b'x'; MAX_RECORD_BYTES + 1];
+    let mut oversized_samples = Vec::with_capacity(options.iterations);
+    let oversized_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(IdentityRecord::from_json_bytes(&oversized_json).is_err());
+        oversized_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_record_reject",
+        options,
+        "identity_record_reject_oversized",
+        oversized_json.len(),
+        &oversized_samples,
+        finish_measurement(oversized_start),
+        "record_size_limit_rejection",
+    );
+
+    let bounded_endpoints = (0..MAX_ENDPOINTS)
+        .map(|index| {
+            IdentityEndpoint::new(
+                "tcp",
+                format!("198.51.100.{}:51820", index % 255),
+                index as u16,
+            )
+            .expect("bounded endpoint")
+        })
+        .collect();
+    let bounded_capabilities = (0..MAX_CAPABILITIES)
+        .map(|index| format!("capability-{index}-{}", "x".repeat(220)))
+        .collect();
+    let bounded_record = IdentityRecord::from_current_identity(
+        &identity,
+        1,
+        now - 10,
+        now + 3_600,
+        bounded_endpoints,
+        bounded_capabilities,
+    )
+    .expect("bounded identity record");
+    let bounded_json = bounded_record
+        .to_json_bytes()
+        .expect("bounded identity JSON");
+
+    let mut bounded_parse_samples = Vec::with_capacity(options.iterations);
+    let bounded_parse_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(IdentityRecord::from_json_bytes(&bounded_json).expect("bounded parse"));
+        bounded_parse_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_record_parse",
+        options,
+        "identity_record_parse_near_structure_limits",
+        bounded_json.len(),
+        &bounded_parse_samples,
+        finish_measurement(bounded_parse_start),
+        "maximum_endpoint_and_capability_counts",
+    );
+
+    let mut bounded_verify_samples = Vec::with_capacity(options.iterations);
+    let bounded_verify_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        black_box(
+            bounded_record
+                .verify(policy)
+                .expect("bounded identity verification"),
+        );
+        bounded_verify_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_record_verify",
+        options,
+        "identity_record_verify_near_structure_limits",
+        bounded_json.len(),
+        &bounded_verify_samples,
+        finish_measurement(bounded_verify_start),
+        "maximum_endpoint_and_capability_counts",
+    );
+
+    let other_identity = IdentityKeyPair::generate().expect("invalid-candidate identity");
+    let invalid_candidate = IdentityRecord::from_current_identity(
+        &other_identity,
+        1,
+        now - 10,
+        now + 3_600,
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("invalid candidate record");
+    let invalid_size = invalid_candidate
+        .to_json_bytes()
+        .expect("invalid candidate JSON")
+        .len();
+    let invalid_provider = StaticIdentityProvider {
+        id: "invalid",
+        records: vec![invalid_candidate],
+    };
+    let invalid_providers: [&dyn DiscoveryProvider; 1] = [&invalid_provider];
+    let mut invalid_samples = Vec::with_capacity(options.iterations);
+    let invalid_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        let mut resolver = DiscoveryResolver::new();
+        black_box(
+            resolver
+                .resolve(&baseline.subject, &invalid_providers, policy)
+                .is_err(),
+        );
+        invalid_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_provider_reject",
+        options,
+        "identity_provider_reject_subject_mismatch",
+        invalid_size,
+        &invalid_samples,
+        finish_measurement(invalid_start),
+        "candidate_subject_mismatch_rejected_before_signature_verification",
+    );
+
+    let mut conflict = baseline.clone();
+    conflict.endpoints[0].priority = conflict.endpoints[0].priority.saturating_add(1);
+    conflict.signatures.clear();
+    conflict
+        .sign_with_identity(&identity)
+        .expect("conflicting identity record");
+    let conflict_left = StaticIdentityProvider {
+        id: "conflict-left",
+        records: vec![baseline.clone()],
+    };
+    let conflict_right = StaticIdentityProvider {
+        id: "conflict-right",
+        records: vec![conflict.clone()],
+    };
+    let conflict_providers: [&dyn DiscoveryProvider; 2] = [&conflict_left, &conflict_right];
+    let mut conflict_samples = Vec::with_capacity(options.iterations);
+    let conflict_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        let mut resolver = DiscoveryResolver::new();
+        black_box(
+            resolver
+                .resolve(&baseline.subject, &conflict_providers, policy)
+                .is_err(),
+        );
+        conflict_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        "identity_provider_reject",
+        options,
+        "identity_provider_reject_conflicting_same_sequence",
+        bounded_json.len(),
+        &conflict_samples,
+        finish_measurement(conflict_start),
+        "same_sequence_conflict_fail_closed",
+    );
+
+    std::fs::remove_dir_all(provider_root).ok();
 }
 
 fn bench_handshake(options: Options) {
@@ -473,6 +1049,7 @@ fn bench_handshake(options: Options) {
         let sample_start = Instant::now();
         let mut init = build_hello_with_profile(&initiator, options.profile).expect("init hello");
         let mut resp = build_hello_with_profile(&responder, options.profile).expect("resp hello");
+        let initiator_hello = init.local_hello.clone();
         if options.profile.uses_pqc() {
             let ct = finalize_initiator_pq(
                 &initiator,
@@ -484,7 +1061,7 @@ fn bench_handshake(options: Options) {
             absorb_responder_pq(
                 &responder,
                 &mut resp,
-                &init.local_hello,
+                &initiator_hello,
                 &ct,
                 &PeerPolicy::single(PeerPin::for_identity(&initiator)),
             )
@@ -501,7 +1078,7 @@ fn bench_handshake(options: Options) {
         let resp_state = shph_core::verify_and_derive(
             &responder,
             &resp,
-            &init.local_hello,
+            &initiator_hello,
             false,
             &shph_core::PeerPolicy::single(shph_core::PeerPin::for_identity(&initiator)),
         )
@@ -580,6 +1157,197 @@ fn bench_dataplane(options: Options, payload_bytes: usize) {
         wire_rate,
         "in_memory_aead_goodput; not TUN or socket throughput",
     );
+}
+
+fn bench_wire(options: Options) {
+    for &payload_bytes in WIRE_PAYLOAD_SIZES {
+        bench_wire_aead_latency(options, payload_bytes);
+        bench_wire_aead_rate(options, payload_bytes);
+        bench_wire_udp_loopback(options, payload_bytes);
+    }
+    bench_wire_shroud2(options);
+}
+
+fn bench_wire_aead_latency(options: Options, payload_bytes: usize) {
+    let payload = vec![0x4d; payload_bytes];
+    let mut sender = SendCipher::new([0x51; 32]);
+    let mut encode_samples = Vec::with_capacity(options.iterations);
+    let mut wire_bytes = 0usize;
+    let encode_start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        let encrypted = sender.encrypt(&payload).expect("wire AEAD encode");
+        wire_bytes = encrypted.len();
+        black_box(encrypted);
+        encode_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency_with_wire(
+        "wire_aead_encode",
+        options,
+        &format!("aead_encode_{payload_bytes}"),
+        payload_bytes,
+        &encode_samples,
+        finish_measurement(encode_start),
+        wire_latency_metrics(payload_bytes, wire_bytes),
+        "in_memory_chacha20_poly1305_encode;udp_ip_headers_excluded;aead_overhead_bytes=28",
+    );
+
+    let mut preparation_sender = SendCipher::new([0x52; 32]);
+    let frames = (0..options.iterations)
+        .map(|_| {
+            preparation_sender
+                .encrypt(&payload)
+                .expect("wire AEAD frame")
+        })
+        .collect::<Vec<_>>();
+    let wire_bytes = frames.first().map_or(0, Vec::len);
+    let mut receiver = ReceiveCipher::new_with_replay_window([0x52; 32], 128);
+    let mut decode_samples = Vec::with_capacity(options.iterations);
+    let decode_start = begin_measurement();
+    for frame in &frames {
+        let sample_start = Instant::now();
+        let decrypted = receiver.decrypt(frame).expect("wire AEAD decode");
+        black_box(decrypted);
+        decode_samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency_with_wire(
+        "wire_aead_decode",
+        options,
+        &format!("aead_decode_{payload_bytes}"),
+        payload_bytes,
+        &decode_samples,
+        finish_measurement(decode_start),
+        wire_latency_metrics(payload_bytes, wire_bytes),
+        "in_memory_chacha20_poly1305_decode;udp_ip_headers_excluded;aead_overhead_bytes=28",
+    );
+}
+
+fn bench_wire_aead_rate(options: Options, payload_bytes: usize) {
+    let payload = vec![0x4d; payload_bytes];
+    let mut sender = SendCipher::new([0x53; 32]);
+    let mut receiver = ReceiveCipher::new_with_replay_window([0x53; 32], 128);
+    let start = begin_measurement();
+    let mut wire_bytes = 0usize;
+    for _ in 0..options.frames {
+        let encrypted = sender.encrypt(&payload).expect("wire AEAD encode");
+        wire_bytes += encrypted.len();
+        let decrypted = receiver.decrypt(&encrypted).expect("wire AEAD decode");
+        black_box(decrypted);
+    }
+    let runtime = finish_measurement(start);
+    let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
+    emit_rate_with_wire(
+        options,
+        &format!("aead_roundtrip_{payload_bytes}"),
+        payload_bytes,
+        runtime,
+        payload.len() as f64 * options.frames as f64 / seconds / 1_000_000.0,
+        wire_bytes as f64 / seconds / 1_000_000.0,
+        wire_rate_metrics(
+            payload_bytes,
+            wire_bytes,
+            options.frames,
+            runtime.elapsed_ns,
+        ),
+        "in_memory_chacha20_poly1305_encode_decode;one_packet_per_frame;udp_ip_headers_excluded;aead_overhead_bytes=28",
+    );
+}
+
+fn bench_wire_udp_loopback(options: Options, payload_bytes: usize) {
+    let receiver_socket = UdpSocket::bind("127.0.0.1:0").expect("wire UDP receiver bind");
+    let sender_socket = UdpSocket::bind("127.0.0.1:0").expect("wire UDP sender bind");
+    let receiver_addr = receiver_socket
+        .local_addr()
+        .expect("wire UDP receiver address");
+    let sender_addr = sender_socket.local_addr().expect("wire UDP sender address");
+    sender_socket
+        .connect(receiver_addr)
+        .expect("wire UDP sender connect");
+    receiver_socket
+        .connect(sender_addr)
+        .expect("wire UDP receiver connect");
+    sender_socket
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("wire UDP write timeout");
+    receiver_socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("wire UDP read timeout");
+
+    let payload = vec![0x4e; payload_bytes];
+    let mut sender = SendCipher::new([0x54; 32]);
+    let mut receiver = ReceiveCipher::new_with_replay_window([0x54; 32], 128);
+    let mut receive_buffer = vec![0u8; payload_bytes + 64];
+    let start = begin_measurement();
+    let mut wire_bytes = 0usize;
+    for _ in 0..options.frames {
+        let encrypted = sender.encrypt(&payload).expect("wire UDP encode");
+        let sent = sender_socket.send(&encrypted).expect("wire UDP send");
+        assert_eq!(sent, encrypted.len());
+        let received = receiver_socket
+            .recv(&mut receive_buffer)
+            .expect("wire UDP receive");
+        assert_eq!(received, encrypted.len());
+        wire_bytes += sent;
+        let decrypted = receiver
+            .decrypt(&receive_buffer[..received])
+            .expect("wire UDP decode");
+        black_box(decrypted);
+    }
+    let runtime = finish_measurement(start);
+    let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
+    emit_rate_with_wire(
+        options,
+        &format!("udp_loopback_{payload_bytes}"),
+        payload_bytes,
+        runtime,
+        payload.len() as f64 * options.frames as f64 / seconds / 1_000_000.0,
+        wire_bytes as f64 / seconds / 1_000_000.0,
+        wire_rate_metrics(payload_bytes, wire_bytes, options.frames, runtime.elapsed_ns),
+        &format!(
+            "connected_udp_loopback;authenticated_send_receive;udp_ip_headers_excluded;ipv4_udp_payload_mtu={WIRE_UDP_IPV4_PAYLOAD_MTU};aead_overhead_bytes={WIRE_AEAD_OVERHEAD}"
+        ),
+    );
+}
+
+fn bench_wire_shroud2(options: Options) {
+    for &payload_bytes in WIRE_PAYLOAD_SIZES {
+        let payload = vec![0x4f; payload_bytes];
+        let mut morphology = MorphologyEngine::from_seed(
+            MorphologyProfile::WebBrowsingLab,
+            0x5749_5245 ^ payload_bytes as u64,
+        );
+        let start = begin_measurement();
+        let mut wire_bytes = 0usize;
+        let mut target_min = usize::MAX;
+        let mut target_max = 0usize;
+        for _ in 0..options.frames {
+            let target = morphology
+                .target_size(payload.len(), WIRE_PATH_MTU)
+                .expect("wire Shroud2 target");
+            let datagram =
+                encode_datagram(&payload, target, WIRE_PATH_MTU).expect("wire Shroud2 encode");
+            target_min = target_min.min(datagram.len());
+            target_max = target_max.max(datagram.len());
+            wire_bytes += datagram.len();
+            let decoded = decode_datagram(&datagram, WIRE_PATH_MTU).expect("wire Shroud2 decode");
+            assert_eq!(decoded, payload);
+            black_box(decoded);
+        }
+        let runtime = finish_measurement(start);
+        let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
+        emit_rate_with_wire(
+            options,
+            &format!("shroud2_envelope_{payload_bytes}"),
+            payload_bytes,
+            runtime,
+            payload.len() as f64 * options.frames as f64 / seconds / 1_000_000.0,
+            wire_bytes as f64 / seconds / 1_000_000.0,
+            wire_rate_metrics(payload_bytes, wire_bytes, options.frames, runtime.elapsed_ns),
+            &format!(
+                "in_memory_shroud2_encode_decode;profile=web-browsing-lab;path_mtu={WIRE_PATH_MTU};target_min={target_min};target_max={target_max};outer_envelope_bytes=7;udp_ip_headers_excluded;ipv4_ethernet_mtu=1500"
+            ),
+        );
+    }
 }
 
 fn bench_replay(options: Options) {
@@ -692,8 +1460,7 @@ fn bench_shroud2_morphology(options: Options) {
             let target = morphology
                 .target_size(payload.len(), path_mtu)
                 .expect("morphology target");
-            let datagram =
-                encode_datagram(&payload, target, path_mtu).expect("morphology encode");
+            let datagram = encode_datagram(&payload, target, path_mtu).expect("morphology encode");
             let decoded = decode_datagram(&datagram, path_mtu).expect("morphology decode");
             black_box(decoded);
             minimum_target = minimum_target.min(target);
@@ -861,10 +1628,7 @@ fn bench_shroud2_impairment(options: Options) {
     );
 }
 
-fn shroud_aead_plaintext(
-    profile: shph_core::ShroudProfile,
-    payload: &[u8],
-) -> Vec<u8> {
+fn shroud_aead_plaintext(profile: shph_core::ShroudProfile, payload: &[u8]) -> Vec<u8> {
     let plaintext_capacity = profile.payload_capacity() - (12 + 16);
     let mut padded = vec![0u8; plaintext_capacity];
     padded[..2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -880,7 +1644,8 @@ fn measure_shroud_framing(
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let sample_start = Instant::now();
-        let cell = encode_cell(profile, shph_core::SHROUD_FRAME_DATA, payload).expect("encode cell");
+        let cell =
+            encode_cell(profile, shph_core::SHROUD_FRAME_DATA, payload).expect("encode cell");
         let decoded = decode_cell(profile, &cell).expect("decode cell");
         black_box(decoded);
         samples.push(sample_start.elapsed().as_nanos());
@@ -1066,7 +1831,7 @@ fn bench_quic_impairment(options: Options) {
         }
     }
     println!(
-        "rate,{},quic_shim_rate_limit,0,1,,,,,,,,0,-,-,-,-,-,-,-,-,accepted={accepted};rejected={rejected};per_ip_rate_limit_probe",
+        "rate,{},quic_shim_rate_limit,0,1,-,-,-,-,-,-,-,0,-,-,-,-,-,-,-,-,-,-,-,accepted={accepted};rejected={rejected};per_ip_rate_limit_probe",
         options.profile.as_str()
     );
 }
@@ -1093,4 +1858,38 @@ fn bench_long_session(options: Options) {
         0.0,
         "single_key_nonce_and_replay_path; use --frames 1000000 for million-frame evidence",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        wire_latency_metrics, wire_rate_metrics, WIRE_AEAD_OVERHEAD, WIRE_MAX_AEAD_PAYLOAD,
+        WIRE_PAYLOAD_SIZES, WIRE_UDP_IPV4_PAYLOAD_MTU,
+    };
+
+    #[test]
+    fn wire_payload_matrix_stays_inside_ipv4_udp_budget() {
+        assert_eq!(
+            WIRE_MAX_AEAD_PAYLOAD + WIRE_AEAD_OVERHEAD,
+            WIRE_UDP_IPV4_PAYLOAD_MTU
+        );
+        assert!(WIRE_PAYLOAD_SIZES
+            .iter()
+            .all(|payload| *payload + WIRE_AEAD_OVERHEAD <= WIRE_UDP_IPV4_PAYLOAD_MTU));
+    }
+
+    #[test]
+    fn wire_metrics_report_fixed_aead_overhead() {
+        let latency = wire_latency_metrics(1_000, 1_028);
+        assert_eq!(latency.wire_bytes_per_packet, Some(1_028.0));
+        assert_eq!(latency.overhead_bytes, Some(28.0));
+        assert!((latency.overhead_pct.expect("latency overhead") - 2.8).abs() < 1e-9);
+        assert_eq!(latency.packets_per_sec, None);
+
+        let rate = wire_rate_metrics(1_000, 10_280, 10, 1_000_000_000);
+        assert_eq!(rate.wire_bytes_per_packet, Some(1_028.0));
+        assert_eq!(rate.overhead_bytes, Some(28.0));
+        assert!((rate.overhead_pct.expect("rate overhead") - 2.8).abs() < 1e-9);
+        assert_eq!(rate.packets_per_sec, Some(10.0));
+    }
 }

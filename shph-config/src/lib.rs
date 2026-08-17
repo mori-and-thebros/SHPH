@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{ConfigError, Result};
+use shph_core::ensure_no_reparse_components;
 pub use shph_core::roadmap::{
     IdentityProviderConfig, PqcConfig, RatchetAuditConfig, RoadmapConfig, ShamirConfig,
     TransportAdapterConfig,
@@ -139,6 +140,12 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
+        ensure_no_reparse_components(path).map_err(|error| {
+            ConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                error.to_string(),
+            ))
+        })?;
         let file = open_config_readonly(path).map_err(ConfigError::Io)?;
         let metadata = file.metadata().map_err(ConfigError::Io)?;
         if metadata.len() > MAX_CONFIG_BYTES {
@@ -176,8 +183,26 @@ impl Config {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
+            ensure_no_reparse_components(parent).map_err(|error| {
+                ConfigError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    error.to_string(),
+                ))
+            })?;
             fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+            ensure_no_reparse_components(parent).map_err(|error| {
+                ConfigError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    error.to_string(),
+                ))
+            })?;
         }
+        ensure_no_reparse_components(path).map_err(|error| {
+            ConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                error.to_string(),
+            ))
+        })?;
         let (mut file, tmp) = create_config_temp_file(path)?;
         if let Err(err) = restrict_config_perms(&tmp).map_err(ConfigError::Io) {
             drop(file);
@@ -195,6 +220,28 @@ impl Config {
             return Err(err);
         }
         drop(file);
+        if let Some(parent) = path.parent() {
+            let result = ensure_no_reparse_components(parent).map_err(|error| {
+                ConfigError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    error.to_string(),
+                ))
+            });
+            if let Err(error) = result {
+                let _ = fs::remove_file(&tmp);
+                return Err(error);
+            }
+        }
+        let result = ensure_no_reparse_components(path).map_err(|error| {
+            ConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                error.to_string(),
+            ))
+        });
+        if let Err(error) = result {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
         if let Err(err) = persist_config_over(&tmp, path).map_err(ConfigError::Io) {
             let _ = fs::remove_file(&tmp);
             return Err(err);
@@ -215,8 +262,14 @@ fn open_config_readonly(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "configuration path must reference a regular file",
+            ));
+        }
         use std::os::unix::fs::PermissionsExt;
         let mode = file.metadata()?.permissions().mode();
         if mode & 0o077 != 0 {
@@ -244,7 +297,14 @@ fn open_config_readonly(path: &Path) -> std::io::Result<std::fs::File> {
         shph_core::enforce_owner_only_file_permissions(path).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
         })?;
-        std::fs::File::open(path)
+        let file = std::fs::File::open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "configuration path must reference a regular file",
+            ));
+        }
+        Ok(file)
     }
 }
 
@@ -527,6 +587,29 @@ route_cidrss = ["10.0.0.0/24"]
         );
         assert!(config.exists());
         assert!(predictable_tmp.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "shph-config-parent-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let real = root.join("real");
+        let link = root.join("link");
+        fs::create_dir_all(&real).expect("mkdir");
+        symlink(&real, &link).expect("symlink");
+
+        assert!(Config::default().save(&link.join("config.toml")).is_err());
+        assert!(!real.join("config.toml").exists());
         fs::remove_dir_all(root).ok();
     }
 

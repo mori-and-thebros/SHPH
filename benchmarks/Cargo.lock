@@ -44,9 +44,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bitflags"
-version = "2.13.1"
+version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "block-buffer"
@@ -385,6 +385,7 @@ checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "ctutils",
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -483,6 +484,7 @@ dependencies = [
  "pkcs8",
  "rand_core 0.10.1",
  "sha3",
+ "zeroize",
 ]
 
 [[package]]
@@ -494,6 +496,7 @@ dependencies = [
  "ctutils",
  "hybrid-array",
  "num-traits",
+ "zeroize",
 ]
 
 [[package]]
@@ -822,9 +825,9 @@ dependencies = [
 
 [[package]]
 name = "rustversion"
-version = "1.0.23"
+version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "scopeguard"
@@ -910,16 +913,18 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shph-benchmarks"
-version = "0.6.1-dev"
+version = "0.6.2-dev"
 dependencies = [
+ "hex",
  "libc",
  "shph-core",
+ "shph-identity",
  "shph-transport",
 ]
 
 [[package]]
 name = "shph-core"
-version = "0.6.1-dev"
+version = "0.6.2-dev"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -943,8 +948,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "shph-identity"
+version = "0.6.2-dev"
+dependencies = [
+ "base64 0.21.7",
+ "hex",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shph-core",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "shph-transport"
-version = "0.6.1-dev"
+version = "0.6.2-dev"
 dependencies = [
  "base64 0.21.7",
  "bytes",
@@ -963,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "shph-tun"
-version = "0.6.1-dev"
+version = "0.6.2-dev"
 dependencies = [
  "libc",
  "sha2",

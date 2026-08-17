@@ -16,6 +16,8 @@ This file maps the repository layout and the main public validation artifacts.
 - `shph-core/`: handshake, framing, transport negotiation primitives.
 - `shph-obfuscation/`: protocol-shaping extension surface.
 - `shph-transport/`: transport enum and socket/parsing support.
+- `shph-identity/`: isolated experimental signed identity records,
+  provider-independent local discovery.
 - `shph-tun/`: TUN abstraction crate.
 - `shph-tui/`: optional terminal UI shell.
 - `fuzz/`: standalone cargo-fuzz targets for parser and replay robustness.
@@ -24,8 +26,8 @@ This file maps the repository layout and the main public validation artifacts.
 - `scripts/`: reproducible demos, benchmark operators, evidence capture, and
   optional multi-checkout synchronization.
 - `docs/BENCHMARKING.md`: Linux-first benchmark methodology, profiles, and obstacles.
-- `docs/BENCHMARK_RESULTS_2026-08-14.md`: current Windows-local `0.6.1-dev`
-  full-suite benchmark capture with both explicit profiles.
+- `docs/BENCHMARK_RESULTS_2026-08-14.md`: historical Windows-local `0.6.1-dev`
+  full-suite benchmark baseline with both explicit profiles.
 - `docs/BENCHMARK_RESULTS_2026-08-05.md`: paired WSL2/Linux and native Windows
   benchmark scores captured during the prior `0.5.0-dev.0` development line.
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`: latest
@@ -36,6 +38,12 @@ This file maps the repository layout and the main public validation artifacts.
   the explicit list of measurements still requiring live/native infrastructure.
 - `docs/PHASE_D_HARDENING_2026-07-28.md`: fuzzing, QUIC-shim repeatability,
   profile comparison, and operator-skip evidence for Phase D.
+- `docs/SUPPORT_MATRIX.md`: authoritative release profile, support levels, and
+  non-claims boundary.
+- `docs/RELEASE_READINESS.md`: binding release gates and evidence package
+  requirements.
+- `docs/SECURITY_EVIDENCE.md`: threat-to-control mapping, evidence tiers, and
+  publication redaction checklist.
 
 ## Repository Layout
 
@@ -58,6 +66,9 @@ This file maps the repository layout and the main public validation artifacts.
   are labeled by date; they are not the current score source.
 - Current generated gate evidence lives under `docs/evidence/` and is refreshed
   by `scripts/capture_evidence.sh`.
+- Local release/security collectors write engineering snapshots under the
+  ignored `benchmark-runs/` directory:
+  `scripts/release_readiness.ps1` and `scripts/security_evidence.ps1`.
 - Public evidence records are retained under `docs/evidence/` and named by
   validation type and date. Internal assessment and project-context records
   are kept outside the publishable checkout.
@@ -80,6 +91,8 @@ cross-platform lock drift.
 - Docs and docs-only changes are kept in `docs/*`.
 - Test command guidance lives in `docs/TESTING.md`.
 - Current code-status is tracked in `README.md`.
+- Product support status is tracked in `docs/SUPPORT_MATRIX.md`; release
+  eligibility is tracked by `docs/RELEASE_READINESS.md`.
 
 ## Review boundaries
 

@@ -51,17 +51,17 @@ impl Endpoint {
 
 /// Panics-free note: callers should prefer [`Endpoint::to_socket_addr_result`].
 /// This infallible conversion exists for ergonomic APIs and only succeeds for
-/// already-valid endpoints; it constructs an IPv4 unspecified address only as a
-/// last-resort to avoid a panic, which the caller will detect as a connection
-/// failure rather than a process crash.
+/// already-valid endpoints; it constructs a loopback address only as a
+/// last-resort to avoid a panic. A malformed endpoint must never turn into a
+/// wildcard bind address.
 impl From<Endpoint> for std::net::SocketAddr {
     fn from(ep: Endpoint) -> Self {
         match ep.to_socket_addr_result() {
             Ok(addr) => addr,
             // Fail safe instead of unwrapping: an invalid endpoint becomes an
-            // unspecified address that connection attempts will reject, rather
-            // than crashing the process on untrusted input.
-            Err(_) => std::net::SocketAddr::from(([0u8, 0, 0, 0], 0)),
+            // loopback address rather than a wildcard address that could
+            // accidentally expose a listener on every interface.
+            Err(_) => std::net::SocketAddr::from(([127u8, 0, 0, 1], 0)),
         }
     }
 }
@@ -128,8 +128,12 @@ mod tests {
             host: "not a valid host !!!".to_string(),
             port: 7000,
         };
-        // The From impl must never panic; it degrades to an unspecified addr.
+        // The From impl must never panic; it degrades to loopback.
         let addr: SocketAddr = ep.into();
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
         assert_eq!(addr.port(), 0);
     }
 }

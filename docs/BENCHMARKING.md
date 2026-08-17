@@ -16,6 +16,11 @@ WSL2 regression records. All reports identify their platform and distinguish
 local-runner results from measurements that still require native Linux, live
 TUN, or two-host execution.
 
+The dated score reports are historical captures. The identity/discovery
+scenarios are part of the `identity` suite in `benchmarks/src/main.rs`; this
+development snapshot does not publish a standalone numeric identity-capture
+report.
+
 ## Default Environment
 
 The primary baseline is a **native Linux host**. Record:
@@ -38,7 +43,9 @@ with native Linux results.
 4. Replay latency: nonce-window insertion cost.
 5. Adapter latency: TCP, QUIC-like lab shim, offline-mesh, and data-mule
    measured separately in later phases.
-6. Throughput and resource behavior: allocations, memory growth, CPU
+6. Wire behavior: encrypted packet size, framing overhead, packet rate, and
+   authenticated UDP loopback.
+7. Throughput and resource behavior: allocations, memory growth, CPU
    saturation, variance, and sustained data-plane performance.
 
 ## Profiles and dimensions
@@ -80,6 +87,10 @@ The runner emits CSV rows with:
 | `p99_9_ns` | 99.9th-percentile sample |
 | `max_ns` | Slowest observed sample |
 | `mean_ns` | Arithmetic mean |
+| `wire_bytes_per_packet` | Average serialized/encrypted bytes per application packet; excludes IP/UDP headers |
+| `overhead_bytes` | Average wire bytes beyond the plaintext payload |
+| `overhead_pct` | Average wire overhead as a percentage of plaintext bytes |
+| `packets_per_sec` | Sustained application packet rate for rate rows |
 
 The handshake row measures the full in-memory setup, including hello
 construction, signatures, X25519, ML-KEM when enabled, and key derivation.
@@ -146,7 +157,7 @@ removes ML-KEM and therefore provides a different security contract.
 
 ## Expanded benchmark coverage
 
-The standalone runner now supports `--suite all|core|dataplane|resource|shroud|quic|scalability`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2.0 morphology profiles, QUIC-shim loopback handshake timing, and long-session replay/nonce behavior.
+The standalone runner now supports `--suite all|core|dataplane|resource|shroud|quic|scalability|identity|wire`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2.0 morphology profiles, QUIC-shim loopback handshake timing, long-session replay/nonce behavior, identity/plugin-provider validation costs, and explicit wire overhead/packet-rate metrics.
 
 These are local measurements, not proof of live VPN throughput, TUN performance, network RTT, reconnect recovery, or control-plane cost. Use `scripts/benchmark_operator.sh` for real-process lifecycle, reconnect, control-plane, and native-TUN prerequisite/timing checks. It emits explicit `SKIP` records when a host, privilege, peer, or tool is unavailable.
 
@@ -154,6 +165,8 @@ Recommended commands:
 
 ```bash
 cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite all --iterations 10000 --frames 100000
+cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite identity --iterations 1000 --frames 1000
+cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite wire --iterations 1000 --frames 10000
 cargo build --release --manifest-path benchmarks/Cargo.toml --locked
 ./benchmarks/target/release/shph-benchmarks --profile secure-default --suite all --iterations 5000 --frames 1000000
 scripts/benchmark_operator.sh --mode lifecycle --config /path/to/config.toml
@@ -168,7 +181,8 @@ For a native Windows host, build the standalone runner and execute the
 PowerShell capture script from the repository root:
 
 ```powershell
-cargo build --release --manifest-path benchmarks/Cargo.toml --locked
+cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml `
+  --target x86_64-pc-windows-msvc --locked
 .\scripts\benchmark_windows.ps1 `
   -Suite all -Iterations 5000 -Frames 100000 `
   -OutputDirectory .\benchmark-runs\windows-YYYY-MM-DD
@@ -179,6 +193,12 @@ The PowerShell runner records separate `secure-default.csv` and
 Wintun packet I/O, route/DNS changes, two-machine throughput, and RTT still
 require a provisioned elevated Windows host and a prepared peer configuration.
 Do not treat a Windows GNU cross-build as native Windows execution evidence.
+
+When MSVC is unavailable, use a complete, supported LLVM-MinGW installation
+configured as the Rust GNU target linker and record its exact linker/CRT
+versions. Do not force Rust's self-contained GNU CRT mode. The capture script
+performs a startup probe before writing evidence so a broken executable cannot
+be mistaken for a benchmark result.
 The latest native Windows validation record is
 `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`; its raw
 captures are ignored local artifacts under `benchmark-runs/`.
@@ -211,6 +231,56 @@ The same suite now includes:
 
 The impairment test is a local queue-pressure model only. It must not be
 reported as QUIC congestion control or Internet loss-recovery evidence.
+
+### Wire and packet-overhead coverage
+
+The `wire` suite measures three distinct local paths for payload sizes from
+64 bytes through 1,444 bytes, the largest plaintext that fits a 1,472-byte
+IPv4 UDP payload after SHPH's 28-byte AEAD nonce/tag overhead:
+
+- `wire_aead_encode` and `wire_aead_decode`: standalone ChaCha20-Poly1305
+  serialization and verification latency;
+- `aead_roundtrip_*`: in-memory authenticated packet rate and the resulting
+  ciphertext overhead;
+- `udp_loopback_*`: authenticated connected-UDP loopback through the host
+  socket stack; and
+- `shroud2_envelope_*`: Shroud2 envelope sizing, randomized padding, and
+  encode/decode rate at a 1,472-byte IPv4 UDP payload budget.
+
+The CSV rows include average serialized bytes per packet, overhead bytes,
+overhead percentage, and packets per second. Wire bytes are application
+datagram bytes: IP, UDP, Ethernet, tunnel-device, NIC, and physical-network
+headers are excluded. UDP loopback is a socket-path regression signal, not
+two-host throughput, Internet RTT, congestion-control evidence, or a
+replacement for native TUN validation.
+
+### Identity and plugin-provider coverage
+
+The `identity` suite measures local identity-record and provider behavior. It
+currently emits rows for:
+
+- Ed25519 record signing, verification, and bounded JSON parsing;
+- filesystem-provider resolution and idempotent publish;
+- in-memory provider resolution;
+- two-provider fan-out where one provider fails;
+- plugin descriptor validation;
+- malformed and oversized record rejection;
+- parsing and verification near endpoint/capability structure limits;
+- subject-mismatch rejection; and
+- conflicting records at the same sequence number.
+
+Provider scenarios use the reviewed local provider implementation and
+benchmark-only in-memory/failing test doubles. They do not execute an
+untrusted remote plugin, measure network availability, or establish discovery
+latency on the handshake path. For identity rows, `payload_bytes` is the
+serialized record size; descriptor validation has no record payload and reports
+zero. Keep these rows separate from transport goodput and network RTT.
+
+The identity suite is intended for regression and hardening work: rejection
+paths are measured as well as successful paths, and fan-out behavior records the
+cost of tolerating one unavailable provider. A future remote adapter should be
+benchmarked only after its timeout, cancellation, quota, and provenance
+behavior has been reviewed.
 
 For native Linux two-host evidence, run authenticated listener/connector configs with `SHPH_TUN_NATIVE=1`, generate traffic through the tunnel with `iperf3`/`ping`, capture CPU and RSS during saturation, record packet size/MTU, then repeat after a controlled disconnect. Keep native Linux, WSL2, Windows, containers, VMs, and two-host results in separate evidence tables. `randomized-lab` and the QUIC-like UDP shim remain lab experiments, not stealth or standards-compliant QUIC claims.
 

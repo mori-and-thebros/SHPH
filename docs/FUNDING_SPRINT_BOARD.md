@@ -20,8 +20,9 @@
 1. `up` data-plane (Linux): verified live on loopback TCP. One-shot
    `startup_payload` exchange (`up` listen/connect) transfers an encrypted
    payload end-to-end; loop mode streams stdin lines as encrypted frames.
-   Windows toolchain builds cleanly (`cargo check --workspace`); Windows live
-   runs must be re-verified in the native Windows environment by the operator.
+   Windows workspace and adapter/session evidence is recorded in the dated
+   native Windows validation report; packet forwarding and two-host live runs
+   remain operator validation gates.
 2. TUN lifecycle / clean teardown: added graceful SIGINT/SIGTERM handling
    (`shph-cli/src/shutdown.rs`) plus poll-driven stdin reads so the connect loop
    observes a shutdown request within ~200ms. Live test: SIGINT to a running
@@ -91,8 +92,8 @@ hardening (2026-07-15)
 3. `ControlPlaneGuard::cleanup` rolls back DNS then routes, collecting all
    errors rather than aborting on the first, maximizing partial rollback.
 4. Windows graceful-shutdown via `SetConsoleCtrlHandler` is wired through
-   `windows-sys`; the Windows checkout still needs native-toolchain validation.
-   Unix SIGINT/SIGTERM parity from A.1 remains in place.
+   `windows-sys`; native Windows parity remains part of the dedicated
+   validation campaigns. Unix SIGINT/SIGTERM parity from A.1 remains in place.
 5. Persistent `apply`, `reconcile`, `undo`, and `down` lifecycle commands now
    record exact live-applied state beside the config and are covered by
    `cli_control_plane`.
@@ -182,8 +183,8 @@ Validation commands executed and passing in this environment:
    code style (fmt/clippy/fail-closed), phase-gating discipline, PR flow,
    release checklist, and governance.
 3. `.github/workflows/ci.yml`: Linux + Windows matrix running `fmt`,
-   `clippy --all-targets -D warnings`, `build`, and `test`; plus an optional
-   Linux native-TUN job (continue-on-error, CAP_NET_ADMIN guarded).
+   `clippy --all-targets -D warnings`, `build`, and `test`; plus a Linux
+   native-TUN job that reports host capability skips explicitly.
 4. `docs/REPRODUCIBILITY.md`: committed `Cargo.lock` discipline, `--locked`
    builds, `cargo tree`/`cargo audit` supply-chain steps, release artifact
    verification, and known caveats (`ring`, Windows toolchain).
@@ -245,7 +246,7 @@ README's doc index updated to link all four pages.
 - Funders can verify claims against tests and changelog: yes (every capability
   row carries a reproduce command; scorecard lists test totals + gates).
 
-Validation commands executed and passing in this environment:
+Historical validation commands executed and passing at that checkpoint:
 - `cargo fmt --all` (clean)
 - `cargo clippy --workspace --all-targets -- -D warnings` (clean)
 - `cargo test --workspace` (52 passed, 0 failed) — A.5 is docs-only; no code
@@ -337,12 +338,14 @@ All four B.1 tasks and evidence items are satisfied in the repository checkout.
 3. **Scanner-driven fixes:** `cargo-audit` run against 178 dependencies.
    - Fixed the one direct finding: `anyhow 1.0.102 -> 1.0.103`
      (RUSTSEC-2026-0190 unsound `downcast_mut`, never called by SHPH).
-   - Accepted 2 transitive warnings (`paste`, `lru`) isolated to the optional
-     TUI via `ratatui`; both documented in `docs/SUPPLY_CHAIN_SCAN.md`.
+   - Historical checkpoint: accepted 2 transitive warnings (`paste`, `lru`)
+     isolated to the optional TUI via `ratatui`; the current lockfile and
+     policy are documented in `docs/SUPPLY_CHAIN_SCAN.md`.
    - Bumped `ratatui 0.27 -> 0.28.1`; fixed the deprecated `frame.size()` ->
      `frame.area()` it introduced.
-   - `cargo audit` wired into CI (`.github/workflows/ci.yml`, non-blocking).
-   - Captured output in `docs/evidence/CARGO_AUDIT.txt`.
+   - `cargo audit --deny warnings` is wired into CI as a blocking gate;
+     the non-blocking configuration was historical.
+   - Historical captured output in `docs/evidence/CARGO_AUDIT.txt`.
 
 #### Exit Criteria Check
 
@@ -355,7 +358,7 @@ Validation commands executed and passing in this environment:
 - `cargo fmt --all -- --check` (clean)
 - `cargo clippy --workspace --all-targets -- -D warnings` (clean)
 - `cargo test --workspace` (0 failed)
-- `cargo audit` (0 vulnerabilities; 2 accepted transitive warnings)
+- Historical `cargo audit` snapshot (0 vulnerabilities; 2 accepted transitive warnings)
 - `cargo build --workspace --locked` (OK)
 
 ---

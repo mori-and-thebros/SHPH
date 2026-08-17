@@ -73,8 +73,9 @@ clean. The rollback path now carries the adapter interface name into
 assertion covers the generated `interface=...` argument.
 
 A final rerun of `validate_windows_tun.ps1` after that source fix remains
-required from an Administrator PowerShell session. The current non-elevated
-shell could not execute the script's `#Requires -RunAsAdministrator` gate.
+required from an Administrator PowerShell session; the initial follow-up
+capture was intentionally non-elevated and therefore did not execute the
+script's `#Requires -RunAsAdministrator` gate.
 
 ## Remaining Host Gates
 

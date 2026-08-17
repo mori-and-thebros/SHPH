@@ -1,9 +1,64 @@
 # Changelog
 
-## [0.6.1-dev] — prerelease hardening follow-up (2026-08-14)
+## [0.6.2-dev] — public release preparation (2026-08-17)
+
+### Release and publication hygiene
+
+- Bumped the workspace and benchmark package metadata to `0.6.2-dev`.
+- Added explicit release-readiness, security-evidence, and support-matrix
+  documents with honest PASS/FAIL/SKIP boundaries.
+- Added public redaction guardrails for credentials, private paths, generated
+  evidence, and local-only research material.
+- Kept identity discovery visibly experimental and outside the release profile;
+  maintainer-only identity design and benchmark-capture notes remain excluded
+  from the public tree.
+
+### CLI and TUI usability
+
+- Published the operator-facing CLI/TUI improvements as part of the
+  `0.6.2-dev` development snapshot: doctor diagnostics, structured JSON
+  output, clearer status/peer views, actionable errors, and the read-only TUI
+  dashboard with reload and in-app help.
+
+This tag is a development snapshot. It does not claim production VPN,
+anti-censorship, native two-host TUN, or independent security-audit status.
+
+## [0.6.1-dev] — prerelease hardening follow-up (2026-08-15)
+
+### CLI and TUI usability
+
+- Added `shph doctor` with human-readable and strict JSON diagnostics for
+  configuration, identity, peer, session, control-plane, and native-TUN
+  prerequisites.
+- Improved `shph status` and `shph list-peers` with structured JSON output,
+  clearer summaries, and compatibility aliases.
+- Added actionable CLI error hints and richer top-level help examples.
+- Reworked `shph-tui` into a read-only dashboard with Overview, Peers, Session,
+  and Control Plane views, reload support, keyboard navigation, and an
+  in-app help overlay.
 
 ### Security and protocol hardening
 
+- Bounded untrusted input and handshake state: replay windows now clamp their
+  allocation size; local secret/config/audit/provider/adapter inputs reject
+  special files; TCP handshakes use one aggregate deadline and preserve
+  pipelined bytes; and X25519 all-zero shared secrets are rejected.
+- Made atomic Unix keystore replacement sync its containing directory and made
+  malformed infallible endpoint conversions fall back to loopback rather than
+  an unspecified wildcard address.
+- Made in-place HKDF context-length accumulation checked so an oversized
+  caller-supplied context fails closed instead of wrapping arithmetic, and
+  bounded the aggregate context and SHA-256 expansion output before
+  intermediate allocation.
+- Enforced canonical zero-prefixed AEAD nonce encoding on receive and rejected
+  outbound TCP payloads that cannot fit the existing encrypted frame limit
+  before consuming a send nonce.
+- Replaced lossy file-adapter path sanitization with digest-bound safe
+  components, bounded adapter polling intervals and offline replay-cache inputs,
+  and capped configured peer-policy pins.
+- Made every TCP accept-loop handshake/read failure peer-local, including
+  cookie disconnects and timeouts, so malformed or slow peers cannot terminate
+  the listener before its aggregate deadline.
 - Added a rotating, stateless HMAC-SHA256 TCP cookie challenge after the
   existing per-source pressure threshold. Cookie validation occurs before
   responder ML-KEM key generation and ciphertext decapsulation.
@@ -33,6 +88,40 @@
 - Captured a fresh Windows-local full benchmark suite for `0.6.1-dev` across
   `secure-default` and `classical-lab` with 5,000 latency samples and 100,000
   sustained frames; native TUN and two-host behavior remain outside the run.
+- Added the standalone `wire` benchmark suite with AEAD encode/decode,
+  authenticated UDP loopback, Shroud2 envelope overhead, MTU-bound payload
+  coverage, and explicit wire-bytes/overhead/packet-rate CSV fields.
+- Bound public handshake verification to the actual local identity, signing
+  key, ephemeral key, nonce, profile, and PQ material, preventing a tampered
+  `HandshakeMaterial` value from reaching session-key derivation.
+- Tightened experimental identity discovery continuity: non-initial records
+  require a predecessor, and accepted updates must advance exactly one
+  sequence while naming the accepted predecessor hash. Added an explicit
+  linked-update constructor and adjusted standalone benchmark fixtures.
+- Rejected oversized unshrouded QUIC and file-adapter payloads before AEAD
+  work, keeping caller-controlled allocation and CPU use inside the configured
+  transport/file budgets.
+- Scoped Linux route rollback deletes to the SHPH interface, cleaned up
+  control-plane temp files on permission/path failures, and extended
+  parent-component reparse checks to sensitive loads.
+- Removed secret/config/audit temporary files on all post-creation failure
+  paths, and synced the audit journal's containing directory after pruning.
+- Rejected unanchored sequence-two identity records during first discovery,
+  preventing a signed update from bootstrapping over an unseen predecessor.
+- Rejected inline PQ ciphertext metadata and malformed ML-KEM public-key
+  lengths during hello verification.
+- Reused strict TUN interface-name validation across privileged CLI command
+  builders and validated the name before optional firewall setup.
+- Removed the long-lived duplicate Ed25519 private-key object from
+  `IdentityKeyPair`; signing reconstructs the ring key object per operation
+  while the persisted seed remains explicitly zeroized on drop.
+- Made TCP and experimental QUIC hostname resolution share the aggregate
+  handshake deadline through bounded resolver workers.
+- Derived offline-mesh and data-mule plaintext capacities from AEAD, base64,
+  and serialized-envelope overhead before encryption, while retaining the
+  final envelope-size check.
+- Made identity discovery refuse peer pins that advertise an active
+  operational signing key unsupported by the current handshake implementation.
 
 These changes do not claim production traffic morphology, DPI resistance,
 privileged firewall execution on every host, or native two-host VPN evidence.
@@ -269,7 +358,7 @@ the phase-gated funding roadmap in `ROADMAP_OSS_AND_DELIVERY.md`.
   severity-based triage SLA (complements `SECURITY.md`).
 - `docs/SUPPLY_CHAIN_SCAN.md` — `cargo-audit` scanner procedure + advisory triage.
 - `docs/evidence/CARGO_AUDIT.txt` — captured advisory-scan output.
-- `cargo audit` job in `.github/workflows/ci.yml` (non-blocking, periodic).
+- Blocking `cargo audit --deny warnings` job in `.github/workflows/ci.yml`.
 
 ### Changed
 - `anyhow` bumped `1.0.102 -> 1.0.103` (RUSTSEC-2026-0190, direct dep).

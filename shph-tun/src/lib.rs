@@ -521,7 +521,13 @@ use std::os::unix::fs::FileTypeExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 
-fn validate_tun_name(name: &str) -> Result<()> {
+/// Validate an interface name before it is passed to a native TUN or host
+/// networking command.
+///
+/// The same constraints are used by [`TunDevice::open`], firewall builders,
+/// and the CLI control-plane path so a malformed name cannot reach a
+/// privileged command builder before the TUN open path rejects it.
+pub fn validate_tun_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(ShphError::InvalidArgument(
             "TUN interface name cannot be empty".into(),

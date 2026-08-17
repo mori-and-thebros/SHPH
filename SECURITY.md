@@ -37,6 +37,10 @@ SHPH is **not** production-hardened or censorship-resistant transport. It is
 suitable for **controlled lab environments, staged engineering, and transparent
 OSS validation only.**
 
+The current security evidence map is `docs/SECURITY_EVIDENCE.md`. The binding
+release gate is `docs/RELEASE_READINESS.md`. Neither document represents an
+independent third-party security audit.
+
 ### What works today
 
 - X25519 identity keys for DH **plus** a separate Ed25519 key that produces a
@@ -55,21 +59,45 @@ OSS validation only.**
 - ChaCha20-Poly1305 AEAD framing on the TCP data plane.
 - AEAD nonce anti-replay: TCP uses strict monotonic counters, while the
   experimental UDP/QUIC receiver uses a bounded sliding bitmap window to accept
-  authenticated reordering and reject duplicates (fail-closed).
-- Deadline-bounded handshake work on the TCP/UDP accept paths: malformed,
-  early-closing, and wrong-key peers are dropped without terminating the
-  listener before its operator deadline.
+  authenticated reordering and reject duplicates (fail-closed). Receivers also
+  reject non-canonical nonce prefixes, and TCP senders enforce the encrypted
+  frame-size budget before consuming a nonce.
+- Deadline-bounded handshake work on the TCP/UDP accept paths: TCP connect,
+  hello/cookie exchange, and the fixed-size ML-KEM frame share one aggregate
+  deadline capped at 60 seconds; malformed, early-closing, and wrong-key peers
+  are dropped without terminating the listener before its operator deadline.
+- The replay window clamps caller/configuration input to 64–65,536 positions,
+  preventing an oversized receive-side allocation or state clone.
 - Configured peer identities are mandatory and pinned at the CLI session boundary; an
   authenticated but unexpected identity is rejected before data-plane use.
+- Public handshake verification also checks that the caller's local hello is
+  still bound to its configured identity, signing key, ephemeral key, nonce,
+  profile, and PQ material before any session keys are derived.
 - Fail-closed IO: EOF/broken-pipe/timeout/errors terminate the session rather
   than corrupting state.
 - Secret-at-rest hygiene: the keystore (private identity key) is written
   owner-only (mode 0600 on Unix) via an atomic temp+rename, and loading refuses
   a group/other-accessible key file rather than silently using a leaked key.
+- Local untrusted-file boundaries reject symlinks/reparse points, FIFOs,
+  devices, and other non-regular files for keystores, configuration, audit
+  logs, identity records, file adapters, control-plane state, certificates,
+  and secret inputs. Filesystem-backed adapter components use bounded,
+  collision-resistant names rather than lossy character replacement, and
+  adapter polling/configuration limits are bounded. Atomic keystore,
+  configuration, and audit replacements remove temporary secret-bearing files
+  on failure and sync the relevant directory where the platform supports it.
+- Privileged CLI networking paths share the strict TUN interface-name validator
+  and validate the name before optional firewall/killswitch setup or command
+  construction.
+- The experimental QUIC shim rejects unshrouded payloads before encryption
+  when they cannot fit its datagram budget. Offline-mesh and data-mule senders
+  similarly enforce their configured file bound before AEAD work.
 - In-memory secret hygiene: session AEAD keys (`SendCipher` / `ReceiveCipher`),
   derived `SessionKeys`, the Ed25519 signing seed, and HKDF intermediates are
   `zeroize`d on drop so live key material does not linger in freed heap memory
-  after a session ends (`hardening-5`).
+  after a session ends (`hardening-5`). `IdentityKeyPair` does not retain a
+  second long-lived ring signing-key copy; it reconstructs that object only
+  while signing.
 - Atomic control-plane apply with preflight validation and best-effort rollback.
 - Optional native host leak containment:
   `up --killswitch` installs a dedicated Linux nftables policy or elevated
@@ -136,8 +164,14 @@ evidence, and receives appropriate external review:
 | Passive eavesdropper on the wire | Mitigated: AEAD-encrypted data plane. |
 | Replay of a captured data frame | Mitigated: TCP strict monotonic anti-replay and experimental UDP/QUIC sliding-window anti-replay (fail-closed); send-side nonce-limit guard prevents nonce reuse. |
 | Tampered/truncated frames | Mitigated: AEAD authentication + length bounds + fail-closed decode. |
-| Unauthenticated handshake flood (resource exhaustion) | Mitigated: deadline-bounded accept loops + handshake timeouts + pre-authentication signature checks + per-source-IP connection rate limiting; not a full DoS defense against a distributed flood. |
+| Non-canonical AEAD nonce encoding | Mitigated: the receiver requires SHPH's zero-prefixed 12-byte nonce form. |
+| Unauthenticated handshake flood (resource exhaustion) | Mitigated: aggregate TCP handshake deadlines + bounded accept loops + pre-authentication signature checks + per-source-IP connection rate limiting; not a full DoS defense against a distributed flood. |
 | Active MITM | Mitigated by Ed25519 transcript signature verification + peer fingerprint pinning (only the holder of the peer's Ed25519 private key can complete the handshake). |
+| Caller-side handshake-state tampering | Mitigated: public verification checks the local hello against the local key material and negotiated profile before derivation. |
+| Low-order X25519 peer input | Mitigated: authenticated handshake derivation rejects an all-zero X25519 shared secret. |
+| Local special-file or FIFO substitution | Mitigated at the supported file-input boundaries by no-follow/nonblocking opens where supported plus regular-file checks; this does not protect arbitrary third-party code outside these boundaries. |
+| File-adapter path aliasing or traversal through identity/envelope text | Mitigated: path components are bounded, safe, and digest-bound; hostile-filesystem TOCTOU remains out of scope. |
+| Identity-record rollback, skipped continuity link, or unanchored bootstrap | Mitigated in the experimental resolver: initial resolution requires sequence one; later records require a predecessor and accepted updates advance exactly one sequence. |
 | Harvest-now-decrypt-later (recorded traffic broken by a future quantum adversary) | Mitigated (v0.4.0): hybrid ML-KEM-768 + X25519 key derivation means breaking ECDH alone is insufficient to recover the session key. Note: this protects confidentiality of recorded sessions, not against an active quantum adversary that also defeats the classical authentication. |
 | Endpoint compromise / key theft | Out of scope: no HSM/TPM binding yet. |
 | Traffic-analysis / DPI | Out of scope: no fingerprint parity yet. |

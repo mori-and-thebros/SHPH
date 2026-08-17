@@ -1,3 +1,8 @@
+# Historical capture from August 5, 2026; not a current scan result.
+# The current policy and lockfile status are documented in
+# docs/SUPPLY_CHAIN_SCAN.md. Regenerate this file with:
+# cargo audit --deny warnings
+
       Loaded 1173 security advisories (from <local Cargo advisory database>)
     Scanning Cargo.lock for vulnerabilities (237 crate dependencies)
 Crate:     paste

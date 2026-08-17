@@ -24,6 +24,55 @@ cargo test --workspace --locked
 `--locked` refuses to build if `Cargo.lock` does not match `Cargo.toml`, which
 prevents silent dependency upgrades.
 
+The benchmark harness is intentionally a standalone manifest so its measurement
+dependencies do not enter the shipped workspace binaries. Validate it
+separately:
+
+```bash
+cargo fmt --manifest-path benchmarks/Cargo.toml -- --check
+cargo check --manifest-path benchmarks/Cargo.toml --all-targets --locked
+cargo build --manifest-path benchmarks/Cargo.toml --release --locked
+```
+
+For identity/plugin-provider coverage, run the explicit suite and preserve the
+environment metadata and CSV output with the reviewed evidence:
+
+```bash
+cargo run --manifest-path benchmarks/Cargo.toml --release -- \
+  --suite identity --iterations 1000 --frames 1000
+```
+
+The identity suite includes local filesystem, in-memory, and failure-model
+providers. It is not a substitute for a native two-host or remote-plugin
+availability test.
+
+For wire and packet-overhead coverage:
+
+```bash
+cargo run --manifest-path benchmarks/Cargo.toml --release -- \
+  --suite wire --iterations 1000 --frames 10000
+```
+
+The wire suite reports encrypted/enveloped bytes, overhead, packet rate,
+in-memory roundtrip behavior, and authenticated UDP loopback. It excludes
+IP/UDP/Ethernet headers and is not a substitute for native TUN or two-host
+throughput evidence.
+
+On Windows, use the MSVC target when Visual Studio C++ build tools are
+available:
+
+```powershell
+cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml `
+  --target x86_64-pc-windows-msvc --locked
+```
+
+If MSVC is unavailable, use a complete, supported LLVM-MinGW installation
+configured as the Rust GNU target linker. Do not force
+`-C link-self-contained=yes` as a substitute for a complete runtime; it can
+produce binaries that fail in the MinGW CRT relocation/startup path before
+`main`. Record the exact linker and CRT versions with any GNU-target benchmark
+evidence.
+
 ## Supply-chain posture
 
 - SHPH composes vetted cryptography from established crates rather than
@@ -37,7 +86,7 @@ prevents silent dependency upgrades.
   version where possible:
   ```bash
   cargo install cargo-audit --version 0.22.2 --locked
-  cargo audit --no-fetch
+  cargo audit --deny warnings
   ```
   Run this before tagging a release and record the result.
 
@@ -63,6 +112,7 @@ prevents silent dependency upgrades.
 
 ## Cargo audit integration
 
-The CI workflow already runs `cargo audit` and explicitly ignores only the two
-accepted optional-TUI advisories documented in `docs/SUPPLY_CHAIN_SCAN.md`.
+The CI workflow runs `cargo audit --deny warnings` without ignored advisory
+IDs. The historical optional-TUI advisories and their old allowlist are
+documented only as historical context in `docs/SUPPLY_CHAIN_SCAN.md`.
 New warnings or vulnerabilities fail the advisory job.

@@ -6,10 +6,52 @@ This project uses workspace-wide validation and crate-level tests.
 
 ```bash
 cargo fmt --all -- --check
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo check --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
+
+For quick local diagnosis:
+
+```bash
+shph doctor
+shph doctor --strict --json
+shph status --json
+shph list-peers --json
+```
+
+For the binding release and security collectors on Windows or PowerShell
+Core:
+
+```powershell
+pwsh -File .\scripts\release_readiness.ps1 -AllowDirty
+pwsh -File .\scripts\security_evidence.ps1 -AllowDirty
+```
+
+These commands write timestamped, machine-readable and Markdown snapshots
+under `benchmark-runs/`. `-AllowDirty` is for engineering evidence only; a
+dirty-tree result is never release-eligible. Both collectors preserve
+`FAIL`/`SKIP` statuses instead of turning unavailable host capabilities into
+passes. See `docs/RELEASE_READINESS.md` and `docs/SECURITY_EVIDENCE.md`.
+
+## Host prerequisites and evidence provenance
+
+The workspace must be validated with a complete native toolchain. On Windows,
+the MSVC Rust target requires Visual C++ Build Tools (including `link.exe`).
+The GNU target is not a substitute unless its complete LLVM-MinGW/libgcc
+runtime is installed. Linux-only scripts and fuzz campaigns require a native
+Linux environment; WSL is not assumed.
+
+Native Windows validation is maintained as a separate, date-stamped host
+campaign and is recorded in
+`docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`. That record
+should be used for platform-status review. Local workstation availability is
+intentionally not treated as release evidence.
+
+Remaining product gates are still explicit: native TUN packet I/O, route/DNS
+rollback, reconnect, teardown, and two-host forwarding require the dedicated
+host campaigns described in `docs/SUPPORT_MATRIX.md` and
+`docs/RELEASE_READINESS.md`.
 
 ## Focused Test Runs
 
@@ -21,13 +63,31 @@ cargo test -p shph-cli --test cli_tcp_handshake
 cargo test -p shph-cli --test cli_tcp_data_plane
 cargo test -p shph-cli --test cli_up_session_mode
 cargo test -p shph-cli --test cli_control_plane
+cargo test -p shph-cli --lib --locked
 ```
 
 ### Core handshake tests
 
 ```bash
-cargo test -p shph-core --test handshake_flow
+cargo test -p shph-core --lib --locked
+cargo test -p shph-core --test handshake_flow --locked
+cargo test -p shph-identity --locked
+cargo test -p shph-transport --lib --locked
 ```
+
+The focused hardening tests include bounded replay-window and HKDF construction
+(including output-size limits),
+peer-policy pin limits, canonical nonce parsing, TCP cookie/line framing,
+pipelined follow-up bytes, outbound TCP and unshrouded-QUIC frame limits,
+local handshake-material binding, inline-PQ metadata rejection, anchored
+identity-record continuity,
+collision-resistant file-adapter paths, pre-encryption adapter payload bounds,
+bounds that include AEAD/base64/envelope overhead, deadline-aware hostname
+resolution, and interface-scoped route rollback. Privileged command-builder
+coverage also exercises the shared
+strict TUN interface-name validator.
+The special-file and X25519 checks are source-level fail-closed guards and
+should be exercised by the complete platform test matrix.
 
 ### Native TUN checks
 

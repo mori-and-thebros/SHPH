@@ -7,11 +7,12 @@ members = [
   "shph-obfuscation",
   "shph-cli",
   "shph-tui",
+  "shph-identity",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.1-dev"
+version = "0.6.2-dev"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["SHPH Team"]

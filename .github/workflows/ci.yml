@@ -87,25 +87,59 @@ jobs:
             cargo +nightly-2026-07-16 fuzz run "$target" -- -runs=1
           done
 
-  # Separate, clearly-scoped job for the experimental native TUN path on Linux.
-  # Requires CAP_NET_ADMIN; guarded so it does not break the main matrix.
-  linux-native-tun:
-    name: Linux native TUN (optional)
+  standalone-validation:
+    name: Standalone ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: benchmarks
+            manifest: benchmarks/Cargo.toml
+          - name: fuzz manifest
+            manifest: fuzz/Cargo.toml
     runs-on: ubuntu-latest
-    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --no-self-update
+      - name: cargo fmt --check
+        run: cargo +1.96.0 fmt --manifest-path "${{ matrix.manifest }}" -- --check
+      - name: cargo check --locked
+        run: cargo +1.96.0 check --manifest-path "${{ matrix.manifest }}" --all-targets --locked
+
+  windows-benchmark-smoke:
+    name: Windows benchmark smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
+      - name: Build standalone benchmark with MSVC
+        run: cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml --target x86_64-pc-windows-msvc --locked
+      - name: Run identity benchmark smoke
+        run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite identity --iterations 2 --frames 2
+      - name: Run wire benchmark smoke
+        run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite wire --iterations 2 --frames 2
+
+  # Separate, clearly-scoped job for the experimental native TUN path on Linux.
+  # Native-TUN evidence is a release gate and must not be silently ignored.
+  linux-native-tun:
+    name: Linux native TUN
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
       - name: build with native TUN path
         run: cargo +1.96.0 build -p shph-cli --locked
-      - name: smoke (requires CAP_NET_ADMIN; may be skipped by host policy)
+      - name: smoke (requires CAP_NET_ADMIN; reports host-policy skips)
         run: SHPH_TUN_NATIVE=1 cargo test -p shph-tun
-      - name: isolated namespace smoke (optional)
+      - name: isolated namespace smoke
         run: ./scripts/native_tun_namespace_test.sh
 
-  # Supply-chain advisory scan. The two currently accepted transitive TUI
-  # advisories are ignored explicitly; any new warning or vulnerability fails.
+  # Supply-chain advisory scan. The current ratatui dependency graph no longer
+  # contains the previously accepted paste/lru advisories, so warnings remain
+  # blocking instead of being hidden by an exception list.
   audit:
     name: cargo audit (advisory scan)
     runs-on: ubuntu-latest
@@ -116,8 +150,4 @@ jobs:
       - name: Install cargo-audit
         run: cargo +1.96.0 install cargo-audit --version 0.22.2 --locked
       - name: cargo audit
-        run: >
-          cargo audit
-          --ignore RUSTSEC-2024-0436
-          --ignore RUSTSEC-2026-0002
-          --deny warnings
+        run: cargo audit --deny warnings

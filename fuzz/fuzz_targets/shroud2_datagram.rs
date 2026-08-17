@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shph_transport::shroud2::{decode_datagram, MorphologyProfile, MorphologyEngine};
+use shph_transport::shroud2::{decode_datagram, MorphologyEngine, MorphologyProfile};
 
 fuzz_target!(|input: &[u8]| {
     if input.len() > 65_535 {
@@ -20,11 +20,7 @@ fuzz_target!(|input: &[u8]| {
             .unwrap_or_default();
         let mut engine = MorphologyEngine::from_seed(MorphologyProfile::WebBrowsingLab, seed);
         if let Ok(target) = engine.target_size(payload.len(), 65_535) {
-            if let Ok(encoded) = shph_transport::shroud2::encode_datagram(
-                payload,
-                target,
-                65_535,
-            ) {
+            if let Ok(encoded) = shph_transport::shroud2::encode_datagram(payload, target, 65_535) {
                 let _ = decode_datagram(&encoded, 65_535);
             }
         }

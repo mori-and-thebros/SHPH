@@ -11,7 +11,7 @@ Make SHPH a **funding-ready, open-source VPN** with:
 
 Non-goals in this roadmap section: stealth/fingerprinting, anti-censorship claims, and optional experimental transports.
 
-## Current State (as of 2026-08-14)
+## Current State (as of 2026-08-17)
 
 ### What is already built
 
@@ -315,12 +315,12 @@ candidate without overstating platform or network evidence.
   lab-only, or operator-dependent.
 - A reviewer can reproduce the claimed results from the documentation.
 
-**Current status (2026-08-14):** preparation is in progress, but Phase E is
+**Current status (2026-08-17):** preparation is in progress, but Phase E is
 not complete. The benchmark/evidence bundle was captured on the prior
-`0.6.0-dev.0` line; the current `0.6.1-dev` prerelease carries follow-up
-hardening. The release snapshot, final claims freeze, mirror-parity check,
-final release checklist, and release tag remain gated on the outstanding
-native TUN evidence.
+`0.6.0-dev.0` and `0.6.1-dev` lines; the current `0.6.2-dev` development
+snapshot carries follow-up hardening and public-surface cleanup. The final
+claims freeze, mirror-parity check, final release checklist, and production
+release sign-off remain gated on the outstanding native TUN evidence.
 
 ### Phase F — Windows TUN Delivery
 

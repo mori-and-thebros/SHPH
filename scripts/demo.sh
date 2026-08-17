@@ -16,6 +16,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 BIN="$ROOT/target/debug/shph"
+DEMO_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/shph-demo.XXXXXX")"
+
+cleanup() {
+  rm -rf -- "$DEMO_ROOT"
+}
+trap cleanup EXIT INT TERM
 
 build_if_needed() {
   if [ ! -x "$BIN" ]; then
@@ -24,11 +30,11 @@ build_if_needed() {
   fi
 }
 
-fresh_dir() { rm -rf "$1"; mkdir -p "$1"; }
+fresh_dir() { mkdir -p -- "$1"; }
 
 demo_happy() {
   echo "================ DEMO 1: encrypted one-shot tunnel (happy path) ================"
-  local a=/tmp/shph-demo-a b=/tmp/shph-demo-b
+  local a="$DEMO_ROOT/a" b="$DEMO_ROOT/b"
   fresh_dir "$a"; fresh_dir "$b"
   "$BIN" --config "$a/config.toml" init --new >/dev/null
   "$BIN" --config "$b/config.toml" init --new >/dev/null
@@ -72,7 +78,7 @@ demo_happy() {
 
 demo_bad_cidr() {
   echo "================ DEMO 2: invalid CIDR rejected (fail-closed) ================"
-  local d=/tmp/shph-demo-cidr; fresh_dir "$d"
+  local d="$DEMO_ROOT/cidr"; fresh_dir "$d"
   "$BIN" --config "$d/config.toml" init --new >/dev/null
   printf '[control_plane]\napply_routes = true\nroute_cidrs = ["10.99.0.0/40"]\ndry_run = false\n' >> "$d/config.toml"
   set +e
@@ -91,7 +97,7 @@ demo_bad_cidr() {
 
 demo_unreachable() {
   echo "================ DEMO 3: unreachable peer (reconnect + backoff, fail-closed) ================"
-  local d=/tmp/shph-demo-unreach; fresh_dir "$d"
+  local d="$DEMO_ROOT/unreachable"; fresh_dir "$d"
   "$BIN" --config "$d/config.toml" init --new >/dev/null
   printf '[session]\nrole = "connect"\npeer = "127.0.0.1:1"\ntimeout_secs = 1\n[session.reconnect]\nenabled = true\nmax_attempts = 2\ninitial_delay_ms = 1\nmax_delay_ms = 2\n' >> "$d/config.toml"
   set +e

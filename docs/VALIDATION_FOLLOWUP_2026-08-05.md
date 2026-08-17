@@ -4,9 +4,13 @@ This note records the remaining validation work performed after the security
 remediation. It covers reproducible commands and platform-specific evidence;
 release claims must still be based on a clean tagged revision.
 
+This is a historical snapshot from August 5, 2026. The current dependency
+policy and advisory command are maintained in `docs/SUPPLY_CHAIN_SCAN.md`;
+the captured output below is not a current scan result.
+
 ## Dependency Audit
 
-Command:
+Historical command:
 
 ```text
 cargo audit --no-fetch

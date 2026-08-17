@@ -2,7 +2,7 @@
 param(
     [string]$Binary = "",
     [string]$OutputDirectory = ".\benchmark-runs\windows",
-    [ValidateSet("all", "core", "dataplane", "resource", "shroud", "quic", "scalability")]
+    [ValidateSet("all", "core", "dataplane", "resource", "shroud", "quic", "scalability", "identity", "wire")]
     [string]$Suite = "all",
     [ValidateRange(1, 10000000)]
     [int]$Iterations = 5000,
@@ -16,22 +16,56 @@ $ErrorActionPreference = "Stop"
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptRoot
+$explicitBinary = -not [string]::IsNullOrWhiteSpace($Binary)
 
-if ([string]::IsNullOrWhiteSpace($Binary)) {
+if ($explicitBinary) {
+    $candidates = @($Binary)
+} else {
     $candidates = @(
         (Join-Path $repoRoot "benchmarks\target\release\shph-benchmarks.exe"),
+        (Join-Path $repoRoot "benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe"),
+        (Join-Path $repoRoot "benchmarks\target\x86_64-pc-windows-gnu\release\shph-benchmarks.exe"),
         (Join-Path $repoRoot "target\release\shph-benchmarks.exe"),
         (Join-Path $repoRoot "target\x86_64-pc-windows-gnu\release\shph-benchmarks.exe")
     )
-    $Binary = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 }
 
-if ([string]::IsNullOrWhiteSpace($Binary) -or
-    -not (Test-Path -LiteralPath $Binary -PathType Leaf)) {
-    throw "Benchmark executable not found. Build it with: cargo build --release --manifest-path benchmarks/Cargo.toml --locked"
+$resolvedBinary = $null
+foreach ($candidate in $candidates) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        continue
+    }
+
+    $candidatePath = (Resolve-Path -LiteralPath $candidate).Path
+    $startupExitCode = -1
+    try {
+        $null = & $candidatePath --help 2>$null
+        $startupExitCode = $LASTEXITCODE
+    } catch {
+        $startupExitCode = -1
+    }
+
+    if ($startupExitCode -eq 0) {
+        $resolvedBinary = $candidatePath
+        break
+    }
+
+    if ($explicitBinary) {
+        throw "Benchmark executable failed its startup probe with exit code ${startupExitCode}: $candidatePath. Rebuild with the MSVC target or a supported, fully configured LLVM-MinGW toolchain; do not use -C link-self-contained=yes."
+    }
+
+    Write-Warning "Skipping benchmark executable that failed its startup probe with exit code ${startupExitCode}: $candidatePath"
 }
 
-$resolvedBinary = (Resolve-Path -LiteralPath $Binary).Path
+if ([string]::IsNullOrWhiteSpace($resolvedBinary)) {
+    if ($explicitBinary -and
+        -not (Test-Path -LiteralPath $candidates[0] -PathType Leaf)) {
+        throw "Benchmark executable not found: $($candidates[0]). Build it with: cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml --target x86_64-pc-windows-msvc --locked"
+    }
+
+    throw "No usable benchmark executable was found. Build it with: cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml --target x86_64-pc-windows-msvc --locked"
+}
+
 $resolvedOutput = Join-Path $repoRoot $OutputDirectory
 New-Item -ItemType Directory -Force -Path $resolvedOutput | Out-Null
 

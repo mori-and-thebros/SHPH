@@ -142,6 +142,7 @@ impl KeyStore {
         // Unix: a private key readable by group/other is a secret-hygiene
         // failure. We still load it but only after the operator fixes perms;
         // failing closed here is safer than silently using a leaky key file.
+        ensure_no_reparse_components(path)?;
         assert_secret_file_perms(path)?;
 
         // Bound the read: a keystore is tiny; reject anything oversized to
@@ -155,9 +156,14 @@ impl KeyStore {
             )));
         }
         // Also seek-check against a stream that lies about metadata.
-        let mut limited = file.take(MAX_KEYSTORE_BYTES);
+        let mut limited = file.take(MAX_KEYSTORE_BYTES.saturating_add(1));
         let mut buf = Zeroizing::new(Vec::new());
         limited.read_to_end(&mut buf)?;
+        if buf.len() > MAX_KEYSTORE_BYTES as usize {
+            return Err(ShphError::InvalidArgument(format!(
+                "keystore file exceeds the {MAX_KEYSTORE_BYTES}-byte safety limit; refusing to load"
+            )));
+        }
         let contents = Zeroizing::new(
             String::from_utf8(std::mem::take(&mut *buf))
                 .map_err(|_| ShphError::InvalidArgument("keystore is not valid UTF-8".into()))?,
@@ -316,15 +322,25 @@ fn atomic_secret_write(path: &Path, data: &[u8]) -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    ensure_no_reparse_components(&dir)?;
     std::fs::create_dir_all(&dir)?;
+    ensure_no_reparse_components(&dir)?;
+    ensure_no_reparse_components(path)?;
 
     let (mut tmp, tmp_path) = create_temp_file(&dir, path)?;
-    restrict_secret_perms(&tmp_path)?;
-    tmp.write_all(data)?;
-    tmp.sync_all()?;
-    drop(tmp);
+    let result = (|| -> Result<()> {
+        restrict_secret_perms(&tmp_path)?;
+        tmp.write_all(data)?;
+        tmp.sync_all()?;
+        drop(tmp);
 
-    if let Err(err) = persist_over(path, &tmp_path) {
+        ensure_no_reparse_components(&dir)?;
+        ensure_no_reparse_components(path)?;
+        persist_over(path, &tmp_path)?;
+        sync_parent_dir(&dir)?;
+        Ok(())
+    })();
+    if let Err(err) = result {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
@@ -366,11 +382,22 @@ fn open_keystore_readonly(path: &Path) -> Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
-            .map_err(ShphError::Io)
+            .map_err(ShphError::Io)?;
+        if !file
+            .metadata()
+            .map_err(ShphError::Io)?
+            .file_type()
+            .is_file()
+        {
+            return Err(ShphError::InvalidArgument(
+                "keystore path must reference a regular file".into(),
+            ));
+        }
+        Ok(file)
     }
     #[cfg(not(unix))]
     {
@@ -381,8 +408,31 @@ fn open_keystore_readonly(path: &Path) -> Result<File> {
                 "refusing to load a symlinked keystore".into(),
             ));
         }
-        File::open(path).map_err(ShphError::Io)
+        let file = File::open(path).map_err(ShphError::Io)?;
+        if !file
+            .metadata()
+            .map_err(ShphError::Io)?
+            .file_type()
+            .is_file()
+        {
+            return Err(ShphError::InvalidArgument(
+                "keystore path must reference a regular file".into(),
+            ));
+        }
+        Ok(file)
     }
+}
+
+fn sync_parent_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
 
 pub fn ensure_not_reparse_point(path: &Path) -> Result<()> {
@@ -405,6 +455,36 @@ pub fn ensure_not_reparse_point(path: &Path) -> Result<()> {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+    Ok(())
+}
+
+/// Refuse to traverse a symlink or Windows reparse point anywhere in `path`.
+///
+/// Missing final components are allowed so callers can use this before
+/// creating a new file or directory. Existing parent components are checked
+/// from the target back to the filesystem root.
+pub fn ensure_no_reparse_components(path: &Path) -> Result<()> {
+    let mut current = Some(path);
+    while let Some(component) = current {
+        if component.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ShphError::InvalidArgument(format!(
+                    "refusing to traverse symlink component '{}'",
+                    component.display()
+                )));
+            }
+            Ok(_) => {
+                #[cfg(windows)]
+                ensure_not_reparse_point(component)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ShphError::Io(error)),
+        }
+        current = component.parent();
     }
     Ok(())
 }
@@ -802,6 +882,29 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         assert!(KeyStore::load(&link, None).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "shph-ks-parent-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = dir.join("real");
+        let link = dir.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, &link).unwrap();
+
+        let ks = KeyStore::new(KeyStoreConfig::default()).unwrap();
+        assert!(ks.save(&link.join("keystore.json")).is_err());
+        assert!(!real.join("keystore.json").exists());
         std::fs::remove_dir_all(dir).ok();
     }
 

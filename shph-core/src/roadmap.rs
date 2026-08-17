@@ -3,6 +3,7 @@
 use base64::Engine as _;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -20,6 +21,11 @@ const MAX_SHAMIR_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_SHAMIR_SECRET_BYTES: usize = MAX_SHAMIR_PAYLOAD_BYTES / 2;
 const MAX_SHAMIR_RECOVERY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SHAMIR_PAYLOAD_B64_BYTES: usize = MAX_SHAMIR_PAYLOAD_BYTES.div_ceil(3) * 4;
+
+/// Upper bound for polling intervals used by file-backed transport adapters.
+/// A public config value must not be able to suspend a handshake for an
+/// effectively unbounded sleep.
+pub const MAX_ADAPTER_POLL_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -144,9 +150,9 @@ impl TransportAdapterConfig {
                 if spool_dir.trim().is_empty() {
                     return Err(ShphError::Config("offline-mesh spool_dir required".into()));
                 }
-                if *poll_interval_ms == 0 {
+                if *poll_interval_ms == 0 || *poll_interval_ms > MAX_ADAPTER_POLL_INTERVAL_MS {
                     return Err(ShphError::Config(
-                        "poll interval must be greater than zero".into(),
+                        "poll interval must be between 1ms and 60000ms".into(),
                     ));
                 }
                 if *max_idle_entries == 0 || *max_idle_entries > 65_536 {
@@ -173,9 +179,9 @@ impl TransportAdapterConfig {
                         "data-mule inbox and outbox must differ".into(),
                     ));
                 }
-                if *poll_interval_ms == 0 {
+                if *poll_interval_ms == 0 || *poll_interval_ms > MAX_ADAPTER_POLL_INTERVAL_MS {
                     return Err(ShphError::Config(
-                        "poll interval must be greater than zero".into(),
+                        "poll interval must be between 1ms and 60000ms".into(),
                     ));
                 }
                 if *max_file_bytes == 0 {
@@ -446,7 +452,10 @@ pub fn validate_shamir_config(cfg: &ShamirConfig) -> Result<()> {
 }
 
 pub fn offline_mesh_envelope_path(base_dir: &str, session_id: &str) -> PathBuf {
-    Path::new(base_dir).join(format!("shph-session-{session_id}.json"))
+    Path::new(base_dir).join(format!(
+        "shph-session-{}.json",
+        safe_path_component(session_id)
+    ))
 }
 
 pub fn offline_spool_path(base_dir: &str, session_id: &str) -> PathBuf {
@@ -455,14 +464,14 @@ pub fn offline_spool_path(base_dir: &str, session_id: &str) -> PathBuf {
 
 pub fn data_mule_inbox_path(inbox_dir: &str, peer: &str, envelope_id: &str) -> PathBuf {
     Path::new(inbox_dir)
-        .join(sanitize_filename(peer))
-        .join(format!("{}.shph", sanitize_filename(envelope_id)))
+        .join(safe_path_component(peer))
+        .join(format!("{}.shph", safe_path_component(envelope_id)))
 }
 
 pub fn offline_session_id(node_a: &str, node_b: &str) -> String {
-    let mut nodes = [sanitize_filename(node_a), sanitize_filename(node_b)];
+    let mut nodes = [safe_path_component(node_a), safe_path_component(node_b)];
     nodes.sort_unstable();
-    format!("{}:{}", nodes[0], nodes[1])
+    format!("{}--{}", nodes[0], nodes[1])
 }
 
 pub fn map_pqc_context(cfg: &PqcConfig) -> Vec<(String, String)> {
@@ -670,9 +679,12 @@ fn write_jsonl_line(path: &Path, record: &RatchetAuditRecord) -> Result<()> {
     let line = serde_json::to_string(record).map_err(ShphError::Serialization)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
+            ensure_audit_path_components(parent).map_err(ShphError::Io)?;
             fs::create_dir_all(parent).map_err(ShphError::Io)?;
+            ensure_audit_path_components(parent).map_err(ShphError::Io)?;
         }
     }
+    ensure_audit_path_components(path).map_err(ShphError::Io)?;
     let mut f = open_audit_append(path).map_err(ShphError::Io)?;
     restrict_audit_file_perms(path)?;
     writeln!(f, "{line}").map_err(ShphError::Io)?;
@@ -681,6 +693,7 @@ fn write_jsonl_line(path: &Path, record: &RatchetAuditRecord) -> Result<()> {
 }
 
 fn prune_jsonl(path: &Path, max_entries: usize) -> Result<()> {
+    ensure_audit_path_components(path).map_err(ShphError::Io)?;
     let file = match open_audit_read(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -720,28 +733,37 @@ fn prune_jsonl(path: &Path, max_entries: usize) -> Result<()> {
     let mut tmp_path = path.to_path_buf();
     let suffix = now_unix_ms()?;
     tmp_path.set_extension(format!("jsonl.tmp.{}.{}", std::process::id(), suffix));
-    let mut f = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(ShphError::Io)?;
-    restrict_audit_file_perms(&tmp_path)?;
-    for record in records {
-        let line = serde_json::to_string(&record).map_err(ShphError::Serialization)?;
-        if let Err(err) = writeln!(f, "{line}").map_err(ShphError::Io) {
-            drop(f);
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
+    if let Some(parent) = tmp_path.parent() {
+        ensure_audit_path_components(parent).map_err(ShphError::Io)?;
+    }
+    ensure_audit_path_components(path).map_err(ShphError::Io)?;
+    let mut temp_created = false;
+    let result = (|| -> Result<()> {
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)
+            .map_err(ShphError::Io)?;
+        temp_created = true;
+        restrict_audit_file_perms(&tmp_path).map_err(ShphError::Io)?;
+        for record in records {
+            let line = serde_json::to_string(&record).map_err(ShphError::Serialization)?;
+            writeln!(f, "{line}").map_err(ShphError::Io)?;
         }
-    }
-    if let Err(err) = f.sync_all().map_err(ShphError::Io) {
+        f.sync_all().map_err(ShphError::Io)?;
         drop(f);
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-    drop(f);
-    if let Err(err) = persist_audit_over(&tmp_path, path).map_err(ShphError::Io) {
-        let _ = fs::remove_file(&tmp_path);
+        if let Some(parent) = path.parent() {
+            ensure_audit_path_components(parent).map_err(ShphError::Io)?;
+        }
+        ensure_audit_path_components(path).map_err(ShphError::Io)?;
+        persist_audit_over(&tmp_path, path).map_err(ShphError::Io)?;
+        sync_audit_parent_dir(path).map_err(ShphError::Io)?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        if temp_created {
+            let _ = fs::remove_file(&tmp_path);
+        }
         return Err(err);
     }
     Ok(())
@@ -772,6 +794,10 @@ fn read_bounded_line(reader: &mut BufReader<File>, line: &mut Vec<u8>) -> io::Re
 }
 
 fn persist_audit_over(tmp: &Path, path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_audit_path_components(parent)?;
+    }
+    ensure_audit_path_components(path)?;
     #[cfg(unix)]
     {
         fs::rename(tmp, path)
@@ -780,6 +806,22 @@ fn persist_audit_over(tmp: &Path, path: &Path) -> io::Result<()> {
     {
         let _ = fs::remove_file(path);
         fs::rename(tmp, path)
+    }
+}
+
+fn sync_audit_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 
@@ -797,51 +839,116 @@ fn restrict_audit_file_perms(path: &Path) -> io::Result<()> {
 }
 
 fn open_audit_read(path: &Path) -> io::Result<File> {
+    ensure_audit_path_components(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit path must reference a regular file",
+            ));
+        }
+        Ok(file)
     }
     #[cfg(not(unix))]
     {
-        File::open(path)
+        let file = File::open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit path must reference a regular file",
+            ));
+        }
+        Ok(file)
     }
 }
 
 fn open_audit_append(path: &Path) -> io::Result<File> {
+    ensure_audit_path_components(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit path must reference a regular file",
+            ));
+        }
+        Ok(file)
     }
     #[cfg(not(unix))]
     {
-        OpenOptions::new().create(true).append(true).open(path)
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit path must reference a regular file",
+            ));
+        }
+        Ok(file)
     }
 }
 
-fn sanitize_filename(input: &str) -> String {
-    let sanitized: String = input
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "_".to_string()
-    } else {
-        sanitized
+fn ensure_audit_path_components(path: &Path) -> io::Result<()> {
+    crate::ensure_no_reparse_components(path)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+}
+
+/// Produce a filesystem-safe, bounded, collision-resistant path component.
+///
+/// Replacing unsafe characters with `_` alone is not sufficient: distinct
+/// identities such as `a/b` and `a_b` would otherwise share a queue directory.
+/// Keep a short readable prefix for operators, then append a domain-separated
+/// digest of the original bytes so path identity remains injective up to the
+/// hash's security level.
+pub fn safe_path_component(input: &str) -> String {
+    const READABLE_PREFIX_BYTES: usize = 24;
+    const HASH_BYTES: usize = 16;
+
+    let mut readable = String::with_capacity(READABLE_PREFIX_BYTES);
+    for ch in input.chars() {
+        if readable.len() >= READABLE_PREFIX_BYTES {
+            break;
+        }
+        readable.push(if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            ch
+        } else {
+            '_'
+        });
+    }
+    if readable.is_empty() {
+        readable.push('_');
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"shph/path-component/v1\0");
+    hasher.update((input.len() as u64).to_be_bytes());
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    format!("{readable}-{}", hex::encode(&digest[..HASH_BYTES]))
+}
+
+#[cfg(test)]
+mod path_component_tests {
+    use super::*;
+
+    #[test]
+    fn path_components_are_stable_and_collision_resistant() {
+        assert_eq!(safe_path_component("a/b"), safe_path_component("a/b"));
+        assert_ne!(safe_path_component("a/b"), safe_path_component("a_b"));
+        assert!(safe_path_component("../../escape")
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')));
     }
 }
 
@@ -989,7 +1096,28 @@ mod tests {
     #[test]
     fn data_mule_paths_confine_peer_and_envelope_components() {
         let path = data_mule_inbox_path("/tmp/inbox", "../../escape", "../payload");
-        assert_eq!(path, Path::new("/tmp/inbox/______escape/___payload.shph"));
+        assert_eq!(
+            path.parent()
+                .and_then(|parent| parent.parent())
+                .expect("inbox parent"),
+            Path::new("/tmp/inbox")
+        );
+        assert!(path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".shph")));
+    }
+
+    #[test]
+    fn file_adapter_paths_do_not_alias_distinct_inputs() {
+        assert_ne!(
+            data_mule_inbox_path("/tmp/inbox", "a/b", "payload"),
+            data_mule_inbox_path("/tmp/inbox", "a_b", "payload")
+        );
+        assert_ne!(
+            offline_session_id("a/b", "peer"),
+            offline_session_id("a_b", "peer")
+        );
     }
 
     #[test]
@@ -1011,6 +1139,18 @@ mod tests {
             spool_dir: "/tmp/shph-offline".to_string(),
             poll_interval_ms: 250,
             max_idle_entries: 65_537,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn file_adapter_rejects_unbounded_poll_interval() {
+        let cfg = TransportAdapterConfig::OfflineMesh {
+            node_id: "node-a".to_string(),
+            peer_id: "node-b".to_string(),
+            spool_dir: "/tmp/shph-offline".to_string(),
+            poll_interval_ms: MAX_ADAPTER_POLL_INTERVAL_MS + 1,
+            max_idle_entries: 1,
         };
         assert!(cfg.validate().is_err());
     }
@@ -1230,9 +1370,48 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ratchet_audit_refuses_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "shph-audit-parent-symlink-{}-{}",
+            std::process::id(),
+            now_unix_ms().expect("clock")
+        ));
+        let real = dir.join("real");
+        let link = dir.join("link");
+        fs::create_dir_all(&real).expect("mkdir");
+        symlink(&real, &link).expect("symlink");
+        let policy = RatchetAuditConfig {
+            journal_path: link.join("audit.jsonl").to_string_lossy().into_owned(),
+            max_entries: 2,
+        };
+
+        assert!(append_ratchet_audit_event(
+            &policy,
+            "local".into(),
+            "peer".into(),
+            "transcript".into(),
+            "connect",
+            "tcp"
+        )
+        .is_err());
+        assert!(!real.join("audit.jsonl").exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn offline_spool_path_is_stable() {
         let got = offline_spool_path("/tmp/spool", "alice:bob");
-        assert!(got.ends_with("shph-session-alice:bob.json"));
+        assert!(got.starts_with(Path::new("/tmp/spool")));
+        assert!(got
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(
+                |name| name.starts_with("shph-session-alice_bob-") && name.ends_with(".json")
+            ));
+        let escaped = offline_spool_path("/tmp/spool", "../../escape");
+        assert_eq!(escaped.parent(), Some(Path::new("/tmp/spool")));
     }
 }

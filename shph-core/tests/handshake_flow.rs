@@ -24,6 +24,10 @@ fn hybrid_exchange(
     // Initiator encapsulates against the responder's PQ public key.
     let init_policy = PeerPolicy::single(PeerPin::for_identity(responder));
     let resp_policy = PeerPolicy::single(PeerPin::for_identity(initiator));
+    // The transport sends the signed hello before it creates the follow-up
+    // ciphertext frame. Keep that wire representation separate from the
+    // initiator's local material, which records the ciphertext for derivation.
+    let initiator_hello = init_mat.local_hello.clone();
     let ct = finalize_initiator_pq(
         initiator,
         &mut init_mat,
@@ -35,7 +39,7 @@ fn hybrid_exchange(
     absorb_responder_pq(
         responder,
         &mut resp_mat,
-        &init_mat.local_hello,
+        &initiator_hello,
         &ct,
         &resp_policy,
     )
@@ -52,7 +56,7 @@ fn hybrid_exchange(
     let resp_state = verify_and_derive(
         responder,
         &resp_mat,
-        &init_mat.local_hello,
+        &initiator_hello,
         false,
         &resp_policy,
     )
@@ -163,6 +167,7 @@ fn corrupted_pq_ciphertext_changes_the_bound_kdf_transcript() {
     let responder = IdentityKeyPair::generate().unwrap();
     let mut init_mat = build_hello(&initiator).unwrap();
     let mut resp_mat = build_hello(&responder).unwrap();
+    let initiator_hello = init_mat.local_hello.clone();
 
     let init_policy = PeerPolicy::single(PeerPin::for_identity(&responder));
     let resp_policy = PeerPolicy::single(PeerPin::for_identity(&initiator));
@@ -178,7 +183,7 @@ fn corrupted_pq_ciphertext_changes_the_bound_kdf_transcript() {
     absorb_responder_pq(
         &responder,
         &mut resp_mat,
-        &init_mat.local_hello,
+        &initiator_hello,
         &ct,
         &resp_policy,
     )
@@ -195,7 +200,7 @@ fn corrupted_pq_ciphertext_changes_the_bound_kdf_transcript() {
     let resp_state = verify_and_derive(
         &responder,
         &resp_mat,
-        &init_mat.local_hello,
+        &initiator_hello,
         false,
         &resp_policy,
     )

@@ -9,11 +9,15 @@ long-term viability.
 | ---- | -------- | ------- | ----------------- |
 | Community | anyone | GitHub issues (non-security), discussions | Best-effort, volunteer response |
 | Security | anyone reporting a vuln | private advisory / maintainer email (see `SECURITY.md`) | 5-business-day ack, coordinated ≤90-day disclosure |
-| Maintainer | core `SHPH Team` | internal | owns merges, releases, policy |
+| Maintainer | core `SHPH Team` | maintainer coordination | owns merges, releases, policy |
 
 SHPH is currently a **community-supported, best-effort** project. There is no
 paid 24/7 support or uptime guarantee. Funders evaluating support should treat
 the `SECURITY.md` disclosure SLA as the firmest commitment.
+
+The product support boundary is maintained in `docs/SUPPORT_MATRIX.md`.
+Experimental transports are intentionally excluded from the release profile,
+and a host-gated result is not treated as a supported deployment.
 
 ## What is supported
 
@@ -21,6 +25,8 @@ the `SECURITY.md` disclosure SLA as the firmest commitment.
 - The TCP transport path (stable).
 - Config-driven `up`/`listen`/`connect`/`send-once`/`recv-once` workflows.
 - The documented control-plane dry-run and safe-apply modes.
+- The release-profile TCP lane and its separately documented host-gated TUN
+  acceptance procedures.
 
 ## What is explicitly unsupported (today)
 
@@ -39,9 +45,10 @@ the `SECURITY.md` disclosure SLA as the firmest commitment.
 - **Per-release:** follow `CONTRIBUTING.md`'s release checklist; bump version in
   workspace `Cargo.toml`, update `Cargo.lock`, run `cargo audit`, mirror to the
   Windows tree, and verify parity (`./scripts/sync_mirror.sh --verify`).
-- **Dependency hygiene:** run `cargo audit` before each release and on any
-  `Cargo.lock` change; review `cargo tree` diffs. (Automating `cargo audit` in
-  CI is a tracked next step — see `docs/REPRODUCIBILITY.md`.)
+- **Dependency hygiene:** run `cargo audit --deny warnings` before each
+  release and on any `Cargo.lock` change; review `cargo tree` diffs. The
+  blocking advisory job is enforced in `.github/workflows/ci.yml`; see
+  `docs/REPRODUCIBILITY.md`.
 
 ### Roles & governance
 

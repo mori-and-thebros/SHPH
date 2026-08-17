@@ -8,7 +8,7 @@ benchmark evidence does not satisfy native-TUN or two-host acceptance criteria.
 
 The August 8-9, 2026 validation refresh adds native Windows workspace,
 Windows-only test, benchmark, and post-loader adapter/session smoke evidence
-from the prior `0.6.0-dev.0` line. The current `0.6.1-dev` prerelease carries
+from the prior `0.6.0-dev.0` line. The current `0.6.2-dev` prerelease carries
 subsequent hardening, while the scorecard still does not promote local
 in-memory measurements, a single-host smoke, or a failed two-node campaign
 into live TUN/VPN claims.
@@ -16,6 +16,12 @@ into live TUN/VPN claims.
 Measurable, verifiable progress against the funding roadmap. Each row ties a
 milestone to its acceptance evidence and a command you can run to reproduce it.
 This is the single source of truth for "how far along is SHPH?"
+
+The product boundary is defined by `docs/SUPPORT_MATRIX.md`. The release gate
+and its PASS/FAIL/SKIP semantics are defined by
+`docs/RELEASE_READINESS.md`; security evidence is mapped in
+`docs/SECURITY_EVIDENCE.md`. Experimental transports do not silently count as
+release-profile support.
 
 ## Phase A — Production Foundations
 
@@ -34,7 +40,7 @@ This is the single source of truth for "how far along is SHPH?"
 | Phase | Title | Status | Evidence (run to verify) |
 | ----- | ----- | ------ | ------------------------ |
 | B.1 | External Review Readiness | **Complete** | `docs/FUNDERS.md`, reproducible demo scripts, `docs/REPRODUCIBILITY.md` |
-| B.2 | API Stability & Supply-Chain Scan | **Complete** | `docs/API_STABILITY.md`, `docs/SECURITY_REPORTING.md`, `docs/SUPPLY_CHAIN_SCAN.md`; `cargo audit` clean (0 vulns, 2 accepted advisories) |
+| B.2 | API Stability & Supply-Chain Scan | **Policy complete; evidence refresh pending** | `docs/API_STABILITY.md`, `docs/SECURITY_REPORTING.md`, `docs/SUPPLY_CHAIN_SCAN.md`; CI uses blocking `cargo audit --deny warnings` |
 
 **Phase B burn-down: 2 / 2 complete (100%).** Tagged at `checkpoint-phaseB-1.0.0`.
 
@@ -58,14 +64,14 @@ This is the single source of truth for "how far along is SHPH?"
 | Fuzz targets and malformed-input regression pass | **Complete for lab evidence** | `fuzz/README.md`, `docs/PHASE_D_HARDENING_2026-07-28.md`; four 20-second no-crash campaigns |
 | QUIC-shim tail repeatability check | **Complete for lab evidence** | Two 5,000-sample runs recorded in `docs/PHASE_D_HARDENING_2026-07-28.md` |
 | Secure-default versus classical-lab benchmark separation | **Complete for lab evidence** | Profile comparison recorded in `docs/PHASE_D_HARDENING_2026-07-28.md` |
-| Static and dependency review | **Complete for current checkout** | Strict fmt/Clippy/tests/build, fuzz manifest check, `cargo audit --no-fetch`; two accepted optional-TUI advisories remain |
+| Static and dependency review | **Remediation complete; current gate rerun pending** | Strict fmt/Clippy/tests/build, standalone fuzz/benchmark checks, and blocking `cargo audit --deny warnings` |
 | Allocation/RSS optimization pass | **Complete for confirmed lab hotspots** | Borrowed Shroud decode plus stack-backed handshake transcript/HKDF; measured in `docs/PHASE_D_HARDENING_2026-07-28.md` |
 | Native Linux TUN lifecycle implementation | **Hardened; async CLI bridge integrated; capability-gated** | `TunDevice::open_native`, `AsyncTunDevice`, bounded async CLI bridge, 15 `shph-tun` tests, complete-write/zeroizing-buffer hardening, one device remains open through `up` setup/reconnect |
 | Opt-in host leak containment and MTU/MSS hardening | **Implemented; privileged execution and crash-leak evidence pending** | `shph up --killswitch`, `--killswitch-dry-run`, `--mss-clamp`; `shph-tun` firewall planners and Windows WFP backend; focused CLI/TUN tests |
 | Native Linux namespace smoke and lifecycle automation | **Implemented; isolated WSL2 smoke passed** | `scripts/native_tun_namespace_test.sh`; `scripts/benchmark_native_tun.sh`; 20/20 lifecycle samples passed (`min=59.1ms`, `p50=189.0ms`, `p95=348.9ms`, `max=349.6ms`) |
 | Standards-QUIC Linux native-TUN bridge | **Implemented; live forwarding evidence pending** | RFC 9221 DATAGRAM bridge in `shph-transport/src/standards_tun.rs`; Linux `up --transport quic-standard`; malformed/IPv4/IPv6 boundary checks |
 | Windows Wintun backend | **Wired; adapter/session smoke passed; packet and two-host evidence pending** | Application-local SHA-256-pinned loader, elevation check, bounded ring, packet release/commit wrappers, bounded event waits, shared-session cloning, public `TunDevice` integration, RAII teardown, and `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`. The Windows validator separately requires valid Authenticode before staging the DLL. |
-| Windows-local `0.6.1-dev` benchmark refresh | **Complete for local lab scope** | `docs/BENCHMARK_RESULTS_2026-08-14.md`; both profiles, full suite, 5,000 samples, 100,000 frames; native TUN disabled |
+| Windows-local `0.6.1-dev` benchmark baseline | **Complete for local lab scope** | `docs/BENCHMARK_RESULTS_2026-08-14.md`; both profiles, full suite, 5,000 samples, 100,000 frames; native TUN disabled |
 | Paired WSL2/native-Windows benchmark campaign | **Complete for local lab scope** | `docs/BENCHMARK_RESULTS_2026-08-05.md` plus the latest native Windows gate record `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`; raw captures remain under ignored `benchmark-runs/` paths |
 | Native TUN/two-host operator evidence | **Pending operator host** | `scripts/benchmark_operator.sh` emits explicit prerequisite `SKIP` records |
 
@@ -80,15 +86,18 @@ two-host forwarding and privileged Windows Wintun packet evidence exist.
 | Public assessment scope and risk register | **Complete** | `SECURITY.md`, `docs/RISK_MATRIX.md`, and `docs/VALIDATION_FOLLOWUP_2026-08-05.md`; private review material is kept outside the public checkout |
 | Finding remediation and regression evidence | **Complete for documented scope** | `docs/VALIDATION_FOLLOWUP_2026-08-05.md`, `docs/evidence/GATE_EVIDENCE.md`, and focused workspace tests |
 | Remediation and focused regressions | **Complete** | High/Medium/Low fixes plus handshake, malformed-peer, standards-QUIC, JA4, and TUN regressions |
-| Full post-remediation validation and parity | **Complete** | `docs/VALIDATION_FOLLOWUP_2026-08-05.md`, `docs/evidence/GATE_EVIDENCE.md`, Windows GNU cross-target evidence, and `scripts/sync_mirror.sh --verify` |
+| Full post-remediation validation and parity | **Pending dedicated validation-lane rerun** | Re-run the root, standalone, advisory, and native-host gates after the current fixes |
 | Public limitations and follow-up publication | **Complete** | `SECURITY.md`, `docs/RISK_MATRIX.md`, and `docs/VALIDATION_FOLLOWUP_2026-08-05.md`; native Windows execution remains an explicit release gate |
 
 ## Phase E — Big Move / Release Readiness (not complete)
 
 | Gate | Status | Evidence |
 | --- | --- | --- |
+| Authoritative release profile and support matrix | **Complete for current scope** | `docs/SUPPORT_MATRIX.md` |
+| Reproducible release-readiness collector | **Implemented; dedicated validation-lane refresh pending** | `scripts/release_readiness.ps1`, `docs/RELEASE_READINESS.md` |
+| Security evidence and publication-redaction pack | **Implemented; dedicated validation-lane refresh pending** | `scripts/security_evidence.ps1`, `docs/SECURITY_EVIDENCE.md` |
 | Paired benchmark/evidence bundle | **Complete for the `0.6.0-dev.0` development line** | `docs/BENCHMARK_RESULTS_2026-08-05.md` and `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` |
-| Windows-local `0.6.1-dev` benchmark refresh | **Complete for local lab scope** | `docs/BENCHMARK_RESULTS_2026-08-14.md`; Wintun/TUN and two-host claims remain out of scope |
+| Windows-local `0.6.1-dev` benchmark baseline | **Complete for local lab scope** | `docs/BENCHMARK_RESULTS_2026-08-14.md`; Wintun/TUN and two-host claims remain out of scope |
 | Claims, limitations, and profile labels | **Complete for current lab scope** | `ROADMAP_OSS_AND_DELIVERY.md`, `docs/RISK_MATRIX.md`, benchmark report |
 | Final release snapshot and SemVer tag | **Pending** | Requires completion of the remaining host-gated TUN evidence and final release checklist |
 | Release-candidate reproducibility review | **Pending** | Run after the final claims/version/commit freeze |
@@ -133,6 +142,8 @@ A phase is complete only when **all** of these hold:
    (`./scripts/sync_mirror.sh --verify`).
 5. `cargo fmt`, `cargo clippy -D warnings`, and `cargo test --workspace` are
    green.
+6. The support matrix, README, risk matrix, and release-readiness report agree
+   on what is supported and what remains host-gated.
 
 No phase is ever marked complete by estimate or intention — only by evidence.
 Phase D cannot be marked complete until Phase D-A is closed.

@@ -16,7 +16,7 @@ attribution, and export posture are consistent and verifiable.
 - [x] **SPDX identifier matches the file texts:** `MIT OR Apache-2.0`.
 - [ ] **Per-crate `LICENSE`/SPDX audit:** each workspace crate (`shph-core`,
       `shph-config`, `shph-tun`, `shph-transport`, `shph-obfuscation`,
-      `shph-cli`, `shph-tui`) inherits the workspace license — verify each
+      `shph-cli`, `shph-tui`, `shph-identity`) inherits the workspace license — verify each
       crate `Cargo.toml` carries the same `license` field (follow-up).
 - [x] **No incompatible copyleft dependencies:** confirmed via `cargo tree`
       (Rust MIT/Apache-2.0/BSD-licensed deps only; see section 3).
@@ -45,8 +45,9 @@ permissively licensed:
 Action items:
 
 - [x] No GPL/AGPL/LGPL in the dependency tree (verified; would block dual MIT/Apache release).
-- [ ] **Add `cargo audit` to CI** as a periodic (non-blocking) supply-chain
-      gate (tracked follow-up; `cargo audit` is not installed in this sandbox).
+- [x] **Run `cargo audit` in CI** as a blocking supply-chain gate. The current
+      checkout carries no advisory exception list; local reproduction still
+      requires a host with a working linker to install `cargo-audit`.
 
 ## 4. Cryptography & export considerations
 
@@ -83,7 +84,7 @@ Action items:
 
 1. Per-crate `license` field audit (section 1).
 2. DCO/CLA policy decision (section 2).
-3. `cargo audit` wired into CI (section 3).
+3. Refresh the captured `cargo audit` evidence after dependency changes.
 4. Export-control counsel review before commercial distribution (section 4).
 5. Release artifact signing (section 6).
 

@@ -24,7 +24,7 @@ use crate::keystore::compute_fingerprint_hex;
 pub struct IdentityKeyPair {
     private: StaticSecret,
     public: PublicKey,
-    signing: std::sync::Arc<ring::signature::Ed25519KeyPair>,
+    signing_public: [u8; 32],
     sign_seed: [u8; 32],
 }
 
@@ -50,14 +50,17 @@ impl IdentityKeyPair {
     pub fn from_seeds(dh_seed: [u8; 32], sign_seed: [u8; 32]) -> Self {
         let private = StaticSecret::from(dh_seed);
         let public = PublicKey::from(&private);
-        let signing = std::sync::Arc::new(
-            ring::signature::Ed25519KeyPair::from_seed_unchecked(&sign_seed)
-                .expect("any 32 bytes is a valid Ed25519 seed"),
-        );
+        let signing = ring::signature::Ed25519KeyPair::from_seed_unchecked(&sign_seed)
+            .expect("any 32 bytes is a valid Ed25519 seed");
+        let signing_public: [u8; 32] = signing
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("Ed25519 public keys are exactly 32 bytes");
         Self {
             private,
             public,
-            signing,
+            signing_public,
             sign_seed,
         }
     }
@@ -115,11 +118,7 @@ impl IdentityKeyPair {
     /// Ed25519 signing public key (32 bytes) used to verify handshake
     /// signatures. Distinct from the X25519 DH public key.
     pub fn signing_public_bytes(&self) -> [u8; 32] {
-        let p = self.signing.public_key().as_ref();
-        let mut out = [0u8; 32];
-        let n = p.len().min(32);
-        out[..n].copy_from_slice(&p[..n]);
-        out
+        self.signing_public
     }
 
     pub fn signing_public_b64(&self) -> String {
@@ -137,7 +136,9 @@ impl IdentityKeyPair {
     /// Sign the handshake transcript with the identity's Ed25519 key.
     /// Returns the detached signature, base64-encoded.
     pub fn sign_handshake(&self, transcript: &[u8]) -> String {
-        let sig = self.signing.sign(transcript);
+        let signing = ring::signature::Ed25519KeyPair::from_seed_unchecked(&self.sign_seed)
+            .expect("any 32 bytes is a valid Ed25519 seed");
+        let sig = signing.sign(transcript);
         base64::engine::general_purpose::STANDARD.encode(sig)
     }
 
@@ -198,9 +199,10 @@ impl zeroize::Zeroize for IdentityKeyPair {
 
 impl Drop for IdentityKeyPair {
     fn drop(&mut self) {
-        // The X25519 `StaticSecret` zeroizes itself on drop; the raw Ed25519
-        // signing seed is a plain array we must wipe explicitly so it does not
-        // persist in freed heap memory after the identity is discarded.
+        // The X25519 `StaticSecret` zeroizes itself on drop. The Ed25519
+        // signing key is reconstructed only for each signature, so the
+        // persisted private material is the raw seed below, which must be
+        // wiped explicitly.
         self.sign_seed.zeroize();
     }
 }
@@ -221,14 +223,42 @@ pub struct SessionKeys {
 }
 
 pub fn hkdf_sha256(input_key: &[u8], info: &[&[u8]], output_len: usize) -> Result<Vec<u8>> {
+    if output_len > MAX_HKDF_OUTPUT_BYTES {
+        return Err(ShphError::Crypto(
+            "HKDF output exceeds the SHA-256 expansion limit".into(),
+        ));
+    }
     let mut output = vec![0u8; output_len];
     hkdf_sha256_into(input_key, info, &mut output)?;
     Ok(output)
 }
 
+/// Maximum output accepted by HKDF-Expand with SHA-256 (255 * HashLen).
+pub const MAX_HKDF_OUTPUT_BYTES: usize = 255 * 32;
+
+/// Maximum aggregate HKDF context accepted from a public API caller.
+///
+/// SHPH handshake contexts are only a few kilobytes. Bounding the aggregate
+/// context before concatenating it prevents a caller-controlled slice list from
+/// forcing an unexpectedly large intermediate allocation.
+pub const MAX_HKDF_CONTEXT_BYTES: usize = 256 * 1024;
+
 pub fn hkdf_sha256_into(input_key: &[u8], info: &[&[u8]], output: &mut [u8]) -> Result<()> {
     const STACK_SALT_BYTES: usize = 256;
-    let salt_len = info.iter().map(|part| part.len()).sum::<usize>();
+    if output.len() > MAX_HKDF_OUTPUT_BYTES {
+        return Err(ShphError::Crypto(
+            "HKDF output exceeds the SHA-256 expansion limit".into(),
+        ));
+    }
+    let salt_len = info
+        .iter()
+        .try_fold(0usize, |total, part| total.checked_add(part.len()))
+        .ok_or_else(|| ShphError::Crypto("HKDF context length overflow".into()))?;
+    if salt_len > MAX_HKDF_CONTEXT_BYTES {
+        return Err(ShphError::Crypto(
+            "HKDF context exceeds the 256 KiB safety limit".into(),
+        ));
+    }
     if salt_len <= STACK_SALT_BYTES {
         let mut salt = [0u8; STACK_SALT_BYTES];
         let mut offset = 0;
@@ -396,6 +426,11 @@ fn nonce_counter(nonce_bytes: &[u8]) -> Result<u64> {
     if nonce_bytes.len() < 12 {
         return Err(ShphError::Crypto("nonce too short".into()));
     }
+    if nonce_bytes[..4] != [0u8; 4] {
+        return Err(ShphError::Crypto(
+            "nonce prefix is not in canonical SHPH form".into(),
+        ));
+    }
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&nonce_bytes[4..12]);
     Ok(u64::from_be_bytes(buf))
@@ -421,11 +456,18 @@ pub struct ReplayWindow {
     size: usize,
 }
 
+/// Maximum replay-window width accepted from configuration or an API caller.
+///
+/// The window is cloned before authenticated decrypts commit their state, so
+/// leaving this unbounded would allow a peer or configuration value to turn a
+/// single receive attempt into an unbounded allocation/copy operation.
+pub const MAX_REPLAY_WINDOW_SIZE: usize = 64 * 1024;
+
 impl ReplayWindow {
     pub fn new(size: usize) -> Self {
         // At least one word (64 nonces) so the window is non-trivial and the
-        // word math is sound.
-        let size = size.max(64);
+        // word math is sound. Clamp the public input before allocating.
+        let size = size.clamp(64, MAX_REPLAY_WINDOW_SIZE);
         let words = size.div_ceil(64);
         Self {
             highest: None,
@@ -520,6 +562,7 @@ mod tests {
     use super::{
         constant_time_eq, hkdf_sha256, hkdf_sha256_into, nonce_counter, IdentityKeyPair,
         ReceiveCipher, ReplayWindow, SendCipher, SessionKeys, AEAD_NONCE_LIMIT,
+        MAX_HKDF_CONTEXT_BYTES, MAX_HKDF_OUTPUT_BYTES, MAX_REPLAY_WINDOW_SIZE,
     };
 
     #[test]
@@ -530,6 +573,18 @@ mod tests {
         let mut actual = [0u8; 32];
         hkdf_sha256_into(&input, &info, &mut actual).expect("in-place HKDF");
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn hkdf_rejects_oversized_context_before_allocating() {
+        let context = vec![0u8; MAX_HKDF_CONTEXT_BYTES + 1];
+        let mut output = [0u8; 32];
+        assert!(hkdf_sha256_into(&[0x41; 32], &[context.as_slice()], &mut output).is_err());
+    }
+
+    #[test]
+    fn hkdf_rejects_oversized_output_before_allocating() {
+        assert!(hkdf_sha256(&[0x41; 32], &[], MAX_HKDF_OUTPUT_BYTES + 1).is_err());
     }
 
     #[test]
@@ -626,6 +681,13 @@ mod tests {
         assert!(nonce_counter(&[0u8; 4]).is_err());
     }
 
+    #[test]
+    fn nonce_counter_rejects_non_canonical_prefix() {
+        let mut bytes = [0u8; 12];
+        bytes[0] = 1;
+        assert!(nonce_counter(&bytes).is_err());
+    }
+
     // --- Crypto-hardening regression tests ---
 
     #[test]
@@ -707,6 +769,13 @@ mod tests {
         // would hit the guard.
         assert!(sender.encrypt(b"last-one").is_ok());
         assert!(sender.encrypt(b"overflow").is_err());
+    }
+
+    #[test]
+    fn replay_window_clamps_untrusted_size() {
+        let window = ReplayWindow::new(usize::MAX);
+        assert_eq!(window.size, MAX_REPLAY_WINDOW_SIZE);
+        assert_eq!(window.bits.len(), MAX_REPLAY_WINDOW_SIZE / 64);
     }
 
     #[test]

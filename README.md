@@ -7,17 +7,40 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-08-14)
+## Current Status (2026-08-17)
 
-Workspace version `0.6.1-dev` (pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.2-dev` (pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
+### Release profile
+
+The current release-readiness target is deliberately narrow: authenticated TCP
+plus one separately validated OS-native TUN lane. Linux native TUN and Windows
+Wintun are independent host-acceptance campaigns. The legacy QUIC shim,
+standards QUIC, Shroud morphology, offline-mesh, data-mule, and identity
+discovery surfaces remain experimental and are excluded from release-profile
+claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
+
 ### Working today
 
-- Rust workspace builds cleanly on Linux and Windows toolchains (`cargo check --workspace`).
+- Native Linux/Windows workspace validation is supported when the complete
+  toolchain is installed. Dedicated native Windows validation evidence is
+  recorded in `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`;
+  workstation-specific tool availability is not a project-status claim.
+  See `docs/TESTING.md` for the prerequisites and evidence boundary.
 - Identity + keystore initialization (`init`) and peer/config workflows (`add-peer`, `list-peers`, `show-public-key`, `show-signing-public-key`, `show-config`).
 - Authenticated TCP handshake (`listen` / `connect`) with transcript-bound key derivation.
+- Current hardening includes bounded replay state, aggregate TCP handshake
+  deadlines, canonical AEAD nonce encoding, outbound TCP frame limits,
+  local handshake-state binding, strict identity-record continuity,
+  collision-resistant file-adapter paths with bounded polling and
+  pre-encryption payload limits, interface-scoped route rollback, low-order
+  X25519 rejection, regular-file-only local inputs, failure-path cleanup for
+  atomic secret/config/audit writes, strict privileged interface-name
+  validation, and anchored identity discovery. See `docs/HARDENING.md` and
+  `docs/TESTING.md` for scope and
+  validation limits.
 - Encrypted framed data transfer (`send-once` / `recv-once`).
 - Session-driven `up` mode:
   - one-shot startup payload exchange, or
@@ -105,7 +128,7 @@ claims.
 
 For the delivery/funding roadmap, see `ROADMAP_OSS_AND_DELIVERY.md`.
 The active sequence is Shroud lab completion, hardening and optimization,
-release-readiness (“big move”), then Windows TUN delivery.
+release-readiness, then the remaining native Windows TUN delivery gates.
 
 SHPH inherits core concepts from the Shroud lineage (adaptive framing and profile-driven morphology concepts), reworked for a VPN-first architecture.
 
@@ -121,6 +144,7 @@ shph/
 ├── shph-tun/          # TUN abstraction
 ├── shph-transport/    # transport mode/parsing support
 ├── shph-obfuscation/  # profile surface
+├── shph-identity/     # experimental signed identity/discovery boundary
 ├── shph-cli/          # shph binary + integration tests
 ├── shph-tui/          # optional terminal UI
 ├── scripts/            # evidence, demo, benchmark, and mirror helpers
@@ -231,6 +255,7 @@ shph apply
 shph reconcile
 shph undo
 shph status
+shph doctor [--strict] [--json]
 shph show-fingerprint
 shph show-public-key
 shph show-signing-public-key
@@ -242,8 +267,12 @@ shph listen --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-
 shph connect --peer <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
 shph send-once --peer <addr> --text <msg> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
 shph recv-once --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
-cargo run -p shph-tui
+cargo run -p shph-tui -- --config <path>
 ```
+
+For automation, use `shph status --json`, `shph doctor --strict --json`, and
+`shph list-peers --json`. Human-facing failures include a next-step hint; use
+`shph doctor` when a configuration or identity error is unclear.
 
 ## Development
 
@@ -259,6 +288,9 @@ Additional docs:
 - `WHY_SHPH.md` (project rationale, transport focus, and funding case)
 - `FIVE_MINUTE_QUICKSTART.md` (local authenticated encrypted exchange)
 - `docs/TESTING.md`
+- `docs/SUPPORT_MATRIX.md` (authoritative product boundary and support levels)
+- `docs/RELEASE_READINESS.md` (binding release gate and evidence rules)
+- `docs/SECURITY_EVIDENCE.md` (threat-to-control map and redaction checklist)
 - `docs/CONTROL_PLANE.md`
 - `docs/TUI.md`
 - `fuzz/README.md`
@@ -278,8 +310,8 @@ Additional docs:
 - `docs/SUPPLY_CHAIN_SCAN.md` (cargo-audit scanner + advisory triage)
 - `docs/HARDENING.md` (post-funding security-hardening summary + threat impact)
 - `docs/BENCHMARKING.md` (Linux-first benchmark methodology and profile plan)
-- `docs/BENCHMARK_RESULTS_2026-08-14.md` (fresh Windows-local `0.6.1-dev`
-  benchmark capture)
+- `docs/BENCHMARK_RESULTS_2026-08-14.md` (historical Windows-local `0.6.1-dev`
+  benchmark baseline)
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md` (latest Shroud 2.0 morphology report)
 - `docs/BENCHMARK_RESULTS_2026-07-28.md` (historical WSL2 benchmark scores and evidence limits)
 - `docs/LAB_PROTOTYPES.md` (operational guide for QUIC-shim, offline-mesh, and data-mule labs)

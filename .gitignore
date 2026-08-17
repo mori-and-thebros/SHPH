@@ -1,6 +1,8 @@
 # Build artifacts
 /target/
 **/target/
+/target-ux-check/
+/target-ux-test/
 fuzz/corpus/
 fuzz/artifacts/
 /benchmark-runs/
@@ -22,6 +24,8 @@ fuzz/artifacts/
 .gapcode/
 
 # Confidential grant-application attachments; never publish these.
+/docs/IDENTITY_DISCOVERY_BENCHMARKS_2026-08-14.md
+/docs/IDENTITY_DISCOVERY_DESIGN.md
 
 # Legacy local state from early two-host validation harness drafts
 /.two-host-validation/

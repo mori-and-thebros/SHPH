@@ -118,6 +118,9 @@ Operational behavior:
 - Envelopes are written with fsync and a unique temporary filename.
 - The receiver validates session and node identity before accepting an
   envelope.
+- Senders reject payloads above the configured file bound before performing
+  AEAD work; the serialized envelope is still checked against the final file
+  limit.
 - Invalid or oversized files are quarantined as `.rejected`.
 - Replay state is bounded; entries are acknowledged only after successful
   authenticated consumption.
@@ -147,6 +150,8 @@ Operational behavior:
 
 - Envelope paths are confined to sanitized peer and envelope components.
 - File size, scan depth, and scan count are bounded.
+- Payloads above `max_file_bytes` are rejected before AEAD encryption, limiting
+  caller-controlled allocation and CPU work.
 - Invalid and oversized files are quarantined rather than retried forever.
 - A courier file is removed only after AEAD authentication succeeds.
 - Envelope identity is stable and replay tracking is bounded.

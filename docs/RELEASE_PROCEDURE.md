@@ -47,7 +47,7 @@ vX.Y.Z                       # semantic-version point releases once a release li
 ```
 
 A versioned release line is live through **`v0.4.0`**. The current workspace is
-an unreleased prerelease development line, **`0.6.1-dev`**, and must not be described as
+an unreleased prerelease development line, **`0.6.2-dev`**, and must not be described as
 `v0.4.0`. Going forward, SemVer releases (`vX.Y.Z`) are the authoritative tags;
 funding checkpoints remain roadmap-anchored milestones. Each checkpoint tag
 carries the roadmap phase it closes.
