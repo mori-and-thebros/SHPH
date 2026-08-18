@@ -14,6 +14,7 @@ use crate::keystore::compute_fingerprint_hex;
 
 const HANDSHAKE_VERSION: u8 = 5;
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 1_400;
+pub const MAX_HANDSHAKE_FRAME_TAIL_BYTES: usize = 64;
 
 /// Maximum number of configured peer pins accepted by a handshake policy.
 ///
@@ -116,6 +117,7 @@ pub struct HandshakeMaterial {
 #[derive(Debug, Clone)]
 pub struct HandshakeState {
     pub peer_fingerprint_hex: String,
+    pub peer_identity_pubkey_b64: String,
     pub peer_signing_pubkey_b64: String,
     pub session_keys: SessionKeys,
     pub transcript_hash_hex: String,
@@ -160,6 +162,7 @@ impl PeerPin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerPolicy {
     pins: Vec<PeerPin>,
+    allow_any: bool,
 }
 
 impl PeerPolicy {
@@ -172,11 +175,29 @@ impl PeerPolicy {
                 "peer policy exceeds the {MAX_PEER_PINS}-pin safety limit"
             )));
         }
-        Ok(Self { pins })
+        Ok(Self {
+            pins,
+            allow_any: false,
+        })
     }
 
     pub fn single(pin: PeerPin) -> Self {
-        Self { pins: vec![pin] }
+        Self {
+            pins: vec![pin],
+            allow_any: false,
+        }
+    }
+
+    /// Create a temporary bootstrap policy for an explicit TOFU enrollment.
+    ///
+    /// Callers must persist and pin the authenticated peer before accepting
+    /// another connection. This is intentionally not exposed through the
+    /// ordinary configuration parser.
+    pub fn allow_any() -> Self {
+        Self {
+            pins: Vec::new(),
+            allow_any: true,
+        }
     }
 
     pub fn pins(&self) -> &[PeerPin] {
@@ -184,10 +205,11 @@ impl PeerPolicy {
     }
 
     fn allows(&self, identity_public: &[u8; 32], signing_public: &[u8; 32]) -> bool {
-        self.pins.iter().any(|pin| {
-            constant_time_eq(&pin.identity_public, identity_public)
-                && constant_time_eq(&pin.signing_public, signing_public)
-        })
+        self.allow_any
+            || self.pins.iter().any(|pin| {
+                constant_time_eq(&pin.identity_public, identity_public)
+                    && constant_time_eq(&pin.signing_public, signing_public)
+            })
     }
 }
 
@@ -274,6 +296,49 @@ pub fn build_hello_with_profile(
         pq_shared: None,
         pq_ciphertext: None,
     })
+}
+
+/// Serialize the outer hello frame with a bounded, randomized whitespace tail.
+///
+/// The tail is deliberately valid JSON whitespace so existing newline- and
+/// datagram-delimited transports can parse the canonical hello without a
+/// second framing format. Its length and byte values are randomized by the
+/// core layer, making the initial envelope size non-deterministic while
+/// keeping the authenticated hello fields unchanged.
+pub fn serialize_hello_frame(hello: &Hello) -> Result<Vec<u8>> {
+    let rng = ring::rand::SystemRandom::new();
+    let mut random = [0u8; 1];
+    ring::rand::SecureRandom::fill(&rng, &mut random)?;
+    let padding_len = usize::from(random[0]) % (MAX_HANDSHAKE_FRAME_TAIL_BYTES + 1);
+    serialize_hello_frame_with_padding_len(hello, padding_len)
+}
+
+/// Serialize a hello with an explicit tail length for deterministic tests and
+/// transport-level size-bound checks.
+pub fn serialize_hello_frame_with_padding_len(
+    hello: &Hello,
+    padding_len: usize,
+) -> Result<Vec<u8>> {
+    if padding_len > MAX_HANDSHAKE_FRAME_TAIL_BYTES {
+        return Err(ShphError::Protocol(
+            "handshake frame tail exceeds size limit".into(),
+        ));
+    }
+    let mut payload = serde_json::to_vec(hello).map_err(ShphError::Serialization)?;
+    if padding_len == 0 {
+        return Ok(payload);
+    }
+
+    let rng = ring::rand::SystemRandom::new();
+    let mut random_tail = [0u8; MAX_HANDSHAKE_FRAME_TAIL_BYTES];
+    ring::rand::SecureRandom::fill(&rng, &mut random_tail)?;
+    payload.reserve(padding_len);
+    for random in random_tail.into_iter().take(padding_len) {
+        // JSON permits only space, tab, CR, and LF after a value. Avoid LF/CR
+        // because TCP uses LF as the outer line delimiter.
+        payload.push(if random & 1 == 0 { b' ' } else { b'\t' });
+    }
+    Ok(payload)
 }
 
 pub fn verify_and_derive(
@@ -745,6 +810,8 @@ pub fn verify_and_derive_with_profile(
 
     Ok(HandshakeState {
         peer_fingerprint_hex: compute_fingerprint_hex(&peer_identity_raw),
+        peer_identity_pubkey_b64: base64::engine::general_purpose::STANDARD
+            .encode(peer_identity_raw),
         peer_signing_pubkey_b64: base64::engine::general_purpose::STANDARD.encode(peer_sign_public),
         session_keys: SessionKeys {
             send_key,
@@ -877,17 +944,66 @@ fn update_transcript_u64(hasher: &mut Sha256, label: &[u8], value: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_hello_with_profile, verify_hello_signature, HandshakeProfile, PeerPin, PeerPolicy,
-        MAX_PEER_PINS,
+        build_hello_with_profile, serialize_hello_frame, serialize_hello_frame_with_padding_len,
+        verify_hello_signature, HandshakeProfile, PeerPin, PeerPolicy,
+        MAX_HANDSHAKE_FRAME_TAIL_BYTES, MAX_PEER_PINS,
     };
     use crate::crypto::IdentityKeyPair;
     use base64::Engine as _;
+
+    #[test]
+    fn hello_frame_tail_is_bounded_random_whitespace() {
+        let identity = IdentityKeyPair::generate().expect("identity");
+        let material =
+            build_hello_with_profile(&identity, HandshakeProfile::ClassicalLab).expect("hello");
+        let canonical = serde_json::to_vec(&material.local_hello).expect("canonical hello");
+        let framed = serialize_hello_frame_with_padding_len(&material.local_hello, 17)
+            .expect("padded hello");
+
+        assert_eq!(&framed[..canonical.len()], canonical.as_slice());
+        assert_eq!(framed.len(), canonical.len() + 17);
+        assert!(framed[canonical.len()..]
+            .iter()
+            .all(u8::is_ascii_whitespace));
+        assert_eq!(
+            serde_json::from_slice::<super::Hello>(&framed)
+                .expect("parse padded hello")
+                .proto,
+            material.local_hello.proto
+        );
+    }
+
+    #[test]
+    fn hello_frame_random_tail_stays_within_bound() {
+        let identity = IdentityKeyPair::generate().expect("identity");
+        let material =
+            build_hello_with_profile(&identity, HandshakeProfile::ClassicalLab).expect("hello");
+        let canonical_len = serde_json::to_vec(&material.local_hello)
+            .expect("canonical hello")
+            .len();
+
+        for _ in 0..64 {
+            let framed = serialize_hello_frame(&material.local_hello).expect("random hello");
+            assert!(
+                (canonical_len..=canonical_len + MAX_HANDSHAKE_FRAME_TAIL_BYTES)
+                    .contains(&framed.len())
+            );
+            serde_json::from_slice::<super::Hello>(&framed).expect("parse random hello");
+        }
+    }
 
     #[test]
     fn peer_policy_bounds_configured_pin_count() {
         let pin = PeerPin::new([1u8; 32], [2u8; 32]);
         assert!(PeerPolicy::new(vec![pin; MAX_PEER_PINS]).is_ok());
         assert!(PeerPolicy::new(vec![pin; MAX_PEER_PINS + 1]).is_err());
+    }
+
+    #[test]
+    fn bootstrap_peer_policy_accepts_one_unpinned_identity() {
+        let policy = PeerPolicy::allow_any();
+        assert!(policy.allows(&[7u8; 32], &[9u8; 32]));
+        assert!(policy.pins().is_empty());
     }
 
     #[test]

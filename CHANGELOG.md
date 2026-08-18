@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.6.3-dev.2] - CLI UX and guided connectivity follow-up (2026-08-18)
+
+This developer release packages the guided CLI workflow, identity sharing, and
+transport usability hardening. It remains limited to controlled lab use and
+does not claim production VPN, censorship-resistance, or hostile-network
+security guarantees.
+
+- Added `shph host` and `shph join` with bounded `shph://v1:` tickets that
+  carry the endpoint, transport, Shroud profile, and pinned host keys.
+- Added `shph id --qr` for identity inspection and terminal QR sharing.
+- Added `shph up --to` with secure defaults: TCP, TUN enabled, and the medium
+  Shroud profile, with explicit `--no-tun` and profile overrides.
+- Added an interactive TTY status bar with handshake, interface, and live
+  traffic counters while preserving line-oriented non-interactive output.
+- Added Linux native-TUN forwarding/NAT setup with scoped nftables rules and
+  rollback cleanup; non-Linux hosts report the capability boundary.
+- Added explicit first-peer TOFU enrollment for `host`, followed by persisted
+  identity pin enforcement.
+- Added endpoint validation, QR/ticket regression coverage, and bootstrap
+  policy tests.
+
 ## [0.6.3-dev] - patches, optimizations, and benchmark updates (2026-08-18)
 
 This developer release is limited to transport patches, lab-profile

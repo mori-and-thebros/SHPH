@@ -1,12 +1,16 @@
 //! SHPH CLI - Command-line interface for Shroud-Phantom VPN.
 
 mod shutdown;
+mod ticket;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use shph_config::{Config, ControlPlaneConfig, PeerConfig, SessionRole};
+use shph_config::{
+    Config, ControlPlaneConfig, PeerConfig, ReconnectConfig, SessionConfig, SessionRole,
+    StealthConfig,
+};
 use shph_core::{
     append_ratchet_audit_event, build_hello, compute_fingerprint_hex, ensure_no_reparse_components,
     read_ratchet_audit_events, recover_secret_from_shares,
@@ -33,8 +37,9 @@ use shph_tun::firewall::FirewallTransport;
 #[cfg(target_os = "linux")]
 use shph_tun::firewall::{
     build_linux_killswitch_cleanup_commands, build_linux_killswitch_commands,
-    build_linux_mss_clamp_cleanup_commands, build_linux_mss_clamp_commands, KILLSWITCH_TABLE_NAME,
-    MSS_CLAMP_TABLE_NAME,
+    build_linux_mss_clamp_cleanup_commands, build_linux_mss_clamp_commands,
+    build_linux_nat_cleanup_commands, build_linux_nat_commands, KILLSWITCH_TABLE_NAME,
+    MSS_CLAMP_TABLE_NAME, NAT_TABLE_NAME,
 };
 #[cfg(target_os = "linux")]
 use shph_tun::AsyncTunDevice;
@@ -44,7 +49,7 @@ use shph_tun::{
 #[cfg(target_os = "windows")]
 use shph_tun::{WindowsFirewallTransport, WindowsKillswitchGuard};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
@@ -56,6 +61,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{future::Future, net::SocketAddr};
 use zeroize::Zeroize;
+
+use ticket::{render_qr, JoinTicket};
 
 const MAX_STDIN_LINE_BYTES: usize = 64 * 1024;
 const MAX_SHAMIR_SECRET_BYTES: u64 = 64 * 1024;
@@ -78,6 +85,117 @@ fn phase_a1_now_ms() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ShphError::Internal("system clock before unix epoch".into()))?
         .as_millis() as u64)
+}
+
+struct LiveStatusBar {
+    stop: Option<Arc<AtomicBool>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl LiveStatusBar {
+    fn start(
+        endpoint: &str,
+        interface_name: &str,
+        profile: HandshakeProfile,
+        handshake_ms: u128,
+        metrics: &MetricsCollector,
+    ) -> Self {
+        if !io::stderr().is_terminal() {
+            return Self {
+                stop: None,
+                worker: None,
+            };
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_worker = Arc::clone(&stop);
+        let endpoint = sanitize_status_label(endpoint);
+        let interface_name = sanitize_status_label(interface_name);
+        let metrics = metrics.clone();
+        let worker = thread::spawn(move || {
+            let mut previous = metrics.snapshot();
+            while !stop_worker.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(1));
+                if stop_worker.load(Ordering::Relaxed) {
+                    break;
+                }
+                let current = metrics.snapshot();
+                let tx_rate = current.bytes_sent.saturating_sub(previous.bytes_sent) as f64;
+                let rx_rate = current.bytes_recv.saturating_sub(previous.bytes_recv) as f64;
+                previous = current.clone();
+                let line = format!(
+                    "[✓] SHPH v{} | CONNECTED TO {} | SECURE ({}) | Interface: {} | Handshake: {} ms | Tx: {} (↑ {}/s) | Rx: {} (↓ {}/s) | Ctrl+C to disconnect",
+                    env!("CARGO_PKG_VERSION"),
+                    endpoint,
+                    if profile.uses_pqc() {
+                        "ML-KEM-768"
+                    } else {
+                        "classical-lab"
+                    },
+                    interface_name,
+                    handshake_ms,
+                    format_bytes(current.bytes_sent),
+                    format_bytes(tx_rate as u64),
+                    format_bytes(current.bytes_recv),
+                    format_bytes(rx_rate as u64),
+                );
+                let _ = write!(io::stderr(), "\r{line}\x1b[K");
+                let _ = io::stderr().flush();
+            }
+        });
+        Self {
+            stop: Some(stop),
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for LiveStatusBar {
+    fn drop(&mut self) {
+        let active = self.stop.is_some() || self.worker.is_some();
+        if !active {
+            return;
+        }
+        if let Some(stop) = self.stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        if io::stderr().is_terminal() {
+            let _ = write!(io::stderr(), "\r\x1b[K");
+            let _ = io::stderr().flush();
+        }
+    }
+}
+
+fn sanitize_status_label(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .take(48)
+        .collect()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -114,11 +232,54 @@ enum Commands {
         #[arg(long)]
         new: bool,
     },
+    /// Start a host listener and print a shareable join ticket
+    Host {
+        /// TCP/UDP listener port
+        #[arg(long, default_value_t = 443)]
+        port: u16,
+        /// Public host or host:port embedded in the join ticket
+        #[arg(long)]
+        advertise: Option<String>,
+        /// Transport override (tcp|quic)
+        #[arg(long, default_value = "tcp")]
+        transport: String,
+        /// Discrete traffic-shaping profile
+        #[arg(long, default_value = "medium")]
+        shroud_profile: String,
+        /// Run without opening a native TUN interface
+        #[arg(long)]
+        no_tun: bool,
+        /// Do not install Linux forwarding/NAT rules
+        #[arg(long)]
+        no_nat: bool,
+    },
+    /// Join a host from a shph://v1 ticket
+    Join {
+        ticket: String,
+        /// Run without opening a native TUN interface
+        #[arg(long)]
+        no_tun: bool,
+    },
+    /// Show local identity material and a shareable host ticket
+    Id {
+        /// Render the shareable ticket as an ANSI terminal QR code
+        #[arg(long)]
+        qr: bool,
+    },
     /// Bring up the VPN tunnel
     Up {
+        /// Connect directly to a peer without editing the saved config
+        #[arg(long)]
+        to: Option<String>,
         /// Optional transport override (tcp|quic|quic-standard|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
+        /// Discrete traffic-shaping profile (off|low|medium|high|extreme-lab)
+        #[arg(long)]
+        shroud_profile: Option<String>,
+        /// Run without opening a native TUN interface
+        #[arg(long)]
+        no_tun: bool,
         /// DER certificate path for standards QUIC; servers write it and clients trust it out of band
         #[arg(long)]
         quic_cert: Option<PathBuf>,
@@ -336,15 +497,54 @@ fn run_cli(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::Init { new } => handle_init(&config_path, &keystore_path, new)?,
-        Commands::Up {
+        Commands::Host {
+            port,
+            advertise,
             transport,
+            shroud_profile,
+            no_tun,
+            no_nat,
+        } => handle_host(
+            &config_path,
+            &keystore_path,
+            port,
+            advertise.as_deref(),
+            &transport,
+            &shroud_profile,
+            no_tun,
+            no_nat,
+        )?,
+        Commands::Join { ticket, no_tun } => {
+            handle_join(&config_path, &keystore_path, &ticket, no_tun)?
+        }
+        Commands::Id { qr } => handle_id(&config_path, &keystore_path, qr)?,
+        Commands::Up {
+            to,
+            transport,
+            shroud_profile,
+            no_tun,
             quic_cert,
             handshake_profile,
             killswitch,
             killswitch_dry_run,
             mss_clamp,
         } => {
-            let config = load_config(&config_path)?;
+            let mut config = if to.is_some() {
+                ensure_workspace(&config_path, &keystore_path)?.0
+            } else {
+                load_config(&config_path)?
+            };
+            if let Some(peer) = to {
+                config.session = Some(SessionConfig {
+                    role: SessionRole::Connect,
+                    bind: None,
+                    peer: Some(peer),
+                    timeout_secs: Some(5),
+                    handshake_profile: None,
+                    reconnect: None,
+                    startup_payload: None,
+                });
+            }
             let mode = resolve_transport_mode(transport.as_deref(), config.roadmap.as_ref())?;
             let profile = resolve_handshake_profile(
                 handshake_profile.as_deref(),
@@ -352,6 +552,13 @@ fn run_cli(cli: Cli) -> Result<()> {
                     .session
                     .as_ref()
                     .and_then(|session| session.handshake_profile),
+            )?;
+            let shroud_profile = resolve_shroud_profile(
+                shroud_profile.as_deref(),
+                config
+                    .stealth
+                    .as_ref()
+                    .map(|stealth| stealth.shroud_profile.as_str()),
             )?;
             let path_keystore = keystore_path_from_config(&config_path);
             handle_up(
@@ -361,10 +568,14 @@ fn run_cli(cli: Cli) -> Result<()> {
                 UpOptions {
                     transport: mode,
                     profile,
+                    shroud_profile,
                     quic_cert_path: quic_cert.as_deref(),
                     killswitch,
                     killswitch_dry_run,
                     mss_clamp,
+                    tun: !no_tun,
+                    host_bootstrap: false,
+                    nat: false,
                 },
             )?
         }
@@ -585,13 +796,378 @@ fn handle_init(config_path: &Path, keystore_path: &Path, force_new: bool) -> Res
     Ok(())
 }
 
+fn ensure_workspace(config_path: &Path, keystore_path: &Path) -> Result<(Config, KeyStore)> {
+    let keystore = if keystore_path.exists() {
+        KeyStore::load(keystore_path, None)?
+    } else {
+        let keystore = KeyStore::new(KeyStoreConfig::default())?;
+        keystore.save(keystore_path)?;
+        keystore
+    };
+
+    let config = if config_path.exists() {
+        load_config(config_path)?
+    } else {
+        let config = Config {
+            peers: to_peer_configs(&keystore),
+            ..Config::default()
+        };
+        save_config(&config, config_path)?;
+        config
+    };
+
+    Ok((config, keystore))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_host(
+    config_path: &Path,
+    keystore_path: &Path,
+    port: u16,
+    advertise: Option<&str>,
+    transport: &str,
+    shroud_profile: &str,
+    no_tun: bool,
+    no_nat: bool,
+) -> Result<()> {
+    if port == 0 {
+        return Err(ShphError::InvalidArgument(
+            "host port must be greater than zero".into(),
+        ));
+    }
+    let mode = TransportMode::parse(transport)?;
+    if !matches!(mode, TransportMode::Tcp | TransportMode::Quic) {
+        return Err(ShphError::InvalidArgument(
+            "host supports only tcp and quic transports".into(),
+        ));
+    }
+    let profile = resolve_shroud_profile(Some(shroud_profile), None)?;
+    let advertised_endpoint = advertised_endpoint(advertise, port)?;
+    let bind = format_endpoint("0.0.0.0", port);
+    let (mut config, keystore) = ensure_workspace(config_path, keystore_path)?;
+
+    config.local_endpoint = bind.clone();
+    config.stealth = Some(StealthConfig {
+        profile: "steady".into(),
+        shroud_profile: profile.clone(),
+    });
+    config.session = Some(SessionConfig {
+        role: SessionRole::Listen,
+        bind: Some(bind),
+        peer: None,
+        timeout_secs: Some(300),
+        handshake_profile: Some(HandshakeProfile::SecureDefault),
+        reconnect: Some(ReconnectConfig {
+            enabled: Some(true),
+            max_attempts: Some(10),
+            initial_delay_ms: Some(250),
+            max_delay_ms: Some(4000),
+        }),
+        startup_payload: None,
+    });
+    save_config(&config, config_path)?;
+    std::env::set_var("SHPH_SHROUD_PROFILE", &profile);
+
+    let ticket = JoinTicket {
+        endpoint: advertised_endpoint,
+        transport: transport_mode_to_str(mode).into(),
+        shroud_profile: profile.clone(),
+        server_identity_b64: keystore.identity.public_key_b64(),
+        server_signing_b64: keystore.identity.signing_public_b64(),
+    }
+    .encode()?;
+
+    println!("SHPH host ready");
+    println!("  Identity: {}", keystore.fingerprint_hex());
+    println!("  Transport: {}", transport_mode_to_str(mode));
+    println!("  Shroud profile: {profile}");
+    println!("  Join ticket: {ticket}");
+    if no_nat {
+        println!("  NAT: disabled");
+    } else {
+        println!("  NAT: enabled when native Linux TUN is active");
+    }
+
+    handle_up(
+        config_path,
+        keystore_path,
+        &config,
+        UpOptions {
+            transport: mode,
+            profile: HandshakeProfile::SecureDefault,
+            shroud_profile: profile,
+            quic_cert_path: None,
+            killswitch: false,
+            killswitch_dry_run: false,
+            mss_clamp: false,
+            tun: !no_tun,
+            host_bootstrap: true,
+            nat: !no_nat,
+        },
+    )
+}
+
+fn handle_join(
+    config_path: &Path,
+    keystore_path: &Path,
+    ticket_value: &str,
+    no_tun: bool,
+) -> Result<()> {
+    let ticket = JoinTicket::decode(ticket_value)?;
+    let mode = TransportMode::parse(&ticket.transport)?;
+    let profile = resolve_shroud_profile(Some(&ticket.shroud_profile), None)?;
+    let endpoint = Endpoint::parse(&ticket.endpoint)
+        .map_err(|error| ShphError::InvalidArgument(format!("invalid ticket endpoint: {error}")))?;
+    let (mut config, mut keystore) = ensure_workspace(config_path, keystore_path)?;
+
+    ensure_peer_pin(
+        &mut config,
+        &mut keystore,
+        "host",
+        &ticket.endpoint,
+        &ticket.server_identity_b64,
+        &ticket.server_signing_b64,
+    )?;
+    config.session = Some(SessionConfig {
+        role: SessionRole::Connect,
+        bind: None,
+        peer: Some(ticket.endpoint.clone()),
+        timeout_secs: Some(10),
+        handshake_profile: Some(HandshakeProfile::SecureDefault),
+        reconnect: Some(ReconnectConfig {
+            enabled: Some(true),
+            max_attempts: Some(10),
+            initial_delay_ms: Some(250),
+            max_delay_ms: Some(4000),
+        }),
+        startup_payload: None,
+    });
+    config.stealth = Some(StealthConfig {
+        profile: "steady".into(),
+        shroud_profile: profile.clone(),
+    });
+    save_config(&config, config_path)?;
+    keystore.save(keystore_path)?;
+    std::env::set_var("SHPH_SHROUD_PROFILE", &profile);
+
+    println!(
+        "SHPH joining {}",
+        format_endpoint(&endpoint.host, endpoint.port)
+    );
+    println!(
+        "  Host identity: {}",
+        shorten_key(&ticket.server_identity_b64)
+    );
+    println!("  Transport: {}", transport_mode_to_str(mode));
+    println!("  Shroud profile: {profile}");
+
+    handle_up(
+        config_path,
+        keystore_path,
+        &config,
+        UpOptions {
+            transport: mode,
+            profile: HandshakeProfile::SecureDefault,
+            shroud_profile: profile,
+            quic_cert_path: None,
+            killswitch: false,
+            killswitch_dry_run: false,
+            mss_clamp: false,
+            tun: !no_tun,
+            host_bootstrap: false,
+            nat: false,
+        },
+    )
+}
+
+fn handle_id(config_path: &Path, keystore_path: &Path, qr: bool) -> Result<()> {
+    let keystore = KeyStore::load(keystore_path, None)?;
+    let config = if config_path.exists() {
+        load_config(config_path)?
+    } else {
+        Config::default()
+    };
+    let profile = resolve_shroud_profile(
+        None,
+        config
+            .stealth
+            .as_ref()
+            .map(|stealth| stealth.shroud_profile.as_str()),
+    )?;
+    let endpoint = shareable_endpoint(&config)?;
+    let mode = resolve_transport_mode(None, config.roadmap.as_ref())?;
+    let mode = if matches!(mode, TransportMode::Tcp | TransportMode::Quic) {
+        mode
+    } else {
+        TransportMode::Tcp
+    };
+    let ticket = JoinTicket {
+        endpoint,
+        transport: transport_mode_to_str(mode).into(),
+        shroud_profile: profile,
+        server_identity_b64: keystore.identity.public_key_b64(),
+        server_signing_b64: keystore.identity.signing_public_b64(),
+    }
+    .encode()?;
+
+    println!("Identity: {}", keystore.fingerprint_hex());
+    println!(
+        "Public Key:  {}",
+        shorten_key(&keystore.identity.public_key_b64())
+    );
+    println!(
+        "Signing Key: {}",
+        shorten_key(&keystore.identity.signing_public_b64())
+    );
+    println!();
+    println!("Shareable Link:");
+    println!("{ticket}");
+    if qr {
+        println!();
+        println!("{}", render_qr(&ticket)?);
+    }
+    Ok(())
+}
+
+fn ensure_peer_pin(
+    config: &mut Config,
+    keystore: &mut KeyStore,
+    alias: &str,
+    endpoint: &str,
+    public_key: &str,
+    signing_key: &str,
+) -> Result<()> {
+    if let Some(existing) = keystore.contacts.get(alias) {
+        if existing.pubkey_b64 != public_key
+            || existing.sign_pubkey_b64.as_deref() != Some(signing_key)
+            || format_endpoint(&existing.endpoint.host, existing.endpoint.port) != endpoint
+        {
+            return Err(ShphError::Auth(format!(
+                "peer pin '{alias}' changed; refusing to overwrite it"
+            )));
+        }
+    } else {
+        let parsed = Endpoint::parse(endpoint).map_err(|error| {
+            ShphError::InvalidArgument(format!("invalid peer endpoint: {error}"))
+        })?;
+        keystore.add_contact(shph_core::Contact {
+            alias: alias.into(),
+            endpoint: parsed,
+            pubkey_b64: public_key.into(),
+            sign_pubkey_b64: Some(signing_key.into()),
+        });
+    }
+
+    if let Some(existing) = config.peers.iter().find(|peer| peer.alias == alias) {
+        if existing.pubkey != public_key
+            || existing.sign_pubkey.as_deref() != Some(signing_key)
+            || existing.endpoint != endpoint
+        {
+            return Err(ShphError::Auth(format!(
+                "configured peer pin '{alias}' changed; refusing to overwrite it"
+            )));
+        }
+    } else {
+        config.peers.push(PeerConfig {
+            alias: alias.into(),
+            endpoint: endpoint.into(),
+            pubkey: public_key.into(),
+            sign_pubkey: Some(signing_key.into()),
+        });
+    }
+    Ok(())
+}
+
+fn enroll_inbound_peer(
+    config_path: &Path,
+    keystore_path: &Path,
+    endpoint: &str,
+    state: &HandshakeState,
+) -> Result<()> {
+    let mut config = load_config(config_path)?;
+    let mut keystore = KeyStore::load(keystore_path, None)?;
+    let alias = format!(
+        "peer-{}",
+        state
+            .peer_fingerprint_hex
+            .get(..12)
+            .unwrap_or(&state.peer_fingerprint_hex)
+    );
+    ensure_peer_pin(
+        &mut config,
+        &mut keystore,
+        &alias,
+        endpoint,
+        &state.peer_identity_pubkey_b64,
+        &state.peer_signing_pubkey_b64,
+    )?;
+    save_config(&config, config_path)?;
+    keystore.save(keystore_path)?;
+    println!("  Bootstrap enrollment: pinned {alias}");
+    Ok(())
+}
+
+fn advertised_endpoint(advertise: Option<&str>, port: u16) -> Result<String> {
+    let raw = advertise.unwrap_or("127.0.0.1").trim();
+    let endpoint = match Endpoint::parse(raw) {
+        Ok(endpoint) => endpoint,
+        Err(error) if raw.contains(':') && !raw.starts_with('[') => {
+            return Err(ShphError::InvalidArgument(format!(
+                "invalid advertised endpoint '{raw}': {error}"
+            )));
+        }
+        Err(_) => Endpoint {
+            host: raw
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(raw)
+                .to_string(),
+            port,
+        },
+    };
+    if endpoint.host.is_empty() || endpoint.port == 0 {
+        return Err(ShphError::InvalidArgument(
+            "advertised endpoint must include a host and non-zero port".into(),
+        ));
+    }
+    if endpoint
+        .host
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(ShphError::InvalidArgument(
+            "advertised endpoint host contains whitespace or control characters".into(),
+        ));
+    }
+    Ok(format_endpoint(&endpoint.host, endpoint.port))
+}
+
+fn shareable_endpoint(config: &Config) -> Result<String> {
+    let raw = config
+        .session
+        .as_ref()
+        .and_then(|session| session.bind.as_deref().or(session.peer.as_deref()))
+        .unwrap_or(&config.local_endpoint);
+    let endpoint = Endpoint::parse(raw)
+        .map_err(|error| ShphError::InvalidArgument(format!("invalid local endpoint: {error}")))?;
+    let host = match endpoint.host.as_str() {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        value => value,
+    };
+    Ok(format_endpoint(host, endpoint.port))
+}
+
 struct UpOptions<'a> {
     transport: TransportMode,
     profile: HandshakeProfile,
+    shroud_profile: String,
     quic_cert_path: Option<&'a Path>,
     killswitch: bool,
     killswitch_dry_run: bool,
     mss_clamp: bool,
+    tun: bool,
+    host_bootstrap: bool,
+    nat: bool,
 }
 
 fn handle_up(
@@ -603,11 +1179,16 @@ fn handle_up(
     let UpOptions {
         transport,
         profile,
+        shroud_profile,
         quic_cert_path,
         killswitch,
         killswitch_dry_run,
         mss_clamp,
+        tun,
+        host_bootstrap,
+        nat,
     } = options;
+    std::env::set_var("SHPH_SHROUD_PROFILE", &shroud_profile);
     validate_config_roadmap(config)?;
     validate_tun_name(&config.interface_name)?;
     if control_plane_state_path(config_path).exists() {
@@ -634,7 +1215,11 @@ fn handle_up(
     } else {
         FirewallGuard::default()
     };
-    let tun = match TunDevice::open(&config.interface_name) {
+    let tun = match if tun {
+        TunDevice::open(&config.interface_name)
+    } else {
+        TunDevice::open_stub(&config.interface_name)
+    } {
         Ok(tun) => tun,
         Err(error) => {
             let _ = killswitch_guard.cleanup();
@@ -665,6 +1250,20 @@ fn handle_up(
     if tun.is_native() {
         configure_native_tun_mtu(tun.name(), DEFAULT_TUN_MTU_BYTES)?;
     }
+    let mut nat_guard = if nat && tun.is_native() {
+        match apply_nat(tun.name(), killswitch_dry_run) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = killswitch_guard.cleanup();
+                return Err(error);
+            }
+        }
+    } else {
+        if nat {
+            println!("  NAT: skipped (native TUN is disabled)");
+        }
+        NatGuard::default()
+    };
     let mut mss_guard = if mss_clamp {
         match apply_mss_clamp(tun.name(), killswitch_dry_run) {
             Ok(guard) => guard,
@@ -750,6 +1349,7 @@ fn handle_up(
                             || {
                                 run_listen_loop(
                                     keystore_path,
+                                    config_path,
                                     &tun,
                                     bind,
                                     timeout_secs,
@@ -757,6 +1357,7 @@ fn handle_up(
                                     profile,
                                     config.roadmap.as_ref(),
                                     quic_cert_path,
+                                    host_bootstrap,
                                 )
                             },
                         )?;
@@ -808,6 +1409,7 @@ fn handle_up(
         Ok(()) => {
             control_guard.cleanup()?;
             mss_guard.cleanup()?;
+            nat_guard.cleanup()?;
             killswitch_guard.cleanup()?;
             if control_state_recorded {
                 remove_control_plane_state(config_path)?;
@@ -826,6 +1428,11 @@ fn handle_up(
             if let Err(clean_err) = mss_cleanup_result {
                 return Err(ShphError::Internal(format!(
                     "session error: {err}; MSS-clamp cleanup error: {clean_err}"
+                )));
+            }
+            if let Err(clean_err) = nat_guard.cleanup() {
+                return Err(ShphError::Internal(format!(
+                    "session error: {err}; NAT cleanup error: {clean_err}"
                 )));
             }
             if let Err(clean_err) = killswitch_cleanup_result {
@@ -2720,6 +3327,20 @@ fn resolve_transport_from_roadmap(cfg: &RoadmapConfig) -> Result<TransportMode> 
     }
 }
 
+fn resolve_shroud_profile(cli_value: Option<&str>, config_value: Option<&str>) -> Result<String> {
+    let value = cli_value.or(config_value).unwrap_or("medium");
+    let normalized = value.trim().to_ascii_lowercase();
+    parse_shroud_profile_name(&normalized)?;
+    Ok(match normalized.as_str() {
+        "none" | "disabled" => "off".into(),
+        "low-latency" => "low".into(),
+        "balanced" => "medium".into(),
+        "bulk" => "high".into(),
+        "extreme" => "extreme-lab".into(),
+        other => other.into(),
+    })
+}
+
 fn quic_lab_config() -> Result<QuicLabConfig> {
     let Some(name) = std::env::var("SHPH_SHROUD_PROFILE").ok() else {
         return Ok(QuicLabConfig::default());
@@ -3037,6 +3658,122 @@ impl FirewallGuard {
 impl Drop for FirewallGuard {
     fn drop(&mut self) {
         let _ = self.cleanup();
+    }
+}
+
+#[derive(Default)]
+struct NatGuard {
+    dry_run: bool,
+    cleanup_commands: Vec<Vec<String>>,
+    previous_forwarding: Option<String>,
+}
+
+impl NatGuard {
+    fn cleanup(&mut self) -> Result<()> {
+        let mut first_error = None;
+        for command in self.cleanup_commands.drain(..) {
+            if !self.dry_run {
+                if let Err(error) = run_shell_command(&command) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        if !self.dry_run {
+            if let Some(previous) = self.previous_forwarding.take() {
+                if let Err(error) = run_shell_command(&[
+                    "sysctl".into(),
+                    "-w".into(),
+                    format!("net.ipv4.ip_forward={previous}"),
+                ]) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        } else {
+            self.previous_forwarding = None;
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for NatGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn read_ipv4_forwarding() -> Result<String> {
+    let output = Command::new("sysctl")
+        .args(["-n", "net.ipv4.ip_forward"])
+        .output()
+        .map_err(ShphError::Io)?;
+    if !output.status.success() {
+        return Err(ShphError::Internal(
+            "unable to read net.ipv4.ip_forward".into(),
+        ));
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| ShphError::Internal("sysctl returned non-UTF-8 output".into()))?;
+    let value = value.trim();
+    if value != "0" && value != "1" {
+        return Err(ShphError::Internal(
+            "net.ipv4.ip_forward returned an unexpected value".into(),
+        ));
+    }
+    Ok(value.into())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn read_ipv4_forwarding() -> Result<String> {
+    Ok("0".into())
+}
+
+fn apply_nat(interface_name: &str, dry_run: bool) -> Result<NatGuard> {
+    #[cfg(target_os = "linux")]
+    {
+        let commands = build_linux_nat_commands(interface_name)?;
+        let cleanup_commands = build_linux_nat_cleanup_commands();
+        let mut guard = NatGuard {
+            dry_run,
+            cleanup_commands,
+            previous_forwarding: None,
+        };
+        if dry_run {
+            println!("  [dry-run] NAT:");
+            for command in &commands {
+                println!("    {command:?}");
+            }
+            println!("    [dry-run] sysctl net.ipv4.ip_forward=1");
+            return Ok(guard);
+        }
+
+        let previous = read_ipv4_forwarding()?;
+        run_shell_command(&["sysctl".into(), "-w".into(), "net.ipv4.ip_forward=1".into()])?;
+        guard.previous_forwarding = Some(previous);
+        for command in &commands {
+            if let Err(error) = run_shell_command(command) {
+                let _ = guard.cleanup();
+                return Err(error);
+            }
+        }
+        println!("  NAT: Linux forwarding and masquerade active ({NAT_TABLE_NAME})");
+        return Ok(guard);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (interface_name, dry_run);
+        println!("  NAT: unavailable on this platform; continuing without host NAT");
+        Ok(NatGuard::default())
     }
 }
 
@@ -3931,6 +4668,7 @@ fn print_standards_tun_stats(start_ms: u64, stats: &standards_tun::StandardsTunB
 #[allow(clippy::too_many_arguments)]
 fn run_listen_loop(
     keystore_path: &Path,
+    config_path: &Path,
     tun: &TunDevice,
     bind: &str,
     timeout_secs: u64,
@@ -3938,11 +4676,17 @@ fn run_listen_loop(
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
+    host_bootstrap: bool,
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
-    let policy = peer_policy_for_endpoint(&keystore, bind, false)?;
+    let bootstrap_unpinned = host_bootstrap && keystore.contacts.is_empty();
+    let policy = if bootstrap_unpinned {
+        PeerPolicy::allow_any()
+    } else {
+        peer_policy_for_endpoint(&keystore, bind, false)?
+    };
     announce_handshake_profile(profile);
     if mode == TransportMode::QuicStandard {
         #[cfg(target_os = "linux")]
@@ -3976,6 +4720,7 @@ fn run_listen_loop(
             ));
         }
     }
+    let handshake_started = std::time::Instant::now();
     let (mut session, state) = match mode {
         TransportMode::Tcp | TransportMode::Quic => accept_secure_session_lab_with_profile(
             bind,
@@ -4012,7 +4757,12 @@ fn run_listen_loop(
             ))
         }
     };
-    enforce_peer_policy(keystore_path, bind, &state, false)?;
+    let handshake_ms = handshake_started.elapsed().as_millis();
+    if bootstrap_unpinned {
+        enroll_inbound_peer(config_path, keystore_path, bind, &state)?;
+    } else {
+        enforce_peer_policy(keystore_path, bind, &state, false)?;
+    }
     append_handshake_audit(
         roadmap,
         &keystore.identity,
@@ -4024,6 +4774,7 @@ fn run_listen_loop(
     print_handshake_state("listen-loop", bind, &state);
     let session_id = format!("listen-{bind}-{start_ms}");
     let metrics = MetricsCollector::new();
+    let _status_bar = LiveStatusBar::start(bind, tun.name(), profile, handshake_ms, &metrics);
     println!("  Session id: {session_id}");
     println!("  Session start: {start_ms}ms");
     println!("  Initial metrics: {:?}", metrics.snapshot());
@@ -4047,8 +4798,10 @@ fn run_listen_loop(
         match session.recv_frame() {
             Ok(payload) => {
                 metrics.inc_bytes_recv(payload.len());
-                let rendered = String::from_utf8_lossy(&payload);
-                println!("  RX: {rendered}");
+                if !io::stderr().is_terminal() {
+                    let rendered = String::from_utf8_lossy(&payload);
+                    println!("  RX: {rendered}");
+                }
             }
             Err(ShphError::ConnectionClosed) | Err(ShphError::Timeout) => break,
             Err(err) => {
@@ -4113,6 +4866,7 @@ fn run_connect_loop(
             ));
         }
     }
+    let handshake_started = std::time::Instant::now();
     let (mut session, state) = match mode {
         TransportMode::Tcp | TransportMode::Quic => connect_secure_session_lab_with_profile(
             peer,
@@ -4150,6 +4904,7 @@ fn run_connect_loop(
             ))
         }
     };
+    let handshake_ms = handshake_started.elapsed().as_millis();
     enforce_peer_policy(keystore_path, peer, &state, true)?;
     append_handshake_audit(
         roadmap,
@@ -4162,6 +4917,7 @@ fn run_connect_loop(
     print_handshake_state("connect-loop", peer, &state);
     let session_id = format!("connect-{peer}-{start_ms}");
     let metrics = MetricsCollector::new();
+    let _status_bar = LiveStatusBar::start(peer, tun.name(), profile, handshake_ms, &metrics);
     println!("  Session id: {session_id}");
     println!("  Session start: {start_ms}ms");
     println!("  Initial metrics: {:?}", metrics.snapshot());
@@ -4735,16 +5491,17 @@ fn record_data_plane_error(metrics: &MetricsCollector, error: &ShphError) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_control_plane, build_control_plane_plan, build_dns_apply_command,
-        build_dns_apply_commands, build_dns_restore_command, build_route_add_command,
-        build_route_delete_command, build_tun_mtu_commands, cli_exit_code,
+        advertised_endpoint, apply_control_plane, build_control_plane_plan,
+        build_dns_apply_command, build_dns_apply_commands, build_dns_restore_command,
+        build_route_add_command, build_route_delete_command, build_tun_mtu_commands, cli_exit_code,
         control_plane_state_path, enforce_peer_policy, handle_up, load_control_plane_state,
         parse_shroud_profile_name, phase_a1_now_ms, reconnect_delay_with_jitter,
-        render_config_for_display, resolve_killswitch_peers, run_with_reconnect,
-        save_control_plane_state, transport_mode_to_str, validate_cidr, CliErrorOutput,
-        ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore, KeyStoreConfig,
-        PersistedControlPlaneState, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES, EXIT_CONFIG,
-        EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
+        render_config_for_display, resolve_killswitch_peers, resolve_shroud_profile,
+        run_with_reconnect, save_control_plane_state, transport_mode_to_str, validate_cidr,
+        CliErrorOutput, ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore,
+        KeyStoreConfig, PersistedControlPlaneState, TransportMode, UpOptions,
+        DEFAULT_TUN_MTU_BYTES, EXIT_CONFIG, EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE,
+        MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
     use shph_config::{
@@ -4961,10 +5718,14 @@ mod tests {
             UpOptions {
                 transport: TransportMode::Tcp,
                 profile: shph_core::HandshakeProfile::SecureDefault,
+                shroud_profile: "medium".into(),
                 quic_cert_path: None,
                 killswitch: true,
                 killswitch_dry_run: true,
                 mss_clamp: false,
+                tun: false,
+                host_bootstrap: false,
+                nat: false,
             },
         )
         .expect("killswitch dry-run should preview without native TUN");
@@ -4993,10 +5754,14 @@ mod tests {
             UpOptions {
                 transport: TransportMode::Tcp,
                 profile: shph_core::HandshakeProfile::SecureDefault,
+                shroud_profile: "medium".into(),
                 quic_cert_path: None,
                 killswitch: false,
                 killswitch_dry_run: false,
                 mss_clamp: false,
+                tun: false,
+                host_bootstrap: false,
+                nat: false,
             },
         )
         .expect_err("stale control-plane state must block up");
@@ -5030,10 +5795,14 @@ mod tests {
             UpOptions {
                 transport: TransportMode::QuicStandard,
                 profile: shph_core::HandshakeProfile::SecureDefault,
+                shroud_profile: "medium".into(),
                 quic_cert_path: Some(std::path::Path::new("/tmp/server.der")),
                 killswitch: false,
                 killswitch_dry_run: false,
                 mss_clamp: false,
+                tun: false,
+                host_bootstrap: false,
+                nat: false,
             },
         )
         .expect_err("standards QUIC reconnect must fail before native TUN setup");
@@ -5091,6 +5860,36 @@ mod tests {
     }
 
     #[test]
+    fn smart_defaults_resolve_to_medium_and_canonical_aliases() {
+        assert_eq!(
+            resolve_shroud_profile(None, None).expect("default profile"),
+            "medium"
+        );
+        assert_eq!(
+            resolve_shroud_profile(Some("low-latency"), None).expect("low alias"),
+            "low"
+        );
+        assert_eq!(
+            resolve_shroud_profile(None, Some("bulk")).expect("bulk alias"),
+            "high"
+        );
+        assert_eq!(
+            resolve_shroud_profile(Some("disabled"), None).expect("disabled alias"),
+            "off"
+        );
+    }
+
+    #[test]
+    fn advertised_endpoint_rejects_malformed_values() {
+        assert!(advertised_endpoint(Some("example.invalid:not-a-port"), 443).is_err());
+        assert!(advertised_endpoint(Some("example.invalid bad"), 443).is_err());
+        assert_eq!(
+            advertised_endpoint(Some("[::1]"), 443).expect("IPv6 host"),
+            "[::1]:443"
+        );
+    }
+
+    #[test]
     fn reconnect_stops_on_non_retryable_error() {
         let calls = Arc::new(AtomicU32::new(0));
         let calls_clone = Arc::clone(&calls);
@@ -5117,6 +5916,7 @@ mod tests {
             .unwrap();
         let state = HandshakeState {
             peer_fingerprint_hex: "00".repeat(32),
+            peer_identity_pubkey_b64: String::new(),
             peer_signing_pubkey_b64: String::new(),
             session_keys: shph_core::SessionKeys {
                 send_nonce: 0,
@@ -5157,6 +5957,7 @@ mod tests {
         keystore.save(&path).unwrap();
         let state = HandshakeState {
             peer_fingerprint_hex: peer.fingerprint_hex(),
+            peer_identity_pubkey_b64: peer.public_key_b64(),
             peer_signing_pubkey_b64: peer.identity.signing_public_b64(),
             session_keys: shph_core::SessionKeys {
                 send_nonce: 0,
@@ -5198,6 +5999,7 @@ mod tests {
         keystore.save(&path).unwrap();
         let state = HandshakeState {
             peer_fingerprint_hex: peer.fingerprint_hex(),
+            peer_identity_pubkey_b64: peer_pubkey.clone(),
             peer_signing_pubkey_b64: peer.identity.signing_public_b64(),
             session_keys: shph_core::SessionKeys {
                 send_nonce: 0,

@@ -9,7 +9,7 @@ anti-censorship guarantees.
 
 ## Current Status (2026-08-18)
 
-Workspace version `0.6.3-dev` (pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.3-dev.2` (pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -30,6 +30,15 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   workstation-specific tool availability is not a project-status claim.
   See `docs/TESTING.md` for the prerequisites and evidence boundary.
 - Identity + keystore initialization (`init`) and peer/config workflows (`add-peer`, `list-peers`, `show-public-key`, `show-signing-public-key`, `show-config`).
+- Guided host/join flow:
+  - `shph host --port 443` creates missing local identity/config state,
+    prints a `shph://v1:` ticket, and bootstraps the first authenticated peer.
+  - `shph join shph://v1:...` creates missing client state, pins the host
+    identity from the ticket, and starts the session.
+  - The first host connection uses explicit TOFU enrollment; subsequent host
+    reconnects require the persisted peer pin.
+- `shph id --qr` combines identity inspection with a terminal QR rendering of
+  the current shareable ticket.
 - Authenticated TCP handshake (`listen` / `connect`) with transcript-bound key derivation.
 - Current hardening includes bounded replay state, aggregate TCP handshake
   deadlines, canonical AEAD nonce encoding, outbound TCP frame limits,
@@ -45,6 +54,9 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
 - Session-driven `up` mode:
   - one-shot startup payload exchange, or
   - continuous secure loop mode (`connect`/`listen`).
+- `shph up --to <host:port>` is a direct-connect shortcut. TCP, TUN-enabled
+  operation, and the `medium` discrete profile are the defaults; use
+  `--transport`, `--no-tun`, or `--shroud-profile off` to override them.
 - Linux native TUN path available behind opt-in flag:
   - set `SHPH_TUN_NATIVE=1` to enable packet read/write via `/dev/net/tun`.
   - Linux `up` uses the Tokio `AsyncFd` bridge with bounded packet queues and
@@ -64,6 +76,8 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   - `--mss-clamp` enables Linux TCP SYN MSS clamping for the 1360-byte native
     TUN MTU. Windows reports unsupported until a safe packet-rewrite backend
     exists.
+  - `host` enables SHPH-owned Linux forwarding and masquerade rules when
+    native TUN is active; use `host --no-nat` to disable that mutation.
 - Windows includes a wired Wintun backend with application-local loading,
   elevation checks, pinned SHA-256 provenance, bounded rings, packet
   validation, shared-session cloning, bounded event waits, and RAII teardown.
@@ -79,7 +93,8 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
 - Lab-only controls:
   - set `SHPH_KEYSTORE_PASSWORD` before `init` to encrypt the keystore at rest.
   - set `SHPH_SHROUD_PROFILE=off|low|medium|high|extreme-lab` with
-    `--transport quic` to choose explicit lab intensity. `off` is the default;
+    `--transport quic` to choose explicit lab intensity. `medium` is the
+    `up` default;
     `low`, `medium`, and `high` map to `low-latency`, `balanced`, and `bulk`.
     `extreme-lab` uses a larger randomized experimental cell. Named profiles
     such as `randomized-lab` remain accepted.
@@ -166,6 +181,13 @@ as described in the testing documentation.
 ```bash
 # from workspace root
 cargo build
+
+# fastest guided flow (the host prints the one-line ticket)
+cargo run -p shph-cli -- host --port 443 --advertise 198.51.100.10
+cargo run -p shph-cli -- join 'shph://v1:...'
+
+# inspect identity and render the current ticket as a terminal QR
+cargo run -p shph-cli -- id --qr
 
 # initialize identities in two folders
 cargo run -p shph-cli -- --config /tmp/shph-a/config.toml init --new
@@ -254,7 +276,12 @@ Behavior:
 
 ```text
 shph init --new
-shph up --config <path> [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
+shph host [--port 443] [--advertise <host[:port]>] [--transport tcp|quic]
+  [--shroud-profile medium] [--no-tun] [--no-nat]
+shph join <shph://v1:...> [--no-tun]
+shph id [--qr]
+shph up [--to <host:port>] [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
+  [--shroud-profile off|low|medium|high|extreme-lab] [--no-tun]
   [--quic-cert <server.der>] [--killswitch] [--killswitch-dry-run] [--mss-clamp]
 shph down
 shph apply
@@ -275,6 +302,11 @@ shph send-once --peer <addr> --text <msg> [--transport tcp|quic|quic-standard|of
 shph recv-once --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
 cargo run -p shph-tui -- --config <path>
 ```
+
+When `up`, `host`, or `join` owns an interactive terminal, the active data
+plane uses a single stderr status bar with handshake profile, interface,
+handshake time, and live TX/RX counters. Non-interactive output keeps the
+line-oriented logs suitable for automation.
 
 For automation, use `shph status --json`, `shph doctor --strict --json`, and
 `shph list-peers --json`. Human-facing failures include a next-step hint; use

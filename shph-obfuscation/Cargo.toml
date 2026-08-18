@@ -7,4 +7,4 @@ description = "Obfuscation profile interfaces for SHPH"
 
 [dependencies]
 shph-core = { path = "../shph-core" }
-
+rand = { workspace = true }

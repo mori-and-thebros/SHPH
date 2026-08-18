@@ -54,6 +54,18 @@ pub struct TunDevice {
 }
 
 impl TunDevice {
+    /// Create a configuration-only device without opening native packet I/O.
+    ///
+    /// This is used by `shph up --no-tun` and keeps the session lifecycle
+    /// available for interactive stream use on hosts without TUN support.
+    pub fn open_stub(name: &str) -> Result<Self> {
+        validate_tun_name(name)?;
+        Ok(Self {
+            name: name.to_string(),
+            backend: TunBackend::Stub,
+        })
+    }
+
     pub fn open(name: &str) -> Result<Self> {
         validate_tun_name(name)?;
 

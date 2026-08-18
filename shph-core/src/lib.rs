@@ -24,9 +24,10 @@ pub use framing::{
 };
 pub use handshake::{
     absorb_responder_pq, build_hello, build_hello_with_profile, deterministic_role,
-    finalize_initiator_pq, verify_and_derive, verify_and_derive_with_profile,
-    verify_hello_signature, HandshakeMaterial, HandshakeProfile, HandshakeRole, HandshakeState,
-    HandshakeVersion, Hello, PeerPin, PeerPolicy, MAX_PEER_PINS,
+    finalize_initiator_pq, serialize_hello_frame, serialize_hello_frame_with_padding_len,
+    verify_and_derive, verify_and_derive_with_profile, verify_hello_signature, HandshakeMaterial,
+    HandshakeProfile, HandshakeRole, HandshakeState, HandshakeVersion, Hello, PeerPin, PeerPolicy,
+    MAX_HANDSHAKE_FRAME_TAIL_BYTES, MAX_PEER_PINS,
 };
 pub use keystore::{
     compute_fingerprint_hex, enforce_owner_only_file_permissions, ensure_no_reparse_components,
