@@ -17,8 +17,8 @@ Internet loss recovery, reconnect recovery, DDoS capacity, or DPI evasion.
 | Field | Value |
 | --- | --- |
 | Date | 2026-08-18 |
-| Repository commit | `2a744832502e2b7c7a5b06481d0be856d60d3e39` |
-| Workspace version | `0.6.3-dev` release candidate |
+| Benchmark source commit | `db516ec53c667815d37d6a2e7cba90e08feb29ac` |
+| Workspace version | `0.6.3-dev` |
 | Host platform | Windows |
 | Rust | `rustc 1.96.0 (ac68faa20 2026-05-25)` |
 | Target | `x86_64-pc-windows-gnu` |
@@ -26,22 +26,23 @@ Internet loss recovery, reconnect recovery, DDoS capacity, or DPI evasion.
 | Build | release, locked, offline |
 | Profile | `secure-default` |
 | Native TUN | disabled |
-| Tree state | dirty engineering tree |
+| Tree state | committed release candidate |
 
-The tree was intentionally not cleaned or committed for this campaign. A
-release record should be regenerated from a reviewed commit.
+The benchmark source was committed before these captures were generated.
+Raw captures remain ignored local artifacts; this report records their hashes
+without publishing the capture files.
 
 Raw captures are ignored local artifacts. The capture files are tied to the
 dirty engineering tree and are not release artifacts:
 
 | Capture | Parameters | SHA-256 |
 | --- | --- | --- |
-| `benchmark-runs/2026-08-18/all-hardening-2026-08-18.txt` | `--suite all --iterations 100 --frames 5000` | `206EADA66E1F3B7DE7F28D61ABEC16E574DA48C1BE8024AB1E326464624E40CC` |
-| `benchmark-runs/2026-08-18/extended-hardening-2026-08-18.txt` | `--suite extended --iterations 10 --frames 5000` | `CD75ED0C26ECCE77CCD732567F825CC8C8618208EDA407D15C5903752DDF6AF1` |
-| `benchmark-runs/2026-08-18/evidence-hardening-2026-08-18.txt` | `--suite evidence --iterations 1 --frames 1` | `0292CFB0E789D38508CB465012B1DB3A679DDA8A2CFA55E9C27B251BA3F3108A` |
-| `benchmark-runs/2026-08-18/repeatability-hardening/summary.csv` | 5 repeated extended runs, 1,000 iterations, 2,000 frames | `CC6B1798FD239DC6065FC4AF9B1D663E90ACE72F1667C8009064D10111C5A3D3` |
-| `benchmark-runs/2026-08-18/windows-wrapper-hardening/secure-default.csv` | PowerShell wrapper, all, 100 iterations, 5,000 frames | `0D83CDEE1375F54151E8061EBBA35AB784ED9EFFC61A919AADFDB3490179F022` |
-| `benchmark-runs/2026-08-18/windows-wrapper-hardening/classical-lab.csv` | PowerShell wrapper, classical comparison profile | `89461A6333BD8E729FC5E6E1263AD80D82E56523B9E551B56A19BD94194C266C` |
+| `benchmark-runs/2026-08-18/all-release-candidate-2026-08-18.txt` | `--suite all --iterations 100 --frames 5000` | `CB1A3AFB321F78F2FB92425CB8B58E2DD054E835B004B2DC79A90932A23D227A` |
+| `benchmark-runs/2026-08-18/extended-release-candidate-2026-08-18.txt` | `--suite extended --iterations 10 --frames 5000` | `6B008FF299E91C1A2FEC6773298CDCA94167F57140278222F006C81D98B77174` |
+| `benchmark-runs/2026-08-18/evidence-release-candidate-2026-08-18.txt` | `--suite evidence --iterations 1 --frames 1` | `FE44DD89B71CC564C30295E3E1434755DB295F8B16D9478F6020BB24181B2A4F` |
+| `benchmark-runs/2026-08-18/repeatability-release-candidate/summary.csv` | 5 repeated extended runs, 1,000 iterations, 2,000 frames | `684523BA620672EAB399851A5ACFB1645816D45845BCEABD05A877A8C7E7D2CB` |
+| `benchmark-runs/2026-08-18/windows-wrapper-release-candidate/secure-default.csv` | PowerShell wrapper, all, 100 iterations, 5,000 frames | `F0F175DB2643EB3771E183EB7DC294D60F570FDB2AF657ED54600582A879F941` |
+| `benchmark-runs/2026-08-18/windows-wrapper-release-candidate/classical-lab.csv` | PowerShell wrapper, classical comparison profile | `C357317639262194390F0AF4111A6150F7D1043C4F1A38589CD8E23D745ECC70` |
 | `benchmark-runs/2026-08-18/operator-capability-skips.txt` | Windows prerequisite audit and explicit SKIPs | local raw skip record |
 
 ## Hardened controls exercised
@@ -124,10 +125,10 @@ included in elapsed time.
 
 | Workers | Goodput (Mbps) | Wire rate (Mbps) | Packets/sec |
 | ---: | ---: | ---: | ---: |
-| 1 | 57.885 | 651.523 | 947,597.839 |
-| 2 | 100.066 | 1,123.719 | 1,633,479.802 |
-| 4 | 178.777 | 2,014.008 | 2,923,121.894 |
-| 8 | 251.265 | 2,837.717 | 4,112,138.003 |
+| 1 | 52.451 | 590.366 | 858,649.173 |
+| 2 | 98.168 | 1,102.398 | 1,602,487.060 |
+| 4 | 163.014 | 1,836.431 | 2,665,387.281 |
+| 8 | 216.828 | 2,448.797 | 3,548,553.077 |
 
 This is useful for spotting local scaling regressions. It is not socket or
 TUN throughput and is not a line-rate claim.
@@ -139,9 +140,9 @@ a fresh morphology engine per session.
 
 | Session models | Goodput (Mbps) | Wire rate (Mbps) | Packets/sec |
 | ---: | ---: | ---: | ---: |
-| 1 | 69.621 | 796.127 | 1,139,731.023 |
-| 4 | 68.339 | 770.956 | 1,115,822.361 |
-| 16 | 68.259 | 781.217 | 1,127,039.942 |
+| 1 | 62.865 | 718.865 | 1,029,124.215 |
+| 4 | 71.269 | 804.007 | 1,163,656.675 |
+| 16 | 67.786 | 775.796 | 1,119,219.233 |
 
 This shows no large local regression from repeatedly constructing the
 benchmark morphology state. It does not include a handshake, socket close,
@@ -156,11 +157,11 @@ pretend that cryptographic padding is byte-for-byte deterministic.
 
 | Run | Capture bytes |
 | ---: | ---: |
-| 1 | 15,794 |
-| 2 | 15,795 |
-| 3 | 15,785 |
-| 4 | 15,806 |
-| 5 | 15,803 |
+| 1 | 15,788 |
+| 2 | 15,798 |
+| 3 | 15,802 |
+| 4 | 15,803 |
+| 5 | 15,792 |
 
 Individual capture hashes are recorded in
 `benchmark-runs/2026-08-18/repeatability-hardening/summary.csv`. They differ,
@@ -184,10 +185,10 @@ Additional local-only rows from the full capture:
 
 | Measurement | Result |
 | --- | ---: |
-| Direct ML-KEM decapsulation | 15,949.331 operations/sec |
-| Stateless cookie gate | 617,116.339 operations/sec |
-| Per-source limiter | 1,464,008.807 operations/sec |
-| 128-bit replay window | 16,457,275.268 validations/sec |
+| Direct ML-KEM decapsulation | 15,158.904 operations/sec |
+| Stateless cookie gate | 457,161.248 operations/sec |
+| Per-source limiter | 1,206,263.887 operations/sec |
+| 128-bit replay window | 10,916,649.200 validations/sec |
 
 These figures supersede no network claim. They remain process-local crypto and
 nonce-validation measurements, as described in
@@ -235,8 +236,8 @@ not substitute a loopback or synthetic result for that gate.
 - Full workspace release build: pass with the recorded LLVM-MinGW
   compatibility linker.
 - Full workspace test build: all workspace test targets compiled, but direct
-  execution was blocked when the local GNU runner could not materialize
-  `shph-31cb3fe3b3357cb7.exe` (`os error 2`). This is an environment runner
+  execution was blocked when the local GNU runner could not materialize the
+  reported test executable (`os error 2`). This is an environment runner
   limitation, not a claimed passing test run.
 - Standards-QUIC transport test binary: compiled with `--no-run`; direct
   execution remains blocked by the local Windows GNU test-runner artifact,
