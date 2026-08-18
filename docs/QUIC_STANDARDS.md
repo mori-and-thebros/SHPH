@@ -143,6 +143,10 @@ The standards path:
 - Uses the awaited datagram send path for one-shot delivery so local
   congestion-buffer exhaustion is reported instead of silently dropping the
   payload.
+- Exposes an opt-in authenticated Shroud2 application-message batch API with
+  negotiated-MTU and message-count bounds, plus profile-aware
+  caller-deadline policies; the native-TUN bridge deliberately keeps
+  independent IP packets as independent datagrams.
 - One-shot CLI sends wait for a bounded receipt acknowledgement on the
   reliable control stream; the receive side keeps the connection alive until
   the sender closes, so success reflects peer receipt rather than only local
@@ -165,6 +169,7 @@ proves, on Linux loopback, that:
 - the SHPH classical application handshake succeeds;
 - reliable control data crosses a bidirectional stream;
 - a QUIC DATAGRAM reaches the peer; and
+- an authenticated Shroud2 application batch preserves message boundaries; and
 - an oversized tunnel datagram is rejected.
 
 This is transport interoperability evidence, not a claim that the legacy shim,

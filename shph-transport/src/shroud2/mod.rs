@@ -9,12 +9,16 @@ use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 use shph_core::{Result, ShphError};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const MORPHOLOGY_MAGIC: [u8; 2] = *b"S2";
 pub const MORPHOLOGY_VERSION: u8 = 1;
 pub const MORPHOLOGY_HEADER_BYTES: usize = 7;
 pub const MAX_MORPHOLOGY_DATAGRAM_BYTES: usize = 65_535;
+pub const BATCH_MESSAGE_LENGTH_BYTES: usize = 2;
+pub const MAX_BATCH_MESSAGES: usize = 32;
+pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(1);
+const MAX_BATCH_PAYLOAD_BYTES: usize = MAX_MORPHOLOGY_DATAGRAM_BYTES - MORPHOLOGY_HEADER_BYTES;
 const MAX_PROFILE_SIZE_CLASSES: usize = 8;
 
 /// A normalized one-dimensional empirical distribution.
@@ -144,10 +148,22 @@ pub enum MorphologyProfile {
 impl MorphologyProfile {
     fn size_classes(self) -> &'static [usize] {
         match self {
-            Self::LowLatency => &[256, 512, 768, 1_024],
+            Self::LowLatency => &[128, 256, 512, 1_024],
             Self::WebBrowsingLab => &[384, 768, 1_024, 1_280, 1_536],
             Self::VideoStreamingLab => &[1_024, 1_280, 1_536, 2_048, 4_096],
             Self::BulkLab => &[1_280, 2_048, 4_096, 8_192, 16_384],
+        }
+    }
+
+    /// Weighted selection among eligible classes keeps larger buckets available
+    /// for shape diversity without making them the common case. The weights
+    /// are intentionally integer-valued so seeded lab runs remain reproducible.
+    fn size_class_weights(self) -> Option<&'static [u32]> {
+        match self {
+            Self::LowLatency => Some(&[65, 25, 8, 2]),
+            Self::WebBrowsingLab => Some(&[45, 30, 15, 8, 2]),
+            Self::VideoStreamingLab => Some(&[45, 30, 15, 8, 2]),
+            Self::BulkLab => None,
         }
     }
 
@@ -166,6 +182,218 @@ pub struct MorphologyEngine {
     profile: MorphologyProfile,
     rng: StdRng,
     size_histogram: Option<EmpiricalHistogram>,
+}
+
+/// Result of adding one application message to a bounded morphology batch.
+///
+/// When adding a message would exceed the negotiated datagram budget or the
+/// message-count bound, the existing batch is returned and the new message is
+/// buffered for the next batch. Callers should send the returned batch
+/// immediately and flush the remaining batch at their normal latency boundary.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MorphologyBatchPushResult {
+    Buffered,
+    Flush(Vec<Vec<u8>>),
+}
+
+/// Caller-selected batching limits for small application messages.
+///
+/// The wait bound is a flush deadline, not a promise that a message will be
+/// delivered within that duration. The caller must call
+/// [`MorphologyBatcher::flush_if_due`] from its event loop or timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MorphologyBatchPolicy {
+    max_messages: usize,
+    max_wait: Duration,
+}
+
+impl MorphologyBatchPolicy {
+    pub fn new(max_messages: usize, max_wait: Duration) -> Result<Self> {
+        if !(1..=MAX_BATCH_MESSAGES).contains(&max_messages) {
+            return Err(ShphError::Config(format!(
+                "morphology batch message limit must be between 1 and {MAX_BATCH_MESSAGES}"
+            )));
+        }
+        if max_wait > MAX_BATCH_WAIT {
+            return Err(ShphError::Config(format!(
+                "morphology batch wait must not exceed {} milliseconds",
+                MAX_BATCH_WAIT.as_millis()
+            )));
+        }
+        Ok(Self {
+            max_messages,
+            max_wait,
+        })
+    }
+
+    /// Conservative lab defaults that trade a bounded latency budget for
+    /// lower small-message overhead while preserving the discrete envelope.
+    pub fn recommended(profile: MorphologyProfile) -> Self {
+        match profile {
+            MorphologyProfile::LowLatency => Self {
+                max_messages: 4,
+                max_wait: Duration::from_millis(2),
+            },
+            MorphologyProfile::WebBrowsingLab => Self {
+                max_messages: 8,
+                max_wait: Duration::from_millis(10),
+            },
+            MorphologyProfile::VideoStreamingLab => Self {
+                max_messages: 8,
+                max_wait: Duration::from_millis(20),
+            },
+            MorphologyProfile::BulkLab => Self {
+                max_messages: MAX_BATCH_MESSAGES,
+                max_wait: Duration::from_millis(50),
+            },
+        }
+    }
+
+    pub const fn max_messages(self) -> usize {
+        self.max_messages
+    }
+
+    pub const fn max_wait(self) -> Duration {
+        self.max_wait
+    }
+}
+
+impl Default for MorphologyBatchPolicy {
+    fn default() -> Self {
+        Self {
+            max_messages: MAX_BATCH_MESSAGES,
+            max_wait: MAX_BATCH_WAIT,
+        }
+    }
+}
+
+/// MTU-aware application-message coalescer for the authenticated morphology
+/// envelope.
+///
+/// This is intentionally not used by the native-TUN bridge: an unreliable
+/// batch would amplify loss across otherwise independent IP packets. It is
+/// intended for small application messages carried through the opt-in
+/// standards-QUIC morphology API.
+#[derive(Debug, Default)]
+pub struct MorphologyBatcher {
+    messages: Vec<Vec<u8>>,
+    encoded_payload_bytes: usize,
+    policy: MorphologyBatchPolicy,
+    first_message_at: Option<Instant>,
+}
+
+impl MorphologyBatcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_policy(policy: MorphologyBatchPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    pub fn for_profile(profile: MorphologyProfile) -> Self {
+        Self::with_policy(MorphologyBatchPolicy::recommended(profile))
+    }
+
+    pub const fn policy(&self) -> MorphologyBatchPolicy {
+        self.policy
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn is_due(&self) -> bool {
+        self.first_message_at
+            .is_some_and(|started_at| self.is_due_at(Instant::now(), started_at))
+    }
+
+    pub fn time_until_due(&self) -> Option<Duration> {
+        self.first_message_at
+            .map(|started_at| self.policy.max_wait.saturating_sub(started_at.elapsed()))
+    }
+
+    pub fn flush_if_due(&mut self) -> Option<Vec<Vec<u8>>> {
+        if self.is_due() {
+            self.flush()
+        } else {
+            None
+        }
+    }
+
+    /// Add one message, returning a full previous batch when the new message
+    /// should start the next datagram. A due batch is flushed before the new
+    /// message is buffered.
+    pub fn push(&mut self, message: &[u8], path_mtu: usize) -> Result<MorphologyBatchPushResult> {
+        self.push_at(message, path_mtu, Instant::now())
+    }
+
+    fn push_at(
+        &mut self,
+        message: &[u8],
+        path_mtu: usize,
+        now: Instant,
+    ) -> Result<MorphologyBatchPushResult> {
+        validate_path_mtu(path_mtu)?;
+        validate_batch_message(message)?;
+        let maximum_payload_bytes = path_mtu - MORPHOLOGY_HEADER_BYTES;
+        let message_bytes = BATCH_MESSAGE_LENGTH_BYTES
+            .checked_add(message.len())
+            .ok_or_else(|| ShphError::Protocol("batch message length overflow".into()))?;
+        if message_bytes > maximum_payload_bytes {
+            return Err(ShphError::Protocol(
+                "batch message exceeds the negotiated datagram limit".into(),
+            ));
+        }
+
+        let batch_is_due = self
+            .first_message_at
+            .is_some_and(|started_at| self.is_due_at(now, started_at));
+        if !self.messages.is_empty()
+            && (batch_is_due
+                || self.messages.len() >= self.policy.max_messages
+                || self.encoded_payload_bytes.saturating_add(message_bytes) > maximum_payload_bytes)
+        {
+            let flushed = self.flush().ok_or_else(|| {
+                ShphError::Protocol("morphology batch state became inconsistent".into())
+            })?;
+            self.push_without_flush(message, now);
+            return Ok(MorphologyBatchPushResult::Flush(flushed));
+        }
+
+        self.push_without_flush(message, now);
+        Ok(MorphologyBatchPushResult::Buffered)
+    }
+
+    pub fn flush(&mut self) -> Option<Vec<Vec<u8>>> {
+        if self.messages.is_empty() {
+            return None;
+        }
+        self.encoded_payload_bytes = 0;
+        self.first_message_at = None;
+        Some(std::mem::take(&mut self.messages))
+    }
+
+    fn push_without_flush(&mut self, message: &[u8], now: Instant) {
+        if self.messages.is_empty() {
+            self.first_message_at = Some(now);
+        }
+        self.encoded_payload_bytes = self
+            .encoded_payload_bytes
+            .saturating_add(BATCH_MESSAGE_LENGTH_BYTES + message.len());
+        self.messages.push(message.to_vec());
+    }
+
+    fn is_due_at(&self, now: Instant, started_at: Instant) -> bool {
+        now.saturating_duration_since(started_at) >= self.policy.max_wait
+    }
 }
 
 impl MorphologyEngine {
@@ -224,9 +452,57 @@ impl MorphologyEngine {
         } else {
             let classes = self.profile.size_classes();
             debug_assert!(classes.len() <= MAX_PROFILE_SIZE_CLASSES);
-            classes[self.rng.gen_range(0..classes.len())]
+            if let Some(weights) = self.profile.size_class_weights() {
+                self.sample_weighted_size_class(classes, weights, minimum, path_mtu)
+            } else {
+                classes[self.rng.gen_range(0..classes.len())]
+            }
         };
         Ok(sampled.max(minimum).min(path_mtu))
+    }
+
+    fn sample_weighted_size_class(
+        &mut self,
+        classes: &[usize],
+        weights: &[u32],
+        minimum: usize,
+        path_mtu: usize,
+    ) -> usize {
+        debug_assert_eq!(classes.len(), weights.len());
+        let mut eligible = [(0usize, 0u32); MAX_PROFILE_SIZE_CLASSES];
+        let mut eligible_len = 0usize;
+        for (class, weight) in classes.iter().copied().zip(weights) {
+            if *weight == 0 {
+                continue;
+            }
+            let effective_class = class.min(path_mtu);
+            if effective_class < minimum {
+                continue;
+            }
+            if eligible_len > 0 && eligible[eligible_len - 1].0 == effective_class {
+                eligible[eligible_len - 1].1 += *weight;
+            } else {
+                eligible[eligible_len] = (effective_class, *weight);
+                eligible_len += 1;
+            }
+        }
+        let total_weight = eligible[..eligible_len]
+            .iter()
+            .map(|(_, weight)| *weight)
+            .sum::<u32>();
+
+        if total_weight == 0 {
+            return minimum;
+        }
+
+        let mut selection = self.rng.gen_range(0..total_weight);
+        for (class, weight) in eligible[..eligible_len].iter().copied() {
+            if selection < weight {
+                return class;
+            }
+            selection -= weight;
+        }
+        unreachable!("weighted class selection must choose an eligible class")
     }
 
     pub fn next_delay(&mut self) -> Duration {
@@ -290,6 +566,122 @@ pub fn encode_datagram(payload: &[u8], target_size: usize, path_mtu: usize) -> R
     Ok(datagram)
 }
 
+fn validate_batch_message(message: &[u8]) -> Result<()> {
+    if message.is_empty() {
+        return Err(ShphError::Protocol(
+            "morphology batch messages must not be empty".into(),
+        ));
+    }
+    if message.len() > u16::MAX as usize {
+        return Err(ShphError::Protocol(
+            "morphology batch message exceeds the length field".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Encode length-prefixed application messages for one morphology datagram.
+///
+/// The resulting payload is authenticated by the surrounding QUIC
+/// connection, and the length prefixes are still bounded by the negotiated
+/// path MTU and `MAX_BATCH_MESSAGES`.
+pub fn encode_batch_payload<M: AsRef<[u8]>>(messages: &[M], path_mtu: usize) -> Result<Vec<u8>> {
+    validate_path_mtu(path_mtu)?;
+    if messages.is_empty() {
+        return Err(ShphError::Protocol(
+            "morphology batch must contain at least one message".into(),
+        ));
+    }
+    if messages.len() > MAX_BATCH_MESSAGES {
+        return Err(ShphError::Protocol(format!(
+            "morphology batch exceeds the {MAX_BATCH_MESSAGES}-message limit"
+        )));
+    }
+
+    let maximum_payload_bytes = path_mtu - MORPHOLOGY_HEADER_BYTES;
+    let mut payload = Vec::new();
+    for message in messages {
+        let message = message.as_ref();
+        validate_batch_message(message)?;
+        let next_len = BATCH_MESSAGE_LENGTH_BYTES
+            .checked_add(message.len())
+            .and_then(|length| payload.len().checked_add(length))
+            .ok_or_else(|| ShphError::Protocol("morphology batch length overflow".into()))?;
+        if next_len > maximum_payload_bytes {
+            return Err(ShphError::Protocol(
+                "morphology batch exceeds the negotiated datagram limit".into(),
+            ));
+        }
+        payload.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        payload.extend_from_slice(message);
+    }
+    Ok(payload)
+}
+
+/// Decode length-prefixed application messages from an authenticated
+/// morphology payload.
+pub fn decode_batch_payload(payload: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if payload.is_empty() {
+        return Err(ShphError::Protocol(
+            "morphology batch payload must not be empty".into(),
+        ));
+    }
+    if payload.len() > MAX_BATCH_PAYLOAD_BYTES {
+        return Err(ShphError::Protocol(
+            "morphology batch payload exceeds the global envelope limit".into(),
+        ));
+    }
+
+    let mut messages = Vec::new();
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        if messages.len() >= MAX_BATCH_MESSAGES {
+            return Err(ShphError::Protocol(format!(
+                "morphology batch exceeds the {MAX_BATCH_MESSAGES}-message limit"
+            )));
+        }
+        let length_end = offset
+            .checked_add(BATCH_MESSAGE_LENGTH_BYTES)
+            .ok_or_else(|| ShphError::Protocol("morphology batch offset overflow".into()))?;
+        let length_bytes = payload.get(offset..length_end).ok_or_else(|| {
+            ShphError::Protocol("morphology batch has a truncated length prefix".into())
+        })?;
+        let message_len = u16::from_be_bytes([length_bytes[0], length_bytes[1]]) as usize;
+        if message_len == 0 {
+            return Err(ShphError::Protocol(
+                "morphology batch contains an empty message".into(),
+            ));
+        }
+        let message_start = length_end;
+        let message_end = message_start
+            .checked_add(message_len)
+            .ok_or_else(|| ShphError::Protocol("morphology batch message overflow".into()))?;
+        let message = payload.get(message_start..message_end).ok_or_else(|| {
+            ShphError::Protocol("morphology batch has a truncated message".into())
+        })?;
+        messages.push(message.to_vec());
+        offset = message_end;
+    }
+    Ok(messages)
+}
+
+/// Encode a bounded batch using the real Shroud2 morphology envelope.
+pub fn encode_batched_datagram<M: AsRef<[u8]>>(
+    morphology: &mut MorphologyEngine,
+    messages: &[M],
+    path_mtu: usize,
+) -> Result<Vec<u8>> {
+    let payload = encode_batch_payload(messages, path_mtu)?;
+    let target_size = morphology.target_size(payload.len(), path_mtu)?;
+    encode_datagram(&payload, target_size, path_mtu)
+}
+
+/// Decode and split one authenticated Shroud2 batch datagram.
+pub fn decode_batched_datagram(datagram: &[u8], path_mtu: usize) -> Result<Vec<Vec<u8>>> {
+    let payload = decode_datagram(datagram, path_mtu)?;
+    decode_batch_payload(&payload)
+}
+
 pub fn decode_datagram(datagram: &[u8], path_mtu: usize) -> Result<Vec<u8>> {
     validate_path_mtu(path_mtu)?;
     if datagram.len() < MORPHOLOGY_HEADER_BYTES || datagram.len() > path_mtu {
@@ -323,10 +715,13 @@ pub fn decode_datagram(datagram: &[u8], path_mtu: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_datagram, encode_datagram, wasserstein_distance, EmpiricalHistogram,
-        MorphologyEngine, MorphologyProfile, MORPHOLOGY_HEADER_BYTES,
+        decode_batch_payload, decode_batched_datagram, decode_datagram, encode_batch_payload,
+        encode_batched_datagram, encode_datagram, wasserstein_distance, EmpiricalHistogram,
+        MorphologyBatchPolicy, MorphologyBatchPushResult, MorphologyBatcher, MorphologyEngine,
+        MorphologyProfile, MAX_BATCH_MESSAGES, MAX_BATCH_WAIT, MORPHOLOGY_HEADER_BYTES,
     };
     use rand::SeedableRng;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn seeded_engine_stays_within_mtu_and_preserves_capacity() {
@@ -339,10 +734,186 @@ mod tests {
     }
 
     #[test]
+    fn low_latency_prefers_small_classes_without_losing_shape_diversity() {
+        let mut engine = MorphologyEngine::from_seed(MorphologyProfile::LowLatency, 7);
+        let mut counts = [0usize; 4];
+        for _ in 0..10_000 {
+            match engine.target_size(1, 2_000).expect("target") {
+                128 => counts[0] += 1,
+                256 => counts[1] += 1,
+                512 => counts[2] += 1,
+                1_024 => counts[3] += 1,
+                target => panic!("unexpected low-latency target size: {target}"),
+            }
+        }
+        assert!(counts[0] > counts[1]);
+        assert!(counts[1] > counts[2]);
+        assert!(counts[2] > counts[3]);
+        assert!(counts[3] > 0);
+    }
+
+    #[test]
+    fn low_latency_weighting_only_uses_classes_that_fit() {
+        let mut engine = MorphologyEngine::from_seed(MorphologyProfile::LowLatency, 7);
+        for _ in 0..100 {
+            let target = engine.target_size(300, 2_000).expect("target");
+            assert!(matches!(target, 512 | 1_024));
+        }
+    }
+
+    #[test]
+    fn web_and_video_profiles_keep_discrete_shape_diversity() {
+        for (profile, classes) in [
+            (
+                MorphologyProfile::WebBrowsingLab,
+                &[384, 768, 1_024, 1_280, 1_536][..],
+            ),
+            (
+                MorphologyProfile::VideoStreamingLab,
+                &[1_024, 1_280, 1_536, 2_048, 4_096][..],
+            ),
+        ] {
+            let mut engine = MorphologyEngine::from_seed(profile, 7);
+            let mut counts = vec![0usize; classes.len()];
+            for _ in 0..10_000 {
+                let target = engine.target_size(1, 8_192).expect("target");
+                let index = classes
+                    .iter()
+                    .position(|class| *class == target)
+                    .expect("target must remain in the profile's discrete classes");
+                counts[index] += 1;
+            }
+            assert!(counts.iter().all(|count| *count > 0));
+            assert!(counts[0] > counts[classes.len() - 1]);
+        }
+    }
+
+    #[test]
+    fn weighted_profiles_fold_large_classes_into_the_mtu_bucket() {
+        for (profile, classes) in [
+            (
+                MorphologyProfile::WebBrowsingLab,
+                &[384, 768, 1_024, 1_280, 1_472][..],
+            ),
+            (
+                MorphologyProfile::VideoStreamingLab,
+                &[1_024, 1_280, 1_472][..],
+            ),
+        ] {
+            let mut engine = MorphologyEngine::from_seed(profile, 11);
+            for _ in 0..1_000 {
+                let target = engine.target_size(1, 1_472).expect("target");
+                assert!(classes.contains(&target));
+            }
+        }
+    }
+
+    #[test]
     fn envelope_round_trip_preserves_payload() {
         let payload = b"authenticated lab payload";
         let encoded = encode_datagram(payload, 256, 512).expect("encode");
         assert_eq!(decode_datagram(&encoded, 512).expect("decode"), payload);
+    }
+
+    #[test]
+    fn batch_envelope_round_trip_preserves_message_boundaries() {
+        let messages = vec![
+            b"one".to_vec(),
+            b"two".to_vec(),
+            b"interactive-message".to_vec(),
+        ];
+        let mut engine = MorphologyEngine::from_seed(MorphologyProfile::LowLatency, 19);
+        let encoded = encode_batched_datagram(&mut engine, &messages, 512).expect("batch encode");
+        assert_eq!(
+            decode_batched_datagram(&encoded, 512).expect("batch decode"),
+            messages
+        );
+        let payload = encode_batch_payload(&messages, 512).expect("payload encode");
+        assert_eq!(
+            decode_batch_payload(&payload).expect("payload decode"),
+            messages
+        );
+    }
+
+    #[test]
+    fn batcher_flushes_at_count_and_mtu_boundaries() {
+        let mut batcher = MorphologyBatcher::new();
+        for _ in 0..MAX_BATCH_MESSAGES {
+            assert_eq!(
+                batcher.push(b"message", 512).expect("batch push"),
+                MorphologyBatchPushResult::Buffered
+            );
+        }
+        let flushed = match batcher.push(b"message", 512).expect("count boundary") {
+            MorphologyBatchPushResult::Flush(messages) => messages,
+            MorphologyBatchPushResult::Buffered => panic!("count boundary did not flush"),
+        };
+        assert_eq!(flushed.len(), MAX_BATCH_MESSAGES);
+        assert_eq!(batcher.len(), 1);
+
+        let mut mtu_batcher = MorphologyBatcher::new();
+        assert_eq!(
+            mtu_batcher.push(&[0u8; 200], 256).expect("first MTU push"),
+            MorphologyBatchPushResult::Buffered
+        );
+        let flushed = match mtu_batcher.push(&[1u8; 50], 256).expect("MTU boundary") {
+            MorphologyBatchPushResult::Flush(messages) => messages,
+            MorphologyBatchPushResult::Buffered => panic!("MTU boundary did not flush"),
+        };
+        assert_eq!(flushed, vec![vec![0u8; 200]]);
+        assert_eq!(mtu_batcher.len(), 1);
+    }
+
+    #[test]
+    fn recommended_batch_policies_bound_interactive_latency() {
+        assert_eq!(
+            MorphologyBatchPolicy::recommended(MorphologyProfile::LowLatency),
+            MorphologyBatchPolicy::new(4, Duration::from_millis(2)).expect("low-latency policy")
+        );
+        assert_eq!(
+            MorphologyBatchPolicy::recommended(MorphologyProfile::WebBrowsingLab),
+            MorphologyBatchPolicy::new(8, Duration::from_millis(10)).expect("web policy")
+        );
+        assert_eq!(
+            MorphologyBatchPolicy::recommended(MorphologyProfile::VideoStreamingLab),
+            MorphologyBatchPolicy::new(8, Duration::from_millis(20)).expect("video policy")
+        );
+        assert!(MorphologyBatchPolicy::new(0, Duration::ZERO).is_err());
+        assert!(MorphologyBatchPolicy::new(MAX_BATCH_MESSAGES + 1, Duration::ZERO).is_err());
+        assert!(MorphologyBatchPolicy::new(1, MAX_BATCH_WAIT + Duration::from_nanos(1)).is_err());
+    }
+
+    #[test]
+    fn batcher_flushes_when_the_latency_budget_expires() {
+        let policy =
+            MorphologyBatchPolicy::new(8, Duration::from_millis(10)).expect("batch policy");
+        let mut batcher = MorphologyBatcher::with_policy(policy);
+        let started_at = Instant::now();
+        assert_eq!(
+            batcher
+                .push_at(b"first", 512, started_at)
+                .expect("first push"),
+            MorphologyBatchPushResult::Buffered
+        );
+        assert!(!batcher.is_due_at(started_at + Duration::from_millis(9), started_at));
+        let flushed = match batcher
+            .push_at(b"second", 512, started_at + Duration::from_millis(10))
+            .expect("deadline push")
+        {
+            MorphologyBatchPushResult::Flush(messages) => messages,
+            MorphologyBatchPushResult::Buffered => panic!("deadline did not flush"),
+        };
+        assert_eq!(flushed, vec![b"first".to_vec()]);
+        assert_eq!(batcher.flush(), Some(vec![b"second".to_vec()]));
+    }
+
+    #[test]
+    fn batch_decoder_rejects_malformed_or_oversized_batches() {
+        assert!(decode_batch_payload(&[0, 1]).is_err());
+        assert!(decode_batch_payload(&[0, 0]).is_err());
+        assert!(decode_batch_payload(&vec![1u8; 65_529]).is_err());
+        let messages = vec![b"message".to_vec(); MAX_BATCH_MESSAGES + 1];
+        assert!(encode_batch_payload(&messages, 4_096).is_err());
     }
 
     #[test]

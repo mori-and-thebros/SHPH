@@ -3,6 +3,11 @@
 **/target/
 /target-ux-check/
 /target-ux-test/
+/target-release-*/
+**/target-release-*/
+/benchmarks/target-ci*/
+/fuzz/target-ci*/
+/target-ci*/
 fuzz/corpus/
 fuzz/artifacts/
 /benchmark-runs/

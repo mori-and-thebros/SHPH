@@ -7,9 +7,9 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-08-17)
+## Current Status (2026-08-18)
 
-Workspace version `0.6.2-dev` (pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.3-dev` (pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -320,6 +320,8 @@ Additional docs:
 - `docs/SUPPLY_CHAIN_SCAN.md` (cargo-audit scanner + advisory triage)
 - `docs/HARDENING.md` (post-funding security-hardening summary + threat impact)
 - `docs/BENCHMARKING.md` (Linux-first benchmark methodology and profile plan)
+- `docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md` (extended local benchmark
+  campaign and explicit host-capability skips)
 - `docs/BENCHMARK_RESULTS_2026-08-14.md` (historical Windows-local `0.6.1-dev`
   benchmark baseline)
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md` (latest Shroud 2.0 morphology report)

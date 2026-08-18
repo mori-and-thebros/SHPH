@@ -5,7 +5,9 @@ handshake profiles used by the benchmark harness. Native operation remains
 `secure-default`; benchmark-only classical operation requires an explicit
 profile on both peers.
 
-The latest Windows-local prerelease score report is
+The latest Windows-local evidence campaign is
+`docs/BENCHMARK_RESULTS_2026-08-17.md`. The latest Windows-local prerelease
+score report is
 `docs/BENCHMARK_RESULTS_2026-08-14.md`. The latest paired platform score
 report remains `docs/BENCHMARK_RESULTS_2026-08-05.md`. The focused Shroud
 morphology report
@@ -15,6 +17,16 @@ morphology report
 WSL2 regression records. All reports identify their platform and distinguish
 local-runner results from measurements that still require native Linux, live
 TUN, or two-host execution.
+
+The latest extended local campaign is
+`docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md`. It covers benchmark-only
+batch framing, deterministic MTU/loss modeling, concurrent in-memory sessions,
+session churn, repeatability, and explicit Windows capability skips.
+
+The network-simulation audit addendum is
+`docs/NETWORK_SIMULATION_EVIDENCE_2026-08-17.md`. It records the MTU/PMTU,
+post-quantum latency, and chaffing claims that remain unsupported or only
+partially implemented.
 
 The dated score reports are historical captures. The identity/discovery
 scenarios are part of the `identity` suite in `benchmarks/src/main.rs`; this
@@ -157,7 +169,7 @@ removes ML-KEM and therefore provides a different security contract.
 
 ## Expanded benchmark coverage
 
-The standalone runner now supports `--suite all|core|dataplane|resource|shroud|quic|scalability|identity|wire`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2.0 morphology profiles, QUIC-shim loopback handshake timing, long-session replay/nonce behavior, identity/plugin-provider validation costs, and explicit wire overhead/packet-rate metrics.
+The standalone runner now supports `--suite all|core|dataplane|resource|shroud|quic|scalability|identity|wire|evidence|extended`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2.0 morphology profiles, QUIC-shim loopback handshake timing, long-session replay/nonce behavior, identity/plugin-provider validation costs, explicit wire overhead/packet-rate metrics, and a fixed-size evidence campaign for Shroud2 overhead, pre-authentication CPU paths, and replay-window throughput.
 
 These are local measurements, not proof of live VPN throughput, TUN performance, network RTT, reconnect recovery, or control-plane cost. Use `scripts/benchmark_operator.sh` for real-process lifecycle, reconnect, control-plane, and native-TUN prerequisite/timing checks. It emits explicit `SKIP` records when a host, privilege, peer, or tool is unavailable.
 
@@ -167,8 +179,12 @@ Recommended commands:
 cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite all --iterations 10000 --frames 100000
 cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite identity --iterations 1000 --frames 1000
 cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite wire --iterations 1000 --frames 10000
+cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite evidence --iterations 1 --frames 1
+cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite extended --iterations 100 --frames 10000
 cargo build --release --manifest-path benchmarks/Cargo.toml --locked
 ./benchmarks/target/release/shph-benchmarks --profile secure-default --suite all --iterations 5000 --frames 1000000
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\benchmark_repeat.ps1 `
+  -Suite extended -Runs 5 -Iterations 1000 -Frames 10000
 scripts/benchmark_operator.sh --mode lifecycle --config /path/to/config.toml
 scripts/benchmark_operator.sh --mode control-plane --config /path/to/config.toml
 scripts/benchmark_operator.sh --mode reconnect --config /path/to/config.toml
@@ -232,6 +248,42 @@ The same suite now includes:
 The impairment test is a local queue-pressure model only. It must not be
 reported as QUIC congestion control or Internet loss-recovery evidence.
 
+### Extended local coverage
+
+The separate `extended` suite adds bounded coverage that is useful before a
+real two-host run:
+
+- `shroud2_batching_*` measures the bounded authenticated Shroud2 application
+  batch API over the real encoder/decoder. The API is opt-in and application
+  message-only; it must not be used to coalesce independent native-TUN IP
+  packets because one lost datagram would lose the whole batch.
+- `shroud2_adaptive_batching_*` exercises the profile-aware
+  `MorphologyBatcher` policy. Its low-latency, web, video, and bulk defaults
+  cap both message count and caller-visible wait budget; the benchmark records
+  the observed batch count and remains an in-memory measurement.
+- `shroud2_mtu_loss_*` sweeps path-MTU values of 1,200, 1,280, 1,360, 1,400,
+  and 1,472 bytes with deterministic 0%, 1%, 5%, and 10% local drops. It
+  measures envelope behavior and a local impairment model, not PMTU discovery,
+  ICMP generation, UDP delivery, or Internet loss recovery.
+- `shroud2_concurrent_sessions_*` runs 1, 2, 4, and 8 in-memory worker
+  sessions. Thread creation and joining are included; socket, TUN, scheduler,
+  and network throughput are not.
+- `shroud2_session_churn_*` creates fresh morphology engines for 1, 4, and 16
+  sequential session models while keeping the requested frame count fixed.
+  This is a resource/churn signal, not reconnect or handshake recovery
+  evidence.
+
+Use `scripts/benchmark_repeat.ps1` for repeated captures. It writes ignored
+raw captures and a SHA-256 summary under `benchmark-runs/`. Shroud2 padding is
+filled with OS randomness, so complete capture hashes are expected to differ
+even when the benchmark seeds and inputs are unchanged. Compare reported
+distributions and counters, not byte-for-byte output.
+
+The extended suite deliberately does not synthesize native Linux TUN, PMTU
+blackhole, two-host throughput, RTT, control-plane, or reconnect results. Those
+remain operator-only measurements and should be recorded as `SKIP` when the
+required host, privilege, peer, or tool is unavailable.
+
 ### Wire and packet-overhead coverage
 
 The `wire` suite measures three distinct local paths for payload sizes from
@@ -253,6 +305,41 @@ datagram bytes: IP, UDP, Ethernet, tunnel-device, NIC, and physical-network
 headers are excluded. UDP loopback is a socket-path regression signal, not
 two-host throughput, Internet RTT, congestion-control evidence, or a
 replacement for native TUN validation.
+
+### Reproducible evidence campaign
+
+The `evidence` suite is a deliberately bounded campaign for claims that are
+otherwise easy to overstate:
+
+- 5,000 deterministic synthetic packets per traffic profile through the
+  current Shroud2 morphology code;
+- 50,000 in-memory ML-KEM decapsulation operations compared with the current
+  rotating HMAC-SHA256 cookie path and per-source rate limiter; and
+- 500,000 `ReplayWindow::new(128)` checks containing deterministic
+  out-of-order and duplicate events.
+
+The dated capture is
+`docs/BENCHMARK_RESULTS_2026-08-17.md`. It records exact inputs, platform,
+raw-capture hash, and non-claims. The supplied 128/256/512/1024/1360 table is
+not reproduced because the original input distribution was not supplied.
+Current `LowLatency`, `WebBrowsingLab`, and `VideoStreamingLab` use weighted
+smallest-fitting selection within their existing discrete class sets; the
+dated report's VoIP, SSH, web, and video rows use that policy, while its
+baseline comparison preserves the earlier uniform-policy values. Likewise,
+the cookie path is HMAC-SHA256 rather than BLAKE3, and the replay result is
+measured directly in Rust rather than projected from Python.
+
+Run this suite as local evidence only:
+
+```bash
+cargo run --manifest-path benchmarks/Cargo.toml --release --offline -- \
+  --profile secure-default --suite evidence --iterations 1 --frames 1
+```
+
+The results exclude IP/UDP headers and do not measure a live flood, DPI
+classifier behavior, TUN forwarding, two-host throughput, or Internet
+conditions. A release record must use a clean reviewed tree and preserve
+platform-specific provenance.
 
 ### Identity and plugin-provider coverage
 

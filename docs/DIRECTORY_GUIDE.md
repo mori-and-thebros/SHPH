@@ -26,6 +26,13 @@ This file maps the repository layout and the main public validation artifacts.
 - `scripts/`: reproducible demos, benchmark operators, evidence capture, and
   optional multi-checkout synchronization.
 - `docs/BENCHMARKING.md`: Linux-first benchmark methodology, profiles, and obstacles.
+- `docs/BENCHMARK_RESULTS_2026-08-17.md`: dated local evidence campaign for
+  Shroud2 overhead, pre-authentication CPU paths, and replay-window throughput.
+- `docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md`: extended local campaign for
+  batch framing, MTU/loss modeling, concurrency, session churn, and
+  repeatability, with explicit host-capability skips.
+- `docs/NETWORK_SIMULATION_EVIDENCE_2026-08-17.md`: audit addendum for MTU/PMTU,
+  post-quantum latency, and Poisson-chaff claims.
 - `docs/BENCHMARK_RESULTS_2026-08-14.md`: historical Windows-local `0.6.1-dev`
   full-suite benchmark baseline with both explicit profiles.
 - `docs/BENCHMARK_RESULTS_2026-08-05.md`: paired WSL2/Linux and native Windows
@@ -55,6 +62,12 @@ This file maps the repository layout and the main public validation artifacts.
 ## Evidence and Historical Artifacts
 
 - Current methodology: `docs/BENCHMARKING.md`.
+- Current evidence campaign:
+  `docs/BENCHMARK_RESULTS_2026-08-17.md`.
+- Extended local evidence campaign:
+  `docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md`.
+- Network-simulation audit:
+  `docs/NETWORK_SIMULATION_EVIDENCE_2026-08-17.md`.
 - Current Windows-local score:
   `docs/BENCHMARK_RESULTS_2026-08-14.md`.
 - Current paired platform scores:

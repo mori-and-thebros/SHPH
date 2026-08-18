@@ -36,6 +36,7 @@ const MAX_HELLO_BYTES: usize = 16 * 1024;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_QUIC_FRAME_BYTES: usize = 16 * 1024;
 const MAX_QUIC_HELLO_BYTES: usize = 12 * 1024;
+const MAX_HANDSHAKE_PADDING_BYTES: usize = 64;
 const SHROUD_AEAD_OVERHEAD: usize = 12 + 16;
 const MAX_QUIC_PAYLOAD_BYTES: usize = MAX_QUIC_FRAME_BYTES - 4 - SHROUD_AEAD_OVERHEAD;
 const MAX_TCP_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - SHROUD_AEAD_OVERHEAD;
@@ -908,8 +909,7 @@ pub fn offline_mesh_connect_and_handshake_with_profile(
     let mut reader = OfflineMeshReadState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
-    let local_hello =
-        serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?;
+    let local_hello = serialize_hello_with_padding(&material.local_hello)?;
     writer.send_payload(&local_hello)?;
 
     let peer_hello = reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
@@ -950,8 +950,7 @@ pub fn offline_mesh_accept_and_handshake_with_profile(
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
     let peer_hello = reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
-    let local_hello =
-        serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?;
+    let local_hello = serialize_hello_with_padding(&material.local_hello)?;
     writer.send_payload(&local_hello)?;
     let mut material = material;
     if profile.uses_pqc() {
@@ -993,9 +992,7 @@ pub fn offline_mesh_connect_secure_session_with_profile(
     let mut reader = OfflineMeshReadState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
-    writer.send_payload(
-        &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
-    )?;
+    writer.send_payload(&serialize_hello_with_padding(&material.local_hello)?)?;
     let peer_hello = reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
 
     let mut material = material;
@@ -1043,9 +1040,7 @@ pub fn offline_mesh_accept_secure_session_with_profile(
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
     let peer_hello = reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
-    writer.send_payload(
-        &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
-    )?;
+    writer.send_payload(&serialize_hello_with_padding(&material.local_hello)?)?;
     let mut material = material;
     if profile.uses_pqc() {
         reader.receive_verified_responder_pq(
@@ -1099,9 +1094,7 @@ pub fn data_mule_connect_and_handshake_with_profile(
     let mut reader = DataMuleReadState::new(cfg, &local_identity.public_key_b64(), Some(peer_node));
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
-    writer.send_payload(
-        &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
-    )?;
+    writer.send_payload(&serialize_hello_with_padding(&material.local_hello)?)?;
     let (peer_hello, _) =
         reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     let mut material = material;
@@ -1142,9 +1135,7 @@ pub fn data_mule_accept_and_handshake_with_profile(
     let (peer_hello, peer_node) =
         reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     let mut writer = DataMuleWriteState::new(cfg, &local_node, &peer_node);
-    writer.send_payload(
-        &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
-    )?;
+    writer.send_payload(&serialize_hello_with_padding(&material.local_hello)?)?;
     let mut material = material;
     if profile.uses_pqc() {
         reader.receive_verified_responder_pq(
@@ -1189,9 +1180,7 @@ pub fn data_mule_connect_secure_session_with_profile(
     let mut reader = DataMuleReadState::new(cfg, &local_node, Some(peer_node));
     let timeout = Duration::from_secs(timeout_secs.max(1));
 
-    writer.send_payload(
-        &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
-    )?;
+    writer.send_payload(&serialize_hello_with_padding(&material.local_hello)?)?;
     let (peer_hello, _) =
         reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     let mut material = material;
@@ -1243,9 +1232,7 @@ pub fn data_mule_accept_secure_session_with_profile(
     let (peer_hello, peer_node) =
         reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
     let mut writer = DataMuleWriteState::new(cfg, &local_node, &peer_node);
-    writer.send_payload(
-        &serde_json::to_vec(&material.local_hello).map_err(ShphError::Serialization)?,
-    )?;
+    writer.send_payload(&serialize_hello_with_padding(&material.local_hello)?)?;
     let mut material = material;
     if profile.uses_pqc() {
         reader.receive_verified_responder_pq(
@@ -1966,12 +1953,35 @@ fn write_tcp_hello_with_deadline(
     hello: &Hello,
     deadline: Instant,
 ) -> Result<()> {
-    let payload = serde_json::to_string(hello).map_err(|e| ShphError::Protocol(e.to_string()))?;
-    write_tcp_all_or_closed_with_deadline(stream, payload.as_bytes(), deadline)?;
+    let payload = serialize_hello_with_padding(hello)?;
+    if payload.len() > MAX_HELLO_BYTES {
+        return Err(ShphError::Protocol("hello exceeds size limit".into()));
+    }
+    write_tcp_all_or_closed_with_deadline(stream, &payload, deadline)?;
     write_tcp_all_or_closed_with_deadline(stream, b"\n", deadline)?;
     refresh_deadline_timeout(stream, deadline)?;
     stream.flush().map_err(map_io_error)?;
     Ok(())
+}
+
+fn serialize_hello_with_padding(hello: &Hello) -> Result<Vec<u8>> {
+    let mut random = [0u8; 1];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut random)
+        .map_err(|_| ShphError::Crypto("OS randomness unavailable".into()))?;
+    let padding_len = usize::from(random[0]) % (MAX_HANDSHAKE_PADDING_BYTES + 1);
+    serialize_hello_with_padding_len(hello, padding_len)
+}
+
+fn serialize_hello_with_padding_len(hello: &Hello, padding_len: usize) -> Result<Vec<u8>> {
+    if padding_len > MAX_HANDSHAKE_PADDING_BYTES {
+        return Err(ShphError::Protocol(
+            "handshake padding exceeds size limit".into(),
+        ));
+    }
+    let mut payload = serde_json::to_vec(hello).map_err(ShphError::Serialization)?;
+    payload.resize(payload.len() + padding_len, b' ');
+    Ok(payload)
 }
 
 fn read_tcp_hello_with_deadline(stream: &mut TcpStream, deadline: Instant) -> Result<Hello> {
@@ -2565,8 +2575,8 @@ fn write_and_wait_quic_hello(
     buf: &mut [u8],
     deadline: Instant,
 ) -> Result<(Hello, SocketAddr)> {
-    let payload = serde_json::to_string(hello).map_err(|e| ShphError::Protocol(e.to_string()))?;
-    if payload.len() + 1 > MAX_QUIC_HELLO_BYTES {
+    let payload = serialize_hello_with_padding(hello)?;
+    if payload.len() > MAX_QUIC_HELLO_BYTES {
         return Err(ShphError::Protocol(
             "quic hello payload exceeds size limit".into(),
         ));
@@ -2579,9 +2589,7 @@ fn write_and_wait_quic_hello(
     socket
         .set_write_timeout(Some(remaining))
         .map_err(ShphError::Io)?;
-    socket
-        .send_to(payload.as_bytes(), peer_addr)
-        .map_err(map_io_error)?;
+    socket.send_to(&payload, peer_addr).map_err(map_io_error)?;
 
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -2630,9 +2638,14 @@ fn decode_quic_hello(
 }
 
 fn write_tcp_hello_to_peer(socket: &UdpSocket, peer_addr: SocketAddr, hello: &Hello) -> Result<()> {
-    let payload = serde_json::to_string(hello).map_err(|e| ShphError::Protocol(e.to_string()))?;
+    let payload = serialize_hello_with_padding(hello)?;
+    if payload.len() > MAX_QUIC_HELLO_BYTES {
+        return Err(ShphError::Protocol(
+            "quic hello payload exceeds size limit".into(),
+        ));
+    }
     socket
-        .send_to(payload.as_bytes(), peer_addr)
+        .send_to(&payload, peer_addr)
         .map_err(map_io_error)
         .map(|_| ())
 }
@@ -4037,6 +4050,45 @@ mod tests {
         let payload = vec![0u8; super::MAX_TCP_PAYLOAD_BYTES + 1];
         assert!(super::validate_tcp_payload(&payload).is_err());
         assert!(super::validate_tcp_payload(&payload[..super::MAX_TCP_PAYLOAD_BYTES]).is_ok());
+    }
+
+    #[test]
+    fn handshake_padding_preserves_json_and_bounds_size() {
+        let identity = IdentityKeyPair::generate().expect("identity");
+        let material = super::build_hello_with_profile(&identity, HandshakeProfile::ClassicalLab)
+            .expect("hello");
+        let canonical = serde_json::to_vec(&material.local_hello).expect("canonical hello");
+        let padded =
+            super::serialize_hello_with_padding_len(&material.local_hello, 64).expect("padding");
+
+        assert_eq!(&padded[..canonical.len()], canonical.as_slice());
+        assert!(padded[canonical.len()..]
+            .iter()
+            .all(u8::is_ascii_whitespace));
+        assert_eq!(
+            serde_json::from_slice::<shph_core::Hello>(&padded)
+                .expect("padded hello")
+                .proto,
+            material.local_hello.proto
+        );
+        assert!(super::serialize_hello_with_padding_len(&material.local_hello, 65).is_err());
+    }
+
+    #[test]
+    fn randomized_handshake_padding_stays_within_bound() {
+        let identity = IdentityKeyPair::generate().expect("identity");
+        let material = super::build_hello_with_profile(&identity, HandshakeProfile::ClassicalLab)
+            .expect("hello");
+        let canonical_len = serde_json::to_vec(&material.local_hello)
+            .expect("canonical hello")
+            .len();
+
+        for _ in 0..128 {
+            let padded =
+                super::serialize_hello_with_padding(&material.local_hello).expect("padding");
+            assert!((canonical_len..=canonical_len + 64).contains(&padded.len()));
+            serde_json::from_slice::<shph_core::Hello>(&padded).expect("padded hello");
+        }
     }
 
     #[test]

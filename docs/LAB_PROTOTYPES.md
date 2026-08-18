@@ -47,6 +47,14 @@ connection
 let payload = connection.recv_morphology_datagram().await?;
 ```
 
+Small application messages may be coalesced with
+`send_morphology_batch`/`recv_morphology_batch`, or queued through
+`MorphologyBatcher::for_profile`. The batch envelope is bounded by the
+negotiated datagram limit and 32 messages. Call
+`flush_morphology_batch_if_due` from the application's event loop when using a
+latency policy. Do not use it for separate native-TUN IP packets: QUIC
+DATAGRAM loss would discard the entire batch.
+
 This is an opt-in lab morphology tool. It does not provide browser fingerprint
 parity, active-probe deflection, censorship bypass, or a stealth guarantee.
 See `docs/SHROUD_2_IMPLEMENTATION.md` for the implementation disposition.

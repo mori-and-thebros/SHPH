@@ -317,7 +317,7 @@ candidate without overstating platform or network evidence.
 
 **Current status (2026-08-17):** preparation is in progress, but Phase E is
 not complete. The benchmark/evidence bundle was captured on the prior
-`0.6.0-dev.0` and `0.6.1-dev` lines; the current `0.6.2-dev` development
+`0.6.0-dev.0` and `0.6.1-dev` lines; the current `0.6.3-dev` development
 snapshot carries follow-up hardening and public-surface cleanup. The final
 claims freeze, mirror-parity check, final release checklist, and production
 release sign-off remain gated on the outstanding native TUN evidence.

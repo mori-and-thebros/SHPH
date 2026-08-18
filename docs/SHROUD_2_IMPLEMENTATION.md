@@ -16,12 +16,26 @@ to native TUN, but does not turn morphology into a stealth or fallback router.
 
 - Explicit morphology profiles for low-latency, web-browsing, video-streaming,
   and bulk lab comparisons.
+- Low-latency, web-browsing, and video-streaming selection prefer the smallest
+  fitting profile class with bounded 65/25/8/2, 45/30/15/8/2, and 45/30/15/8/2
+  weights respectively. Larger classes remain available for shape diversity
+  without making them the common case; `BulkLab` retains uniform class
+  selection for comparison.
+- Profile classes above the negotiated path limit fold into one explicit
+  path-MTU bucket instead of creating arbitrary clipped sizes.
 - Seeded morphology selection for deterministic tests and reproducible
   benchmarks.
 - Negotiated QUIC DATAGRAM limit enforcement.
 - Bounded target-size selection that never shrinks below the payload.
 - Versioned envelope with declared total length and payload length.
 - Random authenticated-transport padding after the payload.
+- Bounded length-prefixed application-message batches with a 32-message cap
+  and negotiated path-MTU enforcement.
+- An MTU-aware `MorphologyBatcher` that flushes before a batch exceeds the
+  envelope budget; this is intentionally excluded from the native-TUN IP path.
+- Profile-aware batch policies with explicit message-count and caller-driven
+  latency-deadline bounds capped at one second; no hidden timer or background
+  task is created.
 - Bounded inter-datagram delay; the delay is not an unbounded sleep or retry
   loop.
 - Offline empirical-histogram construction, normalized sampling, and exact
@@ -52,6 +66,9 @@ one.
   an error instead of panicking or silently emitting predictable padding.
 - Every profile has bounded size classes and bounded delay ranges. The engine
   has no retry loop, unbounded allocation policy, or unbounded sleep.
+- Batch payloads reject empty messages, truncated prefixes, zero-length
+  messages, oversized messages, excess message counts, and batches that exceed
+  the negotiated path-MTU budget.
 
 ### QUIC lifecycle and resource bounds
 
@@ -89,6 +106,12 @@ one.
 - Loopback and in-memory benchmark values do not represent Internet RTT,
   congestion-control behavior, packet loss recovery, CPU saturation on two
   hosts, TUN throughput, or traffic-analysis resistance.
+- Application batching reduces per-message envelope overhead but amplifies
+  loss within a single unreliable QUIC DATAGRAM. The native-TUN bridge
+  therefore continues to send independent IP datagrams.
+- Adaptive batching is a policy primitive, not a delivery guarantee. Callers
+  that need reliable delivery must use the reliable control stream or add an
+  authenticated recovery protocol.
 - A successful fuzz smoke run demonstrates only that the exercised harness did
   not crash during that run; it is not a proof of protocol correctness or
   stealth.
@@ -146,7 +169,7 @@ cargo run --manifest-path benchmarks/Cargo.toml --release --offline -- \
 The benchmark emits `shroud2_morphology` rows for all four morphology
 profiles. Each row includes p50/p95/p99/p99.9 latency, allocation/RSS
 observations, and the observed target-size range under a 1,450-byte datagram
-budget. The current workspace version is `0.5.0-dev.0`; benchmark reports must
+budget. The current workspace version is `0.6.3-dev`; benchmark reports must
 also record the exact commit, platform, toolchain, and whether the run is
 native Linux or WSL2.
 

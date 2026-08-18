@@ -823,3 +823,20 @@ Date: 2026-08-17
 - **Structured automation errors.** `--json` now emits stable error objects
   containing `ok`, `error`, `code`, and an optional `hint`; sysexits-style
   process codes remain available for scripts.
+
+## Increment 31 - bounded handshake wire variance
+
+Date: 2026-08-17
+
+File: `shph-transport/src/lib.rs`.
+
+- **Bounded handshake padding.** TCP, experimental QUIC, Offline Mesh, and
+  Data-Mule hello serialization now appends 0–64 bytes of JSON whitespace
+  selected from OS randomness. The padding is outside the signed `Hello`
+  fields and is accepted by the existing JSON decoders.
+- **Compatibility boundary.** The change varies serialized wire length without
+  changing handshake semantics or authenticated framing. It does not claim
+  browser fingerprint parity, DPI resistance, or production traffic stealth.
+- **Deferred global bucketing.** Shroud's existing fixed-size cell behavior is
+  retained. Global bucketed sizes for unshrouded TCP/QUIC remain deferred until
+  a versioned authenticated length envelope can preserve interoperability.

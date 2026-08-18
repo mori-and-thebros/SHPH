@@ -8,7 +8,10 @@
 //! explicitly.
 
 use crate::ja4::{self, Ja4Observer, Ja4ObserverConfig};
-use crate::shroud2::{decode_datagram, encode_datagram, MorphologyEngine};
+use crate::shroud2::{
+    decode_batched_datagram, decode_datagram, encode_batched_datagram, encode_datagram,
+    MorphologyBatchPushResult, MorphologyBatcher, MorphologyEngine,
+};
 use bytes::Bytes;
 use quinn::rustls::server::ResolvesServerCert;
 use quinn::{
@@ -453,6 +456,83 @@ impl StandardsQuicConnection {
             .map_err(|err| ShphError::Transport(err.to_string()))
     }
 
+    /// Send several small application messages in one authenticated Shroud2
+    /// morphology datagram.
+    ///
+    /// This is for application messages carried by the opt-in morphology API.
+    /// It must not be used for independent native-TUN IP packets because one
+    /// lost QUIC DATAGRAM would lose every message in the batch.
+    pub async fn send_morphology_batch<M: AsRef<[u8]>>(
+        &self,
+        morphology: &mut MorphologyEngine,
+        messages: &[M],
+    ) -> Result<()> {
+        let path_mtu = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let datagram = encode_batched_datagram(morphology, messages, path_mtu)?;
+        let delay = morphology.next_delay();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        self.connection
+            .send_datagram_wait(Bytes::from(datagram))
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))
+    }
+
+    /// Queue one application message and send a full batch when the bounded
+    /// coalescer reaches its count or MTU limit.
+    ///
+    /// Call [`Self::flush_morphology_batch`] at the caller's latency boundary.
+    /// This method intentionally does not add a timer or hidden sleep.
+    pub async fn send_morphology_message(
+        &self,
+        morphology: &mut MorphologyEngine,
+        batcher: &mut MorphologyBatcher,
+        message: &[u8],
+    ) -> Result<()> {
+        let path_mtu = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        match batcher.push(message, path_mtu)? {
+            MorphologyBatchPushResult::Buffered => Ok(()),
+            MorphologyBatchPushResult::Flush(messages) => {
+                self.send_morphology_batch(morphology, &messages).await
+            }
+        }
+    }
+
+    /// Send any messages currently buffered by the bounded morphology
+    /// coalescer.
+    pub async fn flush_morphology_batch(
+        &self,
+        morphology: &mut MorphologyEngine,
+        batcher: &mut MorphologyBatcher,
+    ) -> Result<()> {
+        if let Some(messages) = batcher.flush() {
+            self.send_morphology_batch(morphology, &messages).await?;
+        }
+        Ok(())
+    }
+
+    /// Flush a morphology batch only when its caller-selected latency budget
+    /// has expired. Returns whether a datagram was sent.
+    pub async fn flush_morphology_batch_if_due(
+        &self,
+        morphology: &mut MorphologyEngine,
+        batcher: &mut MorphologyBatcher,
+    ) -> Result<bool> {
+        if let Some(messages) = batcher.flush_if_due() {
+            self.send_morphology_batch(morphology, &messages).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Receive and decode one explicitly opt-in Shroud 2.0 lab envelope.
     pub async fn recv_morphology_datagram(&self) -> Result<Vec<u8>> {
         let path_mtu = self
@@ -465,6 +545,20 @@ impl StandardsQuicConnection {
             .await
             .map_err(|err| ShphError::Transport(err.to_string()))?;
         decode_datagram(&datagram, path_mtu)
+    }
+
+    /// Receive and split one authenticated Shroud2 application batch.
+    pub async fn recv_morphology_batch(&self) -> Result<Vec<Vec<u8>>> {
+        let path_mtu = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let datagram = self
+            .connection
+            .read_datagram()
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))?;
+        decode_batched_datagram(&datagram, path_mtu)
     }
 
     /// Receive one QUIC DATAGRAM, rejecting impossible IP-packet sizes.
@@ -752,6 +846,33 @@ mod tests {
         .expect("morphology datagram timeout")
         .expect("morphology datagram receive");
         assert_eq!(payload, b"morphology-lab");
+
+        let messages = vec![
+            b"one".to_vec(),
+            b"two".to_vec(),
+            b"small-application-message".to_vec(),
+        ];
+        let mut batcher = crate::shroud2::MorphologyBatcher::for_profile(
+            crate::shroud2::MorphologyProfile::WebBrowsingLab,
+        );
+        for message in &messages {
+            client_connection
+                .send_morphology_message(&mut morphology, &mut batcher, message)
+                .await
+                .expect("morphology message send");
+        }
+        client_connection
+            .flush_morphology_batch(&mut morphology, &mut batcher)
+            .await
+            .expect("morphology batch flush");
+        let received = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_connection.recv_morphology_batch(),
+        )
+        .await
+        .expect("morphology batch timeout")
+        .expect("morphology batch receive");
+        assert_eq!(received, messages);
 
         client_connection
             .connection

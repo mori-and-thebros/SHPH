@@ -108,6 +108,24 @@ isolated AsyncFd probe opens and closes a real TUN device, and print `SKIP`
 when the host denies the namespace or network capability. They do not measure
 packet throughput, routing, RTT, jitter, or two-node behavior.
 
+### Isolated authenticated TCP exchange
+
+`scripts/run_isolated_e2e_test.sh` creates two Linux network namespaces,
+connects them with a private veth pair, generates two temporary SHPH
+identities, pins each peer, and verifies a real `recv-once`/`send-once`
+authenticated TCP payload exchange:
+
+```bash
+sudo ./scripts/run_isolated_e2e_test.sh
+```
+
+The script reports `PASS` only after the client exits successfully, the
+receiver exits successfully, and the expected payload appears in the receiver
+log. It has no default route or host firewall mutation, and it reports
+`SKIP` outside Linux or when the required namespace capability is unavailable.
+This is handshake-and-payload evidence only; it is not native-TUN forwarding,
+throughput, DPI-resistance, or production VPN evidence.
+
 ### Firewall and MSS hardening checks
 
 The default test suite does not mutate host firewall state. The bounded plan

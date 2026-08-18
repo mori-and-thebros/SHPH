@@ -1,6 +1,6 @@
 [package]
 name = "shph-benchmarks"
-version = "0.6.2-dev"
+version = "0.6.3-dev"
 edition = "2021"
 publish = false
 
@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 hex = "0.4"
 libc = "0.2"
+serde_json = "1.0"
 shph-core = { path = "../shph-core" }
 shph-identity = { path = "../shph-identity" }
 shph-transport = { path = "../shph-transport" }

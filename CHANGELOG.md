@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.6.3-dev] - patches, optimizations, and benchmark updates (2026-08-18)
+
+This developer release is limited to transport patches, lab-profile
+optimizations, and benchmark/evidence updates; it does not claim a new
+production support tier.
+
+- Added bounded 0–64-byte randomized JSON-whitespace padding to serialized
+  handshakes across TCP, experimental QUIC, Offline Mesh, and Data Mule.
+- Kept the signed `Hello` fields and authenticated framing unchanged, so this
+  varies wire length without changing handshake semantics.
+- Retained Shroud's existing fixed-size cell behavior and deferred global
+  unshrouded frame bucketing until a versioned authenticated length envelope
+  is available.
+- Added a reproducible `benchmarks --suite evidence` campaign for current
+  Shroud2 overhead, pre-authentication CPU paths, and 128-bit replay-window
+  throughput; results are explicitly scoped to local lab evidence.
+- Added a network-simulation evidence addendum documenting the implemented
+  MTU/MSS boundaries and the unsupported synthetic-ICMP, WAN-loss, and
+  Poisson-chaff claims.
+- Rebalanced the opt-in Shroud2 `LowLatency` lab profile to prefer
+  smallest-fitting 128/256/512/1024-byte classes with bounded 65/25/8/2
+  weights.
+- Rebalanced the opt-in `WebBrowsingLab` and `VideoStreamingLab` profiles
+  toward smaller fitting classes with bounded 45/30/15/8/2 weights, while
+  preserving their existing discrete class sets; `BulkLab` remains uniform for
+  comparison.
+- Added a separate `benchmarks --suite extended` campaign for benchmark-only
+  batch framing, deterministic MTU/loss matrices, concurrent in-memory
+  sessions, session churn, and PowerShell repeatability captures.
+- Documented the 2026-08-18 extended results and kept native Linux TUN,
+  two-host, reconnect, and MSVC evidence explicitly capability-gated.
+- Added a bounded authenticated Shroud2 application-message batch API and
+  MTU-aware batcher for small messages; native-TUN IP datagrams remain
+  intentionally unbatched to avoid loss amplification.
+- Added profile-aware batch policies with explicit caller-driven latency
+  deadlines for low-latency, web, video, and bulk application traffic.
+- Capped custom batch deadlines at one second, bounded decoded batch payloads
+  to the global envelope limit, and removed an internal batch-state panic path.
+
 ## [0.6.2-dev.3] - CI hardening follow-up (2026-08-17)
 
 - Refactored the bounded Data-Mule scanner state so strict Clippy checks pass

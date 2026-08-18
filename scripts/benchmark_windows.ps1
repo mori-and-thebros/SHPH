@@ -2,7 +2,7 @@
 param(
     [string]$Binary = "",
     [string]$OutputDirectory = ".\benchmark-runs\windows",
-    [ValidateSet("all", "core", "dataplane", "resource", "shroud", "quic", "scalability", "identity", "wire")]
+    [ValidateSet("all", "core", "dataplane", "resource", "shroud", "quic", "scalability", "identity", "wire", "evidence", "extended")]
     [string]$Suite = "all",
     [ValidateRange(1, 10000000)]
     [int]$Iterations = 5000,
