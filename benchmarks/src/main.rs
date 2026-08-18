@@ -1,7 +1,7 @@
 use shph_core::{
     absorb_responder_pq, build_hello_with_profile, decode_cell, decode_cell_payload, encode_cell,
-    finalize_initiator_pq, HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy, ReceiveCipher,
-    PqcKeypair, ReplayWindow, SendCipher, StatelessCookieAuthority, BALANCED, BULK, LOW_LATENCY,
+    finalize_initiator_pq, HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy, PqcKeypair,
+    ReceiveCipher, ReplayWindow, SendCipher, StatelessCookieAuthority, BALANCED, BULK, LOW_LATENCY,
     RANDOMIZED_LAB,
 };
 use shph_identity::{
@@ -1438,11 +1438,8 @@ fn bench_evidence_overhead_matrix(options: Options) {
             )
             .expect("evidence morphology encode");
             assert_eq!(
-                shph_transport::shroud2::decode_datagram(
-                    &datagram,
-                    EVIDENCE_MORPHOLOGY_PATH_MTU
-                )
-                .expect("evidence morphology decode"),
+                shph_transport::shroud2::decode_datagram(&datagram, EVIDENCE_MORPHOLOGY_PATH_MTU)
+                    .expect("evidence morphology decode"),
                 payload
             );
             raw_bytes += payload.len();
@@ -1453,8 +1450,12 @@ fn bench_evidence_overhead_matrix(options: Options) {
         let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
         let raw_rate = raw_bytes as f64 / seconds / 1_000_000.0;
         let wire_rate = wire_bytes as f64 / seconds / 1_000_000.0;
-        let metrics =
-            aggregate_wire_metrics(raw_bytes, wire_bytes, EVIDENCE_OVERHEAD_PACKETS, runtime.elapsed_ns);
+        let metrics = aggregate_wire_metrics(
+            raw_bytes,
+            wire_bytes,
+            EVIDENCE_OVERHEAD_PACKETS,
+            runtime.elapsed_ns,
+        );
         let size_set = wire_sizes
             .iter()
             .map(|size| size.to_string())
@@ -1490,14 +1491,17 @@ fn bench_evidence_overhead_matrix(options: Options) {
 }
 
 fn evidence_payload_len(profile: &str, packet: usize) -> usize {
-    let mixed = evidence_mix64(packet as u64 ^ match profile {
-        "bulk" => 0x4255_4c4b,
-        "video" => 0x5649_4445,
-        "web" => 0x5745_4242,
-        "voip" => 0x564f_4950,
-        "ssh" => 0x5353_4821,
-        _ => 0,
-    });
+    let mixed = evidence_mix64(
+        packet as u64
+            ^ match profile {
+                "bulk" => 0x4255_4c4b,
+                "video" => 0x5649_4445,
+                "web" => 0x5745_4242,
+                "voip" => 0x564f_4950,
+                "ssh" => 0x5353_4821,
+                _ => 0,
+            },
+    );
     match profile {
         "bulk" => 900 + (mixed % 501) as usize,
         "video" => 800 + (mixed % 601) as usize,
@@ -1553,7 +1557,10 @@ fn bench_evidence_cookie_gate(options: Options) {
         let peer = SocketAddr::from(([198, 51, 100, 7], 10_000 + packet as u16));
         let mut forged = authority.issue(peer).expect("evidence cookie issue");
         forged[0] ^= 1;
-        if !authority.verify(peer, &forged).expect("evidence cookie verify") {
+        if !authority
+            .verify(peer, &forged)
+            .expect("evidence cookie verify")
+        {
             rejected += 1;
         }
     }
@@ -1586,8 +1593,8 @@ fn bench_evidence_cookie_gate(options: Options) {
         }
     }
     let limiter_runtime = finish_measurement(limiter_start);
-    let limiter_rate = EVIDENCE_COOKIE_PACKETS as f64
-        / (limiter_runtime.elapsed_ns as f64 / 1_000_000_000.0);
+    let limiter_rate =
+        EVIDENCE_COOKIE_PACKETS as f64 / (limiter_runtime.elapsed_ns as f64 / 1_000_000_000.0);
     emit_rate_with_wire(
         options,
         "antidos_per_source_rate_limiter",
@@ -1623,8 +1630,8 @@ fn bench_evidence_replay_window(options: Options) {
         }
     }
     let runtime = finish_measurement(start);
-    let packets_per_sec = EVIDENCE_REPLAY_PACKETS as f64
-        / (runtime.elapsed_ns as f64 / 1_000_000_000.0);
+    let packets_per_sec =
+        EVIDENCE_REPLAY_PACKETS as f64 / (runtime.elapsed_ns as f64 / 1_000_000_000.0);
     emit_rate_with_wire(
         options,
         "replay_window_128bit_evidence",
@@ -1966,18 +1973,13 @@ fn bench_batching_api(options: Options) {
                 let message_count = requested_batch_size.min(options.frames - processed);
                 let (messages, raw_application_bytes) =
                     make_extended_batch(name, processed, message_count);
-                let datagram = encode_batched_datagram(
-                    &mut morphology,
-                    &messages,
-                    EXTENDED_PATH_MTU,
-                )
-                .expect("batching API encode");
-                let decoded =
-                    decode_batched_datagram(&datagram, EXTENDED_PATH_MTU)
-                        .expect("batching API decode");
+                let datagram =
+                    encode_batched_datagram(&mut morphology, &messages, EXTENDED_PATH_MTU)
+                        .expect("batching API encode");
+                let decoded = decode_batched_datagram(&datagram, EXTENDED_PATH_MTU)
+                    .expect("batching API decode");
                 assert_eq!(decoded.len(), message_count);
-                let decoded_application_bytes =
-                    decoded.iter().map(Vec::len).sum::<usize>();
+                let decoded_application_bytes = decoded.iter().map(Vec::len).sum::<usize>();
                 assert_eq!(decoded_application_bytes, raw_application_bytes);
                 application_bytes += decoded_application_bytes;
                 wire_bytes += datagram.len();
@@ -2018,8 +2020,7 @@ fn bench_adaptive_batching_api(options: Options) {
         ("video", MorphologyProfile::VideoStreamingLab),
     ] {
         let policy = MorphologyBatchPolicy::recommended(profile);
-        let mut morphology =
-            MorphologyEngine::from_seed(profile, 0x4144_5054 ^ name.len() as u64);
+        let mut morphology = MorphologyEngine::from_seed(profile, 0x4144_5054 ^ name.len() as u64);
         let mut batcher = MorphologyBatcher::with_policy(policy);
         let mut application_bytes = 0usize;
         let mut wire_bytes = 0usize;
@@ -2036,12 +2037,9 @@ fn bench_adaptive_batching_api(options: Options) {
             {
                 MorphologyBatchPushResult::Buffered => {}
                 MorphologyBatchPushResult::Flush(messages) => {
-                    let datagram = encode_batched_datagram(
-                        &mut morphology,
-                        &messages,
-                        EXTENDED_PATH_MTU,
-                    )
-                    .expect("adaptive batching encode");
+                    let datagram =
+                        encode_batched_datagram(&mut morphology, &messages, EXTENDED_PATH_MTU)
+                            .expect("adaptive batching encode");
                     let decoded = decode_batched_datagram(&datagram, EXTENDED_PATH_MTU)
                         .expect("adaptive batching decode");
                     assert_eq!(decoded, messages);
@@ -2054,9 +2052,8 @@ fn bench_adaptive_batching_api(options: Options) {
             }
         }
         if let Some(messages) = batcher.flush() {
-            let datagram =
-                encode_batched_datagram(&mut morphology, &messages, EXTENDED_PATH_MTU)
-                    .expect("adaptive final batch encode");
+            let datagram = encode_batched_datagram(&mut morphology, &messages, EXTENDED_PATH_MTU)
+                .expect("adaptive final batch encode");
             let decoded = decode_batched_datagram(&datagram, EXTENDED_PATH_MTU)
                 .expect("adaptive final batch decode");
             assert_eq!(decoded, messages);
@@ -2095,8 +2092,10 @@ fn bench_adaptive_batching_api(options: Options) {
 fn bench_mtu_loss_matrix(options: Options) {
     for &path_mtu in EXTENDED_PATH_MTUS {
         for &loss_pct in EXTENDED_LOSS_PCTS {
-            let mut morphology =
-                MorphologyEngine::from_seed(MorphologyProfile::WebBrowsingLab, 0x4d54_5500 ^ path_mtu as u64 ^ loss_pct as u64);
+            let mut morphology = MorphologyEngine::from_seed(
+                MorphologyProfile::WebBrowsingLab,
+                0x4d54_5500 ^ path_mtu as u64 ^ loss_pct as u64,
+            );
             let mut attempted_bytes = 0usize;
             let mut wire_bytes = 0usize;
             let mut delivered_bytes = 0usize;
@@ -2111,7 +2110,8 @@ fn bench_mtu_loss_matrix(options: Options) {
                 let target = morphology
                     .target_size(payload.len(), path_mtu)
                     .expect("MTU matrix target");
-                let datagram = encode_datagram(&payload, target, path_mtu).expect("MTU matrix encode");
+                let datagram =
+                    encode_datagram(&payload, target, path_mtu).expect("MTU matrix encode");
                 attempted_bytes += payload.len();
                 wire_bytes += datagram.len();
 
@@ -2136,8 +2136,12 @@ fn bench_mtu_loss_matrix(options: Options) {
 
             let runtime = finish_measurement(start);
             let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
-            let metrics =
-                aggregate_wire_metrics(attempted_bytes, wire_bytes, options.frames, runtime.elapsed_ns);
+            let metrics = aggregate_wire_metrics(
+                attempted_bytes,
+                wire_bytes,
+                options.frames,
+                runtime.elapsed_ns,
+            );
             emit_rate_with_wire(
                 options,
                 &format!("shroud2_mtu_loss_{path_mtu}_{loss_pct}"),
@@ -2189,12 +2193,8 @@ fn bench_concurrent_sessions(options: Options) {
                         let target = morphology
                             .target_size(payload.len(), EXTENDED_PATH_MTU)
                             .expect("concurrency target");
-                        let datagram = encode_datagram(
-                            &payload,
-                            target,
-                            EXTENDED_PATH_MTU,
-                        )
-                        .expect("concurrency encode");
+                        let datagram = encode_datagram(&payload, target, EXTENDED_PATH_MTU)
+                            .expect("concurrency encode");
                         totals.application_bytes += payload.len();
                         totals.wire_bytes += datagram.len();
                         match decode_datagram(&datagram, EXTENDED_PATH_MTU) {
@@ -2264,16 +2264,14 @@ fn bench_session_churn(options: Options) {
                 0x4348_5552 ^ session as u64,
             );
             for frame in 0..frames_this_session {
-                let sequence = session
-                    .saturating_mul(options.frames)
-                    .saturating_add(frame);
+                let sequence = session.saturating_mul(options.frames).saturating_add(frame);
                 let payload_len = extended_payload_len("web", sequence);
                 let payload = extended_payload("web", sequence, payload_len);
                 let target = morphology
                     .target_size(payload.len(), EXTENDED_PATH_MTU)
                     .expect("session churn target");
-                let datagram =
-                    encode_datagram(&payload, target, EXTENDED_PATH_MTU).expect("session churn encode");
+                let datagram = encode_datagram(&payload, target, EXTENDED_PATH_MTU)
+                    .expect("session churn encode");
                 application_bytes += payload.len();
                 wire_bytes += datagram.len();
                 match decode_datagram(&datagram, EXTENDED_PATH_MTU) {
@@ -2323,11 +2321,7 @@ fn bench_extended_repeatability_marker() {
     );
 }
 
-fn make_extended_batch(
-    profile: &str,
-    start: usize,
-    message_count: usize,
-) -> (Vec<Vec<u8>>, usize) {
+fn make_extended_batch(profile: &str, start: usize, message_count: usize) -> (Vec<Vec<u8>>, usize) {
     let mut messages = Vec::with_capacity(message_count);
     let mut application_bytes = 0usize;
     for message in 0..message_count {
@@ -2341,13 +2335,16 @@ fn make_extended_batch(
 }
 
 fn extended_payload_len(profile: &str, packet: usize) -> usize {
-    let mixed = evidence_mix64(packet as u64 ^ match profile {
-        "ssh" => 0x5353_4821,
-        "voip" => 0x564f_4950,
-        "web" => 0x5745_4242,
-        "video" => 0x5649_4445,
-        _ => 0,
-    });
+    let mixed = evidence_mix64(
+        packet as u64
+            ^ match profile {
+                "ssh" => 0x5353_4821,
+                "voip" => 0x564f_4950,
+                "web" => 0x5745_4242,
+                "video" => 0x5649_4445,
+                _ => 0,
+            },
+    );
     match profile {
         "ssh" => 1 + (mixed % 80) as usize,
         "voip" => 24 + (mixed % 96) as usize,
@@ -2365,8 +2362,7 @@ fn extended_payload(profile: &str, packet: usize, payload_len: usize) -> Vec<u8>
 
 fn extended_loss_hit(packet: usize, path_mtu: usize, loss_pct: usize) -> bool {
     loss_pct > 0
-        && evidence_mix64(packet as u64 ^ ((path_mtu as u64) << 16)) % 100
-            < loss_pct as u64
+        && evidence_mix64(packet as u64 ^ ((path_mtu as u64) << 16)) % 100 < loss_pct as u64
 }
 
 fn shroud_aead_plaintext(profile: shph_core::ShroudProfile, payload: &[u8]) -> Vec<u8> {
@@ -2651,9 +2647,7 @@ mod tests {
         let first_block = (0..20).map(evidence_replay_nonce).collect::<Vec<_>>();
         assert_eq!(
             first_block,
-            vec![
-                0, 1, 2, 3, 4, 5, 6, 7, 9, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 18
-            ]
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 9, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 18]
         );
     }
 
@@ -2666,11 +2660,9 @@ mod tests {
             ("video", 4usize),
         ] {
             let (messages, application_bytes) = make_extended_batch(profile, 17, batch_size);
-            let batch = shph_transport::shroud2::encode_batch_payload(
-                &messages,
-                super::EXTENDED_PATH_MTU,
-            )
-            .expect("batch payload");
+            let batch =
+                shph_transport::shroud2::encode_batch_payload(&messages, super::EXTENDED_PATH_MTU)
+                    .expect("batch payload");
             assert!(batch.len() + 7 <= super::EXTENDED_PATH_MTU);
             assert_eq!(
                 shph_transport::shroud2::decode_batch_payload(&batch)
@@ -2685,10 +2677,6 @@ mod tests {
 
     #[test]
     fn extended_loss_model_is_disabled_at_zero_percent() {
-        assert!((0..10_000).all(|packet| !extended_loss_hit(
-            packet,
-            super::EXTENDED_PATH_MTU,
-            0
-        )));
+        assert!((0..10_000).all(|packet| !extended_loss_hit(packet, super::EXTENDED_PATH_MTU, 0)));
     }
 }
