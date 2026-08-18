@@ -3753,20 +3753,20 @@ fn apply_nat(interface_name: &str, dry_run: bool) -> Result<NatGuard> {
                 println!("    {command:?}");
             }
             println!("    [dry-run] sysctl net.ipv4.ip_forward=1");
-            return Ok(guard);
-        }
-
-        let previous = read_ipv4_forwarding()?;
-        run_shell_command(&["sysctl".into(), "-w".into(), "net.ipv4.ip_forward=1".into()])?;
-        guard.previous_forwarding = Some(previous);
-        for command in &commands {
-            if let Err(error) = run_shell_command(command) {
-                let _ = guard.cleanup();
-                return Err(error);
+            Ok(guard)
+        } else {
+            let previous = read_ipv4_forwarding()?;
+            run_shell_command(&["sysctl".into(), "-w".into(), "net.ipv4.ip_forward=1".into()])?;
+            guard.previous_forwarding = Some(previous);
+            for command in &commands {
+                if let Err(error) = run_shell_command(command) {
+                    let _ = guard.cleanup();
+                    return Err(error);
+                }
             }
+            println!("  NAT: Linux forwarding and masquerade active ({NAT_TABLE_NAME})");
+            Ok(guard)
         }
-        println!("  NAT: Linux forwarding and masquerade active ({NAT_TABLE_NAME})");
-        return Ok(guard);
     }
 
     #[cfg(not(target_os = "linux"))]
