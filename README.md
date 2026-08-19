@@ -9,7 +9,7 @@ anti-censorship guarantees.
 
 ## Current Status (2026-08-18)
 
-Workspace version `0.6.3-dev.2` (pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.3-dev.3` (pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -102,6 +102,12 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   - `tcp` (stable), `quic` (experimental UDP shim), `quic-standard`
     (opt-in RFC QUIC for `listen`/`connect`/one-shot commands),
     `offline-mesh` (experimental), `data-mule` (experimental).
+  - TCP also accepts an explicit optional SOCKS5 underlay add-on through
+    `--underlay socks5://host:port` or `[session].underlay`. This is intended
+    for a local Xray-compatible SOCKS5 listener when the direct route is
+    unavailable; SHPH still performs its normal end-to-end handshake through
+    the proxy. The adapter is TCP-only, supports unauthenticated local
+    SOCKS5, and never exposes the proxy as a public SHPH endpoint.
   - `quic-standard` requires `--quic-cert` and trusted out-of-band
     certificate distribution. On Linux, `up --transport quic-standard` uses
     the async standards-QUIC/native-TUN bridge and requires
@@ -229,6 +235,7 @@ bind = "127.0.0.1:7231" # listen only
 peer = "127.0.0.1:7231" # connect only
 timeout_secs = 5
 handshake_profile = "secure-default" # or "classical-lab" for paired lab runs
+underlay = "socks5://127.0.0.1:10808" # optional local TCP underlay add-on
 
 [session.reconnect]
 enabled = true
@@ -272,16 +279,42 @@ Behavior:
 - `up` refuses to overwrite a persisted control-plane state file left by an
   interrupted session. Run `shph reconcile` or `shph undo` first.
 
+## Optional reachability add-on
+
+When a direct TCP route to the SHPH host is unavailable, run an external
+Xray-compatible client or another local SOCKS5 implementation and point SHPH
+at its local listener:
+
+```bash
+shph join --underlay socks5://127.0.0.1:10808 'shph://v1:...'
+shph up --to 198.51.100.10:443 --underlay socks5://127.0.0.1:10808 --no-tun
+shph connect --peer 198.51.100.10:443 --underlay socks5://127.0.0.1:10808
+shph send-once --peer 198.51.100.10:443 --text "hello" \
+  --underlay socks5://127.0.0.1:10808
+```
+
+This add-on is deliberately explicit and optional. The proxy carries the
+existing SHPH TCP byte stream; it does not terminate SHPH authentication,
+decrypt SHPH payloads, or replace the pinned peer identity. SHPH currently
+supports a local unauthenticated SOCKS5 listener only, so keep that listener
+bound to loopback or otherwise protected. SOCKS5 credentials, QUIC underlay,
+proxy auto-discovery, and a bundled Xray binary are out of scope.
+
+See [`docs/REACHABILITY_ADDON.md`](docs/REACHABILITY_ADDON.md) for the
+architecture, operational boundary, and test procedure.
+
 ## Main Commands
 
 ```text
 shph init --new
 shph host [--port 443] [--advertise <host[:port]>] [--transport tcp|quic]
   [--shroud-profile medium] [--no-tun] [--no-nat]
-shph join <shph://v1:...> [--no-tun]
+  [--underlay socks5://host:port]
+shph join <shph://v1:...> [--no-tun] [--underlay socks5://host:port]
 shph id [--qr]
 shph up [--to <host:port>] [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
   [--shroud-profile off|low|medium|high|extreme-lab] [--no-tun]
+  [--underlay socks5://host:port]
   [--quic-cert <server.der>] [--killswitch] [--killswitch-dry-run] [--mss-clamp]
 shph down
 shph apply
@@ -297,8 +330,10 @@ shph add-peer <alias> <host> <port> <pubkey> --sign-pubkey <ed25519-pubkey>
 shph show-config
 shph handshake-sim --peer-pubkey-b64 <key>
 shph listen --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
-shph connect --peer <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
-shph send-once --peer <addr> --text <msg> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
+shph connect --peer <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
+  [--underlay socks5://host:port] [--quic-cert <server.der>]
+shph send-once --peer <addr> --text <msg> [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
+  [--underlay socks5://host:port] [--quic-cert <server.der>]
 shph recv-once --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
 cargo run -p shph-tui -- --config <path>
 ```
@@ -340,7 +375,6 @@ Additional docs:
 - `docs/REPRODUCIBILITY.md`
 - `docs/SYNC.md` (optional synchronization for multiple checkouts)
 - `docs/FUNDERS.md` (what SHPH is/is-not, for grant reviewers)
-- `docs/CRYPTO_FUNDING_BOOTSTRAP.md` (crypto-only bootstrap campaign draft)
 - `docs/RISK_MATRIX.md` (current limits + explicit exclusions)
 - `docs/MILESTONE_SCORECARD.md` (measurable phase scorecard + burn-down)
 - `docs/SUPPORT_AND_MAINTENANCE.md` (support model + maintenance plan)

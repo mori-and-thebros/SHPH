@@ -24,9 +24,9 @@ every claim, and where to find the risk, milestone, and support details.
 - Public status is based on date-stamped validation records, not the
   availability of any single maintainer workstation. Remaining TUN packet,
   rollback, and two-host gates are called out explicitly below.
-- **Phase-gated**: progress is tracked in `docs/FUNDING_SPRINT_BOARD.md` and a
+- **Phase-gated**: progress is tracked in `docs/MILESTONE_SCORECARD.md` and a
   phase is only marked complete when its acceptance criteria and evidence are
-  met and mirrored.
+  met.
 
 ## What SHPH is NOT (do not claim otherwise)
 
@@ -74,7 +74,7 @@ unit/integration tests. Re-run `cargo test --workspace` to reproduce.
 2. Run the gates: `cargo fmt --all -- --check`,
    `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo test --workspace`.
-3. Inspect the evidence trail: `docs/FUNDING_SPRINT_BOARD.md` (phase-by-phase
+3. Inspect the evidence trail: `docs/MILESTONE_SCORECARD.md` (phase-by-phase
    completion + evidence), `docs/TESTING.md` (command logs + per-test intent).
 4. Read the security posture honestly: `SECURITY.md`
    (threat model + non-claims matrix).
@@ -82,8 +82,6 @@ unit/integration tests. Re-run `cargo test --workspace` to reproduce.
 
 ## Related funder documents
 
-- `docs/CRYPTO_FUNDING_BOOTSTRAP.md` — small crypto-only campaign draft,
-  milestones, custody boundaries, and operator checklist.
 - `docs/RISK_MATRIX.md` — current limits and explicit exclusions (severity-rated).
 - `docs/MILESTONE_SCORECARD.md` — measurable phase scorecard + roadmap burn-down.
 - `docs/SUPPORT_AND_MAINTENANCE.md` — support model and maintenance plan.

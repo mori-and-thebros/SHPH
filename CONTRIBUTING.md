@@ -62,9 +62,10 @@ docs/             testing, control-plane, sprint board, reproducibility
 
 ## Phase-Gating Discipline
 
-SHPH uses strict phase-gating (see `docs/FUNDING_SPRINT_BOARD.md`). Do **not**
-mark a phase complete unless every task and evidence criterion is satisfied
-and recorded in the repository.
+SHPH uses strict release and validation gates (see
+`ROADMAP_OSS_AND_DELIVERY.md`, `docs/MILESTONE_SCORECARD.md`, and
+`docs/RELEASE_READINESS.md`). Do **not** mark a capability complete unless
+every task and evidence criterion is satisfied and recorded in the repository.
 
 ## Pull Requests
 

@@ -18,15 +18,16 @@ use shph_core::roadmap::{
 };
 use shph_core::{
     absorb_responder_pq, build_hello_with_profile, finalize_initiator_pq, verify_and_derive,
-    DataMuleConfig, DataMuleEnvelope, HandshakeMaterial, HandshakeProfile, HandshakeState, Hello,
-    IdentityKeyPair, OfflineMeshConfig, OfflineMeshEnvelope, PeerPolicy, ReceiveCipher, Result,
-    SendCipher, ShphError, ShroudProfile, StatelessCookieAuthority, ML_KEM_768_CIPHERTEXT_BYTES,
+    DataMuleConfig, DataMuleEnvelope, Endpoint, HandshakeMaterial, HandshakeProfile,
+    HandshakeState, Hello, IdentityKeyPair, OfflineMeshConfig, OfflineMeshEnvelope, PeerPolicy,
+    ReceiveCipher, Result, SendCipher, ShphError, ShroudProfile, StatelessCookieAuthority,
+    ML_KEM_768_CIPHERTEXT_BYTES,
 };
 use shph_obfuscation::{apply_profile, remove_profile, ProfileTier};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
@@ -69,6 +70,86 @@ pub enum TransportMode {
     QuicStandard,
     OfflineMesh,
     DataMule,
+}
+
+/// Network path used to reach a TCP SHPH peer.
+///
+/// Direct TCP is the default. SOCKS5 is intentionally an underlay adapter:
+/// it carries the existing SHPH byte stream through a local proxy such as an
+/// explicitly configured Xray instance, without terminating or replacing the
+/// SHPH handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TcpUnderlay {
+    Direct,
+    Socks5 { proxy: String },
+}
+
+impl TcpUnderlay {
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Direct);
+        };
+        if value.eq_ignore_ascii_case("direct") {
+            return Ok(Self::Direct);
+        }
+        let proxy = value
+            .strip_prefix("socks5://")
+            .or_else(|| value.strip_prefix("socks5h://"))
+            .ok_or_else(|| {
+                ShphError::InvalidArgument(
+                    "underlay must be direct, socks5://host:port, or socks5h://host:port".into(),
+                )
+            })?
+            .trim();
+        if proxy.is_empty()
+            || proxy.contains('@')
+            || proxy.contains('/')
+            || proxy
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err(ShphError::InvalidArgument(
+                "SOCKS5 underlay must be a host:port without credentials or path".into(),
+            ));
+        }
+        let endpoint = Endpoint::parse(proxy).map_err(|error| {
+            ShphError::InvalidArgument(format!("invalid SOCKS5 proxy: {error}"))
+        })?;
+        if endpoint.port == 0 {
+            return Err(ShphError::InvalidArgument(
+                "SOCKS5 proxy port must be non-zero".into(),
+            ));
+        }
+        Ok(Self::Socks5 {
+            proxy: format_socket_endpoint(&endpoint.host, endpoint.port),
+        })
+    }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct)
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Direct => "direct",
+            Self::Socks5 { .. } => "socks5",
+        }
+    }
+
+    pub fn config_value(&self) -> Option<String> {
+        match self {
+            Self::Direct => None,
+            Self::Socks5 { proxy } => Some(format!("socks5://{proxy}")),
+        }
+    }
+}
+
+fn format_socket_endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 impl TransportMode {
@@ -780,6 +861,120 @@ fn connect_tcp_with_deadline(peer: &str, deadline: Instant) -> Result<TcpStream>
     Err(last_error.map(map_io_error).unwrap_or(ShphError::Timeout))
 }
 
+fn connect_tcp_via_underlay(
+    peer: &str,
+    underlay: &TcpUnderlay,
+    deadline: Instant,
+) -> Result<TcpStream> {
+    match underlay {
+        TcpUnderlay::Direct => connect_tcp_with_deadline(peer, deadline),
+        TcpUnderlay::Socks5 { proxy } => {
+            let mut stream = connect_tcp_with_deadline(proxy, deadline)?;
+            refresh_deadline_timeout(&stream, deadline)?;
+            socks5_connect(&mut stream, peer, deadline)?;
+            refresh_deadline_timeout(&stream, deadline)?;
+            Ok(stream)
+        }
+    }
+}
+
+fn socks5_connect(stream: &mut TcpStream, peer: &str, deadline: Instant) -> Result<()> {
+    const SOCKS5_VERSION: u8 = 5;
+    const SOCKS5_NO_AUTH: u8 = 0;
+    const SOCKS5_CONNECT: u8 = 1;
+    const SOCKS5_RESERVED: u8 = 0;
+    const SOCKS5_SUCCESS: u8 = 0;
+
+    write_tcp_all_or_closed_with_deadline(stream, &[SOCKS5_VERSION, 1, SOCKS5_NO_AUTH], deadline)?;
+    let mut method_response = [0u8; 2];
+    read_exact_or_closed_with_deadline(stream, &mut method_response, deadline)?;
+    if method_response != [SOCKS5_VERSION, SOCKS5_NO_AUTH] {
+        return Err(ShphError::Transport(
+            "SOCKS5 proxy does not support unauthenticated CONNECT".into(),
+        ));
+    }
+
+    let endpoint = Endpoint::parse(peer)
+        .map_err(|error| ShphError::InvalidArgument(format!("invalid SHPH peer: {error}")))?;
+    if endpoint
+        .host
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(ShphError::InvalidArgument(
+            "SHPH peer host contains whitespace or control characters".into(),
+        ));
+    }
+    let host_bytes = endpoint.host.as_bytes();
+    let mut request = Vec::with_capacity(7 + host_bytes.len());
+    request.extend_from_slice(&[SOCKS5_VERSION, SOCKS5_CONNECT, SOCKS5_RESERVED]);
+    match endpoint.host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            request.push(1);
+            request.extend_from_slice(&address.octets());
+        }
+        Ok(IpAddr::V6(address)) => {
+            request.push(4);
+            request.extend_from_slice(&address.octets());
+        }
+        Err(_) => {
+            if host_bytes.is_empty() || host_bytes.len() > u8::MAX as usize {
+                return Err(ShphError::InvalidArgument(
+                    "SOCKS5 destination hostname must be 1-255 bytes".into(),
+                ));
+            }
+            request.push(3);
+            request.push(host_bytes.len() as u8);
+            request.extend_from_slice(host_bytes);
+        }
+    }
+    request.extend_from_slice(&endpoint.port.to_be_bytes());
+    write_tcp_all_or_closed_with_deadline(stream, &request, deadline)?;
+
+    let mut response_header = [0u8; 4];
+    read_exact_or_closed_with_deadline(stream, &mut response_header, deadline)?;
+    if response_header[0] != SOCKS5_VERSION {
+        return Err(ShphError::Protocol(
+            "SOCKS5 proxy returned an invalid version".into(),
+        ));
+    }
+    if response_header[2] != SOCKS5_RESERVED {
+        return Err(ShphError::Protocol(
+            "SOCKS5 proxy returned an invalid reserved field".into(),
+        ));
+    }
+    if response_header[1] != SOCKS5_SUCCESS {
+        return Err(ShphError::Transport(format!(
+            "SOCKS5 CONNECT failed with reply code {}",
+            response_header[1]
+        )));
+    }
+    match response_header[3] {
+        1 => {
+            let mut address = [0u8; 4];
+            read_exact_or_closed_with_deadline(stream, &mut address, deadline)?;
+        }
+        3 => {
+            let mut length = [0u8; 1];
+            read_exact_or_closed_with_deadline(stream, &mut length, deadline)?;
+            let mut address = vec![0u8; length[0] as usize];
+            read_exact_or_closed_with_deadline(stream, &mut address, deadline)?;
+        }
+        4 => {
+            let mut address = [0u8; 16];
+            read_exact_or_closed_with_deadline(stream, &mut address, deadline)?;
+        }
+        value => {
+            return Err(ShphError::Protocol(format!(
+                "SOCKS5 proxy returned an invalid address type {value}"
+            )));
+        }
+    }
+    let mut port = [0u8; 2];
+    read_exact_or_closed_with_deadline(stream, &mut port, deadline)?;
+    Ok(())
+}
+
 fn bounded_quic_timeout_secs(timeout_secs: u64) -> u64 {
     timeout_secs.clamp(1, MAX_QUIC_IDLE_TIMEOUT_SECS)
 }
@@ -1282,14 +1477,40 @@ pub fn connect_secure_session_with_profile(
     mode: TransportMode,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
+    connect_secure_session_with_profile_and_underlay(
+        peer,
+        local_identity,
+        policy,
+        timeout_secs,
+        mode,
+        profile,
+        &TcpUnderlay::Direct,
+    )
+}
+
+pub fn connect_secure_session_with_profile_and_underlay(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout_secs: u64,
+    mode: TransportMode,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+) -> Result<(SecureSession, HandshakeState)> {
+    if !underlay.is_direct() && mode != TransportMode::Tcp {
+        return Err(ShphError::InvalidArgument(
+            "SOCKS5 underlay currently supports TCP transport only".into(),
+        ));
+    }
     match mode {
         TransportMode::Tcp => {
-            let (stream, state) = tcp_connect_and_handshake_with_profile(
+            let (stream, state) = tcp_connect_and_handshake_with_profile_and_underlay(
                 peer,
                 local_identity,
                 policy,
                 timeout_secs,
                 profile,
+                underlay,
             )?;
             Ok((
                 SecureSession {
@@ -1359,13 +1580,37 @@ pub fn connect_secure_session_lab_with_profile(
     lab: QuicLabConfig,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let (session, state) = connect_secure_session_with_profile(
+    connect_secure_session_lab_with_profile_and_underlay(
+        peer,
+        local_identity,
+        policy,
+        timeout_secs,
+        mode,
+        lab,
+        profile,
+        &TcpUnderlay::Direct,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn connect_secure_session_lab_with_profile_and_underlay(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout_secs: u64,
+    mode: TransportMode,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+) -> Result<(SecureSession, HandshakeState)> {
+    let (session, state) = connect_secure_session_with_profile_and_underlay(
         peer,
         local_identity,
         policy,
         timeout_secs,
         mode,
         profile,
+        underlay,
     )?;
     if let Some(shroud_profile) = lab.shroud_profile {
         let padding_profile = ProfileTier::from_shroud_profile(shroud_profile);
@@ -1651,8 +1896,26 @@ pub fn tcp_handshake_client_with_profile(
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<HandshakeState> {
+    tcp_handshake_client_with_profile_and_underlay(
+        peer,
+        local_identity,
+        policy,
+        timeout_secs,
+        profile,
+        &TcpUnderlay::Direct,
+    )
+}
+
+pub fn tcp_handshake_client_with_profile_and_underlay(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+) -> Result<HandshakeState> {
     let deadline = tcp_handshake_deadline(timeout_secs);
-    let mut stream = connect_tcp_with_deadline(peer, deadline)?;
+    let mut stream = connect_tcp_via_underlay(peer, underlay, deadline)?;
     refresh_deadline_timeout(&stream, deadline)?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello_with_deadline(&mut stream, &material.local_hello, deadline)?;
@@ -1713,8 +1976,26 @@ pub fn tcp_connect_and_handshake_with_profile(
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(TcpStream, HandshakeState)> {
+    tcp_connect_and_handshake_with_profile_and_underlay(
+        peer,
+        local_identity,
+        policy,
+        timeout_secs,
+        profile,
+        &TcpUnderlay::Direct,
+    )
+}
+
+pub fn tcp_connect_and_handshake_with_profile_and_underlay(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+) -> Result<(TcpStream, HandshakeState)> {
     let deadline = tcp_handshake_deadline(timeout_secs);
-    let mut stream = connect_tcp_with_deadline(peer, deadline)?;
+    let mut stream = connect_tcp_via_underlay(peer, underlay, deadline)?;
     refresh_deadline_timeout(&stream, deadline)?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello_with_deadline(&mut stream, &material.local_hello, deadline)?;
@@ -4127,8 +4408,8 @@ mod tests {
     };
     use super::{collect_shph_files, DataMuleScanContext, MAX_DATA_MULE_AGE_MS, TEMP_FILE_COUNTER};
     use super::{
-        decode_encrypted_quic_frame, PeerRateLimiter, TransportMode, COOKIE_CHALLENGE_THRESHOLD,
-        MAX_CONNECTS_PER_PEER_PER_WINDOW, MAX_QUIC_TRACKED_PEERS,
+        decode_encrypted_quic_frame, PeerRateLimiter, TcpUnderlay, TransportMode,
+        COOKIE_CHALLENGE_THRESHOLD, MAX_CONNECTS_PER_PEER_PER_WINDOW, MAX_QUIC_TRACKED_PEERS,
     };
     use base64::Engine as _;
     use shph_core::{
@@ -4241,6 +4522,71 @@ mod tests {
             assert!((canonical_len..=canonical_len + 64).contains(&padded.len()));
             serde_json::from_slice::<shph_core::Hello>(&padded).expect("padded hello");
         }
+    }
+
+    #[test]
+    fn tcp_underlay_parses_direct_and_socks5_endpoints() {
+        assert_eq!(
+            TcpUnderlay::parse(None).expect("default underlay"),
+            TcpUnderlay::Direct
+        );
+        assert_eq!(
+            TcpUnderlay::parse(Some("direct")).expect("direct underlay"),
+            TcpUnderlay::Direct
+        );
+        assert_eq!(
+            TcpUnderlay::parse(Some("socks5://127.0.0.1:10808")).expect("SOCKS5 underlay"),
+            TcpUnderlay::Socks5 {
+                proxy: "127.0.0.1:10808".into()
+            }
+        );
+        assert_eq!(
+            TcpUnderlay::parse(Some("socks5h://[::1]:10808")).expect("SOCKS5h underlay"),
+            TcpUnderlay::Socks5 {
+                proxy: "[::1]:10808".into()
+            }
+        );
+        assert!(TcpUnderlay::parse(Some("socks5://user:pass@127.0.0.1:10808")).is_err());
+        assert!(TcpUnderlay::parse(Some("socks5://127.0.0.1:0")).is_err());
+        assert!(TcpUnderlay::parse(Some("http://127.0.0.1:8080")).is_err());
+    }
+
+    #[test]
+    fn socks5_connect_uses_domain_target_and_consumes_success_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind SOCKS5 listener");
+        let proxy_address = listener.local_addr().expect("proxy address");
+        let proxy = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept SOCKS5 client");
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).expect("read greeting");
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).expect("write no-auth method");
+
+            let mut request_header = [0u8; 4];
+            stream
+                .read_exact(&mut request_header)
+                .expect("read CONNECT header");
+            assert_eq!(request_header, [5, 1, 0, 3]);
+            let mut hostname_len = [0u8; 1];
+            stream
+                .read_exact(&mut hostname_len)
+                .expect("read hostname length");
+            let mut hostname = vec![0u8; hostname_len[0] as usize];
+            stream.read_exact(&mut hostname).expect("read hostname");
+            assert_eq!(hostname, b"example.test");
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).expect("read destination port");
+            assert_eq!(u16::from_be_bytes(port), 443);
+
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0x12, 0x34])
+                .expect("write success response");
+        });
+
+        let mut stream = TcpStream::connect(proxy_address).expect("connect SOCKS5 listener");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        super::socks5_connect(&mut stream, "example.test:443", deadline).expect("SOCKS5 CONNECT");
+        proxy.join().expect("proxy thread");
     }
 
     #[test]

@@ -8,7 +8,7 @@ benchmark evidence does not satisfy native-TUN or two-host acceptance criteria.
 
 The August 8-9, 2026 validation refresh adds native Windows workspace,
 Windows-only test, benchmark, and post-loader adapter/session smoke evidence
-from the prior `0.6.0-dev.0` line. The current `0.6.3-dev.2` prerelease carries
+from the prior `0.6.0-dev.0` line. The current `0.6.3-dev.3` prerelease carries
 subsequent hardening, while the scorecard still does not promote local
 in-memory measurements, a single-host smoke, or a failed two-node campaign
 into live TUN/VPN claims.
@@ -136,8 +136,8 @@ A phase is complete only when **all** of these hold:
 
 1. Every task in `ROADMAP_OSS_AND_DELIVERY.md` for that phase is done.
 2. Every acceptance/exit criterion is met.
-3. Evidence (test command + result) is recorded in `docs/FUNDING_SPRINT_BOARD.md`
-   and `docs/TESTING.md`.
+3. Evidence (test command + result) is recorded in the reviewed evidence
+   artifacts under `docs/evidence/` and `docs/TESTING.md`.
 4. The change is mirrored and parity-verified across both trees
    (`./scripts/sync_mirror.sh --verify`).
 5. `cargo fmt`, `cargo clippy -D warnings`, and `cargo test --workspace` are

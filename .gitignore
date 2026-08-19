@@ -28,7 +28,9 @@ fuzz/artifacts/
 .codex/
 .gapcode/
 
-# Confidential grant-application attachments; never publish these.
+# Confidential and internal material; never publish these.
+/docs/CRYPTO_FUNDING_BOOTSTRAP.md
+/docs/FUNDING_SPRINT_BOARD.md
 /docs/IDENTITY_DISCOVERY_BENCHMARKS_2026-08-14.md
 /docs/IDENTITY_DISCOVERY_DESIGN.md
 

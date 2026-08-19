@@ -23,15 +23,15 @@ use shph_core::{
 use shph_transport::standards_tun;
 use shph_transport::{
     accept_secure_session_lab_with_profile, connect_secure_session_lab_with_profile,
+    connect_secure_session_lab_with_profile_and_underlay,
     data_mule_accept_and_handshake_with_profile, data_mule_accept_secure_session_with_profile,
     data_mule_connect_and_handshake_with_profile, data_mule_connect_secure_session_with_profile,
     offline_mesh_accept_and_handshake_with_profile,
     offline_mesh_accept_secure_session_with_profile,
     offline_mesh_connect_and_handshake_with_profile,
     offline_mesh_connect_secure_session_with_profile, quic_handshake_client_with_profile,
-    quic_handshake_server_with_profile, standards_quic, tcp_handshake_client_with_profile,
-    tcp_handshake_server_with_profile, QuicLabConfig, SecureReceiver, SecureSender, SecureSession,
-    TransportMode,
+    quic_handshake_server_with_profile, standards_quic, tcp_handshake_server_with_profile,
+    QuicLabConfig, SecureReceiver, SecureSender, SecureSession, TcpUnderlay, TransportMode,
 };
 use shph_tun::firewall::FirewallTransport;
 #[cfg(target_os = "linux")]
@@ -259,6 +259,9 @@ enum Commands {
         /// Run without opening a native TUN interface
         #[arg(long)]
         no_tun: bool,
+        /// Optional outbound underlay (direct or socks5://host:port)
+        #[arg(long)]
+        underlay: Option<String>,
     },
     /// Show local identity material and a shareable host ticket
     Id {
@@ -280,6 +283,9 @@ enum Commands {
         /// Run without opening a native TUN interface
         #[arg(long)]
         no_tun: bool,
+        /// Optional outbound underlay (direct or socks5://host:port)
+        #[arg(long)]
+        underlay: Option<String>,
         /// DER certificate path for standards QUIC; servers write it and clients trust it out of band
         #[arg(long)]
         quic_cert: Option<PathBuf>,
@@ -404,6 +410,9 @@ enum Commands {
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
+        /// Optional outbound underlay (direct or socks5://host:port)
+        #[arg(long)]
+        underlay: Option<String>,
     },
     /// Send one encrypted payload over a freshly established TCP session
     SendOnce {
@@ -422,6 +431,9 @@ enum Commands {
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
+        /// Optional outbound underlay (direct or socks5://host:port)
+        #[arg(long)]
+        underlay: Option<String>,
     },
     /// Receive one encrypted payload after TCP handshake
     RecvOnce {
@@ -514,15 +526,24 @@ fn run_cli(cli: Cli) -> Result<()> {
             no_tun,
             no_nat,
         )?,
-        Commands::Join { ticket, no_tun } => {
-            handle_join(&config_path, &keystore_path, &ticket, no_tun)?
-        }
+        Commands::Join {
+            ticket,
+            no_tun,
+            underlay,
+        } => handle_join(
+            &config_path,
+            &keystore_path,
+            &ticket,
+            no_tun,
+            underlay.as_deref(),
+        )?,
         Commands::Id { qr } => handle_id(&config_path, &keystore_path, qr)?,
         Commands::Up {
             to,
             transport,
             shroud_profile,
             no_tun,
+            underlay,
             quic_cert,
             handshake_profile,
             killswitch,
@@ -541,11 +562,21 @@ fn run_cli(cli: Cli) -> Result<()> {
                     peer: Some(peer),
                     timeout_secs: Some(5),
                     handshake_profile: None,
+                    underlay: underlay.clone(),
                     reconnect: None,
                     startup_payload: None,
                 });
             }
             let mode = resolve_transport_mode(transport.as_deref(), config.roadmap.as_ref())?;
+            let underlay = parse_tcp_underlay_for_mode(
+                underlay.as_deref().or_else(|| {
+                    config
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.underlay.as_deref())
+                }),
+                mode,
+            )?;
             let profile = resolve_handshake_profile(
                 handshake_profile.as_deref(),
                 config
@@ -576,6 +607,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                     tun: !no_tun,
                     host_bootstrap: false,
                     nat: false,
+                    underlay,
                 },
             )?
         }
@@ -654,8 +686,15 @@ fn run_cli(cli: Cli) -> Result<()> {
             transport,
             quic_cert,
             handshake_profile,
+            underlay,
         } => {
             let config = load_config(&config_path)?;
+            let underlay = underlay.as_deref().or_else(|| {
+                config
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.underlay.as_deref())
+            });
             handle_connect(
                 &keystore_path,
                 &peer,
@@ -669,6 +708,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                         .as_ref()
                         .and_then(|session| session.handshake_profile),
                 )?,
+                underlay,
                 config.roadmap.as_ref(),
             )?
         }
@@ -679,8 +719,15 @@ fn run_cli(cli: Cli) -> Result<()> {
             transport,
             quic_cert,
             handshake_profile,
+            underlay,
         } => {
             let config = load_config(&config_path)?;
+            let underlay = underlay.as_deref().or_else(|| {
+                config
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.underlay.as_deref())
+            });
             handle_send_once(
                 &keystore_path,
                 &peer,
@@ -695,6 +742,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                         .as_ref()
                         .and_then(|session| session.handshake_profile),
                 )?,
+                underlay,
                 config.roadmap.as_ref(),
             )?
         }
@@ -857,6 +905,7 @@ fn handle_host(
         peer: None,
         timeout_secs: Some(300),
         handshake_profile: Some(HandshakeProfile::SecureDefault),
+        underlay: None,
         reconnect: Some(ReconnectConfig {
             enabled: Some(true),
             max_attempts: Some(10),
@@ -903,6 +952,7 @@ fn handle_host(
             tun: !no_tun,
             host_bootstrap: true,
             nat: !no_nat,
+            underlay: TcpUnderlay::Direct,
         },
     )
 }
@@ -912,10 +962,12 @@ fn handle_join(
     keystore_path: &Path,
     ticket_value: &str,
     no_tun: bool,
+    underlay_value: Option<&str>,
 ) -> Result<()> {
     let ticket = JoinTicket::decode(ticket_value)?;
     let mode = TransportMode::parse(&ticket.transport)?;
     let profile = resolve_shroud_profile(Some(&ticket.shroud_profile), None)?;
+    let underlay = parse_tcp_underlay_for_mode(underlay_value, mode)?;
     let endpoint = Endpoint::parse(&ticket.endpoint)
         .map_err(|error| ShphError::InvalidArgument(format!("invalid ticket endpoint: {error}")))?;
     let (mut config, mut keystore) = ensure_workspace(config_path, keystore_path)?;
@@ -934,6 +986,7 @@ fn handle_join(
         peer: Some(ticket.endpoint.clone()),
         timeout_secs: Some(10),
         handshake_profile: Some(HandshakeProfile::SecureDefault),
+        underlay: underlay.config_value(),
         reconnect: Some(ReconnectConfig {
             enabled: Some(true),
             max_attempts: Some(10),
@@ -960,6 +1013,7 @@ fn handle_join(
     );
     println!("  Transport: {}", transport_mode_to_str(mode));
     println!("  Shroud profile: {profile}");
+    println!("  Underlay: {}", underlay.label());
 
     handle_up(
         config_path,
@@ -976,6 +1030,7 @@ fn handle_join(
             tun: !no_tun,
             host_bootstrap: false,
             nat: false,
+            underlay,
         },
     )
 }
@@ -1168,6 +1223,7 @@ struct UpOptions<'a> {
     tun: bool,
     host_bootstrap: bool,
     nat: bool,
+    underlay: TcpUnderlay,
 }
 
 fn handle_up(
@@ -1187,6 +1243,7 @@ fn handle_up(
         tun,
         host_bootstrap,
         nat,
+        underlay,
     } = options;
     std::env::set_var("SHPH_SHROUD_PROFILE", &shroud_profile);
     validate_config_roadmap(config)?;
@@ -1279,6 +1336,7 @@ fn handle_up(
     println!("  Interface: {}", tun.name());
     println!("  Local endpoint: {}", config.local_endpoint);
     println!("  Peer count: {}", config.peers.len());
+    println!("  Underlay: {}", underlay.label());
     print_control_plane_status(config);
     let mut control_guard = apply_control_plane(config, tun.name())?;
     let interface_name = tun.name().to_string();
@@ -1378,6 +1436,7 @@ fn handle_up(
                             Some(transport_mode_to_str(transport).to_string()),
                             quic_cert_path,
                             profile,
+                            underlay.config_value().as_deref(),
                             roadmap,
                         )?;
                     } else {
@@ -1396,6 +1455,7 @@ fn handle_up(
                                     profile,
                                     config.roadmap.as_ref(),
                                     quic_cert_path,
+                                    &underlay,
                                 )
                             },
                         )?;
@@ -2872,6 +2932,7 @@ fn handle_listen(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connect(
     keystore_path: &Path,
     peer: &str,
@@ -2879,6 +2940,7 @@ fn handle_connect(
     transport: Option<String>,
     quic_cert_path: Option<&Path>,
     profile: HandshakeProfile,
+    underlay_value: Option<&str>,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     if let Some(roadmap) = roadmap {
@@ -2886,9 +2948,11 @@ fn handle_connect(
         validate_identity_provider(&roadmap.identity)?;
     }
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
+    let underlay = parse_tcp_underlay_for_mode(underlay_value, mode)?;
     announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
     let policy = peer_policy_for_endpoint(&keystore, peer, true)?;
+    println!("  Underlay: {}", underlay.label());
     if mode == TransportMode::QuicStandard {
         let cert_path = quic_cert_path.ok_or_else(|| {
             ShphError::Config(
@@ -2925,12 +2989,13 @@ fn handle_connect(
         return Ok(());
     }
     let state = match mode {
-        TransportMode::Tcp => tcp_handshake_client_with_profile(
+        TransportMode::Tcp => shph_transport::tcp_handshake_client_with_profile_and_underlay(
             peer,
             &keystore.identity,
             &policy,
             timeout_secs,
             profile,
+            &underlay,
         )?,
         TransportMode::Quic => {
             let (_socket, _peer_addr, state) = quic_handshake_client_with_profile(
@@ -2984,6 +3049,7 @@ fn handle_send_once(
     transport: Option<String>,
     quic_cert_path: Option<&Path>,
     profile: HandshakeProfile,
+    underlay_value: Option<&str>,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     if let Some(roadmap) = roadmap {
@@ -2997,10 +3063,12 @@ fn handle_send_once(
     println!("  Session start: {start_ms}ms");
     println!("  Initial metrics: {:?}", metrics.snapshot());
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
+    let underlay = parse_tcp_underlay_for_mode(underlay_value, mode)?;
     let lab = quic_lab_config()?;
     announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
     let policy = peer_policy_for_endpoint(&keystore, peer, true)?;
+    println!("  Underlay: {}", underlay.label());
     if mode == TransportMode::QuicStandard {
         let cert_path = quic_cert_path.ok_or_else(|| {
             ShphError::Config(
@@ -3051,7 +3119,7 @@ fn handle_send_once(
         return Ok(());
     }
     let (mut session, state) = match mode {
-        TransportMode::Tcp => connect_secure_session_lab_with_profile(
+        TransportMode::Tcp => connect_secure_session_lab_with_profile_and_underlay(
             peer,
             &keystore.identity,
             &policy,
@@ -3059,6 +3127,7 @@ fn handle_send_once(
             mode,
             lab,
             profile,
+            &underlay,
         )?,
         TransportMode::Quic => connect_secure_session_lab_with_profile(
             peer,
@@ -3315,6 +3384,16 @@ fn resolve_transport_mode(
     } else {
         Ok(TransportMode::Tcp)
     }
+}
+
+fn parse_tcp_underlay_for_mode(value: Option<&str>, mode: TransportMode) -> Result<TcpUnderlay> {
+    let underlay = TcpUnderlay::parse(value)?;
+    if !underlay.is_direct() && mode != TransportMode::Tcp {
+        return Err(ShphError::InvalidArgument(
+            "SOCKS5 underlay currently supports TCP transport only".into(),
+        ));
+    }
+    Ok(underlay)
 }
 
 fn resolve_transport_from_roadmap(cfg: &RoadmapConfig) -> Result<TransportMode> {
@@ -4828,6 +4907,7 @@ fn run_connect_loop(
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
+    underlay: &TcpUnderlay,
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
@@ -4868,15 +4948,18 @@ fn run_connect_loop(
     }
     let handshake_started = std::time::Instant::now();
     let (mut session, state) = match mode {
-        TransportMode::Tcp | TransportMode::Quic => connect_secure_session_lab_with_profile(
-            peer,
-            &keystore.identity,
-            &policy,
-            timeout_secs,
-            mode,
-            lab,
-            profile,
-        )?,
+        TransportMode::Tcp | TransportMode::Quic => {
+            connect_secure_session_lab_with_profile_and_underlay(
+                peer,
+                &keystore.identity,
+                &policy,
+                timeout_secs,
+                mode,
+                lab,
+                profile,
+                underlay,
+            )?
+        }
         TransportMode::OfflineMesh => {
             let cfg = roadmap_offline_mesh_config(roadmap)?;
             offline_mesh_connect_secure_session_with_profile(
@@ -5499,7 +5582,7 @@ mod tests {
         render_config_for_display, resolve_killswitch_peers, resolve_shroud_profile,
         run_with_reconnect, save_control_plane_state, transport_mode_to_str, validate_cidr,
         CliErrorOutput, ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore,
-        KeyStoreConfig, PersistedControlPlaneState, TransportMode, UpOptions,
+        KeyStoreConfig, PersistedControlPlaneState, TcpUnderlay, TransportMode, UpOptions,
         DEFAULT_TUN_MTU_BYTES, EXIT_CONFIG, EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE,
         MAX_CONTROL_PLANE_STATE_BYTES,
     };
@@ -5691,6 +5774,7 @@ mod tests {
                 peer: Some("second".into()),
                 timeout_secs: None,
                 handshake_profile: None,
+                underlay: None,
                 reconnect: None,
                 startup_payload: None,
             }),
@@ -5726,6 +5810,7 @@ mod tests {
                 tun: false,
                 host_bootstrap: false,
                 nat: false,
+                underlay: TcpUnderlay::Direct,
             },
         )
         .expect("killswitch dry-run should preview without native TUN");
@@ -5762,6 +5847,7 @@ mod tests {
                 tun: false,
                 host_bootstrap: false,
                 nat: false,
+                underlay: TcpUnderlay::Direct,
             },
         )
         .expect_err("stale control-plane state must block up");
@@ -5779,6 +5865,7 @@ mod tests {
                 timeout_secs: Some(5),
                 startup_payload: None,
                 handshake_profile: None,
+                underlay: None,
                 reconnect: Some(ReconnectConfig {
                     enabled: Some(true),
                     max_attempts: Some(2),
@@ -5803,6 +5890,7 @@ mod tests {
                 tun: false,
                 host_bootstrap: false,
                 nat: false,
+                underlay: TcpUnderlay::Direct,
             },
         )
         .expect_err("standards QUIC reconnect must fail before native TUN setup");

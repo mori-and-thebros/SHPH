@@ -56,7 +56,7 @@ and a host-gated result is not treated as a supported deployment.
   and update this plan. Decision style: transparent, minimal-scope, honest
   capability claims (see `CONTRIBUTING.md`).
 - **Contributors** follow the PR flow in `CONTRIBUTING.md` and the phase-gating
-  discipline in `docs/FUNDING_SPRINT_BOARD.md`.
+  discipline in `docs/MILESTONE_SCORECARD.md`.
 
 ### Phase-gating (governs what "done" means)
 

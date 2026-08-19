@@ -103,6 +103,10 @@ pub struct SessionConfig {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub handshake_profile: Option<HandshakeProfile>,
+    /// Optional outbound underlay adapter, for example
+    /// `socks5://127.0.0.1:10808`. Direct TCP is the default.
+    #[serde(default)]
+    pub underlay: Option<String>,
     pub reconnect: Option<ReconnectConfig>,
     pub startup_payload: Option<String>,
 }

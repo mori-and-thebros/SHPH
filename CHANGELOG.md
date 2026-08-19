@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.3-dev.3] - 2026-08-19
+
+- Added an explicit, opt-in SOCKS5 underlay add-on for outbound TCP paths.
+  This can route the existing SHPH stream through a local Xray-compatible
+  listener without changing SHPH authentication or encrypted framing.
+- Added CLI and session configuration support through `--underlay` and
+  `[session].underlay`, with direct TCP remaining the default.
+- Added bounded SOCKS5 negotiation tests and documented the add-on's
+  TCP-only, no-auth, external-proxy security boundary.
+- Removed internal campaign and sprint material plus personal endpoint examples
+  from the publishable repository tree.
+
 ## [0.6.3-dev.2] - CLI UX and guided connectivity follow-up (2026-08-18)
 
 This developer release packages the guided CLI workflow, identity sharing, and
