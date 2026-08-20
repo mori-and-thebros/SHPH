@@ -46,6 +46,8 @@ This file maps the repository layout and the main public validation artifacts.
   non-claims boundary.
 - `docs/RELEASE_READINESS.md`: binding release gates and evidence package
   requirements.
+- `docs/WHY_CHOOSE_SHPH.md`: public positioning and fit comparison.
+- `docs/QUALITY_EVIDENCE.md`: current release validation and benchmark summary.
 - `docs/SECURITY_EVIDENCE.md`: threat-to-control mapping, evidence tiers, and
   publication redaction checklist.
 

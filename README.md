@@ -394,6 +394,8 @@ Additional docs:
 - `docs/TESTING.md`
 - `docs/SUPPORT_MATRIX.md` (authoritative product boundary and support levels)
 - `docs/RELEASE_READINESS.md` (binding release gate and evidence rules)
+- `docs/WHY_CHOOSE_SHPH.md` (honest fit and comparison guide)
+- `docs/QUALITY_EVIDENCE.md` (release tests, benchmark results, and limits)
 - `docs/SECURITY_EVIDENCE.md` (threat-to-control map and redaction checklist)
 - `docs/CONTROL_PLANE.md`
 - `docs/TUI.md`
