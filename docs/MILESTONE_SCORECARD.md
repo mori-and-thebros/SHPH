@@ -8,7 +8,7 @@ benchmark evidence does not satisfy native-TUN or two-host acceptance criteria.
 
 The August 8-9, 2026 validation refresh adds native Windows workspace,
 Windows-only test, benchmark, and post-loader adapter/session smoke evidence
-from the prior `0.6.0-dev.0` line. The current `0.6.3-dev.3` prerelease carries
+from the prior `0.6.0-dev.0` line. The current `0.6.4-dev` prerelease carries
 subsequent hardening, while the scorecard still does not promote local
 in-memory measurements, a single-host smoke, or a failed two-node campaign
 into live TUN/VPN claims.

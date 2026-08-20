@@ -6,8 +6,10 @@ SHPH control-plane behavior is configured under `[control_plane]` in `config.tom
 
 ```toml
 [control_plane]
+apply_interface_address = true
+interface_cidr = "10.250.0.2/30"
 apply_routes = true
-route_cidrs = ["10.10.0.0/16"]
+route_cidrs = ["10.250.0.1/32"]
 apply_dns = true
 dns_servers = ["1.1.1.1"]
 dry_run = true
@@ -16,11 +18,11 @@ dry_run = true
 ## Modes
 
 - `dry_run=true`:
-  - validates route/DNS values,
+  - validates interface-address, route, and DNS values,
   - prints intended mutations,
   - performs no host mutation.
 - `dry_run=false`:
-  - attempts live route/DNS mutation,
+  - attempts live interface-address, route, and DNS mutation,
   - tracks applied entries in runtime guard,
   - attempts rollback on normal shutdown and failure paths.
   - **atomic preflight** (Phase A.2): all routes and DNS servers are validated
@@ -36,6 +38,18 @@ dry_run = true
 - `shph undo` removes recorded routes/DNS and deletes the state file.
 - `shph down` invokes `undo` before exiting.
 - `shph status` reports whether persisted control-plane state is present.
+
+`apply_interface_address=true` is intentionally opt-in. It assigns the local
+layer-3 address to the native TUN interface; it does not create a default
+route. A typical two-node lab uses `10.250.0.1/30` on the listener and
+`10.250.0.2/30` on the connector, with a narrow `/32` route for the opposite
+endpoint before attempting broader routing.
+
+SHPH refuses a `0.0.0.0/0` or `::/0` route when the session uses a SOCKS5
+underlay. Without an explicit route that keeps the proxy's upstream endpoint
+outside the TUN, the proxy connection can loop back into SHPH and disconnect
+the tunnel. Establish and test that bypass separately before enabling
+full-tunnel routing.
 
 ## Host leak containment
 
@@ -63,9 +77,11 @@ validation is published.
 ## Current Command Backends
 
 - Linux:
+  - interface address: `ip address add` / `ip address delete`
   - routes: `ip route add` / `ip route del` (avoids deleting a pre-existing route during rollback)
   - DNS: `resolvectl dns` / `resolvectl revert`
 - Windows:
+  - interface address: `netsh interface ipv4 add|delete address`
   - routes: `netsh interface {ipv4|ipv6} add|delete route prefix=<cidr> interface=<name> [nexthop=<ip>]`
   - DNS: `netsh interface {ipv4|ipv6} set dns name=<name> static <server>`
 
@@ -80,10 +96,11 @@ validation is published.
 ## Reliability Guarantees (Phase A.2)
 
 - **Preflight validation:** the control plane builds a fully-validated
-  `ControlPlanePlan` (routes + DNS) before applying. A bad CIDR or DNS IP among
+  `ControlPlanePlan` (interface address + routes + DNS) before applying. A bad
+  CIDR or DNS IP among
   otherwise-valid entries causes the entire apply to fail with no mutation.
 - **Rollback ordering:** on apply failure or shutdown, DNS is rolled back first,
-  then routes, in reverse order.
+  then routes in reverse order, then the SHPH-added interface address.
 - **Best-effort, error-preserving rollback:** rollback collects all errors
   rather than aborting on the first, so partial rollback still removes as much
   applied state as possible. DNS restore failures carry the real command error

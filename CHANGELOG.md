@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.6.4-dev] - 2026-08-20
+
+This developer release improves operator workflow around external reachability
+add-ons such as Xray and Quick Tunnel. It does not change the SHPH
+cryptographic protocol, and it remains scoped to controlled lab environments.
+
+- Added bounded `--ticket-file` support to `host`, `join`, and `id` for safer
+  handoff of long `shph://v1:` tickets without embedding them in shell history.
+- Added `join --check`, a no-mutation preflight that validates a ticket,
+  checks the selected transport path, and performs one authenticated handshake
+  without writing configuration, changing routes/DNS, or opening a TUN device.
+- Added `join --transport-peer` so a public ticket endpoint can remain the
+  pinned policy identity while a trusted local relay is used as the socket
+  destination.
+- Added `doctor --deep` diagnostics for persistent connect sessions, including
+  transport-peer reporting, underlay reachability, and authenticated handshake
+  checks.
+- Improved `status` and JSON status output to show the effective transport peer
+  separately from the identity/policy peer.
+- Added bounded Xray/SOCKS5 readiness checks for Windows and Linux under
+  `scripts/check_xray.ps1` and `scripts/check_xray.sh`.
+- Added CLI, configuration, ticket-file, transport-peer, and diagnostic
+  regression coverage.
+- Updated the reachability add-on documentation with Quick Tunnel workflows,
+  ticket-file handling, preflight checks, and explicit safety boundaries.
+
 ## [0.6.3-dev.3] - 2026-08-19
 
 - Added an explicit, opt-in SOCKS5 underlay add-on for outbound TCP paths.

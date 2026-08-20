@@ -169,7 +169,7 @@ cargo run --manifest-path benchmarks/Cargo.toml --release --offline -- \
 The benchmark emits `shroud2_morphology` rows for all four morphology
 profiles. Each row includes p50/p95/p99/p99.9 latency, allocation/RSS
 observations, and the observed target-size range under a 1,450-byte datagram
-budget. The current workspace version is `0.6.3-dev.3`; benchmark reports must
+budget. The current workspace version is `0.6.4-dev`; benchmark reports must
 also record the exact commit, platform, toolchain, and whether the run is
 native Linux or WSL2.
 

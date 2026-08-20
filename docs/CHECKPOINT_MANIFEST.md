@@ -7,7 +7,7 @@ separate and clearly labeled.
 ## Current Development Snapshot
 
 ```text
-Workspace version : 0.6.3-dev.3
+Workspace version : 0.6.4-dev
 Status            : development release candidate
 Repository        : SHPH source tree
 Evidence mode     : development evidence; clean release capture required

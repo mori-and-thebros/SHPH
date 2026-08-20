@@ -87,6 +87,10 @@ pub struct StealthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlPlaneConfig {
+    /// Apply `interface_cidr` to the configured TUN interface.
+    pub apply_interface_address: Option<bool>,
+    /// Local layer-3 address and prefix for the configured TUN interface.
+    pub interface_cidr: Option<String>,
     pub apply_routes: Option<bool>,
     pub route_cidrs: Option<Vec<String>>,
     pub apply_dns: Option<bool>,
@@ -100,6 +104,10 @@ pub struct SessionConfig {
     pub role: SessionRole,
     pub bind: Option<String>,
     pub peer: Option<String>,
+    /// Optional transport endpoint override. `peer` remains the identity and
+    /// peer-policy selector; this endpoint is used only for connection setup.
+    #[serde(default)]
+    pub transport_peer: Option<String>,
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub handshake_profile: Option<HandshakeProfile>,
@@ -469,6 +477,7 @@ dry_run = true
 [session]
 role = "connect"
 peer = "127.0.0.1:7231"
+transport_peer = "127.0.0.1:8443"
 timeout_secs = 8
 
 [session.reconnect]
@@ -481,6 +490,8 @@ max_delay_ms = 2000
         let cfg = toml::from_str::<Config>(input).expect("parse config");
         let session = cfg.session.expect("session config");
         assert_eq!(session.role, SessionRole::Connect);
+        assert_eq!(session.peer.as_deref(), Some("127.0.0.1:7231"));
+        assert_eq!(session.transport_peer.as_deref(), Some("127.0.0.1:8443"));
         let reconnect = session.reconnect.expect("reconnect config");
         assert_eq!(reconnect.enabled, Some(true));
         assert_eq!(reconnect.max_attempts, Some(3));

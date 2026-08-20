@@ -11,6 +11,7 @@
 fuzz/corpus/
 fuzz/artifacts/
 /benchmark-runs/
+.wintun-staging/
 /wintun.dll
 /wintun.h
 

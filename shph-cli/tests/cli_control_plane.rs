@@ -65,9 +65,43 @@ dry_run = true
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("up stdout");
-    assert!(stdout.contains("Control plane: routes=true(1), dns=true(1), dry_run=true"));
+    assert!(stdout
+        .contains("Control plane: address=false(none), routes=true(1), dns=true(1), dry_run=true"));
     assert!(stdout.contains("[dry-run] route add 10.44.0.0/16"));
     assert!(stdout.contains("[dry-run] dns add 1.1.1.1"));
+}
+
+#[test]
+fn up_with_interface_address_dry_run_logs_address() {
+    let workdir = test_dir("cp-address-dry-run");
+    fs::create_dir_all(&workdir).expect("create dir");
+    let cfg = workdir.join("config.toml");
+    init_config(&cfg);
+
+    append_toml(
+        &cfg,
+        r#"[control_plane]
+apply_interface_address = true
+interface_cidr = "10.250.0.2/30"
+dry_run = true
+"#,
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .arg("--config")
+        .arg(&cfg)
+        .arg("up")
+        .output()
+        .expect("run up");
+
+    assert!(
+        out.status.success(),
+        "up stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("up stdout");
+    assert!(stdout.contains("address=true(10.250.0.2/30)"));
+    assert!(stdout.contains("[dry-run] address add 10.250.0.2/30"));
 }
 
 #[test]

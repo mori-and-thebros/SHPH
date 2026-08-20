@@ -50,6 +50,38 @@ shph send-once --peer 198.51.100.10:443 \
   --underlay socks5://127.0.0.1:10808
 ```
 
+For a temporary or changing relay endpoint, keep the ticket in an
+owner-only file instead of copying a long command-line value:
+
+```bash
+shph host --port 443 \
+  --advertise relay.example:443 \
+  --ticket-file /run/shph/join.ticket
+
+shph join --ticket-file ./join.ticket \
+  --underlay socks5://127.0.0.1:10808 \
+  --transport-peer 127.0.0.1:8443
+```
+
+`--ticket-file` is bounded and read as UTF-8. Host and identity commands write
+the file with owner-only permissions where the platform supports them. The
+ticket file is a handoff mechanism, not a secret store: it contains the
+advertised endpoint and public identity keys.
+
+Before changing local configuration or opening a TUN interface, run the
+no-mutation preflight:
+
+```bash
+shph join --ticket-file ./join.ticket \
+  --underlay socks5://127.0.0.1:10808 \
+  --transport-peer 127.0.0.1:8443 \
+  --check
+```
+
+The preflight validates the ticket, checks the selected transport path, and
+performs one authenticated handshake. It does not write configuration, change
+routes or DNS, create a TUN interface, or overwrite peer pins.
+
 For a persistent `up` session, the same value can be stored in the session
 configuration:
 
@@ -63,6 +95,27 @@ underlay = "socks5://127.0.0.1:10808"
 
 The `--underlay` command-line value takes precedence over the session value.
 If neither is present, SHPH uses direct TCP.
+
+For a relay that terminates on the SHPH host itself, `peer` can remain the
+public, pinned identity selector while `transport_peer` names the relay's
+internal destination:
+
+```toml
+[session]
+role = "connect"
+peer = "relay.example:443"
+transport_peer = "127.0.0.1:8443"
+underlay = "socks5://127.0.0.1:10808"
+```
+
+`transport_peer` changes only the socket destination. Peer identity and policy
+verification still use `peer`; it must not be used to bypass the configured
+peer pin.
+
+For an existing persistent session, `shph doctor --deep --json` performs the
+same style of underlay listener and handshake checks without applying the
+configured control plane. It is intended for operator diagnostics and may
+report a failure when the external SOCKS5/Xray process or relay is offline.
 
 `socks5h://host:port` is accepted as an alias and normalized to
 `socks5://host:port`. The destination SHPH hostname is sent to the proxy as a
@@ -83,6 +136,22 @@ operating system.
   does not silently fall back to direct TCP.
 
 ## Validation
+
+The repository includes bounded local Xray checks for the two operator
+environments:
+
+```powershell
+.\scripts\check_xray.ps1
+```
+
+```bash
+chmod +x scripts/check_xray.sh
+./scripts/check_xray.sh
+```
+
+They validate the Xray configuration, confirm a loopback SOCKS inbound, and
+perform only the SOCKS5 no-auth method probe. They do not print credentials or
+attempt to connect to an arbitrary Internet destination.
 
 Run the deterministic transport tests:
 

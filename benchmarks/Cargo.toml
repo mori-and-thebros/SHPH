@@ -1,6 +1,6 @@
 [package]
 name = "shph-benchmarks"
-version = "0.6.3-dev.3"
+version = "0.6.4-dev"
 edition = "2021"
 publish = false
 

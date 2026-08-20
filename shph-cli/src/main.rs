@@ -50,7 +50,7 @@ use shph_tun::{
 use shph_tun::{WindowsFirewallTransport, WindowsKillswitchGuard};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::Command;
@@ -71,6 +71,7 @@ const MAX_SHAMIR_SHARE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_SHAMIR_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SHAMIR_TOTAL_SHARES: usize = 255;
 const MAX_CONTROL_PLANE_STATE_BYTES: u64 = 64 * 1024;
+const MAX_TICKET_FILE_BYTES: u64 = 8 * 1024;
 const QUIC_PAYLOAD_ACK: &[u8] = b"shph/standards-quic/payload-ack-v1";
 const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
@@ -139,6 +140,10 @@ impl LiveStatusBar {
                     format_bytes(current.bytes_recv),
                     format_bytes(rx_rate as u64),
                 );
+                let line = line
+                    .replace("âœ“", "OK")
+                    .replace("â†‘", "up")
+                    .replace("â†“", "down");
                 let _ = write!(io::stderr(), "\r{line}\x1b[K");
                 let _ = io::stderr().flush();
             }
@@ -252,22 +257,42 @@ enum Commands {
         /// Do not install Linux forwarding/NAT rules
         #[arg(long)]
         no_nat: bool,
+        /// Write the generated join ticket to an owner-only file
+        #[arg(long, value_name = "PATH")]
+        ticket_file: Option<PathBuf>,
     },
     /// Join a host from a shph://v1 ticket
     Join {
-        ticket: String,
+        /// Inline ticket value
+        #[arg(
+            required_unless_present = "ticket_file",
+            conflicts_with = "ticket_file"
+        )]
+        ticket: Option<String>,
+        /// Read the ticket from an owner-only file
+        #[arg(long, value_name = "PATH", conflicts_with = "ticket")]
+        ticket_file: Option<PathBuf>,
         /// Run without opening a native TUN interface
         #[arg(long)]
         no_tun: bool,
         /// Optional outbound underlay (direct or socks5://host:port)
         #[arg(long)]
         underlay: Option<String>,
+        /// Override only the socket destination; the ticket endpoint remains pinned
+        #[arg(long, value_name = "HOST:PORT")]
+        transport_peer: Option<String>,
+        /// Validate the ticket and perform one authenticated handshake without changing config or routes
+        #[arg(long)]
+        check: bool,
     },
     /// Show local identity material and a shareable host ticket
     Id {
         /// Render the shareable ticket as an ANSI terminal QR code
         #[arg(long)]
         qr: bool,
+        /// Write the generated ticket to an owner-only file
+        #[arg(long, value_name = "PATH")]
+        ticket_file: Option<PathBuf>,
     },
     /// Bring up the VPN tunnel
     Up {
@@ -317,6 +342,9 @@ enum Commands {
         /// Exit non-zero when any check fails
         #[arg(long)]
         strict: bool,
+        /// Probe the configured underlay and perform a no-mutation handshake check
+        #[arg(long)]
+        deep: bool,
     },
     /// Show peer fingerprint
     #[command(alias = "fingerprint")]
@@ -516,6 +544,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             shroud_profile,
             no_tun,
             no_nat,
+            ticket_file,
         } => handle_host(
             &config_path,
             &keystore_path,
@@ -525,19 +554,30 @@ fn run_cli(cli: Cli) -> Result<()> {
             &shroud_profile,
             no_tun,
             no_nat,
+            ticket_file.as_deref(),
         )?,
         Commands::Join {
             ticket,
+            ticket_file,
             no_tun,
             underlay,
-        } => handle_join(
-            &config_path,
-            &keystore_path,
-            &ticket,
-            no_tun,
-            underlay.as_deref(),
-        )?,
-        Commands::Id { qr } => handle_id(&config_path, &keystore_path, qr)?,
+            transport_peer,
+            check,
+        } => {
+            let ticket = read_ticket_source(ticket.as_deref(), ticket_file.as_deref())?;
+            handle_join(
+                &config_path,
+                &keystore_path,
+                &ticket,
+                no_tun,
+                underlay.as_deref(),
+                transport_peer.as_deref(),
+                check,
+            )?
+        }
+        Commands::Id { qr, ticket_file } => {
+            handle_id(&config_path, &keystore_path, qr, ticket_file.as_deref())?
+        }
         Commands::Up {
             to,
             transport,
@@ -560,6 +600,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                     role: SessionRole::Connect,
                     bind: None,
                     peer: Some(peer),
+                    transport_peer: None,
                     timeout_secs: Some(5),
                     handshake_profile: None,
                     underlay: underlay.clone(),
@@ -616,7 +657,9 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Reconcile => handle_control_plane_reconcile(&config_path)?,
         Commands::Undo => handle_control_plane_undo(&config_path)?,
         Commands::Status => handle_status(&config_path, &keystore_path, json)?,
-        Commands::Doctor { strict } => handle_doctor(&config_path, &keystore_path, json, strict)?,
+        Commands::Doctor { strict, deep } => {
+            handle_doctor(&config_path, &keystore_path, json, strict, deep)?
+        }
         Commands::ShowFingerprint => handle_show_fingerprint(&keystore_path)?,
         Commands::ShowPublicKey => handle_show_public_key(&keystore_path)?,
         Commands::ShowSigningPublicKey => handle_show_signing_public_key(&keystore_path)?,
@@ -730,6 +773,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             });
             handle_send_once(
                 &keystore_path,
+                &peer,
                 &peer,
                 &text,
                 timeout_secs,
@@ -867,6 +911,108 @@ fn ensure_workspace(config_path: &Path, keystore_path: &Path) -> Result<(Config,
     Ok((config, keystore))
 }
 
+fn read_ticket_source(inline: Option<&str>, ticket_file: Option<&Path>) -> Result<String> {
+    match (inline, ticket_file) {
+        (Some(ticket), None) if !ticket.trim().is_empty() => Ok(ticket.trim().to_string()),
+        (None, Some(path)) => {
+            ensure_no_reparse_components(path)?;
+            let file = fs::File::open(path).map_err(|error| {
+                ShphError::Config(format!(
+                    "unable to read ticket file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let metadata = file.metadata().map_err(|error| {
+                ShphError::Config(format!(
+                    "unable to stat ticket file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if metadata.len() > MAX_TICKET_FILE_BYTES {
+                return Err(ShphError::Config(format!(
+                    "ticket file exceeds {} bytes",
+                    MAX_TICKET_FILE_BYTES
+                )));
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_TICKET_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| {
+                    ShphError::Config(format!(
+                        "unable to read ticket file {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            if bytes.len() as u64 > MAX_TICKET_FILE_BYTES {
+                return Err(ShphError::Config(format!(
+                    "ticket file exceeds {} bytes",
+                    MAX_TICKET_FILE_BYTES
+                )));
+            }
+            String::from_utf8(bytes)
+                .map(|value| value.trim().to_string())
+                .map_err(|_| ShphError::InvalidArgument("ticket file is not valid UTF-8".into()))
+        }
+        _ => Err(ShphError::InvalidArgument(
+            "provide exactly one non-empty ticket or --ticket-file".into(),
+        )),
+    }
+}
+
+fn validate_transport_peer(value: &str) -> Result<String> {
+    let endpoint = Endpoint::parse(value)
+        .map_err(|error| ShphError::InvalidArgument(format!("invalid transport peer: {error}")))?;
+    if endpoint.port == 0 {
+        return Err(ShphError::InvalidArgument(
+            "transport peer port must be non-zero".into(),
+        ));
+    }
+    Ok(format_endpoint(&endpoint.host, endpoint.port))
+}
+
+fn handle_join_check(
+    keystore_path: &Path,
+    ticket: &JoinTicket,
+    mode: TransportMode,
+    profile: &str,
+    underlay: &TcpUnderlay,
+    transport_peer: Option<&str>,
+) -> Result<()> {
+    let policy_identity = decode_peer_key(&ticket.server_identity_b64, "ticket server identity")?;
+    let policy_signing = decode_peer_key(&ticket.server_signing_b64, "ticket server signing key")?;
+    let policy = PeerPolicy::single(PeerPin::new(policy_identity, policy_signing));
+    let keystore = KeyStore::load(keystore_path, None)?;
+    let actual_peer = transport_peer.unwrap_or(&ticket.endpoint);
+    let actual_peer = validate_transport_peer(actual_peer)?;
+    let shroud_profile = parse_shroud_profile_name(profile)?;
+    let lab = QuicLabConfig { shroud_profile };
+    let timeout_secs = 10;
+
+    println!("SHPH join preflight");
+    println!("  Policy peer: {}", ticket.endpoint);
+    println!("  Transport peer: {actual_peer}");
+    println!("  Transport: {}", transport_mode_to_str(mode));
+    println!("  Shroud profile: {profile}");
+    println!("  Underlay: {}", underlay.label());
+    let started = std::time::Instant::now();
+    let (_session, state) = connect_secure_session_lab_with_profile_and_underlay(
+        &actual_peer,
+        &keystore.identity,
+        &policy,
+        timeout_secs,
+        mode,
+        lab,
+        HandshakeProfile::SecureDefault,
+        underlay,
+    )?;
+    println!("  Handshake: authenticated");
+    println!("  Peer fingerprint: {}", state.peer_fingerprint_hex);
+    println!("  Transcript hash: {}", state.transcript_hash_hex);
+    println!("  Elapsed: {} ms", started.elapsed().as_millis());
+    println!("Result: preflight passed; no config, TUN, route, or DNS changes were made");
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_host(
     config_path: &Path,
@@ -877,6 +1023,7 @@ fn handle_host(
     shroud_profile: &str,
     no_tun: bool,
     no_nat: bool,
+    ticket_file: Option<&Path>,
 ) -> Result<()> {
     if port == 0 {
         return Err(ShphError::InvalidArgument(
@@ -903,6 +1050,7 @@ fn handle_host(
         role: SessionRole::Listen,
         bind: Some(bind),
         peer: None,
+        transport_peer: None,
         timeout_secs: Some(300),
         handshake_profile: Some(HandshakeProfile::SecureDefault),
         underlay: None,
@@ -925,12 +1073,18 @@ fn handle_host(
         server_signing_b64: keystore.identity.signing_public_b64(),
     }
     .encode()?;
+    if let Some(ticket_file) = ticket_file {
+        write_owner_only_file(ticket_file, ticket.as_bytes())?;
+    }
 
     println!("SHPH host ready");
     println!("  Identity: {}", keystore.fingerprint_hex());
     println!("  Transport: {}", transport_mode_to_str(mode));
     println!("  Shroud profile: {profile}");
     println!("  Join ticket: {ticket}");
+    if let Some(ticket_file) = ticket_file {
+        println!("  Ticket file: {}", ticket_file.display());
+    }
     if no_nat {
         println!("  NAT: disabled");
     } else {
@@ -963,6 +1117,8 @@ fn handle_join(
     ticket_value: &str,
     no_tun: bool,
     underlay_value: Option<&str>,
+    transport_peer_value: Option<&str>,
+    check: bool,
 ) -> Result<()> {
     let ticket = JoinTicket::decode(ticket_value)?;
     let mode = TransportMode::parse(&ticket.transport)?;
@@ -970,6 +1126,19 @@ fn handle_join(
     let underlay = parse_tcp_underlay_for_mode(underlay_value, mode)?;
     let endpoint = Endpoint::parse(&ticket.endpoint)
         .map_err(|error| ShphError::InvalidArgument(format!("invalid ticket endpoint: {error}")))?;
+    let transport_peer = transport_peer_value
+        .map(validate_transport_peer)
+        .transpose()?;
+    if check {
+        return handle_join_check(
+            keystore_path,
+            &ticket,
+            mode,
+            &profile,
+            &underlay,
+            transport_peer.as_deref(),
+        );
+    }
     let (mut config, mut keystore) = ensure_workspace(config_path, keystore_path)?;
 
     ensure_peer_pin(
@@ -984,6 +1153,7 @@ fn handle_join(
         role: SessionRole::Connect,
         bind: None,
         peer: Some(ticket.endpoint.clone()),
+        transport_peer,
         timeout_secs: Some(10),
         handshake_profile: Some(HandshakeProfile::SecureDefault),
         underlay: underlay.config_value(),
@@ -1014,6 +1184,9 @@ fn handle_join(
     println!("  Transport: {}", transport_mode_to_str(mode));
     println!("  Shroud profile: {profile}");
     println!("  Underlay: {}", underlay.label());
+    if let Some(transport_peer) = transport_peer_value {
+        println!("  Transport peer: {transport_peer}");
+    }
 
     handle_up(
         config_path,
@@ -1035,7 +1208,12 @@ fn handle_join(
     )
 }
 
-fn handle_id(config_path: &Path, keystore_path: &Path, qr: bool) -> Result<()> {
+fn handle_id(
+    config_path: &Path,
+    keystore_path: &Path,
+    qr: bool,
+    ticket_file: Option<&Path>,
+) -> Result<()> {
     let keystore = KeyStore::load(keystore_path, None)?;
     let config = if config_path.exists() {
         load_config(config_path)?
@@ -1064,6 +1242,9 @@ fn handle_id(config_path: &Path, keystore_path: &Path, qr: bool) -> Result<()> {
         server_signing_b64: keystore.identity.signing_public_b64(),
     }
     .encode()?;
+    if let Some(ticket_file) = ticket_file {
+        write_owner_only_file(ticket_file, ticket.as_bytes())?;
+    }
 
     println!("Identity: {}", keystore.fingerprint_hex());
     println!(
@@ -1077,6 +1258,10 @@ fn handle_id(config_path: &Path, keystore_path: &Path, qr: bool) -> Result<()> {
     println!();
     println!("Shareable Link:");
     println!("{ticket}");
+    if let Some(ticket_file) = ticket_file {
+        println!();
+        println!("Ticket file: {}", ticket_file.display());
+    }
     if qr {
         println!();
         println!("{}", render_qr(&ticket)?);
@@ -1341,7 +1526,8 @@ fn handle_up(
     let mut control_guard = apply_control_plane(config, tun.name())?;
     let interface_name = tun.name().to_string();
     let control_state_recorded = !control_guard.dry_run
-        && (!control_guard.added_routes.is_empty()
+        && (control_guard.interface_cidr.is_some()
+            || !control_guard.added_routes.is_empty()
             || !control_guard.applied_dns_servers.is_empty());
     if control_state_recorded {
         if let Err(err) = save_control_plane_state(
@@ -1425,12 +1611,17 @@ fn handle_up(
                     let peer = session.peer.as_deref().ok_or_else(|| {
                         ShphError::Config("session.peer required for connect mode".into())
                     })?;
+                    let transport_peer = session.transport_peer.as_deref().unwrap_or(peer);
                     let roadmap = config.roadmap.as_ref();
                     println!("  Session mode: connect ({peer})");
+                    if transport_peer != peer {
+                        println!("  Transport peer: {transport_peer}");
+                    }
                     if let Some(payload) = session.startup_payload.as_deref() {
                         handle_send_once(
                             keystore_path,
                             peer,
+                            transport_peer,
                             payload,
                             timeout_secs,
                             Some(transport_mode_to_str(transport).to_string()),
@@ -1450,6 +1641,7 @@ fn handle_up(
                                     keystore_path,
                                     &tun,
                                     peer,
+                                    transport_peer,
                                     timeout_secs,
                                     transport,
                                     profile,
@@ -1626,6 +1818,7 @@ struct StatusReport {
     interface_name: Option<String>,
     local_endpoint: Option<String>,
     session: Option<String>,
+    transport_peer: Option<String>,
     control_plane: StatusItem,
 }
 
@@ -1690,7 +1883,8 @@ fn handle_status(config_path: &Path, keystore_path: &Path, json: bool) -> Result
             Ok(state) => status_item(
                 "active",
                 format!(
-                    "{} route(s), {} DNS server(s) recorded on {}",
+                    "address {}, {} route(s), {} DNS server(s) recorded on {}",
+                    state.interface_cidr.as_deref().unwrap_or("none"),
                     state.routes.len(),
                     state.dns_servers.len(),
                     state.interface_name
@@ -1712,6 +1906,19 @@ fn handle_status(config_path: &Path, keystore_path: &Path, json: bool) -> Result
                 session.peer.as_deref().unwrap_or("peer not configured")
             ),
         });
+    let transport_peer = config
+        .and_then(|config| config.session.as_ref())
+        .and_then(|session| {
+            (session.role == SessionRole::Connect)
+                .then(|| {
+                    session
+                        .transport_peer
+                        .as_deref()
+                        .or(session.peer.as_deref())
+                })
+                .flatten()
+                .map(str::to_string)
+        });
 
     let report = StatusReport {
         config_path: config_path.display().to_string(),
@@ -1726,6 +1933,7 @@ fn handle_status(config_path: &Path, keystore_path: &Path, json: bool) -> Result
         interface_name: config.map(|config| config.interface_name.clone()),
         local_endpoint: config.map(|config| config.local_endpoint.clone()),
         session,
+        transport_peer,
         control_plane: control_plane_status,
     };
 
@@ -1747,6 +1955,9 @@ fn handle_status(config_path: &Path, keystore_path: &Path, json: bool) -> Result
     }
     if let Some(session) = &report.session {
         println!("  Session: {session}");
+    }
+    if let Some(transport_peer) = &report.transport_peer {
+        println!("  Transport peer: {transport_peer}");
     }
     print_status_item("Control plane", &report.control_plane);
     Ok(())
@@ -1771,7 +1982,13 @@ fn doctor_check(
     });
 }
 
-fn handle_doctor(config_path: &Path, keystore_path: &Path, json: bool, strict: bool) -> Result<()> {
+fn handle_doctor(
+    config_path: &Path,
+    keystore_path: &Path,
+    json: bool,
+    strict: bool,
+    deep: bool,
+) -> Result<()> {
     let mut checks = Vec::new();
     let config_result = Config::load(config_path);
     let config = config_result.as_ref().ok();
@@ -1899,13 +2116,17 @@ fn handle_doctor(config_path: &Path, keystore_path: &Path, json: bool, strict: b
         }
 
         if let Some(control) = &config.control_plane {
-            match build_control_plane_plan(control, &config.interface_name) {
+            match build_control_plane_plan(control, &config.interface_name).and_then(|plan| {
+                validate_control_plane_underlay(config, &plan)?;
+                Ok(plan)
+            }) {
                 Ok(plan) => doctor_check(
                     &mut checks,
                     "control-plane",
                     "pass",
                     format!(
-                        "{} route(s), {} DNS server(s) pass preflight",
+                        "address {}, {} route(s), {} DNS server(s) pass preflight",
+                        plan.interface_cidr.as_deref().unwrap_or("none"),
                         plan.routes.len(),
                         plan.dns_servers.len()
                     ),
@@ -2001,6 +2222,10 @@ fn handle_doctor(config_path: &Path, keystore_path: &Path, json: bool, strict: b
         );
     }
 
+    if deep {
+        append_deep_doctor_checks(&mut checks, config, keystore_path);
+    }
+
     let native_tun = std::env::var("SHPH_TUN_NATIVE").ok().as_deref() == Some("1");
     doctor_check(
         &mut checks,
@@ -2055,9 +2280,255 @@ fn handle_doctor(config_path: &Path, keystore_path: &Path, json: bool, strict: b
     Ok(())
 }
 
+fn append_deep_doctor_checks(
+    checks: &mut Vec<DoctorCheck>,
+    config: Option<&Config>,
+    keystore_path: &Path,
+) {
+    let Some(config) = config else {
+        doctor_check(
+            checks,
+            "deep-session",
+            "info",
+            "skipped until the configuration loads",
+            None,
+        );
+        return;
+    };
+    let Some(session) = config.session.as_ref() else {
+        doctor_check(
+            checks,
+            "deep-session",
+            "info",
+            "skipped because no persistent session is configured",
+            Some("configure [session] or use `shph join --check`".into()),
+        );
+        return;
+    };
+    if session.role != SessionRole::Connect {
+        doctor_check(
+            checks,
+            "deep-session",
+            "info",
+            "listen sessions are not probed by `doctor --deep`",
+            Some("use a client-side connect session or `shph join --check`".into()),
+        );
+        return;
+    }
+    let Some(peer) = session.peer.as_deref() else {
+        doctor_check(
+            checks,
+            "deep-session",
+            "fail",
+            "connect session has no policy peer",
+            Some("set [session].peer to the pinned endpoint".into()),
+        );
+        return;
+    };
+    let transport_peer = match session
+        .transport_peer
+        .as_deref()
+        .map(validate_transport_peer)
+        .transpose()
+    {
+        Ok(value) => value.unwrap_or_else(|| peer.to_string()),
+        Err(error) => {
+            doctor_check(
+                checks,
+                "transport-peer",
+                "fail",
+                error.to_string(),
+                Some("set [session].transport_peer to a valid host:port".into()),
+            );
+            return;
+        }
+    };
+    let mode = match resolve_transport_mode(None, config.roadmap.as_ref()) {
+        Ok(mode) => mode,
+        Err(error) => {
+            doctor_check(
+                checks,
+                "deep-transport",
+                "fail",
+                error.to_string(),
+                Some("run `shph validate-roadmap` and correct the transport settings".into()),
+            );
+            return;
+        }
+    };
+    let underlay = match parse_tcp_underlay_for_mode(session.underlay.as_deref(), mode) {
+        Ok(underlay) => underlay,
+        Err(error) => {
+            doctor_check(
+                checks,
+                "underlay",
+                "fail",
+                error.to_string(),
+                Some("use `direct` or `socks5://127.0.0.1:10808`".into()),
+            );
+            return;
+        }
+    };
+    doctor_check(
+        checks,
+        "transport-peer",
+        "pass",
+        if transport_peer == peer {
+            format!("using policy endpoint {peer}")
+        } else {
+            format!("policy endpoint {peer}; socket target {transport_peer}")
+        },
+        None,
+    );
+
+    let probe_target = match &underlay {
+        TcpUnderlay::Direct => transport_peer.as_str(),
+        TcpUnderlay::Socks5 { proxy } => proxy.as_str(),
+    };
+    match probe_tcp_endpoint(probe_target, session.timeout_secs.unwrap_or(5)) {
+        Ok(elapsed) => doctor_check(
+            checks,
+            "underlay",
+            "pass",
+            format!(
+                "{} listener reachable in {} ms ({})",
+                underlay.label(),
+                elapsed.as_millis(),
+                probe_target
+            ),
+            None,
+        ),
+        Err(error) => doctor_check(
+            checks,
+            "underlay",
+            "fail",
+            error.to_string(),
+            Some("start the local SOCKS5 listener or verify the transport endpoint".into()),
+        ),
+    }
+
+    let keystore = match KeyStore::load(keystore_path, None) {
+        Ok(keystore) => keystore,
+        Err(error) => {
+            doctor_check(
+                checks,
+                "session-handshake",
+                "fail",
+                error.to_string(),
+                Some("make the keystore password available and rerun `shph doctor --deep`".into()),
+            );
+            return;
+        }
+    };
+    let policy = match peer_policy_for_endpoint(&keystore, peer, true) {
+        Ok(policy) => policy,
+        Err(error) => {
+            doctor_check(
+                checks,
+                "session-handshake",
+                "fail",
+                error.to_string(),
+                Some("pin the ticket peer with `shph add-peer` or rerun `shph join`".into()),
+            );
+            return;
+        }
+    };
+    let profile_name = match resolve_shroud_profile(
+        None,
+        config
+            .stealth
+            .as_ref()
+            .map(|stealth| stealth.shroud_profile.as_str()),
+    ) {
+        Ok(profile) => profile,
+        Err(error) => {
+            doctor_check(
+                checks,
+                "session-handshake",
+                "fail",
+                error.to_string(),
+                Some("set a valid [stealth].shroud_profile".into()),
+            );
+            return;
+        }
+    };
+    let profile = match parse_shroud_profile_name(&profile_name) {
+        Ok(profile) => profile,
+        Err(error) => {
+            doctor_check(
+                checks,
+                "session-handshake",
+                "fail",
+                error.to_string(),
+                Some("set a valid Shroud profile".into()),
+            );
+            return;
+        }
+    };
+    let mode_supported = matches!(mode, TransportMode::Tcp | TransportMode::Quic);
+    if !mode_supported {
+        doctor_check(
+            checks,
+            "session-handshake",
+            "info",
+            format!(
+                "skipped for config-only transport {}",
+                transport_mode_to_str(mode)
+            ),
+            None,
+        );
+        return;
+    }
+    let handshake_profile = session
+        .handshake_profile
+        .unwrap_or(HandshakeProfile::SecureDefault);
+    let timeout_secs = session.timeout_secs.unwrap_or(5);
+    match connect_secure_session_lab_with_profile_and_underlay(
+        &transport_peer,
+        &keystore.identity,
+        &policy,
+        timeout_secs,
+        mode,
+        QuicLabConfig {
+            shroud_profile: profile,
+        },
+        handshake_profile,
+        &underlay,
+    ) {
+        Ok((_session, state)) => doctor_check(
+            checks,
+            "session-handshake",
+            "pass",
+            format!(
+                "authenticated peer {} in {}",
+                state.peer_fingerprint_hex,
+                transport_mode_to_str(mode)
+            ),
+            None,
+        ),
+        Err(error) => doctor_check(
+            checks,
+            "session-handshake",
+            "fail",
+            error.to_string(),
+            Some("run `shph join --check` for the same no-mutation preflight".into()),
+        ),
+    }
+}
+
+fn probe_tcp_endpoint(endpoint: &str, timeout_secs: u64) -> Result<Duration> {
+    let address = parse_socket_addr(endpoint)?;
+    let started = std::time::Instant::now();
+    TcpStream::connect_timeout(&address, bounded_cli_timeout(timeout_secs))
+        .map_err(|error| ShphError::Transport(format!("unable to reach {endpoint}: {error}")))?;
+    Ok(started.elapsed())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PersistedControlPlaneState {
     interface_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interface_cidr: Option<String>,
     routes: Vec<String>,
     dns_servers: Vec<String>,
 }
@@ -2233,6 +2704,7 @@ fn restrict_state_file_perms(path: &Path) -> Result<()> {
 fn state_from_guard(interface_name: &str, guard: &ControlPlaneGuard) -> PersistedControlPlaneState {
     PersistedControlPlaneState {
         interface_name: interface_name.to_string(),
+        interface_cidr: guard.interface_cidr.as_ref().map(|(cidr, _)| cidr.clone()),
         routes: guard
             .added_routes
             .iter()
@@ -2244,6 +2716,10 @@ fn state_from_guard(interface_name: &str, guard: &ControlPlaneGuard) -> Persiste
 
 fn guard_from_state(state: &PersistedControlPlaneState) -> ControlPlaneGuard {
     ControlPlaneGuard {
+        interface_cidr: state
+            .interface_cidr
+            .clone()
+            .map(|cidr| (cidr, state.interface_name.clone())),
         added_routes: state
             .routes
             .iter()
@@ -2268,8 +2744,10 @@ fn handle_control_plane_apply(config_path: &Path) -> Result<()> {
         ));
     }
     let plan = build_control_plane_plan(control, interface_name)?;
+    validate_control_plane_underlay(&config, &plan)?;
     let desired = PersistedControlPlaneState {
         interface_name: interface_name.to_string(),
+        interface_cidr: plan.interface_cidr.clone(),
         routes: plan.routes.clone(),
         dns_servers: plan.dns_servers.clone(),
     };
@@ -3044,6 +3522,7 @@ fn handle_connect(
 fn handle_send_once(
     keystore_path: &Path,
     peer: &str,
+    transport_peer: &str,
     text: &str,
     timeout_secs: u64,
     transport: Option<String>,
@@ -3076,7 +3555,7 @@ fn handle_send_once(
             )
         })?;
         let certificate = read_quic_certificate(cert_path)?;
-        let peer_addr = parse_socket_addr(peer)?;
+        let peer_addr = parse_socket_addr(transport_peer)?;
         let state = run_async(async {
             let endpoint = standards_quic::client_endpoint(
                 "0.0.0.0:0".parse().expect("valid ephemeral endpoint"),
@@ -3120,7 +3599,7 @@ fn handle_send_once(
     }
     let (mut session, state) = match mode {
         TransportMode::Tcp => connect_secure_session_lab_with_profile_and_underlay(
-            peer,
+            transport_peer,
             &keystore.identity,
             &policy,
             timeout_secs,
@@ -3130,7 +3609,7 @@ fn handle_send_once(
             &underlay,
         )?,
         TransportMode::Quic => connect_secure_session_lab_with_profile(
-            peer,
+            transport_peer,
             &keystore.identity,
             &policy,
             timeout_secs,
@@ -3601,14 +4080,16 @@ fn print_handshake_state(role: &str, endpoint: &str, state: &HandshakeState) {
 
 fn print_control_plane_status(config: &Config) {
     if let Some(control) = &config.control_plane {
+        let apply_address = control.apply_interface_address.unwrap_or(false);
+        let interface_cidr = control.interface_cidr.as_deref().unwrap_or("none");
         let dry_run = control.dry_run.unwrap_or(true);
         let routes = control.route_cidrs.as_ref().map_or(0, |v| v.len());
         let dns = control.dns_servers.as_ref().map_or(0, |v| v.len());
         let apply_routes = control.apply_routes.unwrap_or(false);
         let apply_dns = control.apply_dns.unwrap_or(false);
         println!(
-            "  Control plane: routes={}({}), dns={}({}), dry_run={}",
-            apply_routes, routes, apply_dns, dns, dry_run
+            "  Control plane: address={}({}), routes={}({}), dns={}({}), dry_run={}",
+            apply_address, interface_cidr, apply_routes, routes, apply_dns, dns, dry_run
         );
     }
 }
@@ -3623,6 +4104,7 @@ fn apply_control_plane(config: &Config, interface_name: &str) -> Result<ControlP
     // front so a live apply is all-or-nothing rather than leaving the host in a
     // half-applied state. Invalid inputs are rejected before any mutation.
     let plan = build_control_plane_plan(control, interface_name)?;
+    validate_control_plane_underlay(config, &plan)?;
 
     let mut guard = ControlPlaneGuard {
         dry_run,
@@ -3630,6 +4112,16 @@ fn apply_control_plane(config: &Config, interface_name: &str) -> Result<ControlP
     };
 
     let apply_result = (|| -> Result<()> {
+        if let Some(interface_cidr) = &plan.interface_cidr {
+            if dry_run {
+                println!("  [dry-run] address add {interface_cidr}");
+            } else {
+                add_interface_address(interface_cidr, interface_name)?;
+                guard.interface_cidr = Some((interface_cidr.clone(), interface_name.to_string()));
+                println!("  address add {interface_cidr}");
+            }
+        }
+
         for route in &plan.routes {
             if dry_run {
                 println!("  [dry-run] route add {route}");
@@ -4117,7 +4609,7 @@ fn build_tun_mtu_commands(interface_name: &str, mtu: usize) -> Result<Vec<Vec<St
                 "ipv4".to_string(),
                 "set".to_string(),
                 "subinterface".to_string(),
-                format!("name={interface_name}"),
+                format!("interface={interface_name}"),
                 format!("mtu={mtu}"),
                 "store=active".to_string(),
             ],
@@ -4127,7 +4619,7 @@ fn build_tun_mtu_commands(interface_name: &str, mtu: usize) -> Result<Vec<Vec<St
                 "ipv6".to_string(),
                 "set".to_string(),
                 "subinterface".to_string(),
-                format!("name={interface_name}"),
+                format!("interface={interface_name}"),
                 format!("mtu={mtu}"),
                 "store=active".to_string(),
             ],
@@ -4143,6 +4635,7 @@ fn build_tun_mtu_commands(interface_name: &str, mtu: usize) -> Result<Vec<Vec<St
 /// Built by preflight validation before any host mutation.
 #[derive(Debug, Clone, Default)]
 struct ControlPlanePlan {
+    interface_cidr: Option<String>,
     routes: Vec<String>,
     apply_dns: bool,
     dns_servers: Vec<String>,
@@ -4155,6 +4648,16 @@ fn build_control_plane_plan(
     validate_tun_name(interface_name)?;
 
     let mut plan = ControlPlanePlan::default();
+
+    if control.apply_interface_address.unwrap_or(false) {
+        let interface_cidr = control.interface_cidr.as_deref().ok_or_else(|| {
+            ShphError::Config(
+                "apply_interface_address=true requires control_plane.interface_cidr".into(),
+            )
+        })?;
+        validate_interface_cidr(interface_cidr)?;
+        plan.interface_cidr = Some(interface_cidr.to_string());
+    }
 
     if control.apply_routes.unwrap_or(false) {
         for route in control.route_cidrs.as_deref().unwrap_or(&[]) {
@@ -4176,8 +4679,48 @@ fn build_control_plane_plan(
     Ok(plan)
 }
 
+fn validate_control_plane_underlay(config: &Config, plan: &ControlPlanePlan) -> Result<()> {
+    let has_default_route = plan.routes.iter().any(|route| {
+        parse_cidr(route)
+            .map(|(_, prefix)| prefix == 0)
+            .unwrap_or(false)
+    });
+    let socks_underlay = config
+        .session
+        .as_ref()
+        .and_then(|session| session.underlay.as_deref())
+        .is_some_and(|underlay| underlay.starts_with("socks5://"));
+
+    if has_default_route && socks_underlay {
+        return Err(ShphError::Config(
+            "refusing a default route while a SOCKS5 underlay is configured; add an explicit underlay bypass route before enabling full-tunnel routing".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_cidr(cidr: &str) -> Result<()> {
     parse_cidr(cidr)?;
+    Ok(())
+}
+
+fn validate_interface_cidr(cidr: &str) -> Result<()> {
+    let (ip_addr, prefix) = parse_cidr(cidr)?;
+    if prefix == 0 {
+        return Err(ShphError::Config(format!(
+            "interface CIDR must not use a /0 prefix: {cidr}"
+        )));
+    }
+    if ip_addr.is_unspecified() || ip_addr.is_loopback() || ip_addr.is_multicast() {
+        return Err(ShphError::Config(format!(
+            "interface CIDR must use a unicast, non-loopback address: {cidr}"
+        )));
+    }
+    if cfg!(target_os = "windows") && ip_addr.is_ipv6() {
+        return Err(ShphError::Unsupported(
+            "Windows interface address apply currently supports IPv4 CIDRs only".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -4207,6 +4750,7 @@ fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8)> {
 /// apply failure. `dry_run` is recorded for diagnostics only.
 #[derive(Default)]
 struct ControlPlaneGuard {
+    interface_cidr: Option<(String, String)>,
     added_routes: Vec<(String, String)>,
     applied_dns_servers: Vec<String>,
     dns_interface_name: Option<String>,
@@ -4240,6 +4784,14 @@ impl ControlPlaneGuard {
             }
         }
 
+        if let Some((interface_cidr, interface_name)) = self.interface_cidr.take() {
+            if let Err(err) = delete_interface_address(&interface_cidr, &interface_name) {
+                rollback_errors.push(err);
+            } else {
+                println!("  address del {interface_cidr}");
+            }
+        }
+
         if let Some(err) = rollback_errors.into_iter().next() {
             return Err(err);
         }
@@ -4254,6 +4806,16 @@ fn add_route(cidr: &str, interface_name: &str) -> Result<()> {
 
 fn delete_route(cidr: &str, interface_name: &str) -> Result<()> {
     let command = build_route_delete_command(cidr, interface_name)?;
+    run_shell_command(&command)
+}
+
+fn add_interface_address(cidr: &str, interface_name: &str) -> Result<()> {
+    let command = build_interface_address_add_command(cidr, interface_name)?;
+    run_shell_command(&command)
+}
+
+fn delete_interface_address(cidr: &str, interface_name: &str) -> Result<()> {
+    let command = build_interface_address_delete_command(cidr, interface_name)?;
     run_shell_command(&command)
 }
 
@@ -4372,6 +4934,104 @@ fn restore_dns_family(interface_name: &str, family: &str) -> Result<()> {
             "dns {family} restore failed for {interface_name}: {err}"
         ))
     })
+}
+
+fn build_interface_address_add_command(cidr: &str, interface_name: &str) -> Result<Vec<String>> {
+    let (ip_addr, prefix) = parse_cidr(cidr)?;
+    validate_interface_cidr(cidr)?;
+    validate_tun_name(interface_name)?;
+
+    if cfg!(target_os = "linux") {
+        return Ok(vec![
+            "ip".to_string(),
+            "address".to_string(),
+            "add".to_string(),
+            cidr.to_string(),
+            "dev".to_string(),
+            interface_name.to_string(),
+        ]);
+    }
+
+    if cfg!(target_os = "windows") {
+        let ip_addr = match ip_addr {
+            IpAddr::V4(address) => address,
+            IpAddr::V6(_) => {
+                return Err(ShphError::Unsupported(
+                    "Windows interface address apply currently supports IPv4 CIDRs only".into(),
+                ))
+            }
+        };
+        return Ok(vec![
+            "netsh".to_string(),
+            "interface".to_string(),
+            "ipv4".to_string(),
+            "add".to_string(),
+            "address".to_string(),
+            format!("name={interface_name}"),
+            format!("address={ip_addr}"),
+            format!("mask={}", ipv4_netmask(prefix)?),
+            "store=active".to_string(),
+        ]);
+    }
+
+    Err(ShphError::Unsupported(
+        "interface address apply unsupported on this platform".into(),
+    ))
+}
+
+fn build_interface_address_delete_command(cidr: &str, interface_name: &str) -> Result<Vec<String>> {
+    let (ip_addr, _) = parse_cidr(cidr)?;
+    validate_interface_cidr(cidr)?;
+    validate_tun_name(interface_name)?;
+
+    if cfg!(target_os = "linux") {
+        return Ok(vec![
+            "ip".to_string(),
+            "address".to_string(),
+            "delete".to_string(),
+            cidr.to_string(),
+            "dev".to_string(),
+            interface_name.to_string(),
+        ]);
+    }
+
+    if cfg!(target_os = "windows") {
+        let ip_addr = match ip_addr {
+            IpAddr::V4(address) => address,
+            IpAddr::V6(_) => {
+                return Err(ShphError::Unsupported(
+                    "Windows interface address apply currently supports IPv4 CIDRs only".into(),
+                ))
+            }
+        };
+        return Ok(vec![
+            "netsh".to_string(),
+            "interface".to_string(),
+            "ipv4".to_string(),
+            "delete".to_string(),
+            "address".to_string(),
+            format!("name={interface_name}"),
+            format!("address={ip_addr}"),
+        ]);
+    }
+
+    Err(ShphError::Unsupported(
+        "interface address delete unsupported on this platform".into(),
+    ))
+}
+
+fn ipv4_netmask(prefix: u8) -> Result<String> {
+    if prefix > 32 {
+        return Err(ShphError::Config(format!(
+            "IPv4 prefix out of range: /{prefix}"
+        )));
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Ok(Ipv4Addr::from(mask).to_string())
 }
 
 fn build_route_add_command(cidr: &str, interface_name: &str) -> Result<Vec<String>> {
@@ -4659,6 +5319,7 @@ fn run_standards_quic_connect_loop(
     keystore: &KeyStore,
     tun: &TunDevice,
     peer: &str,
+    transport_peer: &str,
     timeout_secs: u64,
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
@@ -4670,7 +5331,7 @@ fn run_standards_quic_connect_loop(
             "--quic-cert is required with --transport quic-standard on up connect".into(),
         )
     })?;
-    let peer_addr = parse_socket_addr(peer)?;
+    let peer_addr = parse_socket_addr(transport_peer)?;
     let tun_tx = tun.try_clone()?;
     let tun_rx = tun.try_clone()?;
     let timeout_duration = bounded_cli_timeout(timeout_secs);
@@ -4902,6 +5563,7 @@ fn run_connect_loop(
     keystore_path: &Path,
     tun: &TunDevice,
     peer: &str,
+    transport_peer: &str,
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
@@ -4922,6 +5584,7 @@ fn run_connect_loop(
                 &keystore,
                 tun,
                 peer,
+                transport_peer,
                 timeout_secs,
                 profile,
                 roadmap,
@@ -4950,7 +5613,7 @@ fn run_connect_loop(
     let (mut session, state) = match mode {
         TransportMode::Tcp | TransportMode::Quic => {
             connect_secure_session_lab_with_profile_and_underlay(
-                peer,
+                transport_peer,
                 &keystore.identity,
                 &policy,
                 timeout_secs,
@@ -5576,15 +6239,17 @@ mod tests {
     use super::{
         advertised_endpoint, apply_control_plane, build_control_plane_plan,
         build_dns_apply_command, build_dns_apply_commands, build_dns_restore_command,
+        build_interface_address_add_command, build_interface_address_delete_command,
         build_route_add_command, build_route_delete_command, build_tun_mtu_commands, cli_exit_code,
         control_plane_state_path, enforce_peer_policy, handle_up, load_control_plane_state,
-        parse_shroud_profile_name, phase_a1_now_ms, reconnect_delay_with_jitter,
-        render_config_for_display, resolve_killswitch_peers, resolve_shroud_profile,
-        run_with_reconnect, save_control_plane_state, transport_mode_to_str, validate_cidr,
-        CliErrorOutput, ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore,
-        KeyStoreConfig, PersistedControlPlaneState, TcpUnderlay, TransportMode, UpOptions,
-        DEFAULT_TUN_MTU_BYTES, EXIT_CONFIG, EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE,
-        MAX_CONTROL_PLANE_STATE_BYTES,
+        parse_shroud_profile_name, phase_a1_now_ms, read_ticket_source,
+        reconnect_delay_with_jitter, render_config_for_display, resolve_killswitch_peers,
+        resolve_shroud_profile, run_with_reconnect, save_control_plane_state,
+        transport_mode_to_str, validate_cidr, validate_control_plane_underlay,
+        validate_transport_peer, CliErrorOutput, ControlPlaneGuard, ControlPlanePlan,
+        HandshakeState, KeyStore, KeyStoreConfig, PersistedControlPlaneState, TcpUnderlay,
+        TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES, EXIT_CONFIG, EXIT_PERMISSION,
+        EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
     use shph_config::{
@@ -5592,9 +6257,39 @@ mod tests {
     };
     use shph_core::roadmap::{IdentityProviderConfig, TransportAdapterConfig};
     use shph_core::{Result, ShphError};
+    use std::fs;
     use std::io;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn ticket_source_reads_bounded_trimmed_files() {
+        let path = std::env::temp_dir().join(format!(
+            "shph-ticket-source-{}-{}.ticket",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        fs::write(&path, "  shph://v1:test-ticket  \n").expect("write ticket");
+        assert_eq!(
+            read_ticket_source(None, Some(&path)).expect("read ticket"),
+            "shph://v1:test-ticket"
+        );
+        assert!(read_ticket_source(Some(""), None).is_err());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn transport_peer_validation_canonicalizes_endpoints() {
+        assert_eq!(
+            validate_transport_peer("127.0.0.1:8443").expect("valid transport peer"),
+            "127.0.0.1:8443"
+        );
+        assert_eq!(
+            validate_transport_peer("[::1]:8443").expect("valid IPv6 transport peer"),
+            "[::1]:8443"
+        );
+        assert!(validate_transport_peer("not-an-endpoint").is_err());
+    }
 
     #[test]
     fn show_config_redacts_all_known_credential_fields_by_default() {
@@ -5772,6 +6467,7 @@ mod tests {
                 role: SessionRole::Connect,
                 bind: None,
                 peer: Some("second".into()),
+                transport_peer: None,
                 timeout_secs: None,
                 handshake_profile: None,
                 underlay: None,
@@ -5827,6 +6523,7 @@ mod tests {
         let config_path = dir.join("config.toml");
         let state = PersistedControlPlaneState {
             interface_name: "shph0".into(),
+            interface_cidr: None,
             routes: vec!["10.20.0.0/16".into()],
             dns_servers: Vec::new(),
         };
@@ -5862,6 +6559,7 @@ mod tests {
                 role: SessionRole::Connect,
                 bind: None,
                 peer: Some("127.0.0.1:7231".into()),
+                transport_peer: None,
                 timeout_secs: Some(5),
                 startup_payload: None,
                 handshake_profile: None,
@@ -6137,6 +6835,11 @@ mod tests {
         assert!(commands.iter().all(|command| command
             .iter()
             .any(|part| part.contains(&DEFAULT_TUN_MTU_BYTES.to_string()))));
+        if cfg!(target_os = "windows") {
+            assert!(commands
+                .iter()
+                .all(|command| command.contains(&"interface=shph0".to_string())));
+        }
         assert!(build_tun_mtu_commands("", DEFAULT_TUN_MTU_BYTES).is_err());
         assert!(build_tun_mtu_commands("shph0", 575).is_err());
     }
@@ -6277,6 +6980,8 @@ mod tests {
     fn apply_control_plane_dry_run_accepts_valid_inputs() {
         let cfg = Config {
             control_plane: Some(ControlPlaneConfig {
+                apply_interface_address: Some(false),
+                interface_cidr: None,
                 apply_routes: Some(true),
                 route_cidrs: Some(vec!["10.20.0.0/16".to_string()]),
                 apply_dns: Some(true),
@@ -6294,6 +6999,8 @@ mod tests {
     fn apply_control_plane_rejects_bad_dns() {
         let cfg = Config {
             control_plane: Some(ControlPlaneConfig {
+                apply_interface_address: Some(false),
+                interface_cidr: None,
                 apply_routes: Some(false),
                 route_cidrs: None,
                 apply_dns: Some(true),
@@ -6309,6 +7016,8 @@ mod tests {
     fn control_plane_plan_preflight_validates_all_before_apply() {
         // A bad CIDR alongside a good one must be rejected up front (atomicity).
         let control = ControlPlaneConfig {
+            apply_interface_address: Some(false),
+            interface_cidr: None,
             apply_routes: Some(true),
             route_cidrs: Some(vec!["10.20.0.0/16".to_string(), "10.30.0.0/40".to_string()]),
             apply_dns: Some(true),
@@ -6321,6 +7030,8 @@ mod tests {
     #[test]
     fn control_plane_plan_normalizes_dns_and_routes() {
         let control = ControlPlaneConfig {
+            apply_interface_address: Some(false),
+            interface_cidr: None,
             apply_routes: Some(true),
             route_cidrs: Some(vec![
                 "10.20.0.0/16".to_string(),
@@ -6339,6 +7050,8 @@ mod tests {
     #[test]
     fn control_plane_plan_requires_interface_name() {
         let control = ControlPlaneConfig {
+            apply_interface_address: Some(false),
+            interface_cidr: None,
             apply_routes: Some(true),
             route_cidrs: Some(vec!["10.20.0.0/16".to_string()]),
             apply_dns: None,
@@ -6352,6 +7065,8 @@ mod tests {
     #[test]
     fn control_plane_plan_skips_dns_when_no_servers() {
         let control = ControlPlaneConfig {
+            apply_interface_address: Some(false),
+            interface_cidr: None,
             apply_routes: Some(false),
             route_cidrs: None,
             apply_dns: Some(true),
@@ -6367,6 +7082,8 @@ mod tests {
     fn apply_control_plane_records_dry_run_flag() {
         let cfg = Config {
             control_plane: Some(ControlPlaneConfig {
+                apply_interface_address: Some(false),
+                interface_cidr: None,
                 apply_routes: Some(true),
                 route_cidrs: Some(vec!["10.20.0.0/16".to_string()]),
                 apply_dns: Some(false),
@@ -6383,9 +7100,72 @@ mod tests {
     #[test]
     fn control_plane_plan_default_is_empty() {
         let plan = ControlPlanePlan::default();
+        assert!(plan.interface_cidr.is_none());
         assert!(plan.routes.is_empty());
         assert!(!plan.apply_dns);
         assert!(plan.dns_servers.is_empty());
+    }
+
+    #[test]
+    fn interface_address_command_builders_validate_and_bound_inputs() {
+        let add = build_interface_address_add_command("10.250.0.2/30", "shph0")
+            .expect("interface address add command");
+        let delete = build_interface_address_delete_command("10.250.0.2/30", "shph0")
+            .expect("interface address delete command");
+        assert!(add
+            .iter()
+            .all(|part| !part.contains('\n') && !part.contains('\r')));
+        assert!(delete
+            .iter()
+            .all(|part| !part.contains('\n') && !part.contains('\r')));
+        assert!(build_interface_address_add_command("0.0.0.0/0", "shph0").is_err());
+        assert!(build_interface_address_add_command("10.250.0.2/99", "shph0").is_err());
+        assert!(build_interface_address_delete_command("10.250.0.2/30", "").is_err());
+    }
+
+    #[test]
+    fn control_plane_plan_accepts_explicit_interface_address() {
+        let control = ControlPlaneConfig {
+            apply_interface_address: Some(true),
+            interface_cidr: Some("10.250.0.2/30".into()),
+            apply_routes: Some(true),
+            route_cidrs: Some(vec!["10.250.0.1/32".into()]),
+            apply_dns: Some(false),
+            dns_servers: None,
+            dry_run: Some(true),
+        };
+        let plan = build_control_plane_plan(&control, "shph0").expect("plan");
+        assert_eq!(plan.interface_cidr.as_deref(), Some("10.250.0.2/30"));
+        assert_eq!(plan.routes, vec!["10.250.0.1/32"]);
+    }
+
+    #[test]
+    fn default_route_with_socks_underlay_is_rejected() {
+        let config = Config {
+            session: Some(SessionConfig {
+                role: SessionRole::Connect,
+                bind: None,
+                peer: Some("198.51.100.10:443".into()),
+                transport_peer: None,
+                timeout_secs: Some(5),
+                handshake_profile: None,
+                underlay: Some("socks5://127.0.0.1:10808".into()),
+                reconnect: None,
+                startup_payload: None,
+            }),
+            ..Config::default()
+        };
+        let control = ControlPlaneConfig {
+            apply_interface_address: Some(true),
+            interface_cidr: Some("10.250.0.2/30".into()),
+            apply_routes: Some(true),
+            route_cidrs: Some(vec!["0.0.0.0/0".into()]),
+            apply_dns: Some(false),
+            dns_servers: None,
+            dry_run: Some(true),
+        };
+        let plan = build_control_plane_plan(&control, "shph0").expect("plan");
+        assert!(validate_control_plane_underlay(&config, &plan).is_err());
     }
 
     #[test]

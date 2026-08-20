@@ -9,7 +9,7 @@ anti-censorship guarantees.
 
 ## Current Status (2026-08-18)
 
-Workspace version `0.6.3-dev.3` (pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.4-dev` (pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -192,6 +192,12 @@ cargo build
 cargo run -p shph-cli -- host --port 443 --advertise 198.51.100.10
 cargo run -p shph-cli -- join 'shph://v1:...'
 
+# keep a changing relay ticket in a bounded owner-only file
+cargo run -p shph-cli -- host --port 443 \
+  --advertise relay.example:443 \
+  --ticket-file /run/shph/join.ticket
+cargo run -p shph-cli -- join --ticket-file /run/shph/join.ticket --check
+
 # inspect identity and render the current ticket as a terminal QR
 cargo run -p shph-cli -- id --qr
 
@@ -233,6 +239,7 @@ cargo run -p shph-cli -- --config /tmp/shph-b/config.toml send-once \
 role = "listen"         # or "connect"
 bind = "127.0.0.1:7231" # listen only
 peer = "127.0.0.1:7231" # connect only
+transport_peer = "127.0.0.1:7231" # optional socket target; peer remains the policy selector
 timeout_secs = 5
 handshake_profile = "secure-default" # or "classical-lab" for paired lab runs
 underlay = "socks5://127.0.0.1:10808" # optional local TCP underlay add-on
@@ -244,8 +251,10 @@ initial_delay_ms = 250
 max_delay_ms = 4000
 
 [control_plane]
+apply_interface_address = true
+interface_cidr = "10.250.0.2/30"
 apply_routes = true
-route_cidrs = ["10.10.0.0/16"]
+route_cidrs = ["10.250.0.1/32"]
 apply_dns = true
 dns_servers = ["1.1.1.1"]
 dry_run = true
@@ -264,10 +273,17 @@ Behavior:
   - Linux native TUN now validates interface names, `/dev/net/tun` device mode, and permission requirements before opening.
 - If `[session.reconnect]` is enabled:
   - transient transport failures are retried with exponential backoff.
+- If `transport_peer` is set:
+  - `peer` remains the pinned identity/policy selector;
+  - only the TCP/QUIC socket target is overridden, which supports a trusted
+    relay terminating on the host's internal listener.
 - If `[control_plane]` is enabled:
-  - route/DNS input is validated.
+  - interface-address, route, and DNS input is validated.
   - with `dry_run=true` (recommended default): planned mutations are logged only.
-- with `dry_run=false`: SHPH attempts live route/DNS apply and rollback on shutdown/error.
+- with `dry_run=false`: SHPH attempts live interface-address, route/DNS apply
+  and rollback on shutdown/error.
+- SHPH refuses a default route with a SOCKS5 underlay until an explicit
+  underlay bypass route is configured, preventing a routing loop.
 - `apply`, `reconcile`, `undo`, and `down` provide persistent control-plane
   lifecycle management outside a session process.
 - `up --killswitch` and `up --mss-clamp` require native TUN mode for live
@@ -278,6 +294,10 @@ Behavior:
   silently ignored.
 - `up` refuses to overwrite a persisted control-plane state file left by an
   interrupted session. Run `shph reconcile` or `shph undo` first.
+- `join --check` validates a ticket and performs one authenticated handshake
+  without writing configuration or changing TUN, route, or DNS state.
+- `doctor --deep` probes the configured underlay and performs a no-mutation
+  handshake check for a persistent connect session.
 
 ## Optional reachability add-on
 
@@ -303,15 +323,21 @@ proxy auto-discovery, and a bundled Xray binary are out of scope.
 See [`docs/REACHABILITY_ADDON.md`](docs/REACHABILITY_ADDON.md) for the
 architecture, operational boundary, and test procedure.
 
+For local Xray diagnostics, use `scripts/check_xray.ps1` on Windows or
+`scripts/check_xray.sh` on Linux. These checks validate the configuration and
+loopback SOCKS5 listener without sending traffic to an arbitrary destination.
+
 ## Main Commands
 
 ```text
 shph init --new
 shph host [--port 443] [--advertise <host[:port]>] [--transport tcp|quic]
   [--shroud-profile medium] [--no-tun] [--no-nat]
+  [--ticket-file <path>]
   [--underlay socks5://host:port]
-shph join <shph://v1:...> [--no-tun] [--underlay socks5://host:port]
-shph id [--qr]
+shph join <shph://v1:...> [--ticket-file <path>] [--no-tun]
+  [--underlay socks5://host:port] [--transport-peer <host:port>] [--check]
+shph id [--qr] [--ticket-file <path>]
 shph up [--to <host:port>] [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
   [--shroud-profile off|low|medium|high|extreme-lab] [--no-tun]
   [--underlay socks5://host:port]
@@ -321,7 +347,7 @@ shph apply
 shph reconcile
 shph undo
 shph status
-shph doctor [--strict] [--json]
+shph doctor [--strict] [--deep] [--json]
 shph show-fingerprint
 shph show-public-key
 shph show-signing-public-key
