@@ -7,9 +7,9 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-08-18)
+## Current Status (2026-08-20)
 
-Workspace version `0.6.4-dev` (pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.4-dev.2` (pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -151,9 +151,8 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   Ctrl+C teardown, two-node Windows forwarding, and native Linux two-host
   evidence remain release gates.
 
-For the delivery/funding roadmap, see `ROADMAP_OSS_AND_DELIVERY.md`.
-The active sequence is Shroud lab completion, hardening and optimization,
-release-readiness, then the remaining native Windows TUN delivery gates.
+The current development sequence is Shroud lab completion, hardening and
+optimization, release-readiness, then the remaining native Windows TUN gates.
 
 SHPH inherits core concepts from the Shroud lineage (adaptive framing and profile-driven morphology concepts), reworked for a VPN-first architecture.
 
@@ -255,6 +254,7 @@ apply_interface_address = true
 interface_cidr = "10.250.0.2/30"
 apply_routes = true
 route_cidrs = ["10.250.0.1/32"]
+underlay_bypass_cidrs = ["203.0.113.10/32"] # physical path for local SOCKS underlay
 apply_dns = true
 dns_servers = ["1.1.1.1"]
 dry_run = true
@@ -283,7 +283,9 @@ Behavior:
 - with `dry_run=false`: SHPH attempts live interface-address, route/DNS apply
   and rollback on shutdown/error.
 - SHPH refuses a default route with a SOCKS5 underlay until an explicit
-  underlay bypass route is configured, preventing a routing loop.
+  `underlay_bypass_cidrs` route is configured, preventing a routing loop.
+  Bypass routes are installed on the active physical gateway, persisted, and
+  rolled back with the rest of the control plane.
 - `apply`, `reconcile`, `undo`, and `down` provide persistent control-plane
   lifecycle management outside a session process.
 - `up --killswitch` and `up --mss-clamp` require native TUN mode for live
@@ -388,7 +390,6 @@ cargo test --workspace
 
 Additional docs:
 
-- `WHY_SHPH.md` (project rationale, transport focus, and funding case)
 - `FIVE_MINUTE_QUICKSTART.md` (local authenticated encrypted exchange)
 - `docs/TESTING.md`
 - `docs/SUPPORT_MATRIX.md` (authoritative product boundary and support levels)
@@ -400,17 +401,14 @@ Additional docs:
 - `docs/DIRECTORY_GUIDE.md`
 - `docs/REPRODUCIBILITY.md`
 - `docs/SYNC.md` (optional synchronization for multiple checkouts)
-- `docs/FUNDERS.md` (what SHPH is/is-not, for grant reviewers)
 - `docs/RISK_MATRIX.md` (current limits + explicit exclusions)
-- `docs/MILESTONE_SCORECARD.md` (measurable phase scorecard + burn-down)
 - `docs/SUPPORT_AND_MAINTENANCE.md` (support model + maintenance plan)
 - `docs/evidence/GATE_EVIDENCE.md` (regenerable acceptance-gate evidence log)
-- `docs/RELEASE_PROCEDURE.md` (funding-checkpoint tagging + manifest)
 - `docs/LEGAL_COMPLIANCE.md` (OSS artifact legal/compliance checklist)
 - `docs/API_STABILITY.md` (public-API tiers + validation-window freeze rules)
 - `docs/SECURITY_REPORTING.md` (bug-bounty report template + triage SLA)
 - `docs/SUPPLY_CHAIN_SCAN.md` (cargo-audit scanner + advisory triage)
-- `docs/HARDENING.md` (post-funding security-hardening summary + threat impact)
+- `docs/HARDENING.md` (security-hardening summary + threat impact)
 - `docs/BENCHMARKING.md` (Linux-first benchmark methodology and profile plan)
 - `docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md` (extended local benchmark
   campaign and explicit host-capability skips)

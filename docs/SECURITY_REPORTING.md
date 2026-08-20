@@ -25,7 +25,7 @@ for triage.
 **Report ID:** [REDACTABLE] (assign on intake; do not put personal data here)
 **Date (UTC):** YYYY-MM-DD
 **Reporter handle:** [REDACTABLE]
-**Affected version / commit:** e.g. checkpoint-phaseA-1.0.0 / commit <short hash>
+**Affected version / commit:** e.g. v0.6.4-dev.2 / commit <short hash>
 
 #### 1. Summary
 One-paragraph description of the issue.
@@ -61,9 +61,9 @@ The technical fields (component, impact, repro) are the triage signal.
 
 | Severity | Definition (example) | Target ack | Target fix |
 | -------- | -------------------- | ---------- | ---------- |
-| **Critical** | Remote unauth break of confidentiality/integrity of the data plane (e.g. AEAD forgery, key recovery). | 1 business day | emergency checkpoint, < 30 days |
-| **High** | Authenticated break, or remote crash/DoS of the handshake path bypassing the bounded-accept mitigation. | 3 business days | next checkpoint, < 60 days |
-| **Medium** | Local privilege/footprint issue, or unsoundness reachable only via a non-default path. | 5 business days | next checkpoint, < 90 days |
+| **Critical** | Remote unauth break of confidentiality/integrity of the data plane (e.g. AEAD forgery, key recovery). | 1 business day | emergency release, < 30 days |
+| **High** | Authenticated break, or remote crash/DoS of the handshake path bypassing the bounded-accept mitigation. | 3 business days | next release, < 60 days |
+| **Medium** | Local privilege/footprint issue, or unsoundness reachable only via a non-default path. | 5 business days | next release, < 90 days |
 | **Low** | Defense-in-depth, hardening, or theoretical issues with no shown path. | 5 business days | best-effort, tracked |
 
 ## 4. Triage SLA (operational)

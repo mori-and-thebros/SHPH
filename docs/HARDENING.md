@@ -1,9 +1,7 @@
 # SHPH Hardening Summary
 
-This document consolidates the security-hardening work done *after* the
-funding-readiness track (Phases A + B). It is the Optional/Research hardening
-track from `ROADMAP_OSS_AND_DELIVERY.md`: concrete, tested, verifiable
-defenses rather than research-grade features.
+This document consolidates concrete, tested, verifiable security-hardening
+work rather than research-grade feature claims.
 
 Every increment here:
 - addresses a concrete weakness or boundary,
@@ -278,8 +276,8 @@ Tests: 4 new regression tests proving the key bytes are wiped after drop
 These are hardening of the existing design, not new anti-observation
 capabilities. Per `SECURITY.md`, SHPH still does **not** claim: browser/TLS/QUIC
 fingerprint parity, DPI evasion, constant-time guarantees beyond the crypto
-crates, or hostile-network adversarial posture. Those remain research-track
-items (`ROADMAP_OSS_AND_DELIVERY.md`).
+crates, or hostile-network adversarial posture. Those remain outside the
+current release profile.
 
 ## Increment 10 — TUN and UDP-shim boundary hardening
 

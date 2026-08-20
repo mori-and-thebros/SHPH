@@ -111,8 +111,8 @@ censorship resistance.
   `cargo test --workspace --locked`, and `cargo build --workspace --locked`.
 - Run `./scripts/demo.sh all` for a compact successful-flow plus fail-closed
   demonstration.
-- Read `docs/FUNDERS.md` and `WHY_SHPH.md` for project scope and
-  funding-oriented context.
+- Read `docs/SUPPORT_MATRIX.md` and `docs/RISK_MATRIX.md` for the supported
+  scope and explicit non-claims.
 - For controlled native Linux two-host evidence, use
   `docs/NATIVE_LINUX_TWO_HOST_VALIDATION.md`.
 - For the current threat model and non-claims, read `SECURITY.md`.

@@ -60,12 +60,12 @@ docs/             testing, control-plane, sprint board, reproducibility
 - Do not add inline comments unless requested; do not add copyright/license
   headers to source files (licensing lives in `LICENSE-MIT` / `LICENSE-APACHE`).
 
-## Phase-Gating Discipline
+## Validation Discipline
 
-SHPH uses strict release and validation gates (see
-`ROADMAP_OSS_AND_DELIVERY.md`, `docs/MILESTONE_SCORECARD.md`, and
-`docs/RELEASE_READINESS.md`). Do **not** mark a capability complete unless
-every task and evidence criterion is satisfied and recorded in the repository.
+SHPH uses strict release and validation gates. See
+`docs/RELEASE_READINESS.md` for the binding engineering criteria. Do **not**
+mark a capability complete unless the relevant tests and evidence are
+satisfied and recorded in the repository.
 
 ## Pull Requests
 

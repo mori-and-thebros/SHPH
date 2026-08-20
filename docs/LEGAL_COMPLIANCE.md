@@ -1,9 +1,9 @@
 # SHPH Legal & Compliance Checklist (OSS Artifact Handling)
 
-This is the legal/compliance checklist for handling SHPH open-source artifacts
-(called for by Phase B.1 of `ROADMAP_OSS_AND_DELIVERY.md`). It exists so a
-funder, auditor, or downstream packager can confirm the project's licensing,
-attribution, and export posture are consistent and verifiable.
+This is the legal/compliance checklist for handling SHPH open-source artifacts.
+It exists so maintainers, auditors, and downstream packagers can confirm the
+project's licensing, attribution, and export posture are consistent and
+verifiable.
 
 > This is a **process checklist**, not legal advice. SHPH is dual-licensed
 > MIT OR Apache-2.0 and is not legal-counsel-vetted; treat this as engineering
@@ -75,12 +75,12 @@ Action items:
 
 - [x] **Reproducible build path:** `docs/REPRODUCIBILITY.md` (`--locked`,
       committed `Cargo.lock`).
-- [x] **Release procedure documented:** `docs/RELEASE_PROCEDURE.md`.
-- [x] **Evidence captured per checkpoint:** `docs/evidence/GATE_EVIDENCE.md`.
+- [x] **Release gates documented:** `docs/RELEASE_READINESS.md`.
+- [x] **Evidence captured for validation:** `docs/evidence/GATE_EVIDENCE.md`.
 - [ ] **Signed artifacts:** no GPG/Sigstore signing configured yet (tracked
       follow-up for the first versioned release).
 
-## 7. Outstanding follow-ups (non-blocking for funding review)
+## 7. Outstanding follow-ups
 
 1. Per-crate `license` field audit (section 1).
 2. DCO/CLA policy decision (section 2).

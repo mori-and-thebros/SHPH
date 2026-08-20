@@ -7,9 +7,6 @@ This file maps the repository layout and the main public validation artifacts.
 - `Cargo.toml`: workspace definition and shared dependency setup.
 - `Cargo.lock`: locked dependency graph.
 - `README.md`: entry point, status, and quick start instructions.
-- `ROADMAP_OSS_AND_DELIVERY.md`: roadmap and funding-readiness plan.
-- `docs/MILESTONE_SCORECARD.md`: phase scorecard, including the active
-  Shroud, hardening/optimization, release-readiness, and Windows TUN gates.
 - `docs/`: operator/docs set (testing, control plane, TUI, directory guide).
 - `shph-cli/`: command-line binary and integration tests.
 - `shph-config/`: config model and parser.

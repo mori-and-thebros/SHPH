@@ -75,7 +75,8 @@ independently reviewed. Marketing or implying any of these is a policy violation
 
 ## Policy
 
-- Any funder, marketing, or README claim must be traceable to a green test or a
-  "done" row in this matrix or `docs/MILESTONE_SCORECARD.md`.
+- Any public, marketing, or README claim must be traceable to a green test or a
+  supported row in this matrix or `docs/SUPPORT_MATRIX.md`.
 - When a gap is closed, move it from "Current limits"/"Exclusions" into the
-  capability snapshot in `docs/FUNDERS.md` with a verification command.
+  supported capability snapshot in `docs/SUPPORT_MATRIX.md` with a
+  verification command.

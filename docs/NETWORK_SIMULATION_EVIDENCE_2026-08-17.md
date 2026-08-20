@@ -39,7 +39,7 @@ behavior. These tests validate planners and boundaries; they do not measure
 packet delivery.
 
 The 35.24%, 3.19%, and 100% delivery figures must therefore remain
-**unverified**, and “flawless” must not be used in release or funding
+**unverified**, and “flawless” must not be used in release or public
 materials.
 
 ## 2. Post-quantum handshake latency

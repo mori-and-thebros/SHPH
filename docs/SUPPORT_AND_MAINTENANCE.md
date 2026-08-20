@@ -1,6 +1,6 @@
 # SHPH Support Model & Maintenance Plan
 
-How SHPH is supported and maintained, for funders and adopters evaluating
+How SHPH is supported and maintained for adopters and contributors evaluating
 long-term viability.
 
 ## Support tiers
@@ -12,8 +12,8 @@ long-term viability.
 | Maintainer | core `SHPH Team` | maintainer coordination | owns merges, releases, policy |
 
 SHPH is currently a **community-supported, best-effort** project. There is no
-paid 24/7 support or uptime guarantee. Funders evaluating support should treat
-the `SECURITY.md` disclosure SLA as the firmest commitment.
+paid 24/7 support or uptime guarantee. Operators should treat the `SECURITY.md`
+disclosure SLA as the firmest commitment.
 
 The product support boundary is maintained in `docs/SUPPORT_MATRIX.md`.
 Experimental transports are intentionally excluded from the release profile,
@@ -55,23 +55,23 @@ and a host-gated result is not treated as a supported deployment.
 - **Maintainers (`SHPH Team`)** approve merges/releases, own security disclosure,
   and update this plan. Decision style: transparent, minimal-scope, honest
   capability claims (see `CONTRIBUTING.md`).
-- **Contributors** follow the PR flow in `CONTRIBUTING.md` and the phase-gating
-  discipline in `docs/MILESTONE_SCORECARD.md`.
+- **Contributors** follow the PR flow in `CONTRIBUTING.md` and the validation
+  discipline in `docs/RELEASE_READINESS.md`.
 
-### Phase-gating (governs what "done" means)
+### Validation (governs what "done" means)
 
-Progress is phase-gated; a phase advances only when its acceptance criteria and
-evidence are satisfied and mirrored. See `docs/MILESTONE_SCORECARD.md` for the
-binding definition of "complete" and the current burn-down.
+Work is considered complete only when the relevant acceptance criteria and
+evidence are satisfied. See `docs/RELEASE_READINESS.md` for the engineering
+definition of release readiness.
 
 ### Backwards compatibility
 
 SHPH is pre-1.0 (`0.1.0`). Breaking changes are allowed but must be documented
 in release notes. Config/command surfaces should change conservatively.
 
-### Sustainability signals for funders
+### Sustainability signals
 
-- All claims are test-backed and reproducible (`docs/MILESTONE_SCORECARD.md`).
+- All claims are test-backed and reproducible (`docs/RELEASE_READINESS.md`).
 - Public disclosure + maintenance process exists (`SECURITY.md`, this doc).
 - Reproducible, locked builds (`docs/REPRODUCIBILITY.md`).
 - Two-tree mirror with parity verification (`docs/SYNC.md`).

@@ -93,6 +93,10 @@ pub struct ControlPlaneConfig {
     pub interface_cidr: Option<String>,
     pub apply_routes: Option<bool>,
     pub route_cidrs: Option<Vec<String>>,
+    /// Routes that must remain on the original network underlay while a
+    /// SOCKS-backed session installs a default route through SHPH.
+    #[serde(default)]
+    pub underlay_bypass_cidrs: Option<Vec<String>>,
     pub apply_dns: Option<bool>,
     pub dns_servers: Option<Vec<String>>,
     pub dry_run: Option<bool>,
@@ -470,6 +474,7 @@ peers = []
 [control_plane]
 apply_routes = true
 route_cidrs = ["10.10.0.0/16", "172.20.0.0/16"]
+underlay_bypass_cidrs = ["198.51.100.10/32"]
 apply_dns = true
 dns_servers = ["1.1.1.1", "9.9.9.9"]
 dry_run = true
@@ -506,6 +511,10 @@ max_delay_ms = 2000
                 "10.10.0.0/16".to_string(),
                 "172.20.0.0/16".to_string()
             ])
+        );
+        assert_eq!(
+            cp.underlay_bypass_cidrs,
+            Some(vec!["198.51.100.10/32".to_string()])
         );
         assert_eq!(cp.apply_dns, Some(true));
         assert_eq!(

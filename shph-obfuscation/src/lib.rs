@@ -9,7 +9,7 @@ use shph_core::{Result, ShphError, ShroudProfile, StealthProfile};
 use std::str::FromStr;
 
 const PROFILE_MAGIC: &[u8; 4] = b"SPAD";
-const PROFILE_HEADER_BYTES: usize = 7;
+pub const PROFILE_HEADER_BYTES: usize = 7;
 const LOW_JITTER_BYTES: usize = 7;
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +83,12 @@ impl ProfileTier {
             }
             Self::Medium | Self::High => self.base_tiers().contains(&len),
         }
+    }
+
+    /// Maximum application payload that fits in this profile's largest
+    /// canonical frame after the profile envelope header.
+    pub const fn max_payload_bytes(self) -> usize {
+        self.base_tiers()[self.base_tiers().len() - 1].saturating_sub(PROFILE_HEADER_BYTES)
     }
 }
 
@@ -193,6 +199,13 @@ mod tests {
             &[128, 256, 512, 1024, 1360]
         );
         assert_eq!(ProfileTier::High.base_tiers(), &[512, 1024, 1360]);
+    }
+
+    #[test]
+    fn profile_payload_capacity_accounts_for_the_envelope_header() {
+        assert_eq!(ProfileTier::Low.max_payload_bytes(), 249);
+        assert_eq!(ProfileTier::Medium.max_payload_bytes(), 1353);
+        assert_eq!(ProfileTier::High.max_payload_bytes(), 1353);
     }
 
     #[test]

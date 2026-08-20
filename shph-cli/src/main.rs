@@ -44,7 +44,8 @@ use shph_tun::firewall::{
 #[cfg(target_os = "linux")]
 use shph_tun::AsyncTunDevice;
 use shph_tun::{
-    validate_tun_mtu, validate_tun_name, TunDevice, DEFAULT_TUN_MTU_BYTES, TUN_READ_BUFFER_BYTES,
+    validate_tun_mtu, validate_tun_name, TunDevice, DEFAULT_TUN_MTU_BYTES, MIN_TUN_MTU_BYTES,
+    TUN_READ_BUFFER_BYTES,
 };
 #[cfg(target_os = "windows")]
 use shph_tun::{WindowsFirewallTransport, WindowsKillswitchGuard};
@@ -62,6 +63,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{future::Future, net::SocketAddr};
 use zeroize::Zeroize;
 
+use shph_obfuscation::ProfileTier;
 use ticket::{render_qr, JoinTicket};
 
 const MAX_STDIN_LINE_BYTES: usize = 64 * 1024;
@@ -1489,8 +1491,20 @@ fn handle_up(
     if killswitch {
         killswitch_guard.allow_interface(tun.name())?;
     }
+    let native_tun_mtu = if tun.is_native() {
+        match native_tun_mtu_for_shroud_profile(&shroud_profile) {
+            Ok(mtu) => mtu,
+            Err(error) => {
+                let _ = killswitch_guard.cleanup();
+                return Err(error);
+            }
+        }
+    } else {
+        DEFAULT_TUN_MTU_BYTES
+    };
     if tun.is_native() {
-        configure_native_tun_mtu(tun.name(), DEFAULT_TUN_MTU_BYTES)?;
+        configure_native_tun_mtu(tun.name(), native_tun_mtu)?;
+        configure_native_tun_route_priority(tun.name())?;
     }
     let mut nat_guard = if nat && tun.is_native() {
         match apply_nat(tun.name(), killswitch_dry_run) {
@@ -1507,7 +1521,7 @@ fn handle_up(
         NatGuard::default()
     };
     let mut mss_guard = if mss_clamp {
-        match apply_mss_clamp(tun.name(), killswitch_dry_run) {
+        match apply_mss_clamp(tun.name(), native_tun_mtu, killswitch_dry_run) {
             Ok(guard) => guard,
             Err(error) => {
                 let _ = killswitch_guard.cleanup();
@@ -2530,6 +2544,8 @@ struct PersistedControlPlaneState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     interface_cidr: Option<String>,
     routes: Vec<String>,
+    #[serde(default)]
+    underlay_bypass_routes: Vec<String>,
     dns_servers: Vec<String>,
 }
 
@@ -2710,6 +2726,7 @@ fn state_from_guard(interface_name: &str, guard: &ControlPlaneGuard) -> Persiste
             .iter()
             .map(|(route, _)| route.clone())
             .collect(),
+        underlay_bypass_routes: guard.added_underlay_bypass_routes.clone(),
         dns_servers: guard.applied_dns_servers.clone(),
     }
 }
@@ -2725,6 +2742,7 @@ fn guard_from_state(state: &PersistedControlPlaneState) -> ControlPlaneGuard {
             .iter()
             .map(|route| (route.clone(), state.interface_name.clone()))
             .collect(),
+        added_underlay_bypass_routes: state.underlay_bypass_routes.clone(),
         applied_dns_servers: state.dns_servers.clone(),
         dns_interface_name: (!state.dns_servers.is_empty()).then(|| state.interface_name.clone()),
         dry_run: false,
@@ -2749,6 +2767,7 @@ fn handle_control_plane_apply(config_path: &Path) -> Result<()> {
         interface_name: interface_name.to_string(),
         interface_cidr: plan.interface_cidr.clone(),
         routes: plan.routes.clone(),
+        underlay_bypass_routes: plan.underlay_bypass_routes.clone(),
         dns_servers: plan.dns_servers.clone(),
     };
 
@@ -4084,12 +4103,24 @@ fn print_control_plane_status(config: &Config) {
         let interface_cidr = control.interface_cidr.as_deref().unwrap_or("none");
         let dry_run = control.dry_run.unwrap_or(true);
         let routes = control.route_cidrs.as_ref().map_or(0, |v| v.len());
+        let bypass_routes = control
+            .underlay_bypass_cidrs
+            .as_ref()
+            .map_or(0, |v| v.len());
         let dns = control.dns_servers.as_ref().map_or(0, |v| v.len());
         let apply_routes = control.apply_routes.unwrap_or(false);
         let apply_dns = control.apply_dns.unwrap_or(false);
         println!(
-            "  Control plane: address={}({}), routes={}({}), dns={}({}), dry_run={}",
-            apply_address, interface_cidr, apply_routes, routes, apply_dns, dns, dry_run
+            "  Control plane: address={}({}), routes={}({}), dns={}({}), dry_run={}, bypass={}({})",
+            apply_address,
+            interface_cidr,
+            apply_routes,
+            routes,
+            apply_dns,
+            dns,
+            dry_run,
+            apply_routes,
+            bypass_routes
         );
     }
 }
@@ -4112,6 +4143,20 @@ fn apply_control_plane(config: &Config, interface_name: &str) -> Result<ControlP
     };
 
     let apply_result = (|| -> Result<()> {
+        for route in &plan.underlay_bypass_routes {
+            if dry_run {
+                println!("  [dry-run] underlay bypass add {route}");
+            } else {
+                let added = add_underlay_bypass_route(route)?;
+                if added {
+                    guard.added_underlay_bypass_routes.push(route.clone());
+                    println!("  underlay bypass add {route}");
+                } else {
+                    println!("  underlay bypass reuse {route}");
+                }
+            }
+        }
+
         if let Some(interface_cidr) = &plan.interface_cidr {
             if dry_run {
                 println!("  [dry-run] address add {interface_cidr}");
@@ -4172,6 +4217,31 @@ fn configure_native_tun_mtu(interface_name: &str, mtu: usize) -> Result<()> {
         run_shell_command(command)?;
     }
     println!("  native TUN MTU: {mtu}");
+    Ok(())
+}
+
+fn native_tun_mtu_for_shroud_profile(shroud_profile: &str) -> Result<usize> {
+    let Some(profile) = parse_shroud_profile_name(shroud_profile)? else {
+        return Ok(DEFAULT_TUN_MTU_BYTES);
+    };
+    let tier = ProfileTier::from_shroud_profile(profile);
+    let mtu = tier.max_payload_bytes().min(DEFAULT_TUN_MTU_BYTES);
+    if mtu < MIN_TUN_MTU_BYTES {
+        return Err(ShphError::Config(format!(
+            "native TUN is incompatible with Shroud profile '{shroud_profile}': \
+             maximum profiled payload is {mtu} bytes; use medium/high or disable Shroud"
+        )));
+    }
+    Ok(mtu)
+}
+
+fn configure_native_tun_route_priority(interface_name: &str) -> Result<()> {
+    if !cfg!(target_os = "windows") {
+        return Ok(());
+    }
+    let command = build_tun_route_priority_command(interface_name)?;
+    run_shell_command(&command)?;
+    println!("  native TUN route priority: interface metric=1");
     Ok(())
 }
 
@@ -4451,10 +4521,10 @@ fn apply_linux_firewall_plan(
     }
 }
 
-fn apply_mss_clamp(interface_name: &str, dry_run: bool) -> Result<FirewallGuard> {
+fn apply_mss_clamp(interface_name: &str, mtu: usize, dry_run: bool) -> Result<FirewallGuard> {
     #[cfg(target_os = "linux")]
     {
-        let commands = build_linux_mss_clamp_commands(interface_name, DEFAULT_TUN_MTU_BYTES)?;
+        let commands = build_linux_mss_clamp_commands(interface_name, mtu)?;
         apply_linux_firewall_plan(
             "MSS clamp",
             commands,
@@ -4465,7 +4535,7 @@ fn apply_mss_clamp(interface_name: &str, dry_run: bool) -> Result<FirewallGuard>
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (interface_name, dry_run);
+        let _ = (interface_name, mtu, dry_run);
         Err(ShphError::Unsupported(
             "MSS clamping is currently implemented with Linux nftables only; Windows WFP packet rewriting is not available in this build".into(),
         ))
@@ -4473,7 +4543,7 @@ fn apply_mss_clamp(interface_name: &str, dry_run: bool) -> Result<FirewallGuard>
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = (interface_name, dry_run);
+        let _ = (interface_name, mtu, dry_run);
         Err(ShphError::Unsupported(
             "MSS clamping unsupported on this platform".into(),
         ))
@@ -4631,12 +4701,43 @@ fn build_tun_mtu_commands(interface_name: &str, mtu: usize) -> Result<Vec<Vec<St
     ))
 }
 
+fn build_tun_route_priority_command(interface_name: &str) -> Result<Vec<String>> {
+    validate_tun_name(interface_name)?;
+
+    if cfg!(target_os = "windows") {
+        let script = format!(
+            "$name = '{interface_name}'; \
+             $interfaces = @(Get-NetIPInterface -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction Stop); \
+             if ($interfaces.Count -eq 0) {{ throw \"native TUN interface not found: $name\" }}; \
+             $interfaces | Set-NetIPInterface -InterfaceMetric 1 -PolicyStore ActiveStore -ErrorAction Stop",
+        );
+        return Ok(vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-Command".into(),
+            script,
+        ]);
+    }
+
+    if cfg!(target_os = "linux") {
+        return Ok(Vec::new());
+    }
+
+    Err(ShphError::Unsupported(
+        "native TUN route priority configuration unsupported on this platform".into(),
+    ))
+}
+
 /// Fully-validated, normalized description of what the control plane would do.
 /// Built by preflight validation before any host mutation.
 #[derive(Debug, Clone, Default)]
 struct ControlPlanePlan {
     interface_cidr: Option<String>,
     routes: Vec<String>,
+    underlay_bypass_routes: Vec<String>,
     apply_dns: bool,
     dns_servers: Vec<String>,
 }
@@ -4663,6 +4764,10 @@ fn build_control_plane_plan(
         for route in control.route_cidrs.as_deref().unwrap_or(&[]) {
             validate_cidr(route)?;
             plan.routes.push(route.to_string());
+        }
+        for route in control.underlay_bypass_cidrs.as_deref().unwrap_or(&[]) {
+            validate_underlay_bypass_cidr(route)?;
+            plan.underlay_bypass_routes.push(route.to_string());
         }
     }
 
@@ -4691,9 +4796,9 @@ fn validate_control_plane_underlay(config: &Config, plan: &ControlPlanePlan) -> 
         .and_then(|session| session.underlay.as_deref())
         .is_some_and(|underlay| underlay.starts_with("socks5://"));
 
-    if has_default_route && socks_underlay {
+    if has_default_route && socks_underlay && plan.underlay_bypass_routes.is_empty() {
         return Err(ShphError::Config(
-            "refusing a default route while a SOCKS5 underlay is configured; add an explicit underlay bypass route before enabling full-tunnel routing".into(),
+            "refusing a default route while a SOCKS5 underlay is configured; add the resolved proxy endpoint to control_plane.underlay_bypass_cidrs before enabling full-tunnel routing".into(),
         ));
     }
     Ok(())
@@ -4701,6 +4806,22 @@ fn validate_control_plane_underlay(config: &Config, plan: &ControlPlanePlan) -> 
 
 fn validate_cidr(cidr: &str) -> Result<()> {
     parse_cidr(cidr)?;
+    Ok(())
+}
+
+fn validate_underlay_bypass_cidr(cidr: &str) -> Result<()> {
+    let (ip_addr, prefix) = parse_cidr(cidr)?;
+    let expected_prefix = if ip_addr.is_ipv4() { 32 } else { 128 };
+    if prefix != expected_prefix {
+        return Err(ShphError::Config(format!(
+            "underlay bypass must be a single-host route ({cidr})"
+        )));
+    }
+    if ip_addr.is_unspecified() || ip_addr.is_loopback() || ip_addr.is_multicast() {
+        return Err(ShphError::Config(format!(
+            "underlay bypass must use a unicast, non-loopback address ({cidr})"
+        )));
+    }
     Ok(())
 }
 
@@ -4752,6 +4873,7 @@ fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8)> {
 struct ControlPlaneGuard {
     interface_cidr: Option<(String, String)>,
     added_routes: Vec<(String, String)>,
+    added_underlay_bypass_routes: Vec<String>,
     applied_dns_servers: Vec<String>,
     dns_interface_name: Option<String>,
     /// Recorded for diagnostics/tests; not used by the live apply path.
@@ -4784,6 +4906,14 @@ impl ControlPlaneGuard {
             }
         }
 
+        while let Some(route) = self.added_underlay_bypass_routes.pop() {
+            if let Err(err) = delete_underlay_bypass_route(&route) {
+                rollback_errors.push(err);
+            } else {
+                println!("  underlay bypass del {route}");
+            }
+        }
+
         if let Some((interface_cidr, interface_name)) = self.interface_cidr.take() {
             if let Err(err) = delete_interface_address(&interface_cidr, &interface_name) {
                 rollback_errors.push(err);
@@ -4806,6 +4936,19 @@ fn add_route(cidr: &str, interface_name: &str) -> Result<()> {
 
 fn delete_route(cidr: &str, interface_name: &str) -> Result<()> {
     let command = build_route_delete_command(cidr, interface_name)?;
+    run_shell_command(&command)
+}
+
+fn add_underlay_bypass_route(cidr: &str) -> Result<bool> {
+    let command = build_underlay_bypass_route_add_command(cidr)?;
+    let output = run_shell_command_capture(&command)?;
+    Ok(!output
+        .lines()
+        .any(|line| line.trim() == "SHPH_UNDERLAY_BYPASS_REUSED"))
+}
+
+fn delete_underlay_bypass_route(cidr: &str) -> Result<()> {
+    let command = build_underlay_bypass_route_delete_command(cidr)?;
     run_shell_command(&command)
 }
 
@@ -5059,6 +5202,7 @@ fn build_route_add_command(cidr: &str, interface_name: &str) -> Result<Vec<Strin
             format!("prefix={cidr}"),
             format!("interface={interface_name}"),
             format!("nexthop={nexthop}"),
+            "metric=1".to_string(),
             "store=active".to_string(),
         ])
     } else {
@@ -5098,6 +5242,126 @@ fn build_route_delete_command(cidr: &str, interface_name: &str) -> Result<Vec<St
             "route delete unsupported on this platform".into(),
         ))
     }
+}
+
+fn build_underlay_bypass_route_add_command(cidr: &str) -> Result<Vec<String>> {
+    let (ip_addr, _) = parse_cidr(cidr)?;
+    validate_underlay_bypass_cidr(cidr)?;
+
+    if cfg!(target_os = "linux") {
+        let route_family = if ip_addr.is_ipv6() { "-6" } else { "-4" };
+        let probe = if ip_addr.is_ipv6() {
+            "2606:4700:4700::1111"
+        } else {
+            "1.1.1.1"
+        };
+        let script = format!(
+            r#"set -eu
+target='{cidr}'
+route="$(ip {route_family} route get {probe})"
+dev="$(printf '%s\n' "$route" | awk '{{for (i = 1; i <= NF; i++) if ($i == "dev") {{print $(i + 1); exit}}}}')"
+via="$(printf '%s\n' "$route" | awk '{{for (i = 1; i <= NF; i++) if ($i == "via") {{print $(i + 1); exit}}}}')"
+if [ -z "$dev" ]; then
+    echo "unable to determine the active underlay interface" >&2
+    exit 1
+fi
+existing="$(ip {route_family} route show "$target" 2>/dev/null || true)"
+if [ -n "$existing" ]; then
+    existing_dev="$(printf '%s\n' "$existing" | awk '{{for (i = 1; i <= NF; i++) if ($i == "dev") {{print $(i + 1); exit}}}}')"
+    existing_via="$(printf '%s\n' "$existing" | awk '{{for (i = 1; i <= NF; i++) if ($i == "via") {{print $(i + 1); exit}}}}')"
+    if [ "$existing_dev" = "$dev" ] && [ "$existing_via" = "$via" ]; then
+        printf '%s\n' 'SHPH_UNDERLAY_BYPASS_REUSED'
+        exit 0
+    fi
+    echo "underlay bypass route conflicts with the active underlay: $target" >&2
+    exit 2
+fi
+if [ -n "$via" ]; then
+    ip {route_family} route add "$target" via "$via" dev "$dev"
+else
+    ip {route_family} route add "$target" dev "$dev"
+fi"#,
+        );
+        return Ok(vec!["sh".into(), "-c".into(), script]);
+    }
+
+    if cfg!(target_os = "windows") {
+        let family = if ip_addr.is_ipv6() { "IPv6" } else { "IPv4" };
+        let default_prefix = if ip_addr.is_ipv6() {
+            "::/0"
+        } else {
+            "0.0.0.0/0"
+        };
+        let invalid_next_hop = if ip_addr.is_ipv6() { "::" } else { "0.0.0.0" };
+        let script = format!(
+            "$prefix = '{cidr}'; \
+             $default = Get-NetRoute -DestinationPrefix '{default_prefix}' -AddressFamily {family} -ErrorAction SilentlyContinue \
+               | Where-Object {{ $_.NextHop -and $_.NextHop -ne '{invalid_next_hop}' }} \
+               | Sort-Object RouteMetric,InterfaceMetric \
+               | Select-Object -First 1; \
+             if ($null -eq $default) {{ throw 'unable to determine the active underlay route' }}; \
+             $existing = @(Get-NetRoute -DestinationPrefix $prefix -AddressFamily {family} -ErrorAction SilentlyContinue); \
+             if ($existing.Count -gt 0) {{ \
+               $matching = @($existing | Where-Object {{ $_.InterfaceIndex -eq $default.InterfaceIndex -and $_.NextHop -eq $default.NextHop }}); \
+               if ($matching.Count -gt 0) {{ Write-Output 'SHPH_UNDERLAY_BYPASS_REUSED'; exit 0 }}; \
+               throw \"underlay bypass route conflicts with the active underlay: $prefix\" \
+             }}; \
+             New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $default.InterfaceIndex -NextHop $default.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null",
+        );
+        return Ok(vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-Command".into(),
+            script,
+        ]);
+    }
+
+    Err(ShphError::Unsupported(
+        "underlay bypass route apply unsupported on this platform".into(),
+    ))
+}
+
+fn build_underlay_bypass_route_delete_command(cidr: &str) -> Result<Vec<String>> {
+    let (ip_addr, _) = parse_cidr(cidr)?;
+    validate_underlay_bypass_cidr(cidr)?;
+
+    if cfg!(target_os = "linux") {
+        let route_family = if ip_addr.is_ipv6() { "-6" } else { "-4" };
+        return Ok(vec![
+            "ip".into(),
+            route_family.into(),
+            "route".into(),
+            "del".into(),
+            cidr.into(),
+        ]);
+    }
+
+    if cfg!(target_os = "windows") {
+        let family = if ip_addr.is_ipv6() { "IPv6" } else { "IPv4" };
+        let script = format!(
+            "$prefix = '{cidr}'; \
+             $routes = @(Get-NetRoute -DestinationPrefix $prefix -AddressFamily {family} -ErrorAction SilentlyContinue \
+               | Where-Object {{ $_.PolicyStore -eq 'ActiveStore' }}); \
+             if ($routes.Count -eq 0) {{ exit 0 }}; \
+             $routes | Remove-NetRoute -Confirm:$false -ErrorAction Stop",
+        );
+        return Ok(vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-Command".into(),
+            script,
+        ]);
+    }
+
+    Err(ShphError::Unsupported(
+        "underlay bypass route delete unsupported on this platform".into(),
+    ))
 }
 
 fn build_dns_restore_command(interface_name: &str, family: &str) -> Result<Vec<String>> {
@@ -5165,9 +5429,51 @@ fn run_shell_command(command: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(test))]
+fn run_shell_command_capture(command: &[String]) -> Result<String> {
+    if command.is_empty() {
+        return Err(ShphError::InvalidArgument("empty command".into()));
+    }
+    let output = Command::new(&command[0]).args(&command[1..]).output();
+    let output = match output {
+        Ok(output) => output,
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            return Err(ShphError::PermissionDenied(format!(
+                "failed to run {:?}: {}",
+                command, err
+            )));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(ShphError::Unsupported(format!(
+                "required command not found: {}",
+                command[0]
+            )));
+        }
+        Err(err) => return Err(ShphError::Io(err)),
+    };
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        };
+        return Err(ShphError::Internal(format!(
+            "command failed with status {}{suffix}: {:?}",
+            output.status, command
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(test)]
 fn run_shell_command(_command: &[String]) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+fn run_shell_command_capture(_command: &[String]) -> Result<String> {
+    Ok(String::new())
 }
 
 fn reconnect_delay_with_jitter(base_delay_ms: u64) -> u64 {
@@ -6240,16 +6546,17 @@ mod tests {
         advertised_endpoint, apply_control_plane, build_control_plane_plan,
         build_dns_apply_command, build_dns_apply_commands, build_dns_restore_command,
         build_interface_address_add_command, build_interface_address_delete_command,
-        build_route_add_command, build_route_delete_command, build_tun_mtu_commands, cli_exit_code,
-        control_plane_state_path, enforce_peer_policy, handle_up, load_control_plane_state,
-        parse_shroud_profile_name, phase_a1_now_ms, read_ticket_source,
-        reconnect_delay_with_jitter, render_config_for_display, resolve_killswitch_peers,
-        resolve_shroud_profile, run_with_reconnect, save_control_plane_state,
-        transport_mode_to_str, validate_cidr, validate_control_plane_underlay,
-        validate_transport_peer, CliErrorOutput, ControlPlaneGuard, ControlPlanePlan,
-        HandshakeState, KeyStore, KeyStoreConfig, PersistedControlPlaneState, TcpUnderlay,
-        TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES, EXIT_CONFIG, EXIT_PERMISSION,
-        EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
+        build_route_add_command, build_route_delete_command, build_tun_mtu_commands,
+        build_tun_route_priority_command, build_underlay_bypass_route_add_command,
+        build_underlay_bypass_route_delete_command, cli_exit_code, control_plane_state_path,
+        enforce_peer_policy, handle_up, load_control_plane_state, parse_shroud_profile_name,
+        phase_a1_now_ms, read_ticket_source, reconnect_delay_with_jitter,
+        render_config_for_display, resolve_killswitch_peers, resolve_shroud_profile,
+        run_with_reconnect, save_control_plane_state, transport_mode_to_str, validate_cidr,
+        validate_control_plane_underlay, validate_transport_peer, CliErrorOutput,
+        ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore, KeyStoreConfig,
+        PersistedControlPlaneState, TcpUnderlay, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES,
+        EXIT_CONFIG, EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
     use shph_config::{
@@ -6525,6 +6832,7 @@ mod tests {
             interface_name: "shph0".into(),
             interface_cidr: None,
             routes: vec!["10.20.0.0/16".into()],
+            underlay_bypass_routes: Vec::new(),
             dns_servers: Vec::new(),
         };
         save_control_plane_state(&config_path, &state).expect("save stale state");
@@ -6815,6 +7123,8 @@ mod tests {
         assert!(!add_cmd.is_empty());
         if cfg!(target_os = "linux") {
             assert_eq!(add_cmd[2], "add");
+        } else if cfg!(target_os = "windows") {
+            assert!(add_cmd.contains(&"metric=1".to_string()));
         }
         let del_cmd =
             build_route_delete_command("10.12.0.0/16", "shph0").expect("route del command");
@@ -6825,6 +7135,22 @@ mod tests {
             assert!(del_cmd.ends_with(&["dev".to_string(), "shph0".to_string()]));
         }
         assert!(build_route_add_command("10.12.0.0/64", "shph0").is_err());
+    }
+
+    #[test]
+    fn underlay_bypass_route_builders_are_bounded() {
+        let add_cmd = build_underlay_bypass_route_add_command("104.16.230.132/32")
+            .expect("underlay bypass add command");
+        let del_cmd = build_underlay_bypass_route_delete_command("104.16.230.132/32")
+            .expect("underlay bypass delete command");
+        assert!(!add_cmd.is_empty());
+        assert!(!del_cmd.is_empty());
+        assert!(add_cmd.iter().all(|part| !part.contains('\0')));
+        assert!(del_cmd.iter().all(|part| !part.contains('\0')));
+        assert!(build_underlay_bypass_route_add_command("not-a-cidr").is_err());
+        assert!(build_underlay_bypass_route_delete_command("10.0.0.0/33").is_err());
+        assert!(build_underlay_bypass_route_add_command("10.0.0.0/24").is_err());
+        assert!(build_underlay_bypass_route_add_command("127.0.0.1/32").is_err());
     }
 
     #[test]
@@ -6842,6 +7168,21 @@ mod tests {
         }
         assert!(build_tun_mtu_commands("", DEFAULT_TUN_MTU_BYTES).is_err());
         assert!(build_tun_mtu_commands("shph0", 575).is_err());
+    }
+
+    #[test]
+    fn tun_route_priority_command_builder_is_bounded() {
+        let command =
+            build_tun_route_priority_command("shph0").expect("TUN route priority command");
+        if cfg!(target_os = "windows") {
+            assert!(command.contains(&"powershell.exe".to_string()));
+            assert!(command
+                .iter()
+                .any(|part| part.contains("InterfaceMetric 1")));
+        } else {
+            assert!(command.is_empty());
+        }
+        assert!(build_tun_route_priority_command("").is_err());
     }
 
     #[cfg(unix)]
@@ -6984,6 +7325,7 @@ mod tests {
                 interface_cidr: None,
                 apply_routes: Some(true),
                 route_cidrs: Some(vec!["10.20.0.0/16".to_string()]),
+                underlay_bypass_cidrs: None,
                 apply_dns: Some(true),
                 dns_servers: Some(vec!["1.1.1.1".to_string()]),
                 dry_run: Some(true),
@@ -7003,6 +7345,7 @@ mod tests {
                 interface_cidr: None,
                 apply_routes: Some(false),
                 route_cidrs: None,
+                underlay_bypass_cidrs: None,
                 apply_dns: Some(true),
                 dns_servers: Some(vec!["bad_dns".to_string()]),
                 dry_run: Some(true),
@@ -7020,6 +7363,7 @@ mod tests {
             interface_cidr: None,
             apply_routes: Some(true),
             route_cidrs: Some(vec!["10.20.0.0/16".to_string(), "10.30.0.0/40".to_string()]),
+            underlay_bypass_cidrs: None,
             apply_dns: Some(true),
             dns_servers: Some(vec!["1.1.1.1".to_string()]),
             dry_run: Some(false),
@@ -7037,6 +7381,7 @@ mod tests {
                 "10.20.0.0/16".to_string(),
                 "2001:db8::/32".to_string(),
             ]),
+            underlay_bypass_cidrs: None,
             apply_dns: Some(true),
             dns_servers: Some(vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]),
             dry_run: Some(true),
@@ -7054,6 +7399,7 @@ mod tests {
             interface_cidr: None,
             apply_routes: Some(true),
             route_cidrs: Some(vec!["10.20.0.0/16".to_string()]),
+            underlay_bypass_cidrs: None,
             apply_dns: None,
             dns_servers: None,
             dry_run: Some(true),
@@ -7069,6 +7415,7 @@ mod tests {
             interface_cidr: None,
             apply_routes: Some(false),
             route_cidrs: None,
+            underlay_bypass_cidrs: None,
             apply_dns: Some(true),
             dns_servers: Some(vec![]),
             dry_run: Some(true),
@@ -7086,6 +7433,7 @@ mod tests {
                 interface_cidr: None,
                 apply_routes: Some(true),
                 route_cidrs: Some(vec!["10.20.0.0/16".to_string()]),
+                underlay_bypass_cidrs: None,
                 apply_dns: Some(false),
                 dns_servers: None,
                 dry_run: Some(true),
@@ -7130,6 +7478,7 @@ mod tests {
             interface_cidr: Some("10.250.0.2/30".into()),
             apply_routes: Some(true),
             route_cidrs: Some(vec!["10.250.0.1/32".into()]),
+            underlay_bypass_cidrs: None,
             apply_dns: Some(false),
             dns_servers: None,
             dry_run: Some(true),
@@ -7160,12 +7509,44 @@ mod tests {
             interface_cidr: Some("10.250.0.2/30".into()),
             apply_routes: Some(true),
             route_cidrs: Some(vec!["0.0.0.0/0".into()]),
+            underlay_bypass_cidrs: None,
             apply_dns: Some(false),
             dns_servers: None,
             dry_run: Some(true),
         };
         let plan = build_control_plane_plan(&control, "shph0").expect("plan");
         assert!(validate_control_plane_underlay(&config, &plan).is_err());
+    }
+
+    #[test]
+    fn default_route_with_socks_underlay_accepts_explicit_bypass() {
+        let config = Config {
+            session: Some(SessionConfig {
+                role: SessionRole::Connect,
+                bind: None,
+                peer: Some("198.51.100.10:443".into()),
+                transport_peer: None,
+                timeout_secs: Some(5),
+                handshake_profile: None,
+                underlay: Some("socks5://127.0.0.1:10808".into()),
+                reconnect: None,
+                startup_payload: None,
+            }),
+            ..Config::default()
+        };
+        let control = ControlPlaneConfig {
+            apply_interface_address: Some(true),
+            interface_cidr: Some("10.250.0.2/30".into()),
+            apply_routes: Some(true),
+            route_cidrs: Some(vec!["0.0.0.0/0".into()]),
+            underlay_bypass_cidrs: Some(vec!["104.16.230.132/32".into()]),
+            apply_dns: Some(false),
+            dns_servers: None,
+            dry_run: Some(true),
+        };
+        let plan = build_control_plane_plan(&control, "shph0").expect("plan");
+        assert!(validate_control_plane_underlay(&config, &plan).is_ok());
+        assert_eq!(plan.underlay_bypass_routes, vec!["104.16.230.132/32"]);
     }
 
     #[test]

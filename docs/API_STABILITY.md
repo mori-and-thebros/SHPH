@@ -1,14 +1,11 @@
 # SHPH API Stability Policy
 
-This is the Phase B.2 "freeze API changes during validation window"
-deliverable from `ROADMAP_OSS_AND_DELIVERY.md`. It defines what counts as the
-SHPH public API, the current stability guarantees, and the rules that hold
-during a **validation window** (the period a checkpoint is under external
-review).
+This document defines what counts as the SHPH public API, the current
+stability guarantees, and the rules that hold during a **validation window**.
 
 ## 1. Current versioning
 
-- Workspace version: `0.6.4-dev` (see root `Cargo.toml`). `v0.4.0` added hybrid
+- Workspace version: `0.6.4-dev.2` (see root `Cargo.toml`). `v0.4.0` added hybrid
   post-quantum key exchange (ML-KEM-768) to the handshake (`shph/4`). The
   unreleased profile work adds the breaking, explicitly separated `shph/5`
   `secure-default` and `classical-lab` protocol identities. `v0.3.0` made the
@@ -21,7 +18,7 @@ review).
 SHPH's public API has three surfaces, with **different** stability tiers:
 
 ### Tier 1 — CLI (`shph` binary)
-- Stable within a checkpoint: the subcommands and their flags
+- Stable within a versioned validation snapshot: the subcommands and their flags
   (`init`, `add-peer`, `list-peers`, `show-public-key`, `show-signing-public-key`,
   `show-config`, `status`, `doctor`, `send-once`, `recv-once`,
   `up`, `listen`, `connect`) and the `--config`, `--transport`, `--text`,
@@ -46,7 +43,7 @@ SHPH's public API has three surfaces, with **different** stability tiers:
 
 ## 3. Validation-window freeze rules
 
-While a checkpoint tag (`checkpoint-phaseX-Y.Y.Z`) is under external review:
+While a versioned validation tag is under review:
 
 1. **No breaking Tier-1 (CLI) or Tier-2 (config) changes.** Additive changes
    are permitted if they do not alter existing behavior.
@@ -54,17 +51,17 @@ While a checkpoint tag (`checkpoint-phaseX-Y.Y.Z`) is under external review:
    `CHANGELOG.md` and a note in this file.
 3. **Bug fixes are allowed**, including security fixes, even if they change
    behavior — but a behavior-changing fix must be called out in the CHANGELOG
-   and, where possible, gated behind a flag for one checkpoint.
+   and, where possible, gated behind a flag for one validation snapshot.
 4. **Dependency bumps** that stay within SemVer-compatible ranges are allowed.
    A major-version bump of a runtime dependency (e.g. `ring`, `tokio`) requires
-   a checkpoint note.
+   a validation note.
 
 ## 4. How to propose a breaking change
 
 1. Open an issue labeled `breaking-change` describing the surface, the reason,
    and the migration path.
-2. If inside a validation window, defer to the next checkpoint.
-3. Record the change in `CHANGELOG.md` under a new `[Phase X.Y]` heading.
+2. If inside a validation window, defer to the next versioned snapshot.
+3. Record the change in `CHANGELOG.md` under the new version heading.
 
 ## 5. Exceptions
 

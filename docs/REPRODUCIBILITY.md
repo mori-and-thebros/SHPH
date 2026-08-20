@@ -1,6 +1,6 @@
 # Dependency & Artifact Reproducibility
 
-SHPH aims for transparent, reproducible builds so funders and reviewers can
+SHPH aims for transparent, reproducible builds so operators and reviewers can
 verify exactly what shipped.
 
 ## Lockfile discipline

@@ -1874,7 +1874,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shph-cli"
-version = "0.6.4-dev"
+version = "0.6.4-dev.2"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "shph-config"
-version = "0.6.4-dev"
+version = "0.6.4-dev.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "shph-core"
-version = "0.6.4-dev"
+version = "0.6.4-dev.2"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1941,7 +1941,7 @@ dependencies = [
 
 [[package]]
 name = "shph-identity"
-version = "0.6.4-dev"
+version = "0.6.4-dev.2"
 dependencies = [
  "base64 0.21.7",
  "hex",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "shph-obfuscation"
-version = "0.6.4-dev"
+version = "0.6.4-dev.2"
 dependencies = [
  "rand 0.8.7",
  "shph-core",
@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "shph-transport"
-version = "0.6.4-dev"
+version = "0.6.4-dev.2"
 dependencies = [
  "base64 0.21.7",
  "bytes",
@@ -1984,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "shph-tui"
-version = "0.6.4-dev"
+version = "0.6.4-dev.2"
 dependencies = [
  "clap",
  "crossterm",
@@ -1995,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "shph-tun"
-version = "0.6.4-dev"
+version = "0.6.4-dev.2"
 dependencies = [
  "libc",
  "sha2",

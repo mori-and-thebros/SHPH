@@ -2556,6 +2556,7 @@ pub struct SecureTcpSession {
     send_cipher: SendCipher,
     recv_cipher: ReceiveCipher,
     padding_profile: Option<ProfileTier>,
+    frame_reader: TcpFrameReader,
 }
 
 impl SecureTcpSession {
@@ -2565,6 +2566,7 @@ impl SecureTcpSession {
             send_cipher: SendCipher::new(send_key),
             recv_cipher: ReceiveCipher::new(recv_key),
             padding_profile: None,
+            frame_reader: TcpFrameReader::default(),
         }
     }
 
@@ -2581,6 +2583,7 @@ impl SecureTcpSession {
         read_encrypted_tcp_frame(
             &mut self.stream,
             &mut self.recv_cipher,
+            &mut self.frame_reader,
             self.padding_profile,
         )
     }
@@ -2605,6 +2608,7 @@ impl SecureTcpSession {
             stream: recv_stream,
             recv_cipher: self.recv_cipher,
             padding_profile: self.padding_profile,
+            frame_reader: self.frame_reader,
         };
         Ok((sender, receiver))
     }
@@ -2631,6 +2635,7 @@ pub struct SecureTcpReceiver {
     stream: TcpStream,
     recv_cipher: ReceiveCipher,
     padding_profile: Option<ProfileTier>,
+    frame_reader: TcpFrameReader,
 }
 
 impl SecureTcpReceiver {
@@ -2638,6 +2643,7 @@ impl SecureTcpReceiver {
         read_encrypted_tcp_frame(
             &mut self.stream,
             &mut self.recv_cipher,
+            &mut self.frame_reader,
             self.padding_profile,
         )
     }
@@ -2674,7 +2680,8 @@ pub fn tcp_secure_receive(
     stream: &mut TcpStream,
     recv_cipher: &mut ReceiveCipher,
 ) -> Result<Vec<u8>> {
-    read_encrypted_tcp_frame(stream, recv_cipher, None)
+    let mut frame_reader = TcpFrameReader::default();
+    read_encrypted_tcp_frame(stream, recv_cipher, &mut frame_reader, None)
 }
 
 /// Receive one encrypted TCP frame and remove its shared discrete padding
@@ -2684,7 +2691,8 @@ pub fn tcp_secure_receive_with_profile(
     recv_cipher: &mut ReceiveCipher,
     profile: ProfileTier,
 ) -> Result<Vec<u8>> {
-    read_encrypted_tcp_frame(stream, recv_cipher, Some(profile))
+    let mut frame_reader = TcpFrameReader::default();
+    read_encrypted_tcp_frame(stream, recv_cipher, &mut frame_reader, Some(profile))
 }
 
 // Experimental QUIC-like shim.
@@ -3156,24 +3164,79 @@ fn validate_tcp_payload(payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Incrementally collects length-prefixed TCP frames without losing bytes
+/// when a polling read times out between segments.
+///
+/// Native TUN loops intentionally use a short read timeout so shutdown can be
+/// observed promptly. `std::io::Read::read_exact` is unsafe for that pattern:
+/// it may consume a partial prefix or ciphertext and then return `TimedOut`,
+/// leaving the next call misaligned. This reader retains all bytes and the
+/// current frame boundary across calls.
+#[derive(Debug, Default)]
+struct TcpFrameReader {
+    wire: Vec<u8>,
+    expected_wire_len: Option<usize>,
+}
+
+impl TcpFrameReader {
+    fn recv_frame(
+        &mut self,
+        stream: &mut TcpStream,
+        cipher: &mut ReceiveCipher,
+        padding_profile: Option<ProfileTier>,
+    ) -> Result<Vec<u8>> {
+        loop {
+            if self.expected_wire_len.is_none() && self.wire.len() >= 4 {
+                let len = u32::from_be_bytes(
+                    self.wire[..4]
+                        .try_into()
+                        .expect("four-byte frame prefix is present"),
+                ) as usize;
+                if len == 0 || len > MAX_FRAME_BYTES {
+                    return Err(ShphError::Protocol("encrypted frame length invalid".into()));
+                }
+                self.expected_wire_len = Some(4 + len);
+            }
+
+            if let Some(expected_wire_len) = self.expected_wire_len {
+                if self.wire.len() >= expected_wire_len {
+                    let ciphertext = self.wire[4..expected_wire_len].to_vec();
+                    self.wire.drain(..expected_wire_len);
+                    self.expected_wire_len = None;
+                    let framed = cipher.decrypt(&ciphertext)?;
+                    return match padding_profile {
+                        Some(profile) => remove_profile(profile, &framed),
+                        None => Ok(framed),
+                    };
+                }
+            }
+
+            let needed = match self.expected_wire_len {
+                Some(expected_wire_len) => expected_wire_len.saturating_sub(self.wire.len()),
+                None => 4usize.saturating_sub(self.wire.len()),
+            };
+            let mut chunk = [0u8; 8192];
+            let read_len = needed.min(chunk.len());
+            let read = match stream.read(&mut chunk[..read_len]) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(map_io_error(error)),
+            };
+            if read == 0 {
+                return Err(ShphError::ConnectionClosed);
+            }
+            self.wire.extend_from_slice(&chunk[..read]);
+        }
+    }
+}
+
 fn read_encrypted_tcp_frame(
     stream: &mut TcpStream,
     cipher: &mut ReceiveCipher,
+    frame_reader: &mut TcpFrameReader,
     padding_profile: Option<ProfileTier>,
 ) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    read_tcp_exact_or_closed(stream, &mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_FRAME_BYTES {
-        return Err(ShphError::Protocol("encrypted frame length invalid".into()));
-    }
-    let mut ciphertext = vec![0u8; len];
-    read_tcp_exact_or_closed(stream, &mut ciphertext)?;
-    let framed = cipher.decrypt(&ciphertext)?;
-    match padding_profile {
-        Some(profile) => remove_profile(profile, &framed),
-        None => Ok(framed),
-    }
+    frame_reader.recv_frame(stream, cipher, padding_profile)
 }
 
 #[cfg(test)]
@@ -3395,10 +3458,6 @@ fn write_tcp_all_or_closed_with_deadline(
         written += n;
     }
     Ok(())
-}
-
-fn read_tcp_exact_or_closed(stream: &mut TcpStream, payload: &mut [u8]) -> Result<()> {
-    stream.read_exact(payload).map_err(map_io_error)
 }
 
 struct OfflineMeshSession {
@@ -4476,6 +4535,43 @@ mod tests {
         )
         .expect("send profiled frame");
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn tcp_frame_reader_preserves_partial_frames_across_poll_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP listener");
+        let address = listener.local_addr().expect("listener address");
+        let mut sender = SendCipher::new([0x43; 32]);
+        let encrypted = sender.encrypt(b"partial-frame").expect("encrypt frame");
+        let mut wire = Vec::with_capacity(4 + encrypted.len());
+        wire.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&encrypted);
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            stream.write_all(&wire[..2]).expect("write partial prefix");
+            thread::sleep(Duration::from_millis(100));
+            stream.write_all(&wire[2..]).expect("write remaining frame");
+        });
+
+        let mut stream = TcpStream::connect(address).expect("connect TCP listener");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(25)))
+            .expect("set polling timeout");
+        let mut reader = super::TcpFrameReader::default();
+        let mut receiver = ReceiveCipher::new([0x43; 32]);
+        assert!(matches!(
+            super::read_encrypted_tcp_frame(&mut stream, &mut receiver, &mut reader, None),
+            Err(ShphError::Timeout)
+        ));
+
+        thread::sleep(Duration::from_millis(125));
+        assert_eq!(
+            super::read_encrypted_tcp_frame(&mut stream, &mut receiver, &mut reader, None)
+                .expect("receive frame after timeout"),
+            b"partial-frame"
+        );
+        server.join().expect("server");
     }
 
     #[test]

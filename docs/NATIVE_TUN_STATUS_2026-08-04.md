@@ -3,7 +3,8 @@
 ## Scope
 
 This note records the Linux native-TUN work in workspace version
-`0.5.0-dev.0` against `research stuff/NATIVE_TUN_IMPLANTATION_SPEC.md`.
+`0.5.0-dev.0` against the native-TUN implementation specification used for
+that development pass.
 It is implementation evidence, not a claim that SHPH is a production VPN or
 that Windows Wintun delivery is complete.
 

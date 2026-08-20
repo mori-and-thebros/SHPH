@@ -10,6 +10,8 @@ apply_interface_address = true
 interface_cidr = "10.250.0.2/30"
 apply_routes = true
 route_cidrs = ["10.250.0.1/32"]
+# Keep the local SOCKS/Quick Tunnel endpoint on the physical underlay.
+underlay_bypass_cidrs = ["203.0.113.10/32"]
 apply_dns = true
 dns_servers = ["1.1.1.1"]
 dry_run = true
@@ -29,6 +31,14 @@ dry_run = true
     *before* any host mutation. If any single entry is invalid, the whole apply
     is rejected and nothing is changed.
 
+`underlay_bypass_cidrs` is an explicit safety control for full-tunnel sessions
+that use a local SOCKS5 underlay. Each listed endpoint route is installed on
+the current physical/default interface before SHPH installs the configured
+default route. On Windows, SHPH discovers the active default gateway and
+interface with the native networking cmdlets; on Linux, it derives them from
+`ip route get`. These routes are persisted with the other control-plane state
+and removed during `undo`, `down`, normal shutdown, or failed apply.
+
 ## Commands
 
 - `shph apply` validates and applies configured routes/DNS. Live applies persist
@@ -46,10 +56,12 @@ route. A typical two-node lab uses `10.250.0.1/30` on the listener and
 endpoint before attempting broader routing.
 
 SHPH refuses a `0.0.0.0/0` or `::/0` route when the session uses a SOCKS5
-underlay. Without an explicit route that keeps the proxy's upstream endpoint
-outside the TUN, the proxy connection can loop back into SHPH and disconnect
-the tunnel. Establish and test that bypass separately before enabling
-full-tunnel routing.
+underlay unless `underlay_bypass_cidrs` is configured. Without an explicit
+route that keeps the proxy's upstream endpoint outside the TUN, the proxy
+connection can loop back into SHPH and disconnect the tunnel. Resolve the
+actual Quick Tunnel/Xray endpoint first, add its address as a `/32` (or `/128`)
+entry, and test the bypass before enabling full-tunnel routing. Keep the list
+current if the endpoint's address changes.
 
 ## Host leak containment
 

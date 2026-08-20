@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.4-dev.2] - 2026-08-20
+
+This developer release contains transport reliability fixes, native-TUN
+hardening, and public documentation cleanup. It remains scoped to controlled
+lab environments.
+
+- Fixed TCP frame-reader desynchronization when polling timeouts split a length
+  prefix or ciphertext.
+- Added bounded incremental TCP frame buffering and regression coverage.
+- Corrected Shroud native-TUN MTU budgeting to account for the profile envelope.
+- Hardened underlay bypass and route-priority handling for controlled full-route
+  tests.
+- Removed maintainer-only planning and publication artifacts from the public
+  tree.
+
 ## [0.6.4-dev] - 2026-08-20
 
 This developer release improves operator workflow around external reachability
@@ -324,7 +339,7 @@ release gates have been completed.
   zeroizing packet buffers and capped the malformed-datagram close budget.
 - Retried interrupted native-TUN syscalls, reported native EOF consistently,
   and wiped rejected packets from caller-provided read buffers.
-- Reconciled README, security, testing, funder, and standards-QUIC docs with
+- Reconciled README, security, testing, project-status, and standards-QUIC docs with
   the implemented Linux native-TUN bridge and its remaining host-evidence
   gates.
 
@@ -487,7 +502,7 @@ or substantial design work and are tracked in `docs/RISK_MATRIX.md`.
 
 All notable changes to SHPH are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) principles, adapted to
-the phase-gated funding roadmap in `ROADMAP_OSS_AND_DELIVERY.md`.
+the project's validation and release workflow.
 
 ## [Phase B.2] — Stability Before Feature Expansion (2026-06-29)
 
@@ -515,8 +530,8 @@ the phase-gated funding roadmap in `ROADMAP_OSS_AND_DELIVERY.md`.
 ## [Hardening] — Crypto data-plane hardening (2026-06-30)
 
 Concrete security hardening of `shph-core/src/crypto.rs`, each with a
-regression test. This is the first increment of the post-funding hardening
-track (Optional/Research), not a funding-gate phase.
+regression test. This is the first increment of the post-baseline hardening
+track (Optional/Research), not a release gate.
 
 ### Security
 - **Anti-replay window correctness:** `ReplayWindow` was a `HashSet` that
@@ -593,7 +608,7 @@ Gates referenced below: `cargo fmt --all -- --check`,
 - `scripts/capture_evidence.sh` — regenerates `docs/evidence/GATE_EVIDENCE.md`
   by running every mandatory gate and summing passed/failed/ignored totals.
 - `docs/evidence/GATE_EVIDENCE.md` — captured acceptance-gate evidence log.
-- `docs/RELEASE_PROCEDURE.md` — funding-checkpoint tagging procedure + manifest.
+- `docs/RELEASE_READINESS.md` — release gates and evidence requirements.
 - `docs/LEGAL_COMPLIANCE.md` — OSS artifact handling legal/compliance checklist.
 
 ### Fixed
@@ -602,12 +617,10 @@ Gates referenced below: `cargo fmt --all -- --check`,
 - Evidence script no longer aborts on a single failing gate; all gates are now
   reported before the script returns.
 
-## [Phase A.5] — Documentation for Funders (2026-06-29)
+## [Documentation and Maintenance] — 2026-06-29
 
 ### Added
-- `docs/FUNDERS.md` — what SHPH is / is-not for grant reviewers.
 - `docs/RISK_MATRIX.md` — severity-rated current limits + explicit exclusions.
-- `docs/MILESTONE_SCORECARD.md` — phase scorecard + reproducible quality signals.
 - `docs/SUPPORT_AND_MAINTENANCE.md` — support tiers, SLA, maintenance cadence.
 
 ## [Phase A.4] — Ops, Packaging, and Trust (2026-06-25)
@@ -615,7 +628,7 @@ Gates referenced below: `cargo fmt --all -- --check`,
 ### Added
 - `LICENSE-MIT`, `LICENSE-APACHE` (match `Cargo.toml` `MIT OR Apache-2.0`).
 - `SECURITY.md` — disclosure process, threat model, non-claims matrix.
-- `CONTRIBUTING.md` — build/test, style, phase-gating, release checklist.
+- `CONTRIBUTING.md` — build/test, style, validation, and release checklist.
 - `.github/workflows/ci.yml` — Linux + Windows fmt/clippy/build/test matrix.
 - `docs/REPRODUCIBILITY.md` — lockfile / `--locked` / `cargo audit` discipline.
 - `scripts/sync_mirror.sh` + `docs/SYNC.md` — rsync mirror tooling with parity checks.
