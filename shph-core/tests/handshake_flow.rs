@@ -109,8 +109,6 @@ fn handshake_rejects_bad_protocol() {
     assert!(result.is_err());
 }
 
-// --- Hybrid post-quantum regression tests ---
-
 #[test]
 fn real_signature_verifies_and_roundtrips() {
     let id = IdentityKeyPair::generate().unwrap();
@@ -203,8 +201,6 @@ fn corrupted_pq_ciphertext_changes_the_bound_kdf_transcript() {
         "the exact PQ ciphertext must be bound into each side's KDF transcript"
     );
 }
-
-// --- Ed25519 handshake authentication regression tests ---
 
 #[test]
 fn forged_signature_is_rejected() {

@@ -142,6 +142,18 @@ pub enum MorphologyProfile {
     LowLatency,
     WebBrowsingLab,
     VideoStreamingLab,
+    /// Large-payload video/application-stream profile.
+    ///
+    /// This profile is intentionally scoped to already-aggregated payloads
+    /// near a 1,472-byte UDP payload budget. It is not a claim that arbitrary
+    /// small video/control messages have low overhead.
+    VideoStreamingLargePayloadLab,
+    /// High-entropy, near-MTU video/application stream profile.
+    ///
+    /// This profile is intentionally scoped to already-aggregated payloads
+    /// near a 1,472-byte UDP payload budget. Its tighter classes increase
+    /// shape diversity without introducing a large padding step.
+    VideoStreamingBalancedPayloadLab,
     BulkLab,
 }
 
@@ -151,6 +163,8 @@ impl MorphologyProfile {
             Self::LowLatency => &[128, 256, 512, 1_024],
             Self::WebBrowsingLab => &[384, 768, 1_024, 1_280, 1_536],
             Self::VideoStreamingLab => &[1_024, 1_280, 1_536, 2_048, 4_096],
+            Self::VideoStreamingLargePayloadLab => &[1_408, 1_440, 1_465],
+            Self::VideoStreamingBalancedPayloadLab => &[1_415, 1_430, 1_445, 1_460, 1_472],
             Self::BulkLab => &[1_280, 2_048, 4_096, 8_192, 16_384],
         }
     }
@@ -163,6 +177,8 @@ impl MorphologyProfile {
             Self::LowLatency => Some(&[65, 25, 8, 2]),
             Self::WebBrowsingLab => Some(&[45, 30, 15, 8, 2]),
             Self::VideoStreamingLab => Some(&[45, 30, 15, 8, 2]),
+            Self::VideoStreamingLargePayloadLab => Some(&[60, 30, 10]),
+            Self::VideoStreamingBalancedPayloadLab => Some(&[35, 30, 20, 12, 3]),
             Self::BulkLab => None,
         }
     }
@@ -172,6 +188,12 @@ impl MorphologyProfile {
             Self::LowLatency => (Duration::ZERO, Duration::from_micros(500)),
             Self::WebBrowsingLab => (Duration::from_micros(100), Duration::from_millis(8)),
             Self::VideoStreamingLab => (Duration::from_micros(50), Duration::from_millis(3)),
+            Self::VideoStreamingLargePayloadLab => {
+                (Duration::from_micros(50), Duration::from_millis(3))
+            }
+            Self::VideoStreamingBalancedPayloadLab => {
+                (Duration::from_micros(50), Duration::from_millis(3))
+            }
             Self::BulkLab => (Duration::ZERO, Duration::from_micros(750)),
         }
     }
@@ -239,6 +261,14 @@ impl MorphologyBatchPolicy {
                 max_wait: Duration::from_millis(10),
             },
             MorphologyProfile::VideoStreamingLab => Self {
+                max_messages: 8,
+                max_wait: Duration::from_millis(20),
+            },
+            MorphologyProfile::VideoStreamingLargePayloadLab => Self {
+                max_messages: 8,
+                max_wait: Duration::from_millis(20),
+            },
+            MorphologyProfile::VideoStreamingBalancedPayloadLab => Self {
                 max_messages: 8,
                 max_wait: Duration::from_millis(20),
             },
@@ -772,6 +802,14 @@ mod tests {
                 MorphologyProfile::VideoStreamingLab,
                 &[1_024, 1_280, 1_536, 2_048, 4_096][..],
             ),
+            (
+                MorphologyProfile::VideoStreamingLargePayloadLab,
+                &[1_408, 1_440, 1_465][..],
+            ),
+            (
+                MorphologyProfile::VideoStreamingBalancedPayloadLab,
+                &[1_415, 1_430, 1_445, 1_460, 1_472][..],
+            ),
         ] {
             let mut engine = MorphologyEngine::from_seed(profile, 7);
             let mut counts = vec![0usize; classes.len()];
@@ -798,6 +836,14 @@ mod tests {
             (
                 MorphologyProfile::VideoStreamingLab,
                 &[1_024, 1_280, 1_472][..],
+            ),
+            (
+                MorphologyProfile::VideoStreamingLargePayloadLab,
+                &[1_408, 1_440, 1_465][..],
+            ),
+            (
+                MorphologyProfile::VideoStreamingBalancedPayloadLab,
+                &[1_415, 1_430, 1_445, 1_460, 1_472][..],
             ),
         ] {
             let mut engine = MorphologyEngine::from_seed(profile, 11);
@@ -877,6 +923,16 @@ mod tests {
         assert_eq!(
             MorphologyBatchPolicy::recommended(MorphologyProfile::VideoStreamingLab),
             MorphologyBatchPolicy::new(8, Duration::from_millis(20)).expect("video policy")
+        );
+        assert_eq!(
+            MorphologyBatchPolicy::recommended(MorphologyProfile::VideoStreamingLargePayloadLab),
+            MorphologyBatchPolicy::new(8, Duration::from_millis(20))
+                .expect("large-payload video policy")
+        );
+        assert_eq!(
+            MorphologyBatchPolicy::recommended(MorphologyProfile::VideoStreamingBalancedPayloadLab),
+            MorphologyBatchPolicy::new(8, Duration::from_millis(20))
+                .expect("balanced-payload video policy")
         );
         assert!(MorphologyBatchPolicy::new(0, Duration::ZERO).is_err());
         assert!(MorphologyBatchPolicy::new(MAX_BATCH_MESSAGES + 1, Duration::ZERO).is_err());
@@ -963,6 +1019,8 @@ mod tests {
             MorphologyProfile::LowLatency,
             MorphologyProfile::WebBrowsingLab,
             MorphologyProfile::VideoStreamingLab,
+            MorphologyProfile::VideoStreamingLargePayloadLab,
+            MorphologyProfile::VideoStreamingBalancedPayloadLab,
             MorphologyProfile::BulkLab,
         ] {
             let mut engine = MorphologyEngine::from_seed(profile, 9);

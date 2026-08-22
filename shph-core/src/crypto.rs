@@ -688,8 +688,6 @@ mod tests {
         assert!(nonce_counter(&bytes).is_err());
     }
 
-    // --- Crypto-hardening regression tests ---
-
     #[test]
     fn replay_window_accepts_monotonic_nonces() {
         let mut w = ReplayWindow::new(128);

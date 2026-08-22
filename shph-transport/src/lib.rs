@@ -1873,7 +1873,6 @@ impl SecureReceiver {
     }
 }
 
-// Backward-compatible TCP API
 pub fn tcp_handshake_client(
     peer: &str,
     local_identity: &IdentityKeyPair,
@@ -4478,7 +4477,7 @@ mod tests {
     use shph_obfuscation::ProfileTier;
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -4904,8 +4903,28 @@ mod tests {
         for _ in 0..6 {
             let mut stream = TcpStream::connect(address).expect("malformed peer connection");
             stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("malformed peer read timeout");
+            stream
                 .write_all(b"not-a-valid-hello\n")
                 .expect("malformed hello");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("malformed peer shutdown");
+            let mut response = [0u8; 1];
+            let received = match stream.read(&mut response) {
+                Ok(bytes) => bytes,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    0
+                }
+                Err(error) => panic!("malformed peer received unexpected I/O error: {error}"),
+            };
+            assert_eq!(received, 0, "malformed peer received a response byte");
         }
 
         let client_address = address.to_string();

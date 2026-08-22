@@ -847,7 +847,7 @@ fn append_signed_part(
 /// responder's PQ public key. Returns the ciphertext bytes the transport must
 /// deliver to the responder as a follow-up handshake message, and stashes the
 /// derived PQ shared secret onto `material` so the subsequent
-/// [`verify_and_derive_with_pq`] call can consume it.
+/// [`verify_and_derive_with_profile`] call can consume it.
 pub fn finalize_initiator_pq(
     local_identity: &IdentityKeyPair,
     material: &mut HandshakeMaterial,

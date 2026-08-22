@@ -4,8 +4,12 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -120,6 +124,90 @@ jobs:
         run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite identity --iterations 2 --frames 2
       - name: Run wire benchmark smoke
         run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite wire --iterations 2 --frames 2
+
+  benchmark-linux:
+    name: Full benchmark campaign (ubuntu-latest)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
+      - name: Build standalone benchmark runner
+        run: cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml --locked
+      - name: Run complete local evidence suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="benchmark-runs/github-ubuntu"
+          mkdir -p "$output"
+          binary="./benchmarks/target/release/shph-benchmarks"
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "runner=ubuntu-latest"
+            echo "rustc=$(rustc +1.96.0 --version)"
+            echo "campaign=all+extended+criterion"
+            echo "scope=GitHub-hosted local benchmark;not Internet or censorship evidence"
+            echo "determinism=synthetic inputs and fixed seeds;OS-randomized padding may vary"
+          } > "$output/metadata.txt"
+          for profile in secure-default classical-lab; do
+            "$binary" --profile "$profile" --suite all --iterations 100 --frames 10000 \
+              > "$output/${profile}-all.csv"
+            "$binary" --profile "$profile" --suite extended --iterations 100 --frames 10000 \
+              > "$output/${profile}-extended.csv"
+          done
+      - name: Run Criterion microbenchmarks
+        run: bash ./scripts/benchmark_criterion.sh ./benchmark-runs/github-ubuntu/criterion
+      - name: Upload Ubuntu benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: shph-benchmarks-ubuntu-${{ github.run_id }}
+          path: benchmark-runs/github-ubuntu
+          if-no-files-found: warn
+          retention-days: 30
+
+  benchmark-windows:
+    name: Full benchmark campaign (windows-latest)
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
+      - name: Build standalone benchmark runner with MSVC
+        run: cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml --target x86_64-pc-windows-msvc --locked
+      - name: Run complete local evidence suites
+        shell: pwsh
+        run: |
+          $binary = (Resolve-Path .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe).Path
+          & .\scripts\benchmark_windows.ps1 `
+            -Binary $binary `
+            -Suite all `
+            -Iterations 100 `
+            -Frames 10000 `
+            -OutputDirectory .\benchmark-runs\github-windows\all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\scripts\benchmark_windows.ps1 `
+            -Binary $binary `
+            -Suite extended `
+            -Iterations 100 `
+            -Frames 10000 `
+            -OutputDirectory .\benchmark-runs\github-windows\extended
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run Criterion microbenchmarks
+        shell: pwsh
+        run: .\scripts\benchmark_criterion.ps1 -OutputDirectory .\benchmark-runs\github-windows\criterion
+      - name: Upload Windows benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: shph-benchmarks-windows-${{ github.run_id }}
+          path: benchmark-runs/github-windows
+          if-no-files-found: warn
+          retention-days: 30
 
   # Separate, clearly-scoped job for the experimental native TUN path on Linux.
   # Native-TUN evidence is a release gate and must not be silently ignored.

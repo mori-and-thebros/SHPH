@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.4-dev.3] - 2026-08-22
+
+This follow-up developer release expands the benchmark and evidence workflow.
+It remains scoped to controlled lab environments and does not claim production
+VPN performance, censorship resistance, or independent security-audit status.
+
+- Added a Criterion microbenchmark harness for hybrid/classical handshakes,
+  AEAD/HKDF, replay and cookie defenses, framing, shared padding profiles,
+  Shroud2 morphology/batching, histogram distance, and identity records.
+- Added GitHub-hosted Linux and Windows full benchmark campaigns for the
+  standalone `all` and `extended` suites plus Criterion reports.
+- Added 30-day CI artifact capture with commit, runner, toolchain, scope, and
+  determinism metadata.
+- Documented the difference between deterministic synthetic inputs,
+  GitHub-hosted measurements, local workstation results, and operator/two-host
+  evidence.
+- Updated the benchmark crate and workspace version to `0.6.4-dev.3`.
+
 ## [0.6.4-dev.2] - 2026-08-20
 
 This developer release contains transport reliability fixes, native-TUN

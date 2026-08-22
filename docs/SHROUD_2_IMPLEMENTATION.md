@@ -15,7 +15,15 @@ to native TUN, but does not turn morphology into a stealth or fallback router.
 ## Implemented
 
 - Explicit morphology profiles for low-latency, web-browsing, video-streaming,
-  and bulk lab comparisons.
+  large-payload video/application streams, and bulk lab comparisons.
+- `VideoStreamingLargePayloadLab` is a separate, opt-in morphology profile for
+  already-aggregated payloads near the 1,472-byte UDP budget. It is intended
+  for MTU-sized video/application chunks; it must not be used to generalize
+  low overhead to small control messages or arbitrary video workloads.
+- `VideoStreamingBalancedPayloadLab` is a separate, opt-in near-MTU profile
+  using tighter 1,415/1,430/1,445/1,460/1,472-byte classes. It is intended to
+  test the tradeoff between low padding cost and higher observed wire-size
+  entropy for already-aggregated video/application chunks.
 - Low-latency, web-browsing, and video-streaming selection prefer the smallest
   fitting profile class with bounded 65/25/8/2, 45/30/15/8/2, and 45/30/15/8/2
   weights respectively. Larger classes remain available for shape diversity
@@ -166,10 +174,10 @@ cargo run --manifest-path benchmarks/Cargo.toml --release --offline -- \
   --profile secure-default --suite shroud --iterations 5000 --frames 100000
 ```
 
-The benchmark emits `shroud2_morphology` rows for all four morphology
+The benchmark emits `shroud2_morphology` rows for all six morphology
 profiles. Each row includes p50/p95/p99/p99.9 latency, allocation/RSS
 observations, and the observed target-size range under a 1,450-byte datagram
-budget. The current workspace version is `0.6.4-dev.2`; benchmark reports must
+budget. The current workspace version is `0.6.4-dev.3`; benchmark reports must
 also record the exact commit, platform, toolchain, and whether the run is
 native Linux or WSL2.
 

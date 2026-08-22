@@ -1,27 +1,28 @@
 # SHPH Quality, Tests, and Benchmark Evidence
 
-This document summarizes the validation available for `v0.6.4-dev.2`.
-It combines the release validation run on the tagged code with the latest
-dated benchmark reports. Measurements are labeled carefully: local benchmark
-results are not Internet throughput, and code-path tests are not independent
-security audits.
+This document summarizes the validation available for the `v0.6.4-dev.3`
+follow-up candidate. The tag and commit attached to the GitHub publication are
+the final provenance record. Measurements are labeled carefully: local and
+GitHub-hosted benchmark results are not Internet throughput, and code-path
+tests are not independent security audits.
 
 ## Release provenance
 
 | Field | Value |
 | --- | --- |
-| Release tag | `v0.6.4-dev.2` |
-| Release commit | `109d0a8` |
-| Validation date | 2026-08-20 |
+| Candidate tag | `v0.6.4-dev.3` |
+| Release commit | See the commit attached to the `v0.6.4-dev.3` tag |
+| Validation date | 2026-08-22 |
 | Primary host | Windows |
 | Rust toolchain | `rustc 1.96.0 (ac68faa20 2026-05-25)` |
 | Main target | `x86_64-pc-windows-msvc` |
 | Additional target | `i686-pc-windows-msvc` |
 | Build mode | locked release/debug validation |
+| Local capture provenance | pre-publication candidate tree; commit recorded in each raw capture |
 
 ## Release validation results
 
-The following gates passed on the release tree:
+The following gates passed on the candidate tree:
 
 | Gate | Result |
 | --- | --- |
@@ -40,6 +41,14 @@ The following gates passed on the release tree:
 The workspace test run executed **297 tests with 0 failures** across the CLI,
 configuration, core cryptography/handshake, identity, obfuscation, transport,
 and TUN crates. The audit scanned 299 locked crate dependencies.
+
+The standalone benchmark crate ran **7 tests with 0 failures**, then completed
+both `secure-default` and explicit benchmark-only `classical-lab` captures for
+the `all` and `extended` suites at 100 latency iterations and 10,000 frames.
+The Criterion harness completed **62 result sets** across six groups:
+crypto, defensive paths, handshakes, framing, Shroud2, and identity records.
+Criterion reported one microbenchmark comparison warning for histogram
+distance; that is a performance-regression signal, not a correctness failure.
 
 The transport regression coverage includes a test for a length-prefixed TCP
 frame split across polling timeouts. The receiver now preserves partial
@@ -82,6 +91,23 @@ These are single-process or in-memory measurements. They are not network
 flood capacity, DDoS protection, line-rate throughput, or a guarantee for a
 different CPU or compiler.
 
+### Candidate capture layers
+
+The candidate capture was executed on Windows 11 with Rust 1.96.0 and the
+release benchmark binary. The raw directories are intentionally ignored from
+Git and are recorded here for provenance:
+
+| Capture | Scope | Result |
+| --- | --- | --- |
+| `benchmark-runs/windows-fullrun-dev3` | `all`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
+| `benchmark-runs/windows-extended-dev3` | `extended`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
+| `benchmark-runs/criterion-windows-dev3` | Criterion, 62 result sets, six groups | PASS |
+
+These are workstation-local engineering measurements. The corresponding
+GitHub-hosted Linux and Windows campaigns are configured in CI and will
+produce separate 30-day artifacts after the follow-up commit is pushed.
+GitHub-hosted values must not be merged with this workstation capture.
+
 ### Local scaling and MTU/loss modeling
 
 The extended campaign in
@@ -103,7 +129,7 @@ not PMTU discovery or real-network loss recovery.
 
 ## What the evidence does prove
 
-- The released workspace compiles with locked dependencies on the tested
+- The candidate workspace compiles with locked dependencies on the tested
   Windows MSVC targets.
 - The exercised cryptographic, identity, framing, replay, transport, CLI,
   configuration, and TUN unit/integration paths pass the recorded tests.

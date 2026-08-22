@@ -35,6 +35,37 @@ cargo fuzz run replay_window -- -max_total_time=60
 cargo fuzz run shroud2_datagram -- -max_total_time=60
 ```
 
+For a pinned Windows campaign, use the repository wrapper after installing
+`cargo-fuzz` and the matching nightly toolchain:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_fuzz_campaign.ps1 `
+  -RunsPerTarget 20000000
+```
+
+The default is five targets times 20,000,000 executions (100,000,000 total).
+The wrapper records one log and one summary row per target. On Windows with
+the MSVC AddressSanitizer runtime, it discovers
+`clang_rt.asan_dynamic-x86_64.dll` under the installed Visual Studio tree and
+adds its directory to the child-process path. The campaign is still
+engineering evidence, not proof that all inputs or deployment environments are
+safe.
+
+If a long campaign is interrupted after one or more targets complete, resume
+it without repeating completed logs:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_fuzz_campaign.ps1 `
+  -RunsPerTarget 20000000 `
+  -OutputDirectory .\benchmark-runs\fuzz-campaign-20260822 `
+  -Resume
+```
+
+Do not use `cargo test --all-targets` as the fuzz-run gate: libFuzzer targets
+are executable harnesses rather than Rust test binaries, so MSVC may report
+`LNK1561` when Cargo tries to link them as tests. Use the wrapper above or the
+individual `cargo fuzz run <target>` commands.
+
 The `frame_decode` harness selects every current profile:
 `balanced`, `low-latency`, `bulk`, `randomized-lab`, and `extreme-lab`.
 The dictionary supplies the `SD` header and data/chaff frame markers so

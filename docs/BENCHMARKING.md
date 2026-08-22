@@ -5,7 +5,9 @@ handshake profiles used by the benchmark harness. Native operation remains
 `secure-default`; benchmark-only classical operation requires an explicit
 profile on both peers.
 
-The latest Windows-local evidence campaign is
+The current Windows-local candidate evidence campaign is
+`docs/BENCHMARK_RESULTS_2026-08-22.md`. The latest hardened Shroud2 and
+pre-authentication baseline is
 `docs/BENCHMARK_RESULTS_2026-08-17.md`. The latest Windows-local prerelease
 score report is
 `docs/BENCHMARK_RESULTS_2026-08-14.md`. The latest paired platform score
@@ -103,6 +105,7 @@ The runner emits CSV rows with:
 | `overhead_bytes` | Average wire bytes beyond the plaintext payload |
 | `overhead_pct` | Average wire overhead as a percentage of plaintext bytes |
 | `packets_per_sec` | Sustained application packet rate for rate rows |
+| `wire_entropy_bits` | Shannon entropy of observed serialized wire-size bins in the evidence matrix |
 
 The handshake row measures the full in-memory setup, including hello
 construction, signatures, X25519, ML-KEM when enabled, and key derivation.
@@ -124,6 +127,9 @@ AEAD encrypt/decrypt, and `shroud_profile` for the combined in-memory cell
 path. It also emits `shroud_decode_owned` and `shroud_decode_borrowed` rows to
 measure the allocation cost of an owned payload copy versus a borrowed
 validated view. These are diagnostic layers, not live-network throughput.
+The evidence matrix additionally reports `wire_entropy_bits` for the observed
+size histogram. This is a descriptive statistic for that input distribution,
+not a universal DPI-evasion score, anonymity guarantee, or classifier result.
 
 ## Obstacles and Controls
 
@@ -172,6 +178,35 @@ removes ML-KEM and therefore provides a different security contract.
 The standalone runner now supports `--suite all|core|dataplane|resource|shroud|quic|scalability|identity|wire|evidence|extended`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2.0 morphology profiles, QUIC-shim loopback handshake timing, long-session replay/nonce behavior, identity/plugin-provider validation costs, explicit wire overhead/packet-rate metrics, and a fixed-size evidence campaign for Shroud2 overhead, pre-authentication CPU paths, and replay-window throughput.
 
 These are local measurements, not proof of live VPN throughput, TUN performance, network RTT, reconnect recovery, or control-plane cost. Use `scripts/benchmark_operator.sh` for real-process lifecycle, reconnect, control-plane, and native-TUN prerequisite/timing checks. It emits explicit `SKIP` records when a host, privilege, peer, or tool is unavailable.
+
+### Criterion and GitHub-hosted campaigns
+
+The standalone runner is complemented by a Criterion harness at
+`benchmarks/benches/criterion.rs`. It covers authenticated handshake setup
+(classical lab and secure hybrid profiles), AEAD, HKDF, replay windows,
+stateless cookies, fixed-cell framing, shared TCP/QUIC profile envelopes,
+Shroud2 morphology and batching, histogram distance, and identity-record
+verification/serialization. Criterion results are microbenchmark results with
+statistical repetition; they are not socket, TUN, or Internet throughput.
+
+Run the focused harness locally with:
+
+```bash
+cargo +1.96.0 bench --manifest-path benchmarks/Cargo.toml \
+  --bench criterion --locked -- --noplot
+bash ./scripts/benchmark_criterion.sh
+```
+
+The `CI` workflow also runs the standalone `all` and `extended` suites plus
+Criterion on both `ubuntu-latest` and `windows-latest` for main pushes, version
+tags, manual dispatches, and scheduled campaigns. It uploads the raw captures,
+Criterion report, logs, and provenance metadata as 30-day GitHub artifacts.
+See `docs/GITHUB_BENCHMARKING.md` for the trigger and artifact contract.
+
+GitHub-hosted rows must be labeled as GitHub-hosted. Fixed synthetic inputs and
+seeds make regression comparisons practical, but runner hardware, OS noise, and
+OS-randomized padding still affect captures. Do not merge those rows into local
+workstation, operator/two-host, or external-network evidence.
 
 Recommended commands:
 
@@ -231,11 +266,19 @@ must identify whether they measure the probe, the Linux CLI bridge, or a
 privileged two-host tunnel.
 
 The `shroud` suite additionally measures the Shroud 2.0 lab envelope for
-`low-latency`, `web-browsing-lab`, `video-streaming-lab`, and `bulk-lab` using a
-1,450-byte datagram budget and a 1,024-byte payload. It reports latency for
-target selection, randomized padding, encode, and decode together, plus the
-observed target-size range. These rows are morphology overhead measurements,
-not network throughput or traffic-analysis evidence.
+`low-latency`, `web-browsing-lab`, `video-streaming-lab`,
+`video-streaming-large-payload-lab`, `video-streaming-balanced-payload-lab`,
+and `bulk-lab` using a 1,450-byte
+datagram budget and a 1,024-byte payload. The large-payload video row is also
+exercised by the evidence suite with payloads near the 1,472-byte IPv4/UDP
+budget; that workload-specific row must not be generalized to small or
+unaggregated video messages. The balanced-payload video row has the same
+near-MTU scope and is intended to measure the overhead/shape-diversity
+tradeoff, not to claim generic multimedia resemblance. The suite reports
+latency for target selection,
+randomized padding, encode, and decode together, plus the observed target-size
+range. These rows are morphology overhead measurements, not network throughput
+or traffic-analysis evidence.
 
 The same suite now includes:
 
@@ -312,7 +355,8 @@ The `evidence` suite is a deliberately bounded campaign for claims that are
 otherwise easy to overstate:
 
 - 5,000 deterministic synthetic packets per traffic profile through the
-  current Shroud2 morphology code;
+  current Shroud2 morphology code, including a separately labeled
+  `video-large` workload for already-aggregated near-MTU payloads;
 - 50,000 in-memory ML-KEM decapsulation operations compared with the current
   rotating HMAC-SHA256 cookie path and per-source rate limiter; and
 - 500,000 `ReplayWindow::new(128)` checks containing deterministic

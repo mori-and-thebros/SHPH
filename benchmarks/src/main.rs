@@ -18,7 +18,7 @@ use shph_transport::{
     quic_handshake_client_with_profile, quic_handshake_server_on_socket_with_profile,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::hint::black_box;
 use std::net::{SocketAddr, UdpSocket};
@@ -1416,6 +1416,16 @@ fn bench_evidence_overhead_matrix(options: Options) {
     for (name, profile, seed) in [
         ("bulk", MorphologyProfile::BulkLab, 0x4255_4c4b),
         ("video", MorphologyProfile::VideoStreamingLab, 0x5649_4445),
+        (
+            "video-large",
+            MorphologyProfile::VideoStreamingLargePayloadLab,
+            0x5649_444c,
+        ),
+        (
+            "video-balanced",
+            MorphologyProfile::VideoStreamingBalancedPayloadLab,
+            0x5649_4442,
+        ),
         ("web", MorphologyProfile::WebBrowsingLab, 0x5745_4242),
         ("voip", MorphologyProfile::LowLatency, 0x564f_4950),
         ("ssh", MorphologyProfile::LowLatency, 0x5353_4821),
@@ -1424,6 +1434,7 @@ fn bench_evidence_overhead_matrix(options: Options) {
         let mut raw_bytes = 0usize;
         let mut wire_bytes = 0usize;
         let mut wire_sizes = BTreeSet::new();
+        let mut wire_histogram = BTreeMap::<usize, usize>::new();
         let start = begin_measurement();
         for packet in 0..EVIDENCE_OVERHEAD_PACKETS {
             let payload_len = evidence_payload_len(name, packet);
@@ -1445,6 +1456,7 @@ fn bench_evidence_overhead_matrix(options: Options) {
             raw_bytes += payload.len();
             wire_bytes += datagram.len();
             wire_sizes.insert(datagram.len());
+            *wire_histogram.entry(datagram.len()).or_default() += 1;
         }
         let runtime = finish_measurement(start);
         let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
@@ -1461,6 +1473,12 @@ fn bench_evidence_overhead_matrix(options: Options) {
             .map(|size| size.to_string())
             .collect::<Vec<_>>()
             .join("|");
+        let size_histogram = wire_histogram
+            .iter()
+            .map(|(size, count)| format!("{size}:{count}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let entropy_bits = shannon_entropy(&wire_histogram, EVIDENCE_OVERHEAD_PACKETS);
         let extra_bytes = wire_bytes.saturating_sub(raw_bytes);
         let selection = match profile {
             MorphologyProfile::LowLatency => {
@@ -1471,6 +1489,12 @@ fn bench_evidence_overhead_matrix(options: Options) {
             }
             MorphologyProfile::VideoStreamingLab => {
                 "weighted_smallest_fit;classes=1024|1280|1536|2048|4096;weights=45|30|15|8|2;mtu_cap=path_mtu"
+            }
+            MorphologyProfile::VideoStreamingLargePayloadLab => {
+                "weighted_smallest_fit;classes=1408|1440|1465;weights=60|30|10;mtu_cap=path_mtu;large_payload_workload_only"
+            }
+            MorphologyProfile::VideoStreamingBalancedPayloadLab => {
+                "weighted_smallest_fit;classes=1415|1430|1445|1460|1472;weights=35|30|20|12|3;mtu_cap=path_mtu;near_mtu_entropy_workload_only"
             }
             MorphologyProfile::BulkLab => "uniform_profile_classes",
         };
@@ -1483,11 +1507,25 @@ fn bench_evidence_overhead_matrix(options: Options) {
             wire_rate,
             metrics,
             &format!(
-                "packets={EVIDENCE_OVERHEAD_PACKETS};raw_total_bytes={raw_bytes};shroud2_total_bytes={wire_bytes};extra_bytes={extra_bytes};distinct_wire_sizes={};wire_size_set={size_set};profile={profile:?};selection={selection};path_mtu={EVIDENCE_MORPHOLOGY_PATH_MTU};raw_is_payload_only;ip_udp_headers_excluded",
-                wire_sizes.len()
+                "packets={EVIDENCE_OVERHEAD_PACKETS};raw_total_bytes={raw_bytes};shroud2_total_bytes={wire_bytes};extra_bytes={extra_bytes};distinct_wire_sizes={};wire_size_set={size_set};wire_histogram={size_histogram};wire_entropy_bits={entropy_bits:.6};profile={profile:?};selection={selection};path_mtu={EVIDENCE_MORPHOLOGY_PATH_MTU};raw_is_payload_only;ip_udp_headers_excluded",
+                wire_sizes.len(),
             ),
         );
     }
+}
+
+fn shannon_entropy(histogram: &BTreeMap<usize, usize>, samples: usize) -> f64 {
+    if samples == 0 {
+        return 0.0;
+    }
+    histogram
+        .values()
+        .filter(|count| **count > 0)
+        .map(|count| {
+            let probability = *count as f64 / samples as f64;
+            -probability * probability.log2()
+        })
+        .sum()
 }
 
 fn evidence_payload_len(profile: &str, packet: usize) -> usize {
@@ -1496,6 +1534,8 @@ fn evidence_payload_len(profile: &str, packet: usize) -> usize {
             ^ match profile {
                 "bulk" => 0x4255_4c4b,
                 "video" => 0x5649_4445,
+                "video-large" => 0x5649_444c,
+                "video-balanced" => 0x5649_4442,
                 "web" => 0x5745_4242,
                 "voip" => 0x564f_4950,
                 "ssh" => 0x5353_4821,
@@ -1505,6 +1545,8 @@ fn evidence_payload_len(profile: &str, packet: usize) -> usize {
     match profile {
         "bulk" => 900 + (mixed % 501) as usize,
         "video" => 800 + (mixed % 601) as usize,
+        "video-large" => 1_408 + (mixed % 58) as usize,
+        "video-balanced" => 1_408 + (mixed % 58) as usize,
         "web" if packet.is_multiple_of(20) => 1_000 + (mixed % 401) as usize,
         "web" => 32 + (mixed % 768) as usize,
         "voip" => 24 + (mixed % 96) as usize,
@@ -1761,6 +1803,14 @@ fn bench_shroud2_morphology(options: Options) {
         ("low-latency", MorphologyProfile::LowLatency),
         ("web-browsing-lab", MorphologyProfile::WebBrowsingLab),
         ("video-streaming-lab", MorphologyProfile::VideoStreamingLab),
+        (
+            "video-streaming-large-payload-lab",
+            MorphologyProfile::VideoStreamingLargePayloadLab,
+        ),
+        (
+            "video-streaming-balanced-payload-lab",
+            MorphologyProfile::VideoStreamingBalancedPayloadLab,
+        ),
         ("bulk-lab", MorphologyProfile::BulkLab),
     ] {
         let mut morphology = MorphologyEngine::from_seed(profile, 0x5348_524f_5544);
@@ -1799,6 +1849,14 @@ fn bench_shroud2_delay(options: Options) {
         ("low-latency", MorphologyProfile::LowLatency),
         ("web-browsing-lab", MorphologyProfile::WebBrowsingLab),
         ("video-streaming-lab", MorphologyProfile::VideoStreamingLab),
+        (
+            "video-streaming-large-payload-lab",
+            MorphologyProfile::VideoStreamingLargePayloadLab,
+        ),
+        (
+            "video-streaming-balanced-payload-lab",
+            MorphologyProfile::VideoStreamingBalancedPayloadLab,
+        ),
         ("bulk-lab", MorphologyProfile::BulkLab),
     ] {
         let mut morphology = MorphologyEngine::from_seed(profile, 0x5348_524f_5544);
@@ -2601,9 +2659,10 @@ fn bench_long_session(options: Options) {
 mod tests {
     use super::{
         evidence_payload_len, evidence_replay_nonce, extended_loss_hit, make_extended_batch,
-        wire_latency_metrics, wire_rate_metrics, WIRE_AEAD_OVERHEAD, WIRE_MAX_AEAD_PAYLOAD,
-        WIRE_PAYLOAD_SIZES, WIRE_UDP_IPV4_PAYLOAD_MTU,
+        shannon_entropy, wire_latency_metrics, wire_rate_metrics, WIRE_AEAD_OVERHEAD,
+        WIRE_MAX_AEAD_PAYLOAD, WIRE_PAYLOAD_SIZES, WIRE_UDP_IPV4_PAYLOAD_MTU,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn wire_payload_matrix_stays_inside_ipv4_udp_budget() {
@@ -2633,13 +2692,22 @@ mod tests {
 
     #[test]
     fn evidence_payload_generators_are_bounded() {
-        for profile in ["bulk", "video", "web", "voip", "ssh"] {
+        for profile in ["bulk", "video", "video-large", "web", "voip", "ssh"] {
             for packet in 0..5_000 {
                 let payload = evidence_payload_len(profile, packet);
                 assert!(payload > 0);
                 assert!(payload + 7 <= super::EVIDENCE_MORPHOLOGY_PATH_MTU);
             }
         }
+    }
+
+    #[test]
+    fn shannon_entropy_reports_uniform_and_singleton_distributions() {
+        let uniform = BTreeMap::from([(128, 50usize), (256, 50usize)]);
+        assert!((shannon_entropy(&uniform, 100) - 1.0).abs() < 1e-12);
+
+        let singleton = BTreeMap::from([(1_472, 100usize)]);
+        assert!(shannon_entropy(&singleton, 100).abs() < 1e-12);
     }
 
     #[test]

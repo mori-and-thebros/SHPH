@@ -176,7 +176,6 @@ startup_payload = "vpn-up-path"
     let client_stdout = String::from_utf8(client_out.stdout).expect("client stdout");
     assert!(client_stdout.contains("Session mode: connect"));
     assert!(client_stdout.contains("handshake send-once ok"));
-    // Phase A.1: one-shot up path must emit the full session lifecycle trail.
     assert!(client_stdout.contains("Session id: send-once-"));
     assert!(client_stdout.contains("Session start:"));
     assert!(client_stdout.contains("Session end:"));
@@ -193,7 +192,6 @@ startup_payload = "vpn-up-path"
     assert!(server_stdout.contains("Session mode: listen"));
     assert!(server_stdout.contains("handshake recv-once ok"));
     assert!(server_stdout.contains("Payload: vpn-up-path"));
-    // Phase A.1: receiver side lifecycle trail + received-byte accounting.
     assert!(server_stdout.contains("Session id: recv-once-"));
     assert!(server_stdout.contains("Session start:"));
     assert!(server_stdout.contains("Session end:"));
@@ -300,7 +298,6 @@ timeout_secs = 3
     let client_stdout = String::from_utf8(client_out.stdout).expect("client stdout");
     assert!(client_stdout.contains("Session mode: connect"));
     assert!(client_stdout.contains("handshake connect-loop ok"));
-    // Phase A.1: loop-mode up path emits the lifecycle trail and clean close.
     assert!(client_stdout.contains("Session id: connect-"));
     assert!(client_stdout.contains("Session start:"));
     assert!(client_stdout.contains("Session end:"));

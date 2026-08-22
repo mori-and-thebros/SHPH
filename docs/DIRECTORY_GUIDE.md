@@ -19,10 +19,16 @@ This file maps the repository layout and the main public validation artifacts.
 - `shph-tui/`: optional terminal UI shell.
 - `fuzz/`: standalone cargo-fuzz targets for parser and replay robustness.
 - `benchmarks/`: standalone benchmark crate; its lockfile is intentionally
-  separate from the application workspace.
+  separate from the application workspace. `benches/criterion.rs` contains the
+  statistical microbenchmark harness.
 - `scripts/`: reproducible demos, benchmark operators, evidence capture, and
   optional multi-checkout synchronization.
 - `docs/BENCHMARKING.md`: Linux-first benchmark methodology, profiles, and obstacles.
+- `docs/GITHUB_BENCHMARKING.md`: GitHub-hosted campaign triggers, artifacts,
+  and evidence boundaries.
+- `docs/BENCHMARK_RESULTS_2026-08-22.md`: current local development evidence
+  for the candidate benchmark campaign, near-MTU video profile, validation
+  gates, and fuzz status.
 - `docs/BENCHMARK_RESULTS_2026-08-17.md`: dated local evidence campaign for
   Shroud2 overhead, pre-authentication CPU paths, and replay-window throughput.
 - `docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md`: extended local campaign for
@@ -61,8 +67,8 @@ This file maps the repository layout and the main public validation artifacts.
 ## Evidence and Historical Artifacts
 
 - Current methodology: `docs/BENCHMARKING.md`.
-- Current evidence campaign:
-  `docs/BENCHMARK_RESULTS_2026-08-17.md`.
+- Current candidate evidence campaign:
+  `docs/BENCHMARK_RESULTS_2026-08-22.md`.
 - Extended local evidence campaign:
   `docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md`.
 - Network-simulation audit:
