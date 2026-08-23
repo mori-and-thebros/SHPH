@@ -155,6 +155,14 @@ pub enum MorphologyProfile {
     /// shape diversity without introducing a large padding step.
     VideoStreamingBalancedPayloadLab,
     BulkLab,
+    /// Tuned interactive profile with small fitting classes.
+    TunedLowLatency,
+    /// Tuned general-purpose profile with intermediate classes.
+    TunedWebBrowsingLab,
+    /// Tuned video profile favoring path-aware near-MTU classes.
+    TunedVideoStreamingLab,
+    /// Tuned bulk profile that avoids classes which collapse above the path MTU.
+    TunedBulkLab,
 }
 
 impl MorphologyProfile {
@@ -166,6 +174,10 @@ impl MorphologyProfile {
             Self::VideoStreamingLargePayloadLab => &[1_408, 1_440, 1_465],
             Self::VideoStreamingBalancedPayloadLab => &[1_415, 1_430, 1_445, 1_460, 1_472],
             Self::BulkLab => &[1_280, 2_048, 4_096, 8_192, 16_384],
+            Self::TunedLowLatency => &[64, 96, 128, 192, 256, 512, 768],
+            Self::TunedWebBrowsingLab => &[256, 384, 512, 768, 1_024, 1_280, 1_360],
+            Self::TunedVideoStreamingLab => &[1_024, 1_152, 1_280, 1_360, 1_408, 1_440, 1_472],
+            Self::TunedBulkLab => &[1_024, 1_152, 1_280, 1_360, 1_408, 1_440, 1_472],
         }
     }
 
@@ -180,6 +192,10 @@ impl MorphologyProfile {
             Self::VideoStreamingLargePayloadLab => Some(&[60, 30, 10]),
             Self::VideoStreamingBalancedPayloadLab => Some(&[35, 30, 20, 12, 3]),
             Self::BulkLab => None,
+            Self::TunedLowLatency => Some(&[65, 20, 6, 4, 3, 1, 1]),
+            Self::TunedWebBrowsingLab => Some(&[35, 25, 18, 12, 7, 2, 1]),
+            Self::TunedVideoStreamingLab => Some(&[26, 24, 20, 14, 8, 5, 3]),
+            Self::TunedBulkLab => Some(&[5, 10, 15, 20, 20, 15, 15]),
         }
     }
 
@@ -195,6 +211,10 @@ impl MorphologyProfile {
                 (Duration::from_micros(50), Duration::from_millis(3))
             }
             Self::BulkLab => (Duration::ZERO, Duration::from_micros(750)),
+            Self::TunedLowLatency => (Duration::ZERO, Duration::from_micros(250)),
+            Self::TunedWebBrowsingLab => (Duration::from_micros(50), Duration::from_millis(5)),
+            Self::TunedVideoStreamingLab => (Duration::from_micros(50), Duration::from_millis(3)),
+            Self::TunedBulkLab => (Duration::ZERO, Duration::from_micros(500)),
         }
     }
 }
@@ -275,6 +295,22 @@ impl MorphologyBatchPolicy {
             MorphologyProfile::BulkLab => Self {
                 max_messages: MAX_BATCH_MESSAGES,
                 max_wait: Duration::from_millis(50),
+            },
+            MorphologyProfile::TunedLowLatency => Self {
+                max_messages: 6,
+                max_wait: Duration::from_millis(2),
+            },
+            MorphologyProfile::TunedWebBrowsingLab => Self {
+                max_messages: 10,
+                max_wait: Duration::from_millis(8),
+            },
+            MorphologyProfile::TunedVideoStreamingLab => Self {
+                max_messages: 8,
+                max_wait: Duration::from_millis(16),
+            },
+            MorphologyProfile::TunedBulkLab => Self {
+                max_messages: MAX_BATCH_MESSAGES,
+                max_wait: Duration::from_millis(40),
             },
         }
     }
@@ -491,6 +527,16 @@ impl MorphologyEngine {
         Ok(sampled.max(minimum).min(path_mtu))
     }
 
+    /// Encode one morphology datagram using this engine's session-scoped RNG.
+    ///
+    /// Keeping tail generation on the same stateful CSPRNG as class selection
+    /// avoids an OS-randomness request for every datagram while preserving
+    /// unpredictable wire padding for engines created with [`Self::new`].
+    pub fn encode_datagram(&mut self, payload: &[u8], path_mtu: usize) -> Result<Vec<u8>> {
+        let target_size = self.target_size(payload.len(), path_mtu)?;
+        encode_datagram_with_rng(payload, target_size, path_mtu, &mut self.rng)
+    }
+
     fn sample_weighted_size_class(
         &mut self,
         classes: &[usize],
@@ -561,6 +607,15 @@ pub fn validate_path_mtu(path_mtu: usize) -> Result<()> {
 /// returns. Padding bytes therefore do not carry unauthenticated control data;
 /// the fixed envelope header is only interpreted after QUIC authentication.
 pub fn encode_datagram(payload: &[u8], target_size: usize, path_mtu: usize) -> Result<Vec<u8>> {
+    encode_datagram_with_rng(payload, target_size, path_mtu, &mut rand::rngs::OsRng)
+}
+
+fn encode_datagram_with_rng(
+    payload: &[u8],
+    target_size: usize,
+    path_mtu: usize,
+    rng: &mut impl RngCore,
+) -> Result<Vec<u8>> {
     validate_path_mtu(path_mtu)?;
     if payload.is_empty() {
         return Err(ShphError::Protocol(
@@ -590,9 +645,7 @@ pub fn encode_datagram(payload: &[u8], target_size: usize, path_mtu: usize) -> R
     datagram[3..5].copy_from_slice(&(payload.len() as u16).to_be_bytes());
     datagram[5..7].copy_from_slice(&target_size_u16.to_be_bytes());
     datagram[7..minimum].copy_from_slice(payload);
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut datagram[minimum..])
-        .map_err(|_| ShphError::Crypto("OS randomness unavailable".into()))?;
+    rng.fill_bytes(&mut datagram[minimum..]);
     Ok(datagram)
 }
 
@@ -703,7 +756,7 @@ pub fn encode_batched_datagram<M: AsRef<[u8]>>(
 ) -> Result<Vec<u8>> {
     let payload = encode_batch_payload(messages, path_mtu)?;
     let target_size = morphology.target_size(payload.len(), path_mtu)?;
-    encode_datagram(&payload, target_size, path_mtu)
+    encode_datagram_with_rng(&payload, target_size, path_mtu, &mut morphology.rng)
 }
 
 /// Decode and split one authenticated Shroud2 batch datagram.
@@ -827,6 +880,40 @@ mod tests {
     }
 
     #[test]
+    fn tuned_profiles_keep_path_bounded_discrete_shape_diversity() {
+        for (profile, classes) in [
+            (
+                MorphologyProfile::TunedLowLatency,
+                &[64, 96, 128, 192, 256, 512, 768][..],
+            ),
+            (
+                MorphologyProfile::TunedWebBrowsingLab,
+                &[256, 384, 512, 768, 1_024, 1_280, 1_360][..],
+            ),
+            (
+                MorphologyProfile::TunedVideoStreamingLab,
+                &[1_024, 1_152, 1_280, 1_360, 1_408, 1_440, 1_472][..],
+            ),
+            (
+                MorphologyProfile::TunedBulkLab,
+                &[1_024, 1_152, 1_280, 1_360, 1_408, 1_440, 1_472][..],
+            ),
+        ] {
+            let mut engine = MorphologyEngine::from_seed(profile, 7);
+            let mut counts = vec![0usize; classes.len()];
+            for _ in 0..20_000 {
+                let target = engine.target_size(1, 1_472).expect("target");
+                let index = classes
+                    .iter()
+                    .position(|class| *class == target)
+                    .expect("target must remain in the tuned profile classes");
+                counts[index] += 1;
+            }
+            assert!(counts.iter().all(|count| *count > 0));
+        }
+    }
+
+    #[test]
     fn weighted_profiles_fold_large_classes_into_the_mtu_bucket() {
         for (profile, classes) in [
             (
@@ -933,6 +1020,24 @@ mod tests {
             MorphologyBatchPolicy::recommended(MorphologyProfile::VideoStreamingBalancedPayloadLab),
             MorphologyBatchPolicy::new(8, Duration::from_millis(20))
                 .expect("balanced-payload video policy")
+        );
+        assert_eq!(
+            MorphologyBatchPolicy::recommended(MorphologyProfile::TunedLowLatency),
+            MorphologyBatchPolicy::new(6, Duration::from_millis(2))
+                .expect("tuned low-latency policy")
+        );
+        assert_eq!(
+            MorphologyBatchPolicy::recommended(MorphologyProfile::TunedWebBrowsingLab),
+            MorphologyBatchPolicy::new(10, Duration::from_millis(8)).expect("tuned web policy")
+        );
+        assert_eq!(
+            MorphologyBatchPolicy::recommended(MorphologyProfile::TunedVideoStreamingLab),
+            MorphologyBatchPolicy::new(8, Duration::from_millis(16)).expect("tuned video policy")
+        );
+        assert_eq!(
+            MorphologyBatchPolicy::recommended(MorphologyProfile::TunedBulkLab),
+            MorphologyBatchPolicy::new(MAX_BATCH_MESSAGES, Duration::from_millis(40))
+                .expect("tuned bulk policy")
         );
         assert!(MorphologyBatchPolicy::new(0, Duration::ZERO).is_err());
         assert!(MorphologyBatchPolicy::new(MAX_BATCH_MESSAGES + 1, Duration::ZERO).is_err());

@@ -6,6 +6,7 @@ handshake profiles used by the benchmark harness. Native operation remains
 profile on both peers.
 
 The current Windows-local candidate evidence campaign is
+`docs/BENCHMARK_RESULTS_2026-08-23.md`. The previous candidate campaign is
 `docs/BENCHMARK_RESULTS_2026-08-22.md`. The latest hardened Shroud2 and
 pre-authentication baseline is
 `docs/BENCHMARK_RESULTS_2026-08-17.md`. The latest Windows-local prerelease

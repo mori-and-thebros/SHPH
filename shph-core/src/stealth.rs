@@ -22,6 +22,10 @@ impl ShroudProfile {
         self.cell_size.saturating_sub(5)
     }
 
+    pub fn is_tuned(&self) -> bool {
+        matches!(self.name, "tuned-low" | "tuned-medium" | "tuned-high")
+    }
+
     pub const fn is_valid(&self) -> bool {
         self.cell_size >= 64
             && self.cell_size <= 16 * 1024
@@ -78,6 +82,39 @@ pub const EXTREME_LAB: ShroudProfile = ShroudProfile {
     send_interval: Duration::from_millis(20),
     chaff_interval: Duration::from_secs(1),
     max_payload_chunk: 6144,
+    deterministic_padding: false,
+    adaptive_chunking: true,
+};
+
+/// Tuned low-latency profile for small interactive application frames.
+pub const TUNED_LOW: ShroudProfile = ShroudProfile {
+    name: "tuned-low",
+    cell_size: 256,
+    send_interval: Duration::from_millis(3),
+    chaff_interval: Duration::from_millis(150),
+    max_payload_chunk: 192,
+    deterministic_padding: false,
+    adaptive_chunking: true,
+};
+
+/// Tuned general-purpose profile for mixed application traffic.
+pub const TUNED_MEDIUM: ShroudProfile = ShroudProfile {
+    name: "tuned-medium",
+    cell_size: 768,
+    send_interval: Duration::from_millis(10),
+    chaff_interval: Duration::from_millis(350),
+    max_payload_chunk: 700,
+    deterministic_padding: false,
+    adaptive_chunking: true,
+};
+
+/// Tuned bulk profile sized for the default native-TUN path budget.
+pub const TUNED_HIGH: ShroudProfile = ShroudProfile {
+    name: "tuned-high",
+    cell_size: 1360,
+    send_interval: Duration::from_millis(5),
+    chaff_interval: Duration::from_millis(500),
+    max_payload_chunk: 1200,
     deterministic_padding: false,
     adaptive_chunking: true,
 };
@@ -164,7 +201,16 @@ pub const MIMICRY_LAB: StealthProfile = StealthProfile {
 };
 
 pub fn profiles() -> &'static [ShroudProfile] {
-    &[BALANCED, LOW_LATENCY, BULK, RANDOMIZED_LAB, EXTREME_LAB]
+    &[
+        BALANCED,
+        LOW_LATENCY,
+        BULK,
+        RANDOMIZED_LAB,
+        EXTREME_LAB,
+        TUNED_LOW,
+        TUNED_MEDIUM,
+        TUNED_HIGH,
+    ]
 }
 
 pub fn stealth_profiles() -> &'static [StealthProfile] {
@@ -186,6 +232,9 @@ pub fn shroud_profile_by_selection(name: &str) -> Option<Option<ShroudProfile>> 
         "high" | "bulk" => Some(Some(BULK)),
         "extreme" | "extreme-lab" => Some(Some(EXTREME_LAB)),
         "randomized-lab" => Some(Some(RANDOMIZED_LAB)),
+        "tuned" | "optimized" | "tuned-medium" | "optimized-medium" => Some(Some(TUNED_MEDIUM)),
+        "tuned-low" | "optimized-low" => Some(Some(TUNED_LOW)),
+        "tuned-high" | "optimized-high" => Some(Some(TUNED_HIGH)),
         _ => None,
     }
 }
@@ -200,7 +249,7 @@ pub fn stealth_profile_by_name(name: &str) -> Option<StealthProfile> {
 mod tests {
     use super::{
         profiles, shroud_profile_by_name, shroud_profile_by_selection, ShroudProfile, BALANCED,
-        EXTREME_LAB,
+        EXTREME_LAB, TUNED_HIGH, TUNED_LOW, TUNED_MEDIUM,
     };
 
     #[test]
@@ -244,5 +293,35 @@ mod tests {
         assert!(profiles()
             .iter()
             .any(|profile| profile.name == "extreme-lab"));
+    }
+
+    #[test]
+    fn tuned_profiles_are_valid_and_have_distinct_cells() {
+        assert!(TUNED_LOW.is_valid());
+        assert!(TUNED_MEDIUM.is_valid());
+        assert!(TUNED_HIGH.is_valid());
+        assert!(TUNED_LOW.is_tuned());
+        assert!(TUNED_MEDIUM.is_tuned());
+        assert!(TUNED_HIGH.is_tuned());
+        const {
+            assert!(TUNED_LOW.cell_size < TUNED_MEDIUM.cell_size);
+            assert!(TUNED_MEDIUM.cell_size < TUNED_HIGH.cell_size);
+        }
+    }
+
+    #[test]
+    fn tuned_selection_aliases_resolve_to_canonical_profiles() {
+        assert_eq!(
+            shroud_profile_by_selection("optimized"),
+            Some(Some(TUNED_MEDIUM))
+        );
+        assert_eq!(
+            shroud_profile_by_selection("tuned-low"),
+            Some(Some(TUNED_LOW))
+        );
+        assert_eq!(
+            shroud_profile_by_selection("optimized-high"),
+            Some(Some(TUNED_HIGH))
+        );
     }
 }

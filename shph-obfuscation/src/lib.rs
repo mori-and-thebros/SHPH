@@ -4,7 +4,8 @@
 //! original payload length and the randomized tail inside the authenticated
 //! envelope, while allowing TCP and QUIC to use the same discrete size policy.
 
-use rand::RngCore;
+use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
 use shph_core::{Result, ShphError, ShroudProfile, StealthProfile};
 use std::str::FromStr;
 
@@ -29,6 +30,12 @@ pub enum ProfileTier {
     Medium,
     /// Bulk/video traffic: 512, 1024, and 1360-byte buckets.
     High,
+    /// Tuned low-latency buckets for small interactive messages.
+    TunedLow,
+    /// Tuned mixed-traffic buckets with an intermediate 768-byte class.
+    TunedMedium,
+    /// Tuned bulk buckets aligned with the default 1,360-byte TUN path.
+    TunedHigh,
 }
 
 impl ProfileTier {
@@ -37,6 +44,9 @@ impl ProfileTier {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::TunedLow => "tuned-low",
+            Self::TunedMedium => "tuned-medium",
+            Self::TunedHigh => "tuned-high",
         }
     }
 
@@ -45,6 +55,9 @@ impl ProfileTier {
             Self::Low => 0,
             Self::Medium => 1,
             Self::High => 2,
+            Self::TunedLow => 3,
+            Self::TunedMedium => 4,
+            Self::TunedHigh => 5,
         }
     }
 
@@ -53,12 +66,18 @@ impl ProfileTier {
             Self::Low => &[128, 256],
             Self::Medium => &[128, 256, 512, 1024, 1360],
             Self::High => &[512, 1024, 1360],
+            Self::TunedLow => &[64, 96, 128, 192, 256, 512, 768],
+            Self::TunedMedium => &[128, 256, 512, 768, 1024, 1360],
+            Self::TunedHigh => &[512, 768, 1024, 1280, 1360],
         }
     }
 
     /// Map the existing Shroud lab selection onto the shared transport tier.
     pub fn from_shroud_profile(profile: ShroudProfile) -> Self {
         match profile.name {
+            "tuned-low" => Self::TunedLow,
+            "tuned-medium" => Self::TunedMedium,
+            "tuned-high" => Self::TunedHigh,
             "low-latency" => Self::Low,
             "bulk" | "extreme-lab" => Self::High,
             _ => Self::Medium,
@@ -68,10 +87,10 @@ impl ProfileTier {
     #[cfg(test)]
     fn max_frame_len(self) -> usize {
         let max = self.base_tiers()[self.base_tiers().len() - 1];
-        max + if matches!(self, Self::Low) {
-            LOW_JITTER_BYTES
-        } else {
-            0
+        max + match self {
+            Self::Low => LOW_JITTER_BYTES,
+            Self::TunedLow => 3,
+            _ => 0,
         }
     }
 
@@ -81,7 +100,13 @@ impl ProfileTier {
                 (128..=128 + LOW_JITTER_BYTES).contains(&len)
                     || (256..=256 + LOW_JITTER_BYTES).contains(&len)
             }
-            Self::Medium | Self::High => self.base_tiers().contains(&len),
+            Self::TunedLow => self
+                .base_tiers()
+                .iter()
+                .any(|base| (*base..=*base + 3).contains(&len)),
+            Self::Medium | Self::High | Self::TunedMedium | Self::TunedHigh => {
+                self.base_tiers().contains(&len)
+            }
         }
     }
 
@@ -100,6 +125,9 @@ impl FromStr for ProfileTier {
             "low" | "low-latency" => Ok(Self::Low),
             "medium" | "balanced" => Ok(Self::Medium),
             "high" | "bulk" | "extreme" | "extreme-lab" => Ok(Self::High),
+            "tuned" | "optimized" | "tuned-medium" | "optimized-medium" => Ok(Self::TunedMedium),
+            "tuned-low" | "optimized-low" => Ok(Self::TunedLow),
+            "tuned-high" | "optimized-high" => Ok(Self::TunedHigh),
             _ => Err(ShphError::Obfuscation(format!(
                 "unsupported padding profile: {value}"
             ))),
@@ -107,13 +135,57 @@ impl FromStr for ProfileTier {
     }
 }
 
-/// Apply a bounded, authenticated profile envelope to an application payload.
+/// Session-scoped padding generator.
 ///
-/// The returned bytes contain a small marker, the original payload length, the
-/// payload, and randomized tail bytes. Call [`remove_profile`] after AEAD
-/// decryption. A caller should treat the returned bytes as opaque transport
-/// plaintext rather than application data.
-pub fn apply_profile(profile: ProfileTier, payload: &[u8]) -> Result<Vec<u8>> {
+/// The generator is seeded once from the process RNG and then reused for the
+/// lifetime of a transport session. This avoids an OS-randomness syscall for
+/// every frame while retaining unpredictable padding on the wire. The
+/// `from_seed` constructor is intended for deterministic lab and benchmark
+/// runs only.
+#[derive(Debug)]
+pub struct ProfilePadder {
+    profile: ProfileTier,
+    rng: StdRng,
+}
+
+impl ProfilePadder {
+    pub fn new(profile: ProfileTier) -> Self {
+        Self::from_seed(profile, rand::random())
+    }
+
+    pub fn from_seed(profile: ProfileTier, seed: [u8; 32]) -> Self {
+        Self {
+            profile,
+            rng: StdRng::from_seed(seed),
+        }
+    }
+
+    pub const fn profile(&self) -> ProfileTier {
+        self.profile
+    }
+
+    /// Fill a caller-owned buffer with one authenticated profile envelope.
+    ///
+    /// Reusing `framed` across calls avoids a second allocation in the
+    /// transport send loop; the subsequent AEAD operation still owns its
+    /// ciphertext allocation.
+    pub fn apply_into(&mut self, payload: &[u8], framed: &mut Vec<u8>) -> Result<()> {
+        apply_profile_into_with_rng(self.profile, payload, framed, &mut self.rng)
+    }
+
+    pub fn apply(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        let mut framed = Vec::new();
+        self.apply_into(payload, &mut framed)?;
+        Ok(framed)
+    }
+}
+
+fn apply_profile_into_with_rng(
+    profile: ProfileTier,
+    payload: &[u8],
+    framed: &mut Vec<u8>,
+    rng: &mut impl RngCore,
+) -> Result<()> {
     let minimum = PROFILE_HEADER_BYTES
         .checked_add(payload.len())
         .ok_or_else(|| ShphError::Obfuscation("profile payload length overflow".into()))?;
@@ -129,12 +201,13 @@ pub fn apply_profile(profile: ProfileTier, payload: &[u8]) -> Result<Vec<u8>> {
                 payload.len()
             ))
         })?;
-    let jitter = if matches!(profile, ProfileTier::Low) {
-        let mut random = [0u8; 1];
-        rand::rngs::OsRng
-            .try_fill_bytes(&mut random)
-            .map_err(|_| ShphError::Crypto("OS randomness unavailable".into()))?;
-        usize::from(random[0]) % (LOW_JITTER_BYTES + 1)
+    let jitter = if matches!(profile, ProfileTier::Low | ProfileTier::TunedLow) {
+        let jitter_bound = if matches!(profile, ProfileTier::TunedLow) {
+            3
+        } else {
+            LOW_JITTER_BYTES
+        };
+        usize::from((rng.next_u32() & 0xff) as u8) % (jitter_bound + 1)
     } else {
         0
     };
@@ -142,7 +215,8 @@ pub fn apply_profile(profile: ProfileTier, payload: &[u8]) -> Result<Vec<u8>> {
         .checked_add(jitter)
         .ok_or_else(|| ShphError::Obfuscation("profile frame length overflow".into()))?;
 
-    let mut framed = vec![0u8; frame_len];
+    framed.clear();
+    framed.resize(frame_len, 0);
     framed[..PROFILE_MAGIC.len()].copy_from_slice(PROFILE_MAGIC);
     framed[PROFILE_MAGIC.len()] = profile.id();
     framed[5..7].copy_from_slice(
@@ -152,10 +226,22 @@ pub fn apply_profile(profile: ProfileTier, payload: &[u8]) -> Result<Vec<u8>> {
     );
     framed[PROFILE_HEADER_BYTES..PROFILE_HEADER_BYTES + payload.len()].copy_from_slice(payload);
     if PROFILE_HEADER_BYTES + payload.len() < framed.len() {
-        rand::rngs::OsRng
-            .try_fill_bytes(&mut framed[PROFILE_HEADER_BYTES + payload.len()..])
+        rng.try_fill_bytes(&mut framed[PROFILE_HEADER_BYTES + payload.len()..])
             .map_err(|_| ShphError::Crypto("OS randomness unavailable".into()))?;
     }
+    Ok(())
+}
+
+/// Apply a bounded, authenticated profile envelope to an application payload.
+///
+/// The returned bytes contain a small marker, the original payload length, the
+/// payload, and randomized tail bytes. Call [`remove_profile`] after AEAD
+/// decryption. A caller should treat the returned bytes as opaque transport
+/// plaintext rather than application data.
+pub fn apply_profile(profile: ProfileTier, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut rng = rand::rngs::OsRng;
+    let mut framed = Vec::new();
+    apply_profile_into_with_rng(profile, payload, &mut framed, &mut rng)?;
     Ok(framed)
 }
 
@@ -189,7 +275,7 @@ pub fn remove_profile(profile: ProfileTier, framed: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_profile, remove_profile, ProfileTier};
+    use super::{apply_profile, remove_profile, ProfilePadder, ProfileTier};
 
     #[test]
     fn profile_tiers_match_the_declared_discrete_mapping() {
@@ -199,6 +285,18 @@ mod tests {
             &[128, 256, 512, 1024, 1360]
         );
         assert_eq!(ProfileTier::High.base_tiers(), &[512, 1024, 1360]);
+        assert_eq!(
+            ProfileTier::TunedLow.base_tiers(),
+            &[64, 96, 128, 192, 256, 512, 768]
+        );
+        assert_eq!(
+            ProfileTier::TunedMedium.base_tiers(),
+            &[128, 256, 512, 768, 1024, 1360]
+        );
+        assert_eq!(
+            ProfileTier::TunedHigh.base_tiers(),
+            &[512, 768, 1024, 1280, 1360]
+        );
     }
 
     #[test]
@@ -206,6 +304,9 @@ mod tests {
         assert_eq!(ProfileTier::Low.max_payload_bytes(), 249);
         assert_eq!(ProfileTier::Medium.max_payload_bytes(), 1353);
         assert_eq!(ProfileTier::High.max_payload_bytes(), 1353);
+        assert_eq!(ProfileTier::TunedLow.max_payload_bytes(), 761);
+        assert_eq!(ProfileTier::TunedMedium.max_payload_bytes(), 1353);
+        assert_eq!(ProfileTier::TunedHigh.max_payload_bytes(), 1353);
     }
 
     #[test]
@@ -230,11 +331,30 @@ mod tests {
             ProfileTier::from_shroud_profile(shph_core::EXTREME_LAB),
             ProfileTier::High
         );
+        assert_eq!(
+            ProfileTier::from_shroud_profile(shph_core::TUNED_LOW),
+            ProfileTier::TunedLow
+        );
+        assert_eq!(
+            ProfileTier::from_shroud_profile(shph_core::TUNED_MEDIUM),
+            ProfileTier::TunedMedium
+        );
+        assert_eq!(
+            ProfileTier::from_shroud_profile(shph_core::TUNED_HIGH),
+            ProfileTier::TunedHigh
+        );
     }
 
     #[test]
     fn every_profile_round_trips_and_stays_bounded() {
-        for profile in [ProfileTier::Low, ProfileTier::Medium, ProfileTier::High] {
+        for profile in [
+            ProfileTier::Low,
+            ProfileTier::Medium,
+            ProfileTier::High,
+            ProfileTier::TunedLow,
+            ProfileTier::TunedMedium,
+            ProfileTier::TunedHigh,
+        ] {
             let payload = vec![0x5a; 73];
             let framed = apply_profile(profile, &payload).expect("apply profile");
             assert!(framed.len() <= profile.max_frame_len());
@@ -251,6 +371,37 @@ mod tests {
             let framed = apply_profile(ProfileTier::Low, b"ssh").expect("apply low profile");
             assert!((128..=263).contains(&framed.len()));
         }
+    }
+
+    #[test]
+    fn tuned_profile_jitter_stays_inside_its_declared_bounds() {
+        for _ in 0..128 {
+            let framed =
+                apply_profile(ProfileTier::TunedLow, b"ssh").expect("apply tuned low profile");
+            assert!((64..=67).contains(&framed.len()));
+        }
+    }
+
+    #[test]
+    fn stateful_padder_reuses_rng_without_changing_the_envelope_contract() {
+        let mut padder = ProfilePadder::from_seed(ProfileTier::TunedLow, [7; 32]);
+        let mut framed = Vec::new();
+        padder
+            .apply_into(b"ssh", &mut framed)
+            .expect("first envelope");
+        assert_eq!(
+            remove_profile(ProfileTier::TunedLow, &framed).expect("first decode"),
+            b"ssh"
+        );
+        let first = framed.clone();
+        padder
+            .apply_into(b"ssh", &mut framed)
+            .expect("second envelope");
+        assert_eq!(
+            remove_profile(ProfileTier::TunedLow, &framed).expect("second decode"),
+            b"ssh"
+        );
+        assert_ne!(first, framed);
     }
 
     #[test]

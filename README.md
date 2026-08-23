@@ -7,9 +7,9 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-08-22)
+## Current Status (2026-08-23)
 
-Workspace version `0.6.4-dev.3` (pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.4-dev.4` (pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -87,7 +87,7 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
 - The historical native Windows validation snapshot records formatting, locked
   checks, strict Clippy, **180 workspace tests**, release builds, Windows-only
   Wintun unit tests, Windows ACL coverage, and both benchmark profiles. The
-  current release evidence records 297 workspace tests; these totals belong to
+  current release evidence records 304 workspace tests; these totals belong to
   different snapshots and must not be conflated. The post-loader smoke reached
   a real Wintun adapter/session and left no residue; a clean elevated rerun
   after the route-rollback fix remains the final confirmation. See
@@ -415,7 +415,8 @@ Additional docs:
 - `docs/HARDENING.md` (security-hardening summary + threat impact)
 - `docs/BENCHMARKING.md` (Linux-first methodology, profiles, and benchmark plan)
 - `docs/GITHUB_BENCHMARKING.md` (hosted CI campaigns, artifacts, and evidence boundaries)
-- `docs/BENCHMARK_RESULTS_2026-08-22.md` (current local candidate evidence and limits)
+- `docs/BENCHMARK_RESULTS_2026-08-23.md` (current tuned-profile evidence and limits)
+- `docs/BENCHMARK_RESULTS_2026-08-22.md` (previous local candidate evidence and limits)
 - `docs/BENCHMARK_RESULTS_2026-08-17.md` (dated Shroud2/pre-authentication evidence baseline)
 - `docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md` (extended local benchmark
   campaign and explicit host-capability skips)

@@ -23,7 +23,7 @@ use shph_core::{
     ReceiveCipher, Result, SendCipher, ShphError, ShroudProfile, StatelessCookieAuthority,
     ML_KEM_768_CIPHERTEXT_BYTES,
 };
-use shph_obfuscation::{apply_profile, remove_profile, ProfileTier};
+use shph_obfuscation::{apply_profile, remove_profile, ProfilePadder, ProfileTier};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1613,9 +1613,10 @@ pub fn connect_secure_session_lab_with_profile_and_underlay(
         underlay,
     )?;
     if let Some(shroud_profile) = lab.shroud_profile {
-        let padding_profile = ProfileTier::from_shroud_profile(shroud_profile);
         let session = match mode {
-            TransportMode::Tcp => session.with_tcp_profile(padding_profile)?,
+            TransportMode::Tcp => {
+                session.with_tcp_profile(ProfileTier::from_shroud_profile(shroud_profile))?
+            }
             TransportMode::Quic => session.with_quic_profile(shroud_profile)?,
             _ => session,
         };
@@ -1735,9 +1736,10 @@ pub fn accept_secure_session_lab_with_profile(
         profile,
     )?;
     if let Some(shroud_profile) = lab.shroud_profile {
-        let padding_profile = ProfileTier::from_shroud_profile(shroud_profile);
         let session = match mode {
-            TransportMode::Tcp => session.with_tcp_profile(padding_profile)?,
+            TransportMode::Tcp => {
+                session.with_tcp_profile(ProfileTier::from_shroud_profile(shroud_profile))?
+            }
             TransportMode::Quic => session.with_quic_profile(shroud_profile)?,
             _ => session,
         };
@@ -1749,8 +1751,26 @@ pub fn accept_secure_session_lab_with_profile(
 impl SecureSession {
     fn with_quic_profile(mut self, profile: ShroudProfile) -> Result<Self> {
         if let SecureSessionInner::Quic(session) = &mut self.inner {
-            session.shroud_profile = Some(profile);
-            session.padding_profile = Some(ProfileTier::from_shroud_profile(profile));
+            if profile.is_tuned() {
+                // Tuned profiles use the shared discrete envelope directly.
+                // This avoids the legacy fixed-cell plus shared-wrapper
+                // combination and keeps the full QUIC payload budget usable.
+                session.shroud_profile = None;
+                session.padding_profile = Some(ProfileTier::from_shroud_profile(profile));
+                session.padding_padder = Some(ProfilePadder::new(
+                    ProfileTier::from_shroud_profile(profile),
+                ));
+                session.padding_buffer.clear();
+            } else {
+                // Keep the legacy double envelope for compatibility with
+                // peers from previous developer releases.
+                session.shroud_profile = Some(profile);
+                session.padding_profile = Some(ProfileTier::from_shroud_profile(profile));
+                session.padding_padder = Some(ProfilePadder::new(
+                    ProfileTier::from_shroud_profile(profile),
+                ));
+                session.padding_buffer.clear();
+            }
         }
         Ok(self)
     }
@@ -1758,6 +1778,8 @@ impl SecureSession {
     fn with_tcp_profile(mut self, profile: ProfileTier) -> Result<Self> {
         if let SecureSessionInner::Tcp(session) = &mut self.inner {
             session.padding_profile = Some(profile);
+            session.padding_padder = Some(ProfilePadder::new(profile));
+            session.padding_buffer.clear();
         }
         Ok(self)
     }
@@ -2555,6 +2577,8 @@ pub struct SecureTcpSession {
     send_cipher: SendCipher,
     recv_cipher: ReceiveCipher,
     padding_profile: Option<ProfileTier>,
+    padding_padder: Option<ProfilePadder>,
+    padding_buffer: Vec<u8>,
     frame_reader: TcpFrameReader,
 }
 
@@ -2565,6 +2589,8 @@ impl SecureTcpSession {
             send_cipher: SendCipher::new(send_key),
             recv_cipher: ReceiveCipher::new(recv_key),
             padding_profile: None,
+            padding_padder: None,
+            padding_buffer: Vec::new(),
             frame_reader: TcpFrameReader::default(),
         }
     }
@@ -2575,6 +2601,8 @@ impl SecureTcpSession {
             &mut self.send_cipher,
             payload,
             self.padding_profile,
+            self.padding_padder.as_mut(),
+            &mut self.padding_buffer,
         )
     }
 
@@ -2589,6 +2617,8 @@ impl SecureTcpSession {
 
     pub fn with_padding_profile(mut self, profile: ProfileTier) -> Self {
         self.padding_profile = Some(profile);
+        self.padding_padder = Some(ProfilePadder::new(profile));
+        self.padding_buffer.clear();
         self
     }
 
@@ -2602,6 +2632,8 @@ impl SecureTcpSession {
             stream: self.stream,
             send_cipher: self.send_cipher,
             padding_profile: self.padding_profile,
+            padding_padder: self.padding_padder,
+            padding_buffer: self.padding_buffer,
         };
         let receiver = SecureTcpReceiver {
             stream: recv_stream,
@@ -2617,6 +2649,8 @@ pub struct SecureTcpSender {
     stream: TcpStream,
     send_cipher: SendCipher,
     padding_profile: Option<ProfileTier>,
+    padding_padder: Option<ProfilePadder>,
+    padding_buffer: Vec<u8>,
 }
 
 impl SecureTcpSender {
@@ -2626,6 +2660,8 @@ impl SecureTcpSender {
             &mut self.send_cipher,
             payload,
             self.padding_profile,
+            self.padding_padder.as_mut(),
+            &mut self.padding_buffer,
         )
     }
 }
@@ -2658,7 +2694,15 @@ pub fn tcp_secure_send(
     send_cipher: &mut SendCipher,
     payload: &[u8],
 ) -> Result<()> {
-    write_encrypted_tcp_frame(stream, send_cipher, payload, None)
+    let mut padding_buffer = Vec::new();
+    write_encrypted_tcp_frame(
+        stream,
+        send_cipher,
+        payload,
+        None,
+        None,
+        &mut padding_buffer,
+    )
 }
 
 /// Send one encrypted TCP frame with a shared discrete padding profile.
@@ -2668,7 +2712,16 @@ pub fn tcp_secure_send_with_profile(
     payload: &[u8],
     profile: ProfileTier,
 ) -> Result<()> {
-    write_encrypted_tcp_frame(stream, send_cipher, payload, Some(profile))
+    let mut padder = ProfilePadder::new(profile);
+    let mut padding_buffer = Vec::new();
+    write_encrypted_tcp_frame(
+        stream,
+        send_cipher,
+        payload,
+        Some(profile),
+        Some(&mut padder),
+        &mut padding_buffer,
+    )
 }
 
 /// Receive one encrypted TCP frame using the caller-owned, stateful AEAD cipher.
@@ -3035,6 +3088,8 @@ pub struct ExperimentalQuicSession {
     recv_cipher: ReceiveCipher,
     shroud_profile: Option<ShroudProfile>,
     padding_profile: Option<ProfileTier>,
+    padding_padder: Option<ProfilePadder>,
+    padding_buffer: Vec<u8>,
 }
 
 pub struct ExperimentalQuicSender {
@@ -3043,6 +3098,8 @@ pub struct ExperimentalQuicSender {
     send_cipher: SendCipher,
     shroud_profile: Option<ShroudProfile>,
     padding_profile: Option<ProfileTier>,
+    padding_padder: Option<ProfilePadder>,
+    padding_buffer: Vec<u8>,
 }
 
 pub struct ExperimentalQuicReceiver {
@@ -3062,6 +3119,8 @@ impl ExperimentalQuicSession {
             recv_cipher: ReceiveCipher::new_with_replay_window(recv_key, 128),
             shroud_profile: None,
             padding_profile: None,
+            padding_padder: None,
+            padding_buffer: Vec::new(),
         }
     }
 
@@ -3073,6 +3132,8 @@ impl ExperimentalQuicSession {
             payload,
             self.shroud_profile,
             self.padding_profile,
+            self.padding_padder.as_mut(),
+            &mut self.padding_buffer,
         )
     }
 
@@ -3097,6 +3158,8 @@ impl ExperimentalQuicSession {
                 send_cipher: self.send_cipher,
                 shroud_profile: self.shroud_profile,
                 padding_profile: self.padding_profile,
+                padding_padder: self.padding_padder,
+                padding_buffer: self.padding_buffer,
             },
             ExperimentalQuicReceiver {
                 socket: recv_socket,
@@ -3118,6 +3181,8 @@ impl ExperimentalQuicSender {
             payload,
             self.shroud_profile,
             self.padding_profile,
+            self.padding_padder.as_mut(),
+            &mut self.padding_buffer,
         )
     }
 }
@@ -3139,13 +3204,23 @@ fn write_encrypted_tcp_frame(
     cipher: &mut SendCipher,
     payload: &[u8],
     padding_profile: Option<ProfileTier>,
+    padding_padder: Option<&mut ProfilePadder>,
+    padding_buffer: &mut Vec<u8>,
 ) -> Result<()> {
     validate_tcp_payload(payload)?;
-    let framed = match padding_profile {
-        Some(profile) => apply_profile(profile, payload)?,
-        None => payload.to_vec(),
+    let fallback;
+    let framed = match (padding_profile, padding_padder) {
+        (Some(_), Some(padder)) => {
+            padder.apply_into(payload, padding_buffer)?;
+            padding_buffer.as_slice()
+        }
+        (Some(profile), None) => {
+            fallback = apply_profile(profile, payload)?;
+            fallback.as_slice()
+        }
+        (None, _) => payload,
     };
-    let encrypted = cipher.encrypt(&framed)?;
+    let encrypted = cipher.encrypt(framed)?;
     let len = u32::try_from(encrypted.len())
         .map_err(|_| ShphError::Protocol("encrypted frame length overflows u32".into()))?;
     write_tcp_all_or_closed(stream, &len.to_be_bytes())?;
@@ -3246,9 +3321,20 @@ fn write_encrypted_quic_frame(
     payload: &[u8],
     shroud_profile: Option<ShroudProfile>,
 ) -> Result<()> {
-    write_encrypted_quic_frame_with_profile(socket, peer, cipher, payload, shroud_profile, None)
+    let mut padding_buffer = Vec::new();
+    write_encrypted_quic_frame_with_profile(
+        socket,
+        peer,
+        cipher,
+        payload,
+        shroud_profile,
+        None,
+        None,
+        &mut padding_buffer,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_encrypted_quic_frame_with_profile(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -3256,10 +3342,20 @@ fn write_encrypted_quic_frame_with_profile(
     payload: &[u8],
     shroud_profile: Option<ShroudProfile>,
     padding_profile: Option<ProfileTier>,
+    padding_padder: Option<&mut ProfilePadder>,
+    padding_buffer: &mut Vec<u8>,
 ) -> Result<()> {
-    let framed_payload = match padding_profile {
-        Some(profile) => apply_profile(profile, payload)?,
-        None => payload.to_vec(),
+    let fallback;
+    let framed_payload = match (padding_profile, padding_padder) {
+        (Some(_), Some(padder)) => {
+            padder.apply_into(payload, padding_buffer)?;
+            padding_buffer.as_slice()
+        }
+        (Some(profile), None) => {
+            fallback = apply_profile(profile, payload)?;
+            fallback.as_slice()
+        }
+        (None, _) => payload,
     };
     let encrypted = if let Some(profile) = shroud_profile {
         if !profile.is_valid() {
@@ -3282,7 +3378,7 @@ fn write_encrypted_quic_frame_with_profile(
         padded[..SHROUD_LENGTH_PREFIX]
             .copy_from_slice(&(framed_payload.len() as u16).to_be_bytes());
         padded[SHROUD_LENGTH_PREFIX..SHROUD_LENGTH_PREFIX + framed_payload.len()]
-            .copy_from_slice(&framed_payload);
+            .copy_from_slice(framed_payload);
         if !profile.deterministic_padding {
             rand::rngs::OsRng
                 .fill_bytes(&mut padded[SHROUD_LENGTH_PREFIX + framed_payload.len()..]);
@@ -3294,7 +3390,7 @@ fn write_encrypted_quic_frame_with_profile(
                 "QUIC payload exceeds the {MAX_QUIC_PAYLOAD_BYTES}-byte frame capacity"
             )));
         }
-        cipher.encrypt(&framed_payload)?
+        cipher.encrypt(framed_payload)?
     };
     let encrypted = if let Some(profile) = shroud_profile {
         shph_core::encode_cell(profile, shph_core::SHROUD_FRAME_DATA, &encrypted)?
@@ -5245,6 +5341,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(session.recv_frame().unwrap(), b"shroud-lab");
+        client_handle.join().unwrap();
+    }
+
+    #[test]
+    fn quic_tuned_profile_roundtrip_uses_shared_envelope_capacity() {
+        use shph_core::IdentityKeyPair;
+        use std::io::ErrorKind;
+        use std::net::UdpSocket;
+        use std::thread;
+
+        match UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => drop(socket),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("skipping tuned quic test: UDP bind denied ({err})");
+                return;
+            }
+            Err(err) => panic!("tuned quic test requires UDP bind: {err}"),
+        }
+        let server_id = IdentityKeyPair::generate().unwrap();
+        let client_id = IdentityKeyPair::generate().unwrap();
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_id));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_id));
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = probe.local_addr().unwrap();
+        drop(probe);
+        let peer = server_addr.to_string();
+        let client_policy2 = client_policy.clone();
+        let client_handle = thread::spawn(move || {
+            let (mut session, _) = connect_secure_session_lab(
+                &peer,
+                &client_id,
+                &client_policy2,
+                5,
+                TransportMode::Quic,
+                QuicLabConfig {
+                    shroud_profile: Some(shph_core::TUNED_MEDIUM),
+                },
+            )
+            .unwrap();
+            session.send_frame(&[0x4d; 1_000]).unwrap();
+        });
+        let (mut session, _) = accept_secure_session_lab(
+            &server_addr.to_string(),
+            &server_id,
+            &server_policy,
+            5,
+            TransportMode::Quic,
+            QuicLabConfig {
+                shroud_profile: Some(shph_core::TUNED_MEDIUM),
+            },
+        )
+        .unwrap();
+        assert_eq!(session.recv_frame().unwrap(), vec![0x4d; 1_000]);
         client_handle.join().unwrap();
     }
 

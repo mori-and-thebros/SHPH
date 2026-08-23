@@ -1429,6 +1429,28 @@ fn bench_evidence_overhead_matrix(options: Options) {
         ("web", MorphologyProfile::WebBrowsingLab, 0x5745_4242),
         ("voip", MorphologyProfile::LowLatency, 0x564f_4950),
         ("ssh", MorphologyProfile::LowLatency, 0x5353_4821),
+        ("tuned-low", MorphologyProfile::TunedLowLatency, 0x544c_4f57),
+        (
+            "tuned-web",
+            MorphologyProfile::TunedWebBrowsingLab,
+            0x5457_4542,
+        ),
+        (
+            "tuned-video",
+            MorphologyProfile::TunedVideoStreamingLab,
+            0x5456_4944,
+        ),
+        (
+            "tuned-video-near-mtu",
+            MorphologyProfile::TunedVideoStreamingLab,
+            0x5456_4e4d,
+        ),
+        ("tuned-bulk", MorphologyProfile::TunedBulkLab, 0x5442_554c),
+        (
+            "tuned-voip",
+            MorphologyProfile::TunedLowLatency,
+            0x5456_4f49,
+        ),
     ] {
         let mut morphology = MorphologyEngine::from_seed(profile, seed);
         let mut raw_bytes = 0usize;
@@ -1497,6 +1519,10 @@ fn bench_evidence_overhead_matrix(options: Options) {
                 "weighted_smallest_fit;classes=1415|1430|1445|1460|1472;weights=35|30|20|12|3;mtu_cap=path_mtu;near_mtu_entropy_workload_only"
             }
             MorphologyProfile::BulkLab => "uniform_profile_classes",
+            MorphologyProfile::TunedLowLatency => "weighted_smallest_fit;classes=64|96|128|192|256|512|768;weights=65|20|6|4|3|1|1;mtu_cap=path_mtu;tuned",
+            MorphologyProfile::TunedWebBrowsingLab => "weighted_smallest_fit;classes=256|384|512|768|1024|1280|1360;weights=35|25|18|12|7|2|1;mtu_cap=path_mtu;tuned",
+            MorphologyProfile::TunedVideoStreamingLab => "weighted_path_aware;classes=1024|1152|1280|1360|1408|1440|1472;weights=26|24|20|14|8|5|3;mtu_cap=path_mtu;tuned",
+            MorphologyProfile::TunedBulkLab => "weighted_path_aware;classes=1024|1152|1280|1360|1408|1440|1472;weights=5|10|15|20|20|15|15;mtu_cap=path_mtu;tuned",
         };
         emit_rate_with_wire(
             options,
@@ -1539,6 +1565,12 @@ fn evidence_payload_len(profile: &str, packet: usize) -> usize {
                 "web" => 0x5745_4242,
                 "voip" => 0x564f_4950,
                 "ssh" => 0x5353_4821,
+                "tuned-low" => 0x544c_4f57,
+                "tuned-web" => 0x5457_4542,
+                "tuned-video" => 0x5456_4944,
+                "tuned-video-near-mtu" => 0x5456_4e4d,
+                "tuned-bulk" => 0x5442_554c,
+                "tuned-voip" => 0x5456_4f49,
                 _ => 0,
             },
     );
@@ -1551,6 +1583,13 @@ fn evidence_payload_len(profile: &str, packet: usize) -> usize {
         "web" => 32 + (mixed % 768) as usize,
         "voip" => 24 + (mixed % 96) as usize,
         "ssh" => 1 + (mixed % 80) as usize,
+        "tuned-low" => 1 + (mixed % 80) as usize,
+        "tuned-web" if packet.is_multiple_of(20) => 1_000 + (mixed % 401) as usize,
+        "tuned-web" => 32 + (mixed % 768) as usize,
+        "tuned-video" => 800 + (mixed % 601) as usize,
+        "tuned-video-near-mtu" => 1_408 + (mixed % 58) as usize,
+        "tuned-bulk" => 900 + (mixed % 501) as usize,
+        "tuned-voip" => 24 + (mixed % 96) as usize,
         _ => 1,
     }
 }
@@ -1812,6 +1851,16 @@ fn bench_shroud2_morphology(options: Options) {
             MorphologyProfile::VideoStreamingBalancedPayloadLab,
         ),
         ("bulk-lab", MorphologyProfile::BulkLab),
+        ("tuned-low-latency", MorphologyProfile::TunedLowLatency),
+        (
+            "tuned-web-browsing-lab",
+            MorphologyProfile::TunedWebBrowsingLab,
+        ),
+        (
+            "tuned-video-streaming-lab",
+            MorphologyProfile::TunedVideoStreamingLab,
+        ),
+        ("tuned-bulk-lab", MorphologyProfile::TunedBulkLab),
     ] {
         let mut morphology = MorphologyEngine::from_seed(profile, 0x5348_524f_5544);
         let mut samples = Vec::with_capacity(options.iterations);
@@ -1858,6 +1907,16 @@ fn bench_shroud2_delay(options: Options) {
             MorphologyProfile::VideoStreamingBalancedPayloadLab,
         ),
         ("bulk-lab", MorphologyProfile::BulkLab),
+        ("tuned-low-latency", MorphologyProfile::TunedLowLatency),
+        (
+            "tuned-web-browsing-lab",
+            MorphologyProfile::TunedWebBrowsingLab,
+        ),
+        (
+            "tuned-video-streaming-lab",
+            MorphologyProfile::TunedVideoStreamingLab,
+        ),
+        ("tuned-bulk-lab", MorphologyProfile::TunedBulkLab),
     ] {
         let mut morphology = MorphologyEngine::from_seed(profile, 0x5348_524f_5544);
         let start = begin_measurement();
@@ -2692,7 +2751,20 @@ mod tests {
 
     #[test]
     fn evidence_payload_generators_are_bounded() {
-        for profile in ["bulk", "video", "video-large", "web", "voip", "ssh"] {
+        for profile in [
+            "bulk",
+            "video",
+            "video-large",
+            "web",
+            "voip",
+            "ssh",
+            "tuned-low",
+            "tuned-web",
+            "tuned-video",
+            "tuned-video-near-mtu",
+            "tuned-bulk",
+            "tuned-voip",
+        ] {
             for packet in 0..5_000 {
                 let payload = evidence_payload_len(profile, packet);
                 assert!(payload > 0);

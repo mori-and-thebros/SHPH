@@ -1,0 +1,1590 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; style-src 'unsafe-inline' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; img-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; font-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; media-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; worker-src blob:; connect-src blob: data:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Shph Evidence Dashboard.Fragment</title>
+<style>:root{color-scheme:light dark;background:light-dark(rgb(255 255 255), rgb(24 24 24))}html,body{margin:0}body{box-sizing:border-box;padding:1rem;background:inherit}iframe{display:block;width:100%;max-width:736px;height:calc(100vh - 2rem);margin:0 auto;border:0}</style>
+</head>
+<body>
+<iframe sandbox="allow-scripts" referrerpolicy="no-referrer" title="Shph Evidence Dashboard.Fragment" srcdoc="&lt;!doctype html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;
+&lt;meta name=&quot;referrer&quot; content=&quot;no-referrer&quot;&gt;
+&lt;meta http-equiv=&quot;Content-Security-Policy&quot; content=&quot;default-src &#x27;none&#x27;; script-src &#x27;unsafe-inline&#x27; &#x27;unsafe-eval&#x27; &#x27;wasm-unsafe-eval&#x27; blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; style-src &#x27;unsafe-inline&#x27; blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; img-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; font-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; media-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; worker-src blob:; connect-src blob: data:; frame-src &#x27;none&#x27;; object-src &#x27;none&#x27;; base-uri &#x27;none&#x27;; form-action &#x27;none&#x27;&quot;&gt;
+&lt;title&gt;Shph Evidence Dashboard.Fragment&lt;/title&gt;
+&lt;style&gt;:root {
+  color-scheme: light dark;
+  background-color: var(--background) !important;
+
+  /* Agent-facing contract; keep in sync with SKILL.md. */
+  --background: light-dark(rgb(255 255 255), rgb(24 24 24));
+  --foreground: light-dark(rgb(26 28 31), rgb(255 255 255));
+  --card: color-mix(in oklab, var(--foreground) 5%, transparent);
+  --card-foreground: var(--foreground);
+  --popover: light-dark(rgb(255 255 255), rgb(45 45 45));
+  --popover-foreground: var(--foreground);
+  --primary: light-dark(rgb(51 156 255), rgb(131 195 255));
+  --primary-foreground: light-dark(rgb(255 255 255), rgb(13 13 13));
+  --secondary: light-dark(rgb(255 255 255 / 96%), rgb(54 54 54 / 96%));
+  --secondary-foreground: var(--foreground);
+  --muted: color-mix(in srgb, var(--foreground) 10%, transparent);
+  --muted-foreground: light-dark(
+    rgb(26 28 31 / 49.4%),
+    rgb(255 255 255 / 49.8%)
+  );
+  --accent: light-dark(rgb(229 242 255), rgb(13 39 63));
+  --accent-foreground: var(--primary);
+  --destructive: light-dark(rgb(226 85 7), rgb(255 133 73));
+  --border: light-dark(rgb(26 28 31 / 8%), rgb(255 255 255 / 8.2%));
+  --input: light-dark(
+    rgb(26 28 31 / 11.8%),
+    color-mix(in oklab, rgb(0 0 0) 10%, transparent)
+  );
+  --ring: light-dark(rgb(51 156 255), rgb(131 195 255 / 76%));
+  --font-size-base: 14px;
+  --viz-series-1: var(--primary);
+  --viz-series-2: light-dark(rgb(243 136 59), rgb(245 154 86));
+  --viz-series-3: light-dark(rgb(93 201 119), rgb(116 213 139));
+  --viz-series-4: light-dark(rgb(235 119 177), rgb(240 143 192));
+  --viz-series-5: light-dark(rgb(155 121 236), rgb(170 145 239));
+  --viz-series-6: light-dark(rgb(58 185 177), rgb(90 203 194));
+
+  /* Internal implementation variables; not part of the agent contract. */
+  --font-sans: -apple-system, system-ui, &quot;Segoe UI&quot;, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, &quot;SF Mono&quot;, Menlo, Consolas, &quot;Liberation Mono&quot;,
+    monospace;
+  --font-size-normal: max(11px, var(--font-size-base));
+  --font-size-tooltip: calc(var(--font-size-base) - 1px);
+  --font-size-small: max(11px, calc(var(--font-size-base) - 2px));
+  --font-size-h1: calc(var(--font-size-normal) * 1.7142857143);
+  --font-size-h2: calc(var(--font-size-normal) * 1.4285714286);
+  --font-size-h3: calc(var(--font-size-normal) * 1.2857142857);
+  --font-weight-normal: 430;
+  --font-weight-medium: 500;
+  --line-height-normal: calc(var(--font-size-normal) * 1.5);
+  --line-height-tooltip: calc(var(--font-size-tooltip) * 1.4285714286);
+  --line-height-small: calc(var(--font-size-small) + 4px);
+  --radius: 12.5px;
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-2xl: calc(var(--radius) * 1.6);
+  --radius-full: 9999px;
+  --shadow-sm: 0 1px 2px -1px rgb(0 0 0 / 8%);
+  --checkmark-image: url(&quot;data:image/svg+xml,%3Csvg xmlns=&#x27;http://www.w3.org/2000/svg&#x27; viewBox=&#x27;0 0 17 17&#x27;%3E%3Cpath d=&#x27;M12.8961 3.64101C13.1297 3.41418 13.4984 3.37523 13.7779 3.56581C14.0571 3.75635 14.1554 4.11331 14.0299 4.41347L13.9615 4.53847L7.71151 13.7045C7.59411 13.8767 7.4063 13.9877 7.19881 14.0072C6.99136 14.0267 6.78564 13.9533 6.63826 13.806L2.88826 10.056L2.79842 9.9457C2.6192 9.67407 2.64927 9.30496 2.88826 9.06581C3.12738 8.82669 3.49647 8.79676 3.76815 8.97597L3.8785 9.06581L7.03084 12.2182L12.8053 3.74941L12.8961 3.64101Z&#x27;/%3E%3C/svg%3E&quot;);
+
+  /* Legacy aliases; not part of the current agent contract. */
+  --viz-bg: transparent;
+  --viz-panel: var(--card);
+  --viz-border: var(--border);
+  --viz-text: var(--foreground);
+  --viz-muted: var(--muted-foreground);
+  --viz-accent: var(--primary);
+  --viz-accent-text: var(--primary-foreground);
+  --viz-accent-bg: var(--accent);
+  --viz-font-size: var(--font-size-base);
+  --viz-warning: var(--destructive);
+  --color-background-primary: var(--background);
+  --color-text-primary: var(--foreground);
+  --color-border-secondary: var(--border);
+}
+
+:root[data-theme=&quot;light&quot;] {
+  color-scheme: light;
+}
+
+:root[data-theme=&quot;dark&quot;] {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html &gt; body {
+  margin: 0;
+  padding: 5px;
+  color: var(--foreground);
+  background: transparent !important;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-normal);
+  font-weight: var(--font-weight-normal);
+  line-height: var(--line-height-normal);
+}
+
+a {
+  color: color-mix(in srgb, var(--viz-accent) 80%, var(--viz-text) 20%);
+  cursor: pointer;
+  font-weight: var(--font-weight-medium);
+  text-decoration: none;
+  text-underline-offset: 2px;
+}
+
+a:is(:hover, :focus-visible) {
+  text-decoration-line: underline;
+  text-decoration-style: dashed;
+  text-decoration-thickness: 0.5px;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  margin-block: 0;
+}
+
+h1 {
+  font-size: var(--font-size-h1);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h2 {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h3,
+h4,
+h5,
+h6 {
+  font-size: var(--font-size-h3);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.3;
+}
+
+b,
+strong,
+th {
+  font-weight: var(--font-weight-medium);
+}
+
+code:not(pre code) {
+  display: inline;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  corner-shape: superellipse(1.5);
+  background: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  word-break: break-word;
+}
+
+#widget {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  padding: 0;
+  background: transparent !important;
+}
+
+.card {
+  min-width: 0;
+  padding: 12px;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  border-radius: var(--radius-2xl);
+  corner-shape: superellipse(1.5);
+  color: var(--card-foreground);
+  background: var(--card);
+}
+
+#widget &gt; :not(.card) {
+  width: 100% !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.tooltip {
+  position: fixed;
+  z-index: 50;
+  top: 0;
+  left: 0;
+  width: max-content;
+  max-width: min(
+    20rem,
+    var(--tooltip-available-width, calc(100vw - 10px)),
+    calc(100vw - 10px)
+  );
+  max-height: min(
+    var(--tooltip-available-height, calc(100vh - 10px)),
+    calc(100vh - 10px)
+  );
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--popover-foreground);
+  background: var(--popover);
+  box-shadow: none;
+  font-size: var(--font-size-tooltip);
+  line-height: var(--line-height-tooltip);
+  overflow-wrap: break-word;
+  white-space: normal;
+  pointer-events: none;
+  user-select: none;
+}
+
+.viz-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(max(180px, 24%), 1fr));
+  gap: 10px;
+}
+
+.viz-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.viz-stat-value {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+.viz-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.viz-badge {
+  padding: 3px 8px;
+  border-radius: var(--radius-full);
+  color: var(--accent-foreground);
+  background: var(--accent);
+  font-weight: var(--font-weight-medium);
+}
+
+small,
+.text-small,
+.viz-badge {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.text-muted {
+  color: var(--muted-foreground);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.viz-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.viz-controls &gt; .form-label {
+  display: grid;
+  min-width: min(100%, 260px);
+  flex: 1 1 280px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 12px;
+  margin-bottom: 0;
+}
+
+.viz-controls &gt; .form-label &gt; :is(.form-control, .form-range, .form-select) {
+  grid-column: 1 / -1;
+}
+
+.btn,
+.form-check-input,
+.form-control,
+.form-range,
+.form-select {
+  font: inherit;
+}
+
+.btn {
+  appearance: button;
+  display: inline-flex;
+  inline-size: fit-content;
+  max-inline-size: 100%;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0 8px;
+  -webkit-app-region: no-drag;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: var(--cursor-interaction, pointer);
+  text-align: center;
+  text-decoration: none;
+  white-space: nowrap;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.btn:is(.btn-block, .viz-tile) {
+  inline-size: 100%;
+}
+
+.btn.viz-tile {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+a.btn {
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.btn:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.btn-primary {
+  border-color: transparent;
+  color: var(--primary-foreground);
+  background: var(--foreground);
+  background-clip: padding-box;
+}
+
+.btn-primary .text-muted {
+  color: color-mix(in srgb, var(--primary-foreground) 50%, transparent);
+}
+
+.btn-primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 80%, transparent);
+  background-clip: padding-box;
+}
+
+.btn-ghost {
+  border-color: transparent;
+  color: var(--muted-foreground);
+  background: transparent;
+}
+
+.btn-ghost:not(:disabled):hover {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+[data-lucide] {
+  stroke-width: 1.6;
+}
+
+.form-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--foreground);
+}
+
+.form-control {
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--foreground);
+  background: var(--secondary);
+}
+
+.form-control::placeholder {
+  color: var(--muted-foreground);
+}
+
+.form-control[type=&quot;file&quot;] {
+  padding: 0;
+  overflow: hidden;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control[type=&quot;file&quot;]::file-selector-button {
+  min-height: 26px;
+  margin-right: 8px;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid var(--input);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: inherit;
+  font: inherit;
+}
+
+.form-control[type=&quot;file&quot;]:not(:disabled):hover::file-selector-button {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-control-color[type=&quot;color&quot;] {
+  width: 40px;
+  height: 28px;
+  padding: 3px;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control-color[type=&quot;color&quot;]::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.form-control-color[type=&quot;color&quot;]::-webkit-color-swatch {
+  border: 0;
+  border-radius: calc(var(--radius-lg) - 4px);
+  corner-shape: superellipse(1.5);
+}
+
+textarea.form-control {
+  height: auto;
+  min-height: 72px;
+  padding: 8px 10px;
+  resize: vertical;
+}
+
+.form-control:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-control:disabled,
+.form-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.form-select {
+  appearance: none;
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 32px 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--foreground);
+  background-color: var(--secondary);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted-foreground) 50%),
+    linear-gradient(135deg, var(--muted-foreground) 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 50%,
+    calc(100% - 10px) 50%;
+  background-repeat: no-repeat;
+  background-size: 4px 4px;
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-select:not(:disabled):hover {
+  background-color: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-select:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-check {
+  display: flex;
+  min-height: 20px;
+  align-items: center;
+  gap: 6px;
+}
+
+.form-check-input {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  border: 1px solid var(--input);
+  color: var(--primary-foreground);
+  background-color: transparent;
+  cursor: var(--cursor-interaction, default);
+  transition:
+    background-color 150ms,
+    border-color 150ms,
+    box-shadow 150ms;
+}
+
+.form-check:not(.form-switch) .form-check-input[type=&quot;checkbox&quot;] {
+  border-color: var(--input);
+  border-radius: var(--radius-sm);
+  corner-shape: superellipse(1.5);
+  background-color: var(--secondary);
+  box-shadow: var(--shadow-sm);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input:not(:disabled):not(:checked):hover {
+  background-color: var(--card);
+}
+
+.form-check:not(.form-switch) .form-check-input[type=&quot;checkbox&quot;]:checked {
+  border-color: var(--primary);
+  background-color: var(--primary);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input[type=&quot;checkbox&quot;]:checked::before {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--primary-foreground);
+  content: &quot;&quot;;
+  mask: var(--checkmark-image) center / 12px 12px no-repeat;
+}
+
+.form-check-input[type=&quot;radio&quot;] {
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-full);
+}
+
+.form-check-input[type=&quot;radio&quot;]:checked {
+  border: 2px solid var(--primary);
+  background:
+    radial-gradient(circle, var(--primary-foreground) 0 2.5px, transparent 3px),
+    var(--primary);
+}
+
+.form-check:not(.form-switch) .form-check-input:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+}
+
+.form-switch .form-check-input:disabled,
+.form-switch .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.form-check-label {
+  color: var(--foreground);
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-switch .form-check-input {
+  position: relative;
+  width: 32px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--muted);
+  box-shadow: none;
+  transition: background-color 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input::before {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 16px;
+  height: 16px;
+  box-sizing: border-box;
+  border: 1px solid light-dark(var(--primary-foreground), var(--foreground));
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+  box-shadow: var(--shadow-sm);
+  content: &quot;&quot;;
+  transform: translate(2px, -50%);
+  transition: transform 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input:checked {
+  background: var(--primary);
+}
+
+.form-switch .form-check-input:checked::before {
+  transform: translate(14px, -50%);
+}
+
+.form-switch .form-check-input:focus-visible {
+  box-shadow: 0 0 0 2px var(--ring);
+}
+
+.form-range {
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 28px;
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  outline: none;
+  border: 0;
+  accent-color: var(--primary);
+  background: linear-gradient(
+      color-mix(in srgb, var(--foreground) 7%, transparent),
+      color-mix(in srgb, var(--foreground) 7%, transparent)
+    )
+    center / 100% 2px no-repeat;
+}
+
+.form-range::-webkit-slider-runnable-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-webkit-slider-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range::-moz-range-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-moz-range-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.btn:not(.btn-primary, .viz-tile):is(
+    [aria-pressed=&quot;true&quot;],
+    [aria-selected=&quot;true&quot;],
+    .is-selected
+  ) {
+  border-color: var(--primary);
+  color: var(--primary-foreground);
+  background: var(--primary);
+}
+
+.btn.viz-tile:is([aria-pressed=&quot;true&quot;], [aria-selected=&quot;true&quot;], .is-selected) {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+#widget &gt; svg {
+  width: 100%;
+}
+
+.text-warning,
+.text-destructive {
+  color: var(--destructive);
+}
+
+html&gt;body{padding:0}&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;div id=&quot;shphEvidenceDashboard&quot;&gt;
+  &lt;style&gt;
+    #shphEvidenceDashboard {
+      display: grid;
+      gap: 1.25rem;
+      color: var(--foreground);
+    }
+
+    #shphEvidenceDashboard .chart-block {
+      display: grid;
+      gap: 0.45rem;
+      min-width: 0;
+    }
+
+    #shphEvidenceDashboard .chart {
+      width: 100%;
+      height: auto;
+      overflow: visible;
+    }
+
+    #shphEvidenceDashboard .axis,
+    #shphEvidenceDashboard .gridline,
+    #shphEvidenceDashboard .zero-line {
+      stroke: var(--border);
+      stroke-width: 1;
+    }
+
+    #shphEvidenceDashboard .gridline {
+      opacity: 0.7;
+      stroke-dasharray: 3 5;
+    }
+
+    #shphEvidenceDashboard .zero-line {
+      stroke: var(--foreground);
+      stroke-width: 1.5;
+    }
+
+    #shphEvidenceDashboard .label,
+    #shphEvidenceDashboard .value,
+    #shphEvidenceDashboard .axis-label,
+    #shphEvidenceDashboard .panel-title,
+    #shphEvidenceDashboard .note {
+      fill: var(--foreground);
+      font-family: inherit;
+    }
+
+    #shphEvidenceDashboard .label {
+      font-size: 12px;
+    }
+
+    #shphEvidenceDashboard .value {
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    #shphEvidenceDashboard .axis-label,
+    #shphEvidenceDashboard .note {
+      fill: var(--muted-foreground);
+      font-size: 11px;
+    }
+
+    #shphEvidenceDashboard .panel-title {
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    #shphEvidenceDashboard .mobile-summary {
+      display: none;
+    }
+
+    #shphEvidenceDashboard table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    #shphEvidenceDashboard th,
+    #shphEvidenceDashboard td {
+      padding: 0.35rem 0;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    #shphEvidenceDashboard th {
+      color: var(--muted-foreground);
+      font-weight: 400;
+    }
+
+    #shphEvidenceDashboard .bar {
+      fill: var(--viz-series-1);
+    }
+
+    #shphEvidenceDashboard .bar.highlight,
+    #shphEvidenceDashboard .bar.windows {
+      fill: var(--viz-series-2);
+    }
+
+    #shphEvidenceDashboard .bar.linux {
+      fill: var(--viz-series-1);
+    }
+
+    #shphEvidenceDashboard .bar.negative {
+      fill: var(--destructive);
+    }
+
+    #shphEvidenceDashboard .bar.pass {
+      fill: var(--viz-series-3);
+    }
+
+    #shphEvidenceDashboard .status {
+      fill: var(--viz-series-3);
+    }
+
+    @media (max-width: 480px) {
+      #shphEvidenceDashboard .chart {
+        display: none;
+      }
+
+      #shphEvidenceDashboard .mobile-summary {
+        display: block;
+      }
+    }
+  &lt;/style&gt;
+
+  &lt;section class=&quot;chart-block&quot; aria-labelledby=&quot;overhead-label&quot;&gt;
+    &lt;svg class=&quot;chart&quot; viewBox=&quot;0 0 760 770&quot; role=&quot;img&quot; aria-labelledby=&quot;overhead-label overhead-desc&quot;&gt;
+      &lt;title id=&quot;overhead-label&quot;&gt;Shroud2 wire overhead with linear small multiples&lt;/title&gt;
+      &lt;desc id=&quot;overhead-desc&quot;&gt;Measured local synthetic overhead for baseline and tuned profiles, split into linear panels so each bar length is proportional to its displayed percentage.&lt;/desc&gt;
+      &lt;g id=&quot;overhead-panels&quot;&gt;&lt;/g&gt;
+      &lt;text class=&quot;note&quot; x=&quot;220&quot; y=&quot;750&quot;&gt;Plaintext baseline; IP, UDP, and Ethernet headers excluded. Tuned rows are separate profile captures.&lt;/text&gt;
+    &lt;/svg&gt;
+    &lt;div class=&quot;mobile-summary&quot;&gt;
+      &lt;table&gt;
+        &lt;thead&gt;&lt;tr&gt;&lt;th&gt;Workload / profile&lt;/th&gt;&lt;th&gt;Overhead&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+        &lt;tbody&gt;
+          &lt;tr&gt;&lt;td&gt;Bulk / baseline&lt;/td&gt;&lt;td&gt;24.965%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Bulk / tuned&lt;/td&gt;&lt;td&gt;20.156%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Mixed video / baseline&lt;/td&gt;&lt;td&gt;21.093%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Mixed video / tuned&lt;/td&gt;&lt;td&gt;18.446%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Near-MTU video / baseline&lt;/td&gt;&lt;td&gt;1.427%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Near-MTU video / tuned&lt;/td&gt;&lt;td&gt;1.857%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Balanced near-MTU / baseline&lt;/td&gt;&lt;td&gt;1.360%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Web / baseline&lt;/td&gt;&lt;td&gt;90.340%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Web / tuned&lt;/td&gt;&lt;td&gt;64.575%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;VoIP-sized / baseline&lt;/td&gt;&lt;td&gt;191.303%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;VoIP-sized / tuned&lt;/td&gt;&lt;td&gt;126.978%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;SSH-sized / baseline&lt;/td&gt;&lt;td&gt;422.775%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;SSH-sized / tuned&lt;/td&gt;&lt;td&gt;179.399%&lt;/td&gt;&lt;/tr&gt;
+        &lt;/tbody&gt;
+      &lt;/table&gt;
+      &lt;p class=&quot;note&quot;&gt;Each panel uses a linear axis with its own declared range.&lt;/p&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;chart-block&quot; aria-labelledby=&quot;tuning-label&quot;&gt;
+    &lt;svg class=&quot;chart&quot; viewBox=&quot;0 0 760 330&quot; role=&quot;img&quot; aria-labelledby=&quot;tuning-label tuning-desc&quot;&gt;
+      &lt;title id=&quot;tuning-label&quot;&gt;Tuned Shroud2 overhead change&lt;/title&gt;
+      &lt;desc id=&quot;tuning-desc&quot;&gt;Percentage reduction in overhead from baseline to tuned captures. The near-MTU video row is negative because the tuned capture used more overhead.&lt;/desc&gt;
+      &lt;text class=&quot;axis-label&quot; x=&quot;260&quot; y=&quot;22&quot;&gt;Change in overhead, percent - positive means lower overhead&lt;/text&gt;
+      &lt;line class=&quot;axis&quot; x1=&quot;250&quot; y1=&quot;48&quot; x2=&quot;700&quot; y2=&quot;48&quot;&gt;&lt;/line&gt;
+      &lt;g id=&quot;tuning-grid&quot;&gt;&lt;/g&gt;
+      &lt;g id=&quot;tuning-bars&quot;&gt;&lt;/g&gt;
+      &lt;text class=&quot;note&quot; x=&quot;250&quot; y=&quot;312&quot;&gt;Near-MTU video is a measured regression in this comparison, not a hidden success.&lt;/text&gt;
+    &lt;/svg&gt;
+    &lt;div class=&quot;mobile-summary&quot;&gt;
+      &lt;table&gt;
+        &lt;thead&gt;&lt;tr&gt;&lt;th&gt;Workload&lt;/th&gt;&lt;th&gt;Reduction&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+        &lt;tbody&gt;
+          &lt;tr&gt;&lt;td&gt;Bulk&lt;/td&gt;&lt;td&gt;+19.26%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Mixed video&lt;/td&gt;&lt;td&gt;+12.55%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Near-MTU video&lt;/td&gt;&lt;td&gt;-30.13%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Web&lt;/td&gt;&lt;td&gt;+28.52%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;VoIP-sized&lt;/td&gt;&lt;td&gt;+33.62%&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;SSH-sized&lt;/td&gt;&lt;td&gt;+57.57%&lt;/td&gt;&lt;/tr&gt;
+        &lt;/tbody&gt;
+      &lt;/table&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;chart-block&quot; aria-labelledby=&quot;runner-label&quot;&gt;
+    &lt;svg class=&quot;chart&quot; viewBox=&quot;0 0 760 610&quot; role=&quot;img&quot; aria-labelledby=&quot;runner-label runner-desc&quot;&gt;
+      &lt;title id=&quot;runner-label&quot;&gt;GitHub-hosted Linux and Windows benchmark comparison&lt;/title&gt;
+      &lt;desc id=&quot;runner-desc&quot;&gt;Selected secure-default measurements from the extracted GitHub-hosted artifacts, separated into handshake latency, in-memory echo p99, and in-memory dataplane goodput.&lt;/desc&gt;
+      &lt;g id=&quot;runner-panels&quot;&gt;&lt;/g&gt;
+      &lt;text class=&quot;note&quot; x=&quot;220&quot; y=&quot;590&quot;&gt;Commit afb2910...; GitHub-hosted local operations, not Internet throughput or network RTT.&lt;/text&gt;
+    &lt;/svg&gt;
+    &lt;div class=&quot;mobile-summary&quot;&gt;
+      &lt;table&gt;
+        &lt;thead&gt;&lt;tr&gt;&lt;th&gt;Measurement&lt;/th&gt;&lt;th&gt;Linux&lt;/th&gt;&lt;th&gt;Windows&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+        &lt;tbody&gt;
+          &lt;tr&gt;&lt;td&gt;Handshake p50&lt;/td&gt;&lt;td&gt;1.217 ms&lt;/td&gt;&lt;td&gt;1.415 ms&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;In-memory echo p99&lt;/td&gt;&lt;td&gt;18.928 µs&lt;/td&gt;&lt;td&gt;13.900 µs&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Goodput, 1 KiB&lt;/td&gt;&lt;td&gt;180.918 Mbps&lt;/td&gt;&lt;td&gt;196.795 Mbps&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Goodput, 64 KiB&lt;/td&gt;&lt;td&gt;584.644 Mbps&lt;/td&gt;&lt;td&gt;478.786 Mbps&lt;/td&gt;&lt;/tr&gt;
+        &lt;/tbody&gt;
+      &lt;/table&gt;
+      &lt;p class=&quot;note&quot;&gt;Linux and Windows are separate GitHub-hosted runner captures.&lt;/p&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;chart-block&quot; aria-labelledby=&quot;criterion-label&quot;&gt;
+    &lt;svg class=&quot;chart&quot; viewBox=&quot;0 0 760 700&quot; role=&quot;img&quot; aria-labelledby=&quot;criterion-label criterion-desc&quot;&gt;
+      &lt;title id=&quot;criterion-label&quot;&gt;Criterion cross-platform microbenchmark comparison&lt;/title&gt;
+      &lt;desc id=&quot;criterion-desc&quot;&gt;Selected Criterion means from Windows and Linux GitHub-hosted captures. Panels use separate linear ranges in microseconds to avoid hiding the small operations beside full handshakes.&lt;/desc&gt;
+      &lt;g id=&quot;criterion-panels&quot;&gt;&lt;/g&gt;
+      &lt;text class=&quot;note&quot; x=&quot;220&quot; y=&quot;680&quot;&gt;31 result sets across six groups; values are mean operation times from Criterion.&lt;/text&gt;
+    &lt;/svg&gt;
+    &lt;div class=&quot;mobile-summary&quot;&gt;
+      &lt;table&gt;
+        &lt;thead&gt;&lt;tr&gt;&lt;th&gt;Benchmark&lt;/th&gt;&lt;th&gt;Windows&lt;/th&gt;&lt;th&gt;Linux&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+        &lt;tbody&gt;
+          &lt;tr&gt;&lt;td&gt;Secure handshake&lt;/td&gt;&lt;td&gt;1,756.35 us&lt;/td&gt;&lt;td&gt;1,318.69 us&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Classical handshake&lt;/td&gt;&lt;td&gt;1,145.35 us&lt;/td&gt;&lt;td&gt;804.78 us&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;AEAD encrypt 1 KiB&lt;/td&gt;&lt;td&gt;2.55 us&lt;/td&gt;&lt;td&gt;2.86 us&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;AEAD decrypt 1 KiB&lt;/td&gt;&lt;td&gt;2.68 us&lt;/td&gt;&lt;td&gt;2.82 us&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Replay window batch&lt;/td&gt;&lt;td&gt;11.80 us&lt;/td&gt;&lt;td&gt;7.62 us&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Shroud2 bulk encode/decode&lt;/td&gt;&lt;td&gt;0.49 us&lt;/td&gt;&lt;td&gt;2.02 us&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Shroud2 web encode/decode&lt;/td&gt;&lt;td&gt;0.50 us&lt;/td&gt;&lt;td&gt;1.75 us&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Shroud2 video encode/decode&lt;/td&gt;&lt;td&gt;0.49 us&lt;/td&gt;&lt;td&gt;2.08 us&lt;/td&gt;&lt;/tr&gt;
+        &lt;/tbody&gt;
+      &lt;/table&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;chart-block&quot; aria-labelledby=&quot;coverage-label&quot;&gt;
+    &lt;svg class=&quot;chart&quot; viewBox=&quot;0 0 760 290&quot; role=&quot;img&quot; aria-labelledby=&quot;coverage-label coverage-desc&quot;&gt;
+      &lt;title id=&quot;coverage-label&quot;&gt;Criterion result-set coverage&lt;/title&gt;
+      &lt;desc id=&quot;coverage-desc&quot;&gt;Counts of Criterion result sets in each benchmark group from the extracted GitHub artifacts.&lt;/desc&gt;
+      &lt;text class=&quot;axis-label&quot; x=&quot;220&quot; y=&quot;22&quot;&gt;Criterion result sets by group&lt;/text&gt;
+      &lt;line class=&quot;axis&quot; x1=&quot;220&quot; y1=&quot;48&quot; x2=&quot;700&quot; y2=&quot;48&quot;&gt;&lt;/line&gt;
+      &lt;g id=&quot;coverage-grid&quot;&gt;&lt;/g&gt;
+      &lt;g id=&quot;coverage-bars&quot;&gt;&lt;/g&gt;
+      &lt;text class=&quot;value&quot; x=&quot;220&quot; y=&quot;270&quot;&gt;31 result sets - six groups - Windows and Linux captures&lt;/text&gt;
+    &lt;/svg&gt;
+    &lt;div class=&quot;mobile-summary&quot;&gt;
+      &lt;table&gt;
+        &lt;thead&gt;&lt;tr&gt;&lt;th&gt;Group&lt;/th&gt;&lt;th&gt;Sets&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+        &lt;tbody&gt;
+          &lt;tr&gt;&lt;td&gt;Core crypto&lt;/td&gt;&lt;td&gt;3&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Defensive paths&lt;/td&gt;&lt;td&gt;3&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Handshake&lt;/td&gt;&lt;td&gt;3&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Identity&lt;/td&gt;&lt;td&gt;3&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Transport framing&lt;/td&gt;&lt;td&gt;8&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Transport Shroud2&lt;/td&gt;&lt;td&gt;11&lt;/td&gt;&lt;/tr&gt;
+        &lt;/tbody&gt;
+      &lt;/table&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;chart-block&quot; aria-labelledby=&quot;defense-label&quot;&gt;
+    &lt;svg class=&quot;chart&quot; viewBox=&quot;0 0 760 300&quot; role=&quot;img&quot; aria-labelledby=&quot;defense-label defense-desc&quot;&gt;
+      &lt;title id=&quot;defense-label&quot;&gt;Local defensive-path processing rates&lt;/title&gt;
+      &lt;desc id=&quot;defense-desc&quot;&gt;Log-scale comparison of in-memory operation rates for direct ML-KEM, the cookie path, the per-source limiter, and replay-window validation.&lt;/desc&gt;
+      &lt;text class=&quot;axis-label&quot; x=&quot;250&quot; y=&quot;22&quot;&gt;Operations per second - logarithmic scale&lt;/text&gt;
+      &lt;line class=&quot;axis&quot; x1=&quot;250&quot; y1=&quot;48&quot; x2=&quot;720&quot; y2=&quot;48&quot;&gt;&lt;/line&gt;
+      &lt;g id=&quot;defense-grid&quot;&gt;&lt;/g&gt;
+      &lt;g id=&quot;defense-bars&quot;&gt;&lt;/g&gt;
+      &lt;text class=&quot;note&quot; x=&quot;250&quot; y=&quot;287&quot;&gt;Single-process/in-memory evidence; not network-flood capacity.&lt;/text&gt;
+    &lt;/svg&gt;
+    &lt;div class=&quot;mobile-summary&quot;&gt;
+      &lt;table&gt;
+        &lt;thead&gt;&lt;tr&gt;&lt;th&gt;Path&lt;/th&gt;&lt;th&gt;Rate&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+        &lt;tbody&gt;
+          &lt;tr&gt;&lt;td&gt;Direct ML-KEM-768&lt;/td&gt;&lt;td&gt;15.478k/s&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Stateless cookie path&lt;/td&gt;&lt;td&gt;0.619M/s&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Per-source limiter&lt;/td&gt;&lt;td&gt;1.406M/s&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;Replay-window validation&lt;/td&gt;&lt;td&gt;14.114M/s&lt;/td&gt;&lt;/tr&gt;
+        &lt;/tbody&gt;
+      &lt;/table&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;chart-block&quot; aria-labelledby=&quot;fuzz-label&quot;&gt;
+    &lt;svg class=&quot;chart&quot; viewBox=&quot;0 0 760 350&quot; role=&quot;img&quot; aria-labelledby=&quot;fuzz-label fuzz-desc&quot;&gt;
+      &lt;title id=&quot;fuzz-label&quot;&gt;Fuzz campaign completion and elapsed time&lt;/title&gt;
+      &lt;desc id=&quot;fuzz-desc&quot;&gt;Five fuzz targets completed 20 million executions each. The companion panel shows captured elapsed seconds for the resumed local campaign.&lt;/desc&gt;
+      &lt;text class=&quot;axis-label&quot; x=&quot;210&quot; y=&quot;22&quot;&gt;Executions per target&lt;/text&gt;
+      &lt;line class=&quot;axis&quot; x1=&quot;210&quot; y1=&quot;48&quot; x2=&quot;720&quot; y2=&quot;48&quot;&gt;&lt;/line&gt;
+      &lt;g id=&quot;fuzz-grid&quot;&gt;&lt;/g&gt;
+      &lt;g id=&quot;fuzz-bars&quot;&gt;&lt;/g&gt;
+      &lt;text class=&quot;axis-label&quot; x=&quot;210&quot; y=&quot;242&quot;&gt;Elapsed seconds for the resumed campaign&lt;/text&gt;
+      &lt;line class=&quot;axis&quot; x1=&quot;210&quot; y1=&quot;258&quot; x2=&quot;720&quot; y2=&quot;258&quot;&gt;&lt;/line&gt;
+      &lt;g id=&quot;fuzz-time-grid&quot;&gt;&lt;/g&gt;
+      &lt;g id=&quot;fuzz-time-bars&quot;&gt;&lt;/g&gt;
+      &lt;text class=&quot;note&quot; x=&quot;210&quot; y=&quot;338&quot;&gt;100M aggregate executions; local resumed campaign, not one frozen-commit run.&lt;/text&gt;
+    &lt;/svg&gt;
+    &lt;div class=&quot;mobile-summary&quot;&gt;
+      &lt;table&gt;
+        &lt;thead&gt;&lt;tr&gt;&lt;th&gt;Target&lt;/th&gt;&lt;th&gt;Runs&lt;/th&gt;&lt;th&gt;Seconds&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+        &lt;tbody&gt;
+          &lt;tr&gt;&lt;td&gt;frame_decode&lt;/td&gt;&lt;td&gt;20M PASS&lt;/td&gt;&lt;td&gt;509&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;config_parse&lt;/td&gt;&lt;td&gt;20M PASS&lt;/td&gt;&lt;td&gt;15,035&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;audit_record&lt;/td&gt;&lt;td&gt;20M PASS&lt;/td&gt;&lt;td&gt;758&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;replay_window&lt;/td&gt;&lt;td&gt;20M PASS&lt;/td&gt;&lt;td&gt;268&lt;/td&gt;&lt;/tr&gt;
+          &lt;tr&gt;&lt;td&gt;shroud2_datagram&lt;/td&gt;&lt;td&gt;20M PASS&lt;/td&gt;&lt;td&gt;600&lt;/td&gt;&lt;/tr&gt;
+        &lt;/tbody&gt;
+      &lt;/table&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;script&gt;
+    (() =&gt; {
+      const root = document.getElementById(&quot;shphEvidenceDashboard&quot;);
+      const ns = &quot;http://www.w3.org/2000/svg&quot;;
+
+      const make = (tag, attrs, parent) =&gt; {
+        const node = document.createElementNS(ns, tag);
+        Object.entries(attrs).forEach(([key, value]) =&gt; node.setAttribute(key, value));
+        parent.appendChild(node);
+        return node;
+      };
+
+      const addText = (parent, attrs, value) =&gt; {
+        const node = make(&quot;text&quot;, attrs, parent);
+        node.textContent = value;
+        return node;
+      };
+
+      const linearScale = (value, min, max, left, right) =&gt;
+        left + ((value - min) / (max - min)) * (right - left);
+
+      const format = (value, digits = 2) =&gt;
+        Number(value).toLocaleString(&quot;en-US&quot;, {
+          minimumFractionDigits: digits,
+          maximumFractionDigits: digits
+        });
+
+      const drawPanel = (parent, config) =&gt; {
+        const {
+          title, y, axisY, bottom, rows, max, ticks, unit,
+          left = 220, right = 650, rowStart = 68, rowGap = 25,
+          barHeight = 16, labelX = 210
+        } = config;
+        addText(parent, { class: &quot;panel-title&quot;, x: left, y: y + 14 }, title);
+        make(&quot;line&quot;, { class: &quot;axis&quot;, x1: left, y1: axisY, x2: right, y2: axisY }, parent);
+        ticks.forEach((tick) =&gt; {
+          const x = linearScale(tick, 0, max, left, right);
+          make(&quot;line&quot;, { class: &quot;gridline&quot;, x1: x, y1: axisY, x2: x, y2: bottom }, parent);
+          addText(parent, { class: &quot;axis-label&quot;, x, y: axisY - 6, &quot;text-anchor&quot;: &quot;middle&quot; }, `${tick}${unit}`);
+        });
+        rows.forEach((row, index) =&gt; {
+          const rowY = rowStart + index * rowGap;
+          const x = linearScale(row.value, 0, max, left, right);
+          const cls = row.className || (row.highlight ? &quot;bar highlight&quot; : &quot;bar&quot;);
+          addText(parent, { class: &quot;label&quot;, x: labelX, y: rowY + 12, &quot;text-anchor&quot;: &quot;end&quot; }, row.label);
+          make(&quot;rect&quot;, {
+            class: cls,
+            x: left,
+            y: rowY,
+            width: Math.max(3, x - left),
+            height: barHeight,
+            rx: 3
+          }, parent);
+          addText(parent, { class: &quot;value&quot;, x: 748, y: rowY + 12, &quot;text-anchor&quot;: &quot;end&quot; }, `${format(row.value, row.digits ?? 3)}${unit}`);
+        });
+      };
+
+      const overheadPanels = root.querySelector(&quot;#overhead-panels&quot;);
+      drawPanel(overheadPanels, {
+        title: &quot;Large-payload workloads - linear 0 to 30%&quot;,
+        y: 20, axisY: 55, bottom: 245, max: 30, ticks: [0, 10, 20, 30], unit: &quot;%&quot;,
+        rows: [
+          { label: &quot;Bulk / baseline&quot;, value: 24.965 },
+          { label: &quot;Bulk / tuned&quot;, value: 20.156, highlight: true },
+          { label: &quot;Mixed video / baseline&quot;, value: 21.093 },
+          { label: &quot;Mixed video / tuned&quot;, value: 18.446, highlight: true },
+          { label: &quot;Near-MTU video / baseline&quot;, value: 1.427 },
+          { label: &quot;Near-MTU video / tuned&quot;, value: 1.857, highlight: true },
+          { label: &quot;Balanced near-MTU / baseline&quot;, value: 1.360 }
+        ],
+        rowStart: 70, rowGap: 25
+      });
+      drawPanel(overheadPanels, {
+        title: &quot;Web and voice-sized workloads - linear 0 to 220%&quot;,
+        y: 275, axisY: 310, bottom: 420, max: 220, ticks: [0, 55, 110, 165, 220], unit: &quot;%&quot;,
+        rows: [
+          { label: &quot;Web / baseline&quot;, value: 90.340 },
+          { label: &quot;Web / tuned&quot;, value: 64.575, highlight: true },
+          { label: &quot;VoIP-sized / baseline&quot;, value: 191.303 },
+          { label: &quot;VoIP-sized / tuned&quot;, value: 126.978, highlight: true }
+        ],
+        rowStart: 325, rowGap: 25
+      });
+      drawPanel(overheadPanels, {
+        title: &quot;SSH-sized workload - linear 0 to 450%&quot;,
+        y: 450, axisY: 485, bottom: 555, max: 450, ticks: [0, 150, 300, 450], unit: &quot;%&quot;,
+        rows: [
+          { label: &quot;SSH-sized / baseline&quot;, value: 422.775 },
+          { label: &quot;SSH-sized / tuned&quot;, value: 179.399, highlight: true }
+        ],
+        rowStart: 500, rowGap: 25
+      });
+
+      const tuningGrid = root.querySelector(&quot;#tuning-grid&quot;);
+      const tuningBars = root.querySelector(&quot;#tuning-bars&quot;);
+      const tuningTicks = [-40, -20, 0, 20, 40, 60];
+      tuningTicks.forEach((tick) =&gt; {
+        const x = linearScale(tick, -40, 60, 250, 700);
+        make(&quot;line&quot;, { class: tick === 0 ? &quot;zero-line&quot; : &quot;gridline&quot;, x1: x, y1: 48, x2: x, y2: 277 }, tuningGrid);
+        addText(tuningGrid, { class: &quot;axis-label&quot;, x, y: 42, &quot;text-anchor&quot;: &quot;middle&quot; }, `${tick}%`);
+      });
+      [
+        [&quot;Bulk&quot;, 19.26],
+        [&quot;Mixed video&quot;, 12.55],
+        [&quot;Near-MTU video&quot;, -30.13],
+        [&quot;Web&quot;, 28.52],
+        [&quot;VoIP-sized&quot;, 33.62],
+        [&quot;SSH-sized&quot;, 57.57]
+      ].forEach(([label, value], index) =&gt; {
+        const y = 68 + index * 34;
+        const x0 = linearScale(0, -40, 60, 250, 700);
+        const x1 = linearScale(value, -40, 60, 250, 700);
+        addText(tuningBars, { class: &quot;label&quot;, x: 240, y: y + 13, &quot;text-anchor&quot;: &quot;end&quot; }, label);
+        make(&quot;rect&quot;, {
+          class: value &lt; 0 ? &quot;bar negative&quot; : &quot;bar highlight&quot;,
+          x: Math.min(x0, x1),
+          y,
+          width: Math.max(3, Math.abs(x1 - x0)),
+          height: 18,
+          rx: 3
+        }, tuningBars);
+        addText(tuningBars, { class: &quot;value&quot;, x: 748, y: y + 13, &quot;text-anchor&quot;: &quot;end&quot; }, `${value &gt; 0 ? &quot;+&quot; : &quot;&quot;}${value.toFixed(2)}%`);
+      });
+
+      const runnerPanels = root.querySelector(&quot;#runner-panels&quot;);
+      drawPanel(runnerPanels, {
+        title: &quot;Secure handshake p50 - linear 0 to 2.0 ms&quot;,
+        y: 20, axisY: 55, bottom: 125, max: 2, ticks: [0, 0.5, 1, 1.5, 2], unit: &quot; ms&quot;,
+        rows: [
+          { label: &quot;Linux runner&quot;, value: 1.217, className: &quot;bar linux&quot;, digits: 3 },
+          { label: &quot;Windows runner&quot;, value: 1.415, className: &quot;bar windows&quot;, digits: 3 }
+        ],
+        rowStart: 70, rowGap: 25
+      });
+      drawPanel(runnerPanels, {
+        title: &quot;In-memory echo p99 - linear 0 to 20 µs&quot;,
+        y: 160, axisY: 195, bottom: 265, max: 20, ticks: [0, 5, 10, 15, 20], unit: &quot; µs&quot;,
+        rows: [
+          { label: &quot;Linux runner&quot;, value: 18.928, className: &quot;bar linux&quot;, digits: 3 },
+          { label: &quot;Windows runner&quot;, value: 13.900, className: &quot;bar windows&quot;, digits: 3 }
+        ],
+        rowStart: 210, rowGap: 25
+      });
+      drawPanel(runnerPanels, {
+        title: &quot;In-memory dataplane goodput - linear 0 to 650 Mbps&quot;,
+        y: 300, axisY: 335, bottom: 535, max: 650, ticks: [0, 162.5, 325, 487.5, 650], unit: &quot; Mbps&quot;,
+        rows: [
+          { label: &quot;Linux / 1 KiB&quot;, value: 180.918, className: &quot;bar linux&quot;, digits: 3 },
+          { label: &quot;Windows / 1 KiB&quot;, value: 196.795, className: &quot;bar windows&quot;, digits: 3 },
+          { label: &quot;Linux / 64 KiB&quot;, value: 584.644, className: &quot;bar linux&quot;, digits: 3 },
+          { label: &quot;Windows / 64 KiB&quot;, value: 478.786, className: &quot;bar windows&quot;, digits: 3 }
+        ],
+        rowStart: 350, rowGap: 42
+      });
+
+      const criterionPanels = root.querySelector(&quot;#criterion-panels&quot;);
+      const drawGroupedPanel = (config) =&gt; {
+        const { title, y, axisY, bottom, max, ticks, rows, unit = &quot; us&quot; } = config;
+        const left = 220;
+        const right = 650;
+        addText(criterionPanels, { class: &quot;panel-title&quot;, x: left, y: y + 14 }, title);
+        make(&quot;line&quot;, { class: &quot;axis&quot;, x1: left, y1: axisY, x2: right, y2: axisY }, criterionPanels);
+        ticks.forEach((tick) =&gt; {
+          const x = linearScale(tick, 0, max, left, right);
+          make(&quot;line&quot;, { class: &quot;gridline&quot;, x1: x, y1: axisY, x2: x, y2: bottom }, criterionPanels);
+          addText(criterionPanels, { class: &quot;axis-label&quot;, x, y: axisY - 6, &quot;text-anchor&quot;: &quot;middle&quot; }, `${tick}${unit}`);
+        });
+        rows.forEach((row, index) =&gt; {
+          const y0 = y + 48 + index * 44;
+          const xWindows = linearScale(row.windows, 0, max, left, right);
+          const xLinux = linearScale(row.linux, 0, max, left, right);
+          addText(criterionPanels, { class: &quot;label&quot;, x: 210, y: y0 + 16, &quot;text-anchor&quot;: &quot;end&quot; }, row.label);
+          make(&quot;rect&quot;, { class: &quot;bar windows&quot;, x: left, y: y0, width: Math.max(3, xWindows - left), height: 14, rx: 3 }, criterionPanels);
+          make(&quot;rect&quot;, { class: &quot;bar linux&quot;, x: left, y: y0 + 17, width: Math.max(3, xLinux - left), height: 14, rx: 3 }, criterionPanels);
+          addText(criterionPanels, { class: &quot;value&quot;, x: 748, y: y0 + 11, &quot;text-anchor&quot;: &quot;end&quot; }, `W ${format(row.windows)}${unit}`);
+          addText(criterionPanels, { class: &quot;value&quot;, x: 748, y: y0 + 28, &quot;text-anchor&quot;: &quot;end&quot; }, `L ${format(row.linux)}${unit}`);
+        });
+      };
+      drawGroupedPanel({
+        title: &quot;Handshake paths - linear 0 to 2,000 us&quot;,
+        y: 20, axisY: 55, bottom: 170, max: 2000, ticks: [0, 500, 1000, 1500, 2000],
+        rows: [
+          { label: &quot;Secure hybrid&quot;, windows: 1756.346, linux: 1318.692 },
+          { label: &quot;Classical lab&quot;, windows: 1145.348, linux: 804.782 }
+        ]
+      });
+      drawGroupedPanel({
+        title: &quot;Crypto and replay paths - linear 0 to 15 us&quot;,
+        y: 205, axisY: 240, bottom: 390, max: 15, ticks: [0, 5, 10, 15],
+        rows: [
+          { label: &quot;AEAD encrypt 1 KiB&quot;, windows: 2.546, linux: 2.862 },
+          { label: &quot;AEAD decrypt 1 KiB&quot;, windows: 2.678, linux: 2.818 },
+          { label: &quot;Replay window batch&quot;, windows: 11.796, linux: 7.619 }
+        ]
+      });
+      drawGroupedPanel({
+        title: &quot;Shroud2 encode/decode - linear 0 to 2.5 us&quot;,
+        y: 425, axisY: 460, bottom: 625, max: 2.5, ticks: [0, 0.5, 1, 1.5, 2, 2.5],
+        rows: [
+          { label: &quot;Bulk&quot;, windows: 0.493, linux: 2.019 },
+          { label: &quot;Web&quot;, windows: 0.496, linux: 1.747 },
+          { label: &quot;Video&quot;, windows: 0.491, linux: 2.083 }
+        ]
+      });
+
+      const coverageGrid = root.querySelector(&quot;#coverage-grid&quot;);
+      const coverageBars = root.querySelector(&quot;#coverage-bars&quot;);
+      [0, 3, 6, 9, 12].forEach((tick) =&gt; {
+        const x = linearScale(tick, 0, 12, 220, 700);
+        make(&quot;line&quot;, { class: &quot;gridline&quot;, x1: x, y1: 48, x2: x, y2: 245 }, coverageGrid);
+        addText(coverageGrid, { class: &quot;axis-label&quot;, x, y: 42, &quot;text-anchor&quot;: &quot;middle&quot; }, `${tick}`);
+      });
+      [
+        [&quot;Core crypto&quot;, 3],
+        [&quot;Defensive paths&quot;, 3],
+        [&quot;Handshake&quot;, 3],
+        [&quot;Identity&quot;, 3],
+        [&quot;Transport framing&quot;, 8],
+        [&quot;Transport Shroud2&quot;, 11]
+      ].forEach(([label, value], index) =&gt; {
+        const y = 68 + index * 29;
+        const x = linearScale(value, 0, 12, 220, 700);
+        addText(coverageBars, { class: &quot;label&quot;, x: 210, y: y + 13, &quot;text-anchor&quot;: &quot;end&quot; }, label);
+        make(&quot;rect&quot;, { class: &quot;bar&quot;, x: 220, y, width: x - 220, height: 17, rx: 3 }, coverageBars);
+        addText(coverageBars, { class: &quot;value&quot;, x: 748, y: y + 13, &quot;text-anchor&quot;: &quot;end&quot; }, `${value} sets`);
+      });
+
+      const logScale = (value, min, max, left, right) =&gt; {
+        if (!Number.isFinite(value) || value &lt;= 0) return left;
+        return left + ((Math.log10(value) - Math.log10(min)) / (Math.log10(max) - Math.log10(min))) * (right - left);
+      };
+      const defenseGrid = root.querySelector(&quot;#defense-grid&quot;);
+      const defenseBars = root.querySelector(&quot;#defense-bars&quot;);
+      [10000, 100000, 1000000, 10000000].forEach((tick) =&gt; {
+        const x = logScale(tick, 10000, 20000000, 250, 650);
+        make(&quot;line&quot;, { class: &quot;gridline&quot;, x1: x, y1: 48, x2: x, y2: 257 }, defenseGrid);
+        addText(defenseGrid, { class: &quot;axis-label&quot;, x, y: 42, &quot;text-anchor&quot;: &quot;middle&quot; }, tick &gt;= 1000000 ? `${tick / 1000000}M` : `${tick / 1000}k`);
+      });
+      [
+        [&quot;Direct ML-KEM-768&quot;, 15478],
+        [&quot;Stateless cookie path&quot;, 618909],
+        [&quot;Per-source limiter&quot;, 1405809],
+        [&quot;Replay-window validation&quot;, 14113888]
+      ].forEach(([label, value], index) =&gt; {
+        const y = 72 + index * 43;
+        addText(defenseBars, { class: &quot;label&quot;, x: 240, y: y + 15, &quot;text-anchor&quot;: &quot;end&quot; }, label);
+        make(&quot;rect&quot;, { class: &quot;bar&quot;, x: 250, y, width: Math.max(3, logScale(value, 10000, 20000000, 250, 650) - 250), height: 22, rx: 3 }, defenseBars);
+        addText(defenseBars, { class: &quot;value&quot;, x: 748, y: y + 15, &quot;text-anchor&quot;: &quot;end&quot; }, `${value &gt;= 1000000 ? (value / 1000000).toFixed(3) + &quot;M/s&quot; : (value / 1000).toFixed(3) + &quot;k/s&quot;}`);
+      });
+
+      const fuzzGrid = root.querySelector(&quot;#fuzz-grid&quot;);
+      const fuzzBars = root.querySelector(&quot;#fuzz-bars&quot;);
+      [0, 5, 10, 15, 20].forEach((tick) =&gt; {
+        const x = 210 + (tick / 20) * 440;
+        make(&quot;line&quot;, { class: &quot;gridline&quot;, x1: x, y1: 48, x2: x, y2: 220 }, fuzzGrid);
+        addText(fuzzGrid, { class: &quot;axis-label&quot;, x, y: 42, &quot;text-anchor&quot;: &quot;middle&quot; }, `${tick}M`);
+      });
+      [
+        [&quot;frame_decode&quot;, 20],
+        [&quot;config_parse&quot;, 20],
+        [&quot;audit_record&quot;, 20],
+        [&quot;replay_window&quot;, 20],
+        [&quot;shroud2_datagram&quot;, 20]
+      ].forEach(([label, value], index) =&gt; {
+        const y = 70 + index * 29;
+        addText(fuzzBars, { class: &quot;label&quot;, x: 200, y: y + 14, &quot;text-anchor&quot;: &quot;end&quot; }, label);
+        make(&quot;rect&quot;, { class: &quot;bar pass&quot;, x: 210, y, width: 440, height: 20, rx: 3 }, fuzzBars);
+        make(&quot;circle&quot;, { class: &quot;status&quot;, cx: 665, cy: y + 10, r: 5 }, fuzzBars);
+        addText(fuzzBars, { class: &quot;value&quot;, x: 748, y: y + 14, &quot;text-anchor&quot;: &quot;end&quot; }, `${value}M PASS`);
+      });
+
+      const fuzzTimeGrid = root.querySelector(&quot;#fuzz-time-grid&quot;);
+      const fuzzTimeBars = root.querySelector(&quot;#fuzz-time-bars&quot;);
+      [0, 4000, 8000, 12000, 16000].forEach((tick) =&gt; {
+        const x = linearScale(tick, 0, 16000, 210, 650);
+        make(&quot;line&quot;, { class: &quot;gridline&quot;, x1: x, y1: 258, x2: x, y2: 325 }, fuzzTimeGrid);
+        addText(fuzzTimeGrid, { class: &quot;axis-label&quot;, x, y: 252, &quot;text-anchor&quot;: &quot;middle&quot; }, `${tick}s`);
+      });
+      [
+        [&quot;frame_decode&quot;, 509],
+        [&quot;config_parse&quot;, 15035],
+        [&quot;audit_record&quot;, 758],
+        [&quot;replay_window&quot;, 268],
+        [&quot;shroud2_datagram&quot;, 600]
+      ].forEach(([label, value], index) =&gt; {
+        const y = 263 + index * 13;
+        const x = linearScale(value, 0, 16000, 210, 650);
+        addText(fuzzTimeBars, { class: &quot;label&quot;, x: 200, y: y + 9, &quot;text-anchor&quot;: &quot;end&quot; }, label);
+        make(&quot;rect&quot;, { class: &quot;bar highlight&quot;, x: 210, y, width: Math.max(3, x - 210), height: 9, rx: 2 }, fuzzTimeBars);
+        addText(fuzzTimeBars, { class: &quot;value&quot;, x: 748, y: y + 9, &quot;text-anchor&quot;: &quot;end&quot; }, `${value.toLocaleString(&quot;en-US&quot;)}s`);
+      });
+    })();
+  &lt;/script&gt;
+&lt;/div&gt;
+
+&lt;script src=&quot;https://unpkg.com/@floating-ui/core@1.7.3/dist/floating-ui.core.umd.min.js&quot;&gt;&lt;/script&gt;
+&lt;script src=&quot;https://unpkg.com/@floating-ui/dom@1.7.4/dist/floating-ui.dom.umd.min.js&quot;&gt;&lt;/script&gt;
+&lt;script&gt;
+(() =&gt; {
+  if (window.FloatingUIDOM == null) {
+    return;
+  }
+  const { autoUpdate, computePosition, flip, offset, shift, size } =
+    window.FloatingUIDOM;
+  const tooltipPlacements = new Set([&quot;top&quot;, &quot;right&quot;, &quot;bottom&quot;, &quot;left&quot;]);
+  const tooltipId = `codex-visualization-tooltip-${
+    window.crypto?.randomUUID?.() ?? Date.now().toString(36)
+  }`;
+  const tooltipGap = 5;
+  const hoverDelay = 700;
+  const skipDelay = 300;
+  let activeTrigger = null;
+  let pendingTrigger = null;
+  let tooltip = null;
+  let openTimeout = null;
+  let autoUpdateCleanup = null;
+  let positionRequest = 0;
+  let skipDelayUntil = 0;
+
+  const getTrigger = (target) =&gt;
+    target?.nodeType === Node.ELEMENT_NODE
+      ? target.closest(&quot;[data-tooltip]&quot;)
+      : null;
+  const containsTarget = (trigger, target) =&gt;
+    target?.nodeType != null &amp;&amp; trigger.contains(target);
+  const getContent = (trigger) =&gt;
+    trigger.getAttribute(&quot;data-tooltip&quot;)?.trim() ?? &quot;&quot;;
+  const getPlacement = (trigger) =&gt; {
+    const placement = trigger.getAttribute(&quot;data-tooltip-placement&quot;);
+    return tooltipPlacements.has(placement) ? placement : &quot;top&quot;;
+  };
+  const getTooltip = () =&gt; {
+    if (tooltip == null) {
+      tooltip = document.createElement(&quot;div&quot;);
+      tooltip.id = tooltipId;
+      tooltip.className = &quot;tooltip&quot;;
+      tooltip.setAttribute(&quot;role&quot;, &quot;tooltip&quot;);
+    }
+    return tooltip;
+  };
+  const setDescribedBy = (trigger, described) =&gt; {
+    const ids = new Set(
+      (trigger.getAttribute(&quot;aria-describedby&quot;) ?? &quot;&quot;)
+        .split(/\s+/)
+        .filter(Boolean),
+    );
+    if (described) {
+      ids.add(tooltipId);
+    } else {
+      ids.delete(tooltipId);
+    }
+    if (ids.size === 0) {
+      trigger.removeAttribute(&quot;aria-describedby&quot;);
+    } else {
+      trigger.setAttribute(&quot;aria-describedby&quot;, [...ids].join(&quot; &quot;));
+    }
+  };
+  const clearOpenTimeout = () =&gt; {
+    if (openTimeout != null) {
+      window.clearTimeout(openTimeout);
+      openTimeout = null;
+    }
+    pendingTrigger = null;
+  };
+  const closeTooltip = (activateSkipDelay = true) =&gt; {
+    clearOpenTimeout();
+    positionRequest += 1;
+    autoUpdateCleanup?.();
+    autoUpdateCleanup = null;
+    if (activeTrigger == null) {
+      return;
+    }
+    setDescribedBy(activeTrigger, false);
+    activeTrigger = null;
+    tooltip?.remove();
+    if (activateSkipDelay) {
+      skipDelayUntil = Date.now() + skipDelay;
+    }
+  };
+  const updatePosition = (trigger, floating) =&gt; {
+    const request = ++positionRequest;
+    void computePosition(trigger, floating, {
+      middleware: [
+        offset(tooltipGap),
+        flip({ padding: tooltipGap }),
+        shift({ padding: tooltipGap }),
+        size({
+          padding: tooltipGap,
+          apply({ availableHeight, availableWidth, elements }) {
+            elements.floating.style.setProperty(
+              &quot;--tooltip-available-width&quot;,
+              `${Math.max(0, availableWidth)}px`,
+            );
+            elements.floating.style.setProperty(
+              &quot;--tooltip-available-height&quot;,
+              `${Math.max(0, availableHeight)}px`,
+            );
+          },
+        }),
+      ],
+      placement: getPlacement(trigger),
+      strategy: &quot;fixed&quot;,
+    })
+      .then(({ x, y }) =&gt; {
+        if (activeTrigger !== trigger || request !== positionRequest) {
+          return;
+        }
+        const scale = window.devicePixelRatio || 1;
+        floating.style.transform = `translate(${Math.round(x * scale) / scale}px, ${Math.round(y * scale) / scale}px)`;
+        floating.style.visibility = &quot;visible&quot;;
+      })
+      .catch(() =&gt; {
+        if (activeTrigger === trigger &amp;&amp; request === positionRequest) {
+          closeTooltip(false);
+        }
+      });
+  };
+  const openTooltip = (trigger) =&gt; {
+    const content = getContent(trigger);
+    if (!trigger.isConnected || content.length === 0) {
+      return;
+    }
+    clearOpenTimeout();
+    if (activeTrigger === trigger) {
+      return;
+    }
+    closeTooltip();
+    const floating = getTooltip();
+    floating.textContent = content;
+    floating.style.visibility = &quot;hidden&quot;;
+    floating.style.transform = &quot;translate(0, 0)&quot;;
+    document.body.appendChild(floating);
+    activeTrigger = trigger;
+    setDescribedBy(trigger, true);
+    autoUpdateCleanup = autoUpdate(trigger, floating, () =&gt; {
+      updatePosition(trigger, floating);
+    });
+  };
+  const requestOpen = (trigger, immediate = false) =&gt; {
+    if (
+      getContent(trigger).length === 0 ||
+      activeTrigger === trigger ||
+      pendingTrigger === trigger
+    ) {
+      return;
+    }
+    clearOpenTimeout();
+    pendingTrigger = trigger;
+    const delay =
+      immediate || activeTrigger != null || Date.now() &lt; skipDelayUntil
+        ? 0
+        : hoverDelay;
+    if (delay === 0) {
+      openTooltip(trigger);
+      return;
+    }
+    openTimeout = window.setTimeout(() =&gt; {
+      openTimeout = null;
+      pendingTrigger = null;
+      openTooltip(trigger);
+    }, delay);
+  };
+  const handlePointerOpen = (event) =&gt; {
+    if (event.pointerType === &quot;touch&quot;) {
+      return;
+    }
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    requestOpen(trigger);
+  };
+  const handleLeave = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const handleFocusIn = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (trigger?.matches(&quot;:focus-visible&quot;)) {
+      requestOpen(trigger, true);
+    }
+  };
+  const handleKeyDown = (event) =&gt; {
+    if (event.key === &quot;Escape&quot;) {
+      closeTooltip();
+    }
+  };
+  const handleContextMenu = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const destroy = () =&gt; {
+    closeTooltip(false);
+    document.removeEventListener(&quot;pointerover&quot;, handlePointerOpen);
+    document.removeEventListener(&quot;pointerout&quot;, handleLeave);
+    document.removeEventListener(&quot;focusin&quot;, handleFocusIn);
+    document.removeEventListener(&quot;focusout&quot;, handleLeave);
+    document.removeEventListener(&quot;keydown&quot;, handleKeyDown);
+    document.removeEventListener(&quot;contextmenu&quot;, handleContextMenu);
+    tooltip = null;
+  };
+
+  document.addEventListener(&quot;pointerover&quot;, handlePointerOpen);
+  document.addEventListener(&quot;pointerout&quot;, handleLeave);
+  document.addEventListener(&quot;focusin&quot;, handleFocusIn);
+  document.addEventListener(&quot;focusout&quot;, handleLeave);
+  document.addEventListener(&quot;keydown&quot;, handleKeyDown);
+  document.addEventListener(&quot;contextmenu&quot;, handleContextMenu);
+  window.addEventListener(&quot;pagehide&quot;, destroy, { once: true });
+})();
+&lt;/script&gt;
+&lt;script id=&quot;codex-visualization-lucide&quot; async src=&quot;https://unpkg.com/lucide@1.17.0/dist/umd/lucide.js&quot;&gt;&lt;/script&gt;
+&lt;script&gt;
+(() =&gt; {
+  const initialize = () =&gt; {
+    globalThis.lucide?.createIcons({ attrs: { width: 16, height: 16 } });
+  };
+  if (globalThis.lucide != null) {
+    initialize();
+    return;
+  }
+  document
+    .getElementById(&quot;codex-visualization-lucide&quot;)
+    ?.addEventListener(&quot;load&quot;, initialize, { once: true });
+})();
+&lt;/script&gt;
+
+&lt;/body&gt;
+&lt;/html&gt;
+"></iframe>
+</body>
+</html>

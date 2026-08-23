@@ -26,7 +26,9 @@ This file maps the repository layout and the main public validation artifacts.
 - `docs/BENCHMARKING.md`: Linux-first benchmark methodology, profiles, and obstacles.
 - `docs/GITHUB_BENCHMARKING.md`: GitHub-hosted campaign triggers, artifacts,
   and evidence boundaries.
-- `docs/BENCHMARK_RESULTS_2026-08-22.md`: current local development evidence
+- `docs/BENCHMARK_RESULTS_2026-08-23.md`: current local development evidence
+  for tuned profiles, validation gates, and benchmark boundaries.
+- `docs/BENCHMARK_RESULTS_2026-08-22.md`: previous local development evidence
   for the candidate benchmark campaign, near-MTU video profile, validation
   gates, and fuzz status.
 - `docs/BENCHMARK_RESULTS_2026-08-17.md`: dated local evidence campaign for
@@ -68,7 +70,7 @@ This file maps the repository layout and the main public validation artifacts.
 
 - Current methodology: `docs/BENCHMARKING.md`.
 - Current candidate evidence campaign:
-  `docs/BENCHMARK_RESULTS_2026-08-22.md`.
+  `docs/BENCHMARK_RESULTS_2026-08-23.md`.
 - Extended local evidence campaign:
   `docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md`.
 - Network-simulation audit:

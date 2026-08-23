@@ -49,5 +49,5 @@ pub use stealth::{
     profiles, shroud_profile_by_name, shroud_profile_by_selection, stealth_profile_by_name,
     stealth_profiles, ChunkDistribution, MorphProfile, ShroudProfile, StealthProfile,
     TlsCamouflage, BALANCED, BULK, CAMOUFLAGE, EXTREME_LAB, LOW_LATENCY, MIMICRY_LAB,
-    RANDOMIZED_LAB, STEADY,
+    RANDOMIZED_LAB, STEADY, TUNED_HIGH, TUNED_LOW, TUNED_MEDIUM,
 };

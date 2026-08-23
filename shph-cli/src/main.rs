@@ -3914,6 +3914,9 @@ fn resolve_shroud_profile(cli_value: Option<&str>, config_value: Option<&str>) -
         "balanced" => "medium".into(),
         "bulk" => "high".into(),
         "extreme" => "extreme-lab".into(),
+        "tuned" | "optimized" | "optimized-medium" => "tuned-medium".into(),
+        "optimized-low" => "tuned-low".into(),
+        "optimized-high" => "tuned-high".into(),
         other => other.into(),
     })
 }
@@ -3931,7 +3934,7 @@ fn quic_lab_config() -> Result<QuicLabConfig> {
 fn parse_shroud_profile_name(name: &str) -> Result<Option<shph_core::ShroudProfile>> {
     shph_core::shroud_profile_by_selection(name).ok_or_else(|| {
         ShphError::Config(format!(
-            "unknown SHPH_SHROUD_PROFILE '{name}'; expected off, low, medium, high, extreme-lab, or a named lab profile"
+            "unknown SHPH_SHROUD_PROFILE '{name}'; expected off, low, medium, high, tuned, tuned-low, tuned-medium, tuned-high, extreme-lab, or a named lab profile"
         ))
     })
 }
@@ -6549,10 +6552,11 @@ mod tests {
         build_route_add_command, build_route_delete_command, build_tun_mtu_commands,
         build_tun_route_priority_command, build_underlay_bypass_route_add_command,
         build_underlay_bypass_route_delete_command, cli_exit_code, control_plane_state_path,
-        enforce_peer_policy, handle_up, load_control_plane_state, parse_shroud_profile_name,
-        phase_a1_now_ms, read_ticket_source, reconnect_delay_with_jitter,
-        render_config_for_display, resolve_killswitch_peers, resolve_shroud_profile,
-        run_with_reconnect, save_control_plane_state, transport_mode_to_str, validate_cidr,
+        enforce_peer_policy, handle_up, load_control_plane_state,
+        native_tun_mtu_for_shroud_profile, parse_shroud_profile_name, phase_a1_now_ms,
+        read_ticket_source, reconnect_delay_with_jitter, render_config_for_display,
+        resolve_killswitch_peers, resolve_shroud_profile, run_with_reconnect,
+        save_control_plane_state, transport_mode_to_str, validate_cidr,
         validate_control_plane_underlay, validate_transport_peer, CliErrorOutput,
         ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore, KeyStoreConfig,
         PersistedControlPlaneState, TcpUnderlay, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES,
@@ -6939,6 +6943,31 @@ mod tests {
         assert_eq!(
             parse_shroud_profile_name("extreme-lab").unwrap(),
             Some(shph_core::EXTREME_LAB)
+        );
+        assert_eq!(
+            parse_shroud_profile_name("optimized").unwrap(),
+            Some(shph_core::TUNED_MEDIUM)
+        );
+        assert_eq!(
+            parse_shroud_profile_name("optimized-low").unwrap(),
+            Some(shph_core::TUNED_LOW)
+        );
+        assert_eq!(
+            parse_shroud_profile_name("tuned-high").unwrap(),
+            Some(shph_core::TUNED_HIGH)
+        );
+    }
+
+    #[test]
+    fn tuned_profiles_keep_native_tun_mtu_above_the_minimum() {
+        assert_eq!(native_tun_mtu_for_shroud_profile("tuned-low").unwrap(), 761);
+        assert_eq!(
+            native_tun_mtu_for_shroud_profile("tuned-medium").unwrap(),
+            1_353
+        );
+        assert_eq!(
+            native_tun_mtu_for_shroud_profile("optimized-high").unwrap(),
+            1_353
         );
     }
 

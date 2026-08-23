@@ -5,7 +5,7 @@ use shph_core::{
     PeerPolicy, ReceiveCipher, ReplayWindow, SendCipher, StatelessCookieAuthority, BALANCED,
 };
 use shph_identity::{IdentityEndpoint, IdentityRecord, VerificationPolicy};
-use shph_obfuscation::{apply_profile, remove_profile, ProfileTier};
+use shph_obfuscation::{apply_profile, remove_profile, ProfilePadder, ProfileTier};
 use shph_transport::shroud2::{
     decode_batched_datagram, decode_datagram, encode_batched_datagram, encode_datagram,
     wasserstein_distance, EmpiricalHistogram, MorphologyBatcher, MorphologyEngine,
@@ -195,6 +195,16 @@ fn bench_framing_and_profiles(c: &mut Criterion) {
         group.bench_function(format!("profile_apply_{label}"), |b| {
             b.iter(|| black_box(apply_profile(profile, black_box(&payload)).expect("apply")))
         });
+        group.bench_function(format!("profile_apply_stateful_{label}"), |b| {
+            let mut padder = ProfilePadder::from_seed(profile, [0x42; 32]);
+            let mut framed = Vec::new();
+            b.iter(|| {
+                padder
+                    .apply_into(black_box(&payload), &mut framed)
+                    .expect("apply stateful");
+                black_box(framed.len())
+            })
+        });
         let framed = apply_profile(profile, &payload).expect("profile frame");
         group.bench_function(format!("profile_remove_{label}"), |b| {
             b.iter(|| black_box(remove_profile(profile, black_box(&framed)).expect("remove")))
@@ -211,6 +221,10 @@ fn bench_morphology(c: &mut Criterion) {
         MorphologyProfile::WebBrowsingLab,
         MorphologyProfile::VideoStreamingBalancedPayloadLab,
         MorphologyProfile::BulkLab,
+        MorphologyProfile::TunedLowLatency,
+        MorphologyProfile::TunedWebBrowsingLab,
+        MorphologyProfile::TunedVideoStreamingLab,
+        MorphologyProfile::TunedBulkLab,
     ] {
         let label = format!("{profile:?}").to_ascii_lowercase();
         group.bench_function(format!("target_size_{label}"), |b| {
@@ -223,6 +237,15 @@ fn bench_morphology(c: &mut Criterion) {
                 let target = engine.target_size(payload.len(), PATH_MTU).expect("target");
                 let datagram =
                     encode_datagram(black_box(&payload), target, PATH_MTU).expect("encode");
+                black_box(decode_datagram(&datagram, PATH_MTU).expect("decode"))
+            })
+        });
+        group.bench_function(format!("encode_decode_{label}_session_rng_tail"), |b| {
+            let mut engine = MorphologyEngine::from_seed(profile, 0x5348_524f_5544);
+            b.iter(|| {
+                let datagram = engine
+                    .encode_datagram(black_box(&payload), PATH_MTU)
+                    .expect("session-rng encode");
                 black_box(decode_datagram(&datagram, PATH_MTU).expect("decode"))
             })
         });

@@ -23,6 +23,7 @@ fuzz/artifacts/
 
 # Stray working dirs (kept locally, not versioned)
 /THE WORKING ONE/
+/tmp/
 
 # Per-agent local state
 .agents/

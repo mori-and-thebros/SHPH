@@ -9,8 +9,8 @@
 
 use crate::ja4::{self, Ja4Observer, Ja4ObserverConfig};
 use crate::shroud2::{
-    decode_batched_datagram, decode_datagram, encode_batched_datagram, encode_datagram,
-    MorphologyBatchPushResult, MorphologyBatcher, MorphologyEngine,
+    decode_batched_datagram, decode_datagram, encode_batched_datagram, MorphologyBatchPushResult,
+    MorphologyBatcher, MorphologyEngine,
 };
 use bytes::Bytes;
 use quinn::rustls::server::ResolvesServerCert;
@@ -444,8 +444,7 @@ impl StandardsQuicConnection {
             .connection
             .max_datagram_size()
             .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
-        let target_size = morphology.target_size(payload.len(), path_mtu)?;
-        let datagram = encode_datagram(payload, target_size, path_mtu)?;
+        let datagram = morphology.encode_datagram(payload, path_mtu)?;
         let delay = morphology.next_delay();
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;

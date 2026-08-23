@@ -20,7 +20,7 @@ Choose SHPH when you value:
 - an optional SOCKS5 underlay when the direct route is unavailable, without
   replacing SHPH's own end-to-end authentication.
 
-The current release line is `v0.6.4-dev.3`. Its supported boundary is
+The current release line is `v0.6.4-dev.4`. Its supported boundary is
 controlled-lab networking, as defined by
 [`docs/SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md).
 

@@ -1,6 +1,6 @@
 # SHPH Quality, Tests, and Benchmark Evidence
 
-This document summarizes the validation available for the `v0.6.4-dev.3`
+This document summarizes the validation available for the `v0.6.4-dev.4`
 follow-up candidate. The tag and commit attached to the GitHub publication are
 the final provenance record. Measurements are labeled carefully: local and
 GitHub-hosted benchmark results are not Internet throughput, and code-path
@@ -10,9 +10,9 @@ tests are not independent security audits.
 
 | Field | Value |
 | --- | --- |
-| Candidate tag | `v0.6.4-dev.3` |
-| Release commit | See the commit attached to the `v0.6.4-dev.3` tag |
-| Validation date | 2026-08-22 |
+| Candidate tag | `v0.6.4-dev.4` |
+| Release commit | See the commit attached to the `v0.6.4-dev.4` tag |
+| Validation date | 2026-08-23 |
 | Primary host | Windows |
 | Rust toolchain | `rustc 1.96.0 (ac68faa20 2026-05-25)` |
 | Main target | `x86_64-pc-windows-msvc` |
@@ -36,19 +36,23 @@ The following gates passed on the candidate tree:
 | Standalone fuzz-manifest format/check gates | PASS |
 | Windows benchmark identity smoke | PASS |
 | Windows benchmark wire smoke | PASS |
+| Windows full `all` and `extended` campaigns | PASS |
+| Criterion capture | PASS — 150 estimate files |
+| Five-target fuzz smoke | PASS |
 | `cargo audit --deny warnings` | PASS |
 
-The workspace test run executed **297 tests with 0 failures** across the CLI,
+The workspace test run executed **304 tests with 0 failures** across the CLI,
 configuration, core cryptography/handshake, identity, obfuscation, transport,
 and TUN crates. The audit scanned 299 locked crate dependencies.
 
 The standalone benchmark crate ran **7 tests with 0 failures**, then completed
 both `secure-default` and explicit benchmark-only `classical-lab` captures for
 the `all` and `extended` suites at 100 latency iterations and 10,000 frames.
-The Criterion harness completed **62 result sets** across six groups:
-crypto, defensive paths, handshakes, framing, Shroud2, and identity records.
-Criterion reported one microbenchmark comparison warning for histogram
-distance; that is a performance-regression signal, not a correctness failure.
+The Criterion harness completed **150 estimate files** across the crypto,
+defensive-path, handshake, framing, Shroud2, identity-record, and tuned
+session-padding groups. Criterion comparison output includes ordinary
+performance-regression signals for some microbenchmarks; those are engineering
+signals, not correctness failures.
 
 The transport regression coverage includes a test for a length-prefixed TCP
 frame split across polling timeouts. The receiver now preserves partial
@@ -57,8 +61,8 @@ frame.
 
 ## Local benchmark results
 
-The following values come from the dated hardened benchmark campaign in
-[`docs/BENCHMARK_RESULTS_2026-08-17.md`](BENCHMARK_RESULTS_2026-08-17.md).
+The current values come from the dated tuned-profile campaign in
+[`docs/BENCHMARK_RESULTS_2026-08-23.md`](BENCHMARK_RESULTS_2026-08-23.md).
 They measure the current Shroud2 implementation in memory on a Windows
 workstation; IP, UDP, Ethernet, socket, TUN, and Internet overhead are
 excluded unless stated.
@@ -99,9 +103,9 @@ Git and are recorded here for provenance:
 
 | Capture | Scope | Result |
 | --- | --- | --- |
-| `benchmark-runs/windows-fullrun-dev3` | `all`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
-| `benchmark-runs/windows-extended-dev3` | `extended`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
-| `benchmark-runs/criterion-windows-dev3` | Criterion, 62 result sets, six groups | PASS |
+| `benchmark-runs/readiness-full-20260823` | `all`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
+| `benchmark-runs/readiness-extended-20260823` | `extended`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
+| `benchmark-runs/readiness-criterion-20260823` | Criterion, 150 estimate files | PASS |
 
 These are workstation-local engineering measurements. The corresponding
 GitHub-hosted Linux and Windows campaigns are configured in CI and will
@@ -151,9 +155,10 @@ This document does not establish:
 - route/DNS/killswitch crash-leak behavior on every supported host; or
 - independent cryptographic or security-audit certification.
 
-Linux namespace tests and nightly cargo-fuzz smoke runs were not executed on
-the Windows release workstation because Bash, Linux namespaces, nightly Rust,
-and cargo-fuzz were unavailable. They remain separate release gates in
+The local Windows fuzz wrapper completed one smoke run for each of the five
+checked-in fuzz targets. This does not replace a long-duration fuzz campaign,
+Linux namespace validation, native TUN acceptance, or an independent audit.
+Those remain separate evidence layers in
 [`docs/RELEASE_READINESS.md`](RELEASE_READINESS.md).
 
 ## Reproduce the core checks

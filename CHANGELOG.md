@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.6.4-dev.4] - 2026-08-23
+
+This developer release packages tuned Shroud profiles, stateful padding and
+morphology improvements, and refreshed reproducible evidence. It remains
+scoped to controlled lab environments and does not claim production VPN
+performance, censorship resistance, or independent security-audit status.
+
+- Added explicit `tuned`/`optimized` profile aliases with low, medium, and high
+  tuned tiers for controlled overhead and morphology experiments.
+- Added session-scoped padding state and reusable output buffers across the
+  TCP, QUIC, and Shroud2 lab paths to avoid resetting randomness per frame.
+- Added tuned profile overhead, morphology, batching, and session-RNG
+  Criterion coverage plus tuned-profile fuzz input selection.
+- Added the refreshed public benchmark report and evidence dashboard, with
+  corrected units and explicit local/synthetic measurement boundaries.
+- Revalidated the release candidate with 304 workspace tests, 7 standalone
+  benchmark tests, full local `all` and `extended` benchmark campaigns,
+  150 Criterion estimate files, five fuzz-target smoke runs, and a clean
+  dependency advisory scan.
+
 ## [0.6.4-dev.3] - 2026-08-22
 
 This follow-up developer release expands the benchmark and evidence workflow.
