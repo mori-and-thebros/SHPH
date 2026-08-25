@@ -1812,9 +1812,7 @@ fn bench_defensive(options: Options) {
         "shroud2_reject_oversized_datagram",
         "shroud2_reject_over_path_mtu",
         oversized_datagram.len(),
-        || {
-            decode_datagram(&oversized_datagram, EVIDENCE_MORPHOLOGY_PATH_MTU).is_err()
-        },
+        || decode_datagram(&oversized_datagram, EVIDENCE_MORPHOLOGY_PATH_MTU).is_err(),
         "in_memory_path_mtu_bound_rejection;not_packet_loss_or_pmtu_evidence",
     );
 

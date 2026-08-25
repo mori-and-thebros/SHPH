@@ -1,10 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use shph_core::roadmap::TransportAdapterConfig;
 use shph_core::{
     absorb_responder_pq, build_hello_with_profile, decode_cell, encode_data_cell,
     finalize_initiator_pq, hkdf_sha256_into, HandshakeProfile, IdentityKeyPair, PeerPin,
     PeerPolicy, ReceiveCipher, ReplayWindow, SendCipher, StatelessCookieAuthority, BALANCED,
 };
-use shph_core::roadmap::TransportAdapterConfig;
 use shph_identity::{IdentityEndpoint, IdentityRecord, VerificationPolicy};
 use shph_obfuscation::{apply_profile, remove_profile, ProfilePadder, ProfileTier};
 use shph_transport::ja4::{Ja4ClientHello, Ja4TlsVersion, Ja4Transport};
@@ -173,13 +173,7 @@ fn bench_defensive_rejections(c: &mut Criterion) {
 
     let oversized = vec![0u8; PATH_MTU + 1];
     group.bench_function("shroud2_oversized_datagram", |b| {
-        b.iter(|| {
-            black_box(decode_datagram(
-                black_box(&oversized),
-                PATH_MTU,
-            )
-            .is_err())
-        })
+        b.iter(|| black_box(decode_datagram(black_box(&oversized), PATH_MTU).is_err()))
     });
 
     let peer: SocketAddr = "198.51.100.42:443".parse().expect("defensive peer");
