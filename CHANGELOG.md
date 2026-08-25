@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.6.5-dev] - 2026-08-25
+
+This prototype release packages security hardening, transport reliability
+improvements, defensive benchmark coverage, refreshed public evidence, and
+cross-platform validation updates. It remains scoped to controlled lab
+environments and does not claim production VPN performance, censorship
+resistance, or independent security-audit status.
+
+- Removed automatic first-peer TOFU enrollment from `host`; a listener now
+  requires a configured client identity/signing-key pin before it can accept
+  traffic.
+- Added bounded concurrent TCP pre-auth workers with a short header deadline,
+  preserving listener availability under slow-client conditions.
+- Serialized Windows WFP killswitch ownership with a process-wide mutex so
+  stale-filter cleanup cannot remove another active SHPH instance's policy.
+- Added handle-aware no-reparse file opens for config, keystore, ticket, and
+  Wintun inputs, with post-open validation.
+- Hardened offline-mesh replay identity by binding the creation timestamp with
+  the sequence number, preventing a post-restart sequence reset from reusing an
+  older replay key.
+- Added authenticated offline-mesh/data-mule session round-trip tests and a
+  distinct-spool offline replication regression test.
+- Added Windows extended-length path handling for file-adapter claims,
+  persistence, and reparse-point checks, plus Criterion coverage for adapter
+  validation, SOCKS5 parsing, and JA4 fingerprint computation.
+- Added a `defensive` standalone benchmark suite and Criterion rejection group
+  covering malformed Shroud cells, oversized datagrams, cookie failures,
+  duplicate nonces, and per-source rate limiting.
+- Added Windows CI smoke coverage for the defensive suite and documented its
+  local-rejection-only evidence boundary.
+- Recorded elevated Windows Wintun lifecycle, route/DNS rollback, and loopback
+  WFP smoke evidence; native packet forwarding and two-host gates remain open.
+- Updated workspace and standalone benchmark metadata to `0.6.5-dev`.
+
 ## [0.6.4-dev.4] - 2026-08-23
 
 This developer release packages tuned Shroud profiles, stateful padding and

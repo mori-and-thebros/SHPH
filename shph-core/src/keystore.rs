@@ -379,48 +379,90 @@ fn create_temp_file(dir: &Path, target: &Path) -> Result<(File, PathBuf)> {
 }
 
 fn open_keystore_readonly(path: &Path) -> Result<File> {
+    open_readonly_no_reparse(path)
+}
+
+/// Open an existing regular file without following a symlink/reparse point
+/// for the final path component.
+///
+/// The path is checked before and after opening. Unix uses `O_NOFOLLOW`; on
+/// Windows the handle is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and the
+/// handle's attributes are inspected directly. This does not replace
+/// directory-handle-relative APIs, but it closes the common check-then-open
+/// gap for the local secret/config inputs SHPH accepts.
+pub fn open_readonly_no_reparse(path: &Path) -> Result<File> {
+    ensure_no_reparse_components(path)?;
+
     #[cfg(unix)]
-    {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
+        OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
-            .map_err(ShphError::Io)?;
-        if !file
-            .metadata()
             .map_err(ShphError::Io)?
-            .file_type()
-            .is_file()
-        {
-            return Err(ShphError::InvalidArgument(
-                "keystore path must reference a regular file".into(),
-            ));
-        }
-        Ok(file)
-    }
-    #[cfg(not(unix))]
+    };
+
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(ShphError::Io)?
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let file = File::open(path).map_err(ShphError::Io)?;
+
+    ensure_open_handle_not_reparse(&file)?;
+    ensure_no_reparse_components(path)?;
+    if !file
+        .metadata()
+        .map_err(ShphError::Io)?
+        .file_type()
+        .is_file()
     {
-        ensure_not_reparse_point(path)?;
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(ShphError::InvalidArgument(
-                "refusing to load a symlinked keystore".into(),
-            ));
-        }
-        let file = File::open(path).map_err(ShphError::Io)?;
-        if !file
-            .metadata()
-            .map_err(ShphError::Io)?
-            .file_type()
-            .is_file()
-        {
-            return Err(ShphError::InvalidArgument(
-                "keystore path must reference a regular file".into(),
-            ));
-        }
-        Ok(file)
+        return Err(ShphError::InvalidArgument(
+            "path must reference a regular file".into(),
+        ));
     }
+    Ok(file)
+}
+
+pub fn ensure_open_handle_not_reparse(file: &File) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_ATTRIBUTE_TAG_INFO,
+        };
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                FileAttributeTagInfo,
+                (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(windows_error("GetFileInformationByHandleEx"));
+        }
+        if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ShphError::InvalidArgument(
+                "refusing to access a reparse-point file handle".into(),
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+    }
+    Ok(())
 }
 
 fn sync_parent_dir(dir: &Path) -> Result<()> {
@@ -477,9 +519,14 @@ pub fn ensure_no_reparse_components(path: &Path) -> Result<()> {
                     component.display()
                 )));
             }
-            Ok(_) => {
+            Ok(_) =>
+            {
                 #[cfg(windows)]
-                ensure_not_reparse_point(component)?;
+                match ensure_not_reparse_point(component) {
+                    Ok(()) => {}
+                    Err(ShphError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(ShphError::Io(error)),
@@ -543,12 +590,30 @@ fn assert_secret_file_perms(path: &Path) -> Result<()> {
 #[cfg(windows)]
 fn wide_path(path: &Path) -> Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
+
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     if wide.contains(&0) {
         return Err(ShphError::InvalidArgument(
             "keystore path contains an embedded NUL".into(),
         ));
     }
+
+    // Use the extended-length namespace for absolute paths so Windows
+    // security checks remain valid for bounded but nested adapter paths.
+    let unc_prefix = "\\\\".encode_utf16().collect::<Vec<_>>();
+    let extended_prefix = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
+    if path.is_absolute() && !wide.starts_with(&extended_prefix) {
+        if wide.starts_with(&unc_prefix) {
+            let mut prefixed = "\\\\?\\UNC\\".encode_utf16().collect::<Vec<_>>();
+            prefixed.extend_from_slice(&wide[2..]);
+            wide = prefixed;
+        } else {
+            let mut prefixed = extended_prefix;
+            prefixed.extend_from_slice(&wide);
+            wide = prefixed;
+        }
+    }
+
     wide.push(0);
     Ok(wide)
 }
@@ -556,10 +621,12 @@ fn wide_path(path: &Path) -> Result<Vec<u16>> {
 #[cfg(windows)]
 fn windows_error(operation: &str) -> ShphError {
     use windows_sys::Win32::Foundation::GetLastError;
-    ShphError::Io(io::Error::other(format!(
-        "{operation} failed with Win32 error {}",
-        unsafe { GetLastError() }
-    )))
+    let code = unsafe { GetLastError() } as i32;
+    let source = io::Error::from_raw_os_error(code);
+    ShphError::Io(io::Error::new(
+        source.kind(),
+        format!("{operation} failed with Win32 error {code}: {source}"),
+    ))
 }
 
 #[cfg(windows)]

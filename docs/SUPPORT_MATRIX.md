@@ -25,16 +25,16 @@ claim.
 | TCP `listen` / `connect` / `send-once` / `recv-once` | Supported for controlled lab use | In scope | CLI integration tests, demo, and locked workspace gates |
 | Session `up` without native TUN | Supported for controlled lab use | In scope | Session, shutdown, reconnect, and control-plane tests |
 | Linux native TUN | Implemented and capability-gated | In scope for a Linux host campaign | `/dev/net/tun`, privilege, route/DNS, killswitch, packet, and two-host evidence are separate gates |
-| Windows Wintun | Wired; adapter/session smoke exists | In scope for a Windows host campaign only after packet evidence | Signed/hash-pinned runtime, elevation, packet I/O, rollback, reconnect, and two-host evidence remain required |
+| Windows Wintun | Wired; elevated adapter/session and control-plane lifecycle smoke validated | In scope for a Windows host campaign only after packet evidence | Signed/hash-pinned runtime, elevation, packet I/O, reconnect, and two-host evidence remain required; see `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md` |
 | Linux/Windows control-plane dry run | Supported | In scope | Planner and CLI tests; no host mutation is implied |
 | Live route/DNS mutation | Implemented with rollback paths | Host-gated | Requires an isolated privileged operator campaign |
 | Linux killswitch and MSS clamp | Implemented as opt-in controls | Host-gated | Unit/planner tests exist; privileged crash-leak and rollback evidence remain open |
-| Windows WFP killswitch | Implemented as an opt-in policy backend | Host-gated | Requires elevated Windows policy and packet-path validation |
+| Windows WFP killswitch | Implemented as an opt-in policy backend | Host-gated | Elevated loopback install/teardown smoke validated; crash-leak, packet-path, and two-host policy evidence remain open |
 | Legacy `quic` UDP shim | Experimental | Out of release profile | Lab round trips and malformed-input tests only; not conformant QUIC |
-| `quic-standard` | Experimental, host-gated | Out of release profile | Quinn/rustls and RFC 9221 implementation exists; live forwarding and operational trust evidence remain open |
+| `quic-standard` | Experimental, host-gated | Out of release profile | Quinn/rustls, RFC 9221, persistent certificate/key reuse, host/join onboarding, and Linux native-TUN bridge exist; privileged two-host forwarding and Windows native-TUN evidence remain open |
 | Shroud morphology profiles | Experimental lab instrumentation | Out of release profile | Benchmark and framing evidence only; no fingerprint or stealth claim |
-| `offline-mesh` | Experimental filesystem adapter | Out of release profile | Bounded spool tests; no wireless discovery or delivery guarantee |
-| `data-mule` | Experimental filesystem courier adapter | Out of release profile | Bounded file-envelope tests; no courier or hostile-filesystem guarantee |
+| `offline-mesh` | Experimental filesystem adapter | Out of release profile | Authenticated shared-spool session, distinct-root copy/replication, bounded scan/quarantine, restart-safe replay, and Windows long-path tests; no wireless discovery or delivery guarantee |
+| `data-mule` | Experimental filesystem courier adapter | Out of release profile | Authenticated shared-spool session, bounded file-envelope/quarantine/quota tests, and Windows long-path coverage; no courier or hostile-filesystem guarantee |
 | Identity discovery/provider boundary | Experimental library surface | Out of release profile | Local/provider-independent tests and benchmark notes; no automatic peer mutation |
 | Hardware-backed key custody | Not implemented | Out of scope | HSM/TPM/YubiKey/PKCS#11 claims are prohibited |
 | DPI evasion or censorship resistance | Not implemented | Out of scope | No production anti-observation claim is permitted |

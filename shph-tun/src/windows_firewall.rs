@@ -14,26 +14,29 @@ use shph_core::{Result, ShphError};
 use std::net::{IpAddr, SocketAddr};
 use std::ptr::{null, null_mut};
 use windows_sys::core::GUID;
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceAliasToLuid;
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0, FWPM_ACTION0,
     FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_CONDITION_IP_PROTOCOL,
-    FWPM_CONDITION_IP_REMOTE_ADDRESS_V4, FWPM_CONDITION_IP_REMOTE_ADDRESS_V6,
-    FWPM_CONDITION_IP_REMOTE_PORT, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
-    FWPM_FILTER_FLAG_PERSISTENT, FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-    FWPM_SUBLAYER_UNIVERSAL, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_CONDITION_VALUE0,
-    FWP_CONDITION_VALUE0_0, FWP_UINT16, FWP_UINT8, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
-    FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
+    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_FILTER0,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SUBLAYER_UNIVERSAL, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT,
+    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_UINT16, FWP_UINT8, FWP_V4_ADDR_AND_MASK,
+    FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_TYPE, FWP_UINT64,
 };
+use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 
 const MAX_PEER_SLOTS: usize = 64;
 const FILTER_WEIGHT_BLOCK: u64 = 10;
 const FILTER_WEIGHT_ALLOW: u64 = 100;
+const WFP_MUTEX_NAME: &str = "Global\\SHPH-WFP-KILLSWITCH";
+const WFP_AUTHN_SERVICE: u32 = RPC_C_AUTHN_WINNT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirewallTransport {
@@ -52,6 +55,7 @@ impl FirewallTransport {
 
 pub struct WindowsKillswitchGuard {
     engine: HANDLE,
+    mutex: HANDLE,
     keys: Vec<GUID>,
 }
 
@@ -60,6 +64,7 @@ impl std::fmt::Debug for WindowsKillswitchGuard {
         formatter
             .debug_struct("WindowsKillswitchGuard")
             .field("engine_open", &(!self.engine.is_null()))
+            .field("mutex_held", &(!self.mutex.is_null()))
             .field("filter_count", &self.keys.len())
             .finish()
     }
@@ -78,14 +83,20 @@ impl WindowsKillswitchGuard {
             )));
         }
 
+        let mutex = acquire_wfp_mutex()?;
         let mut engine = null_mut();
-        let status = unsafe { FwpmEngineOpen0(null(), 0, null(), null(), &mut engine) };
+        let status =
+            unsafe { FwpmEngineOpen0(null(), WFP_AUTHN_SERVICE, null(), null(), &mut engine) };
         if status != 0 || engine.is_null() {
+            unsafe {
+                CloseHandle(mutex);
+            }
             return Err(wfp_error("FwpmEngineOpen0", status));
         }
 
         let mut guard = Self {
             engine,
+            mutex,
             keys: Vec::new(),
         };
         guard.remove_stale_filters();
@@ -125,35 +136,49 @@ impl WindowsKillswitchGuard {
     }
 
     pub fn cleanup(&mut self) -> Result<()> {
-        if self.engine.is_null() {
+        if self.engine.is_null() && self.mutex.is_null() {
             return Ok(());
         }
         let mut first_error = None;
-        for key in self.keys.drain(..) {
-            let status = unsafe { FwpmFilterDeleteByKey0(self.engine, &key) };
+        if !self.engine.is_null() {
+            for key in self.keys.drain(..) {
+                let status = unsafe { FwpmFilterDeleteByKey0(self.engine, &key) };
+                if status != 0 && first_error.is_none() {
+                    first_error = Some(wfp_error("FwpmFilterDeleteByKey0", status));
+                }
+            }
+            let status = unsafe { FwpmEngineClose0(self.engine) };
+            self.engine = null_mut();
             if status != 0 && first_error.is_none() {
-                first_error = Some(wfp_error("FwpmFilterDeleteByKey0", status));
+                first_error = Some(wfp_error("FwpmEngineClose0", status));
             }
         }
-        let status = unsafe { FwpmEngineClose0(self.engine) };
-        self.engine = null_mut();
-        if let Some(error) = first_error {
-            return Err(error);
+        if !self.mutex.is_null() {
+            let closed = unsafe { CloseHandle(self.mutex) };
+            self.mutex = null_mut();
+            if closed == 0 && first_error.is_none() {
+                first_error = Some(wfp_error("CloseHandle(WFP mutex)", unsafe {
+                    GetLastError()
+                }));
+            }
         }
-        if status != 0 {
-            return Err(wfp_error("FwpmEngineClose0", status));
-        }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn clear_stale() -> Result<()> {
+        let mutex = acquire_wfp_mutex()?;
         let mut engine = null_mut();
-        let status = unsafe { FwpmEngineOpen0(null(), 0, null(), null(), &mut engine) };
+        let status =
+            unsafe { FwpmEngineOpen0(null(), WFP_AUTHN_SERVICE, null(), null(), &mut engine) };
         if status != 0 || engine.is_null() {
+            unsafe {
+                CloseHandle(mutex);
+            }
             return Err(wfp_error("FwpmEngineOpen0", status));
         }
         let mut guard = Self {
             engine,
+            mutex,
             keys: Vec::new(),
         };
         guard.remove_stale_filters();
@@ -189,7 +214,7 @@ impl WindowsKillswitchGuard {
                     mask: u32::from_be_bytes([255, 0, 0, 0]),
                 };
                 let condition = FWPM_FILTER_CONDITION0 {
-                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS_V4,
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
                     matchType: 0,
                     conditionValue: FWP_CONDITION_VALUE0 {
                         r#type: FWP_V4_ADDR_MASK,
@@ -206,7 +231,7 @@ impl WindowsKillswitchGuard {
                     prefixLength: 128,
                 };
                 let condition = FWPM_FILTER_CONDITION0 {
-                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS_V6,
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
                     matchType: 0,
                     conditionValue: FWP_CONDITION_VALUE0 {
                         r#type: FWP_V6_ADDR_MASK,
@@ -253,7 +278,7 @@ impl WindowsKillswitchGuard {
                 (
                     FWPM_LAYER_ALE_AUTH_CONNECT_V4,
                     FWPM_FILTER_CONDITION0 {
-                        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS_V4,
+                        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
                         matchType: 0,
                         conditionValue: FWP_CONDITION_VALUE0 {
                             r#type: FWP_V4_ADDR_MASK,
@@ -272,7 +297,7 @@ impl WindowsKillswitchGuard {
                 (
                     FWPM_LAYER_ALE_AUTH_CONNECT_V6,
                     FWPM_FILTER_CONDITION0 {
-                        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS_V6,
+                        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
                         matchType: 0,
                         conditionValue: FWP_CONDITION_VALUE0 {
                             r#type: FWP_V6_ADDR_MASK,
@@ -391,6 +416,23 @@ impl Drop for WindowsKillswitchGuard {
     }
 }
 
+fn acquire_wfp_mutex() -> Result<HANDLE> {
+    let name: Vec<u16> = WFP_MUTEX_NAME.encode_utf16().chain(Some(0)).collect();
+    let mutex = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
+    if mutex.is_null() {
+        return Err(wfp_error("CreateMutexW", unsafe { GetLastError() }));
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            CloseHandle(mutex);
+        }
+        return Err(ShphError::ResourceExhausted(
+            "SHPH Windows killswitch is already active in another process".into(),
+        ));
+    }
+    Ok(mutex)
+}
+
 pub fn interface_luid(interface_name: &str) -> Result<u64> {
     let mut wide: Vec<u16> = interface_name.encode_utf16().chain(Some(0)).collect();
     let mut luid = NET_LUID_LH::default();
@@ -418,4 +460,15 @@ fn wfp_error(operation: &str, status: u32) -> ShphError {
     ShphError::PermissionDenied(format!(
         "{operation} failed with Windows Filtering Platform status 0x{status:08x}; administrator elevation is required"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RPC_C_AUTHN_WINNT, WFP_AUTHN_SERVICE};
+
+    #[test]
+    fn engine_open_uses_supported_rpc_authentication() {
+        assert_eq!(WFP_AUTHN_SERVICE, RPC_C_AUTHN_WINNT);
+        assert_ne!(WFP_AUTHN_SERVICE, 0);
+    }
 }

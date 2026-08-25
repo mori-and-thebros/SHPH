@@ -162,7 +162,6 @@ impl PeerPin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerPolicy {
     pins: Vec<PeerPin>,
-    allow_any: bool,
 }
 
 impl PeerPolicy {
@@ -175,29 +174,11 @@ impl PeerPolicy {
                 "peer policy exceeds the {MAX_PEER_PINS}-pin safety limit"
             )));
         }
-        Ok(Self {
-            pins,
-            allow_any: false,
-        })
+        Ok(Self { pins })
     }
 
     pub fn single(pin: PeerPin) -> Self {
-        Self {
-            pins: vec![pin],
-            allow_any: false,
-        }
-    }
-
-    /// Create a temporary bootstrap policy for an explicit TOFU enrollment.
-    ///
-    /// Callers must persist and pin the authenticated peer before accepting
-    /// another connection. This is intentionally not exposed through the
-    /// ordinary configuration parser.
-    pub fn allow_any() -> Self {
-        Self {
-            pins: Vec::new(),
-            allow_any: true,
-        }
+        Self { pins: vec![pin] }
     }
 
     pub fn pins(&self) -> &[PeerPin] {
@@ -205,11 +186,10 @@ impl PeerPolicy {
     }
 
     fn allows(&self, identity_public: &[u8; 32], signing_public: &[u8; 32]) -> bool {
-        self.allow_any
-            || self.pins.iter().any(|pin| {
-                constant_time_eq(&pin.identity_public, identity_public)
-                    && constant_time_eq(&pin.signing_public, signing_public)
-            })
+        self.pins.iter().any(|pin| {
+            constant_time_eq(&pin.identity_public, identity_public)
+                && constant_time_eq(&pin.signing_public, signing_public)
+        })
     }
 }
 
@@ -997,13 +977,6 @@ mod tests {
         let pin = PeerPin::new([1u8; 32], [2u8; 32]);
         assert!(PeerPolicy::new(vec![pin; MAX_PEER_PINS]).is_ok());
         assert!(PeerPolicy::new(vec![pin; MAX_PEER_PINS + 1]).is_err());
-    }
-
-    #[test]
-    fn bootstrap_peer_policy_accepts_one_unpinned_identity() {
-        let policy = PeerPolicy::allow_any();
-        assert!(policy.allows(&[7u8; 32], &[9u8; 32]));
-        assert!(policy.pins().is_empty());
     }
 
     #[test]

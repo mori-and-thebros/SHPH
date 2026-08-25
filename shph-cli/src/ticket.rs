@@ -66,9 +66,12 @@ fn validate_ticket(ticket: &JoinTicket) -> Result<()> {
             "ticket endpoint host contains whitespace or control characters".into(),
         ));
     }
-    if ticket.transport != "tcp" && ticket.transport != "quic" {
+    if ticket.transport != "tcp"
+        && ticket.transport != "quic"
+        && ticket.transport != "quic-standard"
+    {
         return Err(ShphError::InvalidArgument(
-            "ticket transport must be tcp or quic".into(),
+            "ticket transport must be tcp, quic, or quic-standard".into(),
         ));
     }
     if shph_core::shroud_profile_by_selection(&ticket.shroud_profile).is_none() {
@@ -125,7 +128,18 @@ mod tests {
     #[test]
     fn ticket_rejects_unknown_transport() {
         let mut ticket = ticket();
-        ticket.transport = "quic-standard".into();
+        ticket.transport = "not-a-transport".into();
         assert!(ticket.encode().is_err());
+    }
+
+    #[test]
+    fn ticket_accepts_standards_quic() {
+        let mut ticket = ticket();
+        ticket.transport = "quic-standard".into();
+        let encoded = ticket.encode().expect("encode standards QUIC ticket");
+        assert_eq!(
+            JoinTicket::decode(&encoded).expect("decode standards QUIC ticket"),
+            ticket
+        );
     }
 }

@@ -62,13 +62,17 @@ See `docs/SHROUD_2_IMPLEMENTATION.md` for the implementation disposition.
 ## Standards QUIC module
 
 For real RFC QUIC behavior, use `--transport quic-standard` with
-`--quic-cert` on `listen`, `connect`, `send-once`, or `recv-once`, or use the
-explicit `shph_transport::standards_quic` API documented in
-`docs/QUIC_STANDARDS.md`. It is separate from `--transport quic`, which
+`--quic-cert` on `listen`, `connect`, `send-once`, or `recv-once`, and add
+`--quic-key` to server commands. The `host`/`join` flow also supports
+`quic-standard`; the host persists the certificate/key pair and the joiner
+receives the public certificate out of band. The explicit
+`shph_transport::standards_quic` API is documented in
+`docs/QUIC_STANDARDS.md`. This is separate from `--transport quic`, which
 remains the compatibility name for the legacy UDP shim. The standards module
 uses Quinn/rustls TLS 1.3, reliable QUIC streams for control messages, and RFC
-9221 QUIC DATAGRAM frames for tunnel payloads. Continuous `up` mode and native
-TUN are intentionally not supported by this path yet.
+9221 QUIC DATAGRAM frames for tunnel payloads. Continuous `up` mode is
+available with Linux native TUN and stable server material; Windows native-TUN
+forwarding remains host-gated.
 
 Intensity semantics:
 
@@ -130,12 +134,23 @@ Operational behavior:
   AEAD work; the serialized envelope is still checked against the final file
   limit.
 - Invalid or oversized files are quarantined as `.rejected`.
-- Replay state is bounded; entries are acknowledged only after successful
-  authenticated consumption.
+- Replay state is bounded and keyed by `(created_at_unix_ms, sequence)` so a
+  writer sequence reset after restart cannot silently collide with an older
+  envelope; entries are acknowledged only after successful authenticated
+  consumption.
 - Queue scans are bounded by entry count and filesystem depth.
+- Windows claims and atomic persistence use the extended-length Win32 path
+  namespace, so nested temporary spool paths do not fall back to legacy
+  `MAX_PATH` behavior.
 
 The sender and receiver must use the same logical spool, or an external
 replication step must copy the sender's output tree into the receiver's spool.
+
+The local regression suite also exercises a complete authenticated session
+round trip on a shared spool and an authenticated envelope copied between
+distinct spool roots. These tests prove the bounded file-adapter code path and
+AEAD/session binding only; they do not prove physical mesh discovery, courier
+delivery, or synchronized-spool consistency under an external filesystem.
 
 ## Data-mule store and forward
 
@@ -185,9 +200,13 @@ cp -a /tmp/shph-mule/outbox/. /tmp/shph-mule/inbox/
 3. Run a QUIC-shim round trip with `randomized-lab`.
 4. Exercise a malformed or oversized courier file and confirm it becomes
    `.rejected`.
-5. Copy an offline/data-mule envelope between distinct spool roots.
-6. Verify the receiver can retry an envelope after a failed authentication
+5. Run the authenticated offline-mesh and data-mule session round-trip tests.
+6. Copy an offline-mesh envelope between distinct spool roots and verify the
+   source remains available after destination consumption.
+7. Verify the receiver can retry an envelope after a failed authentication
    attempt and consumes it only after successful decryption.
+8. Verify a writer sequence reset with a new creation timestamp is accepted,
+   while the original `(timestamp, sequence)` replay key remains rejected.
 
 None of these prototypes should be exposed as a production VPN transport
 without a separate design review, interoperability work, and hostile-network

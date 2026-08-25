@@ -13,7 +13,7 @@ use shph_config::{
 };
 use shph_core::{
     append_ratchet_audit_event, build_hello, compute_fingerprint_hex, ensure_no_reparse_components,
-    read_ratchet_audit_events, recover_secret_from_shares,
+    open_readonly_no_reparse, read_ratchet_audit_events, recover_secret_from_shares,
     roadmap::{DataMuleConfig, OfflineMeshConfig, RoadmapConfig},
     split_secret, validate_identity_provider, validate_roadmap, verify_and_derive, Contact,
     Endpoint, HandshakeProfile, HandshakeState, KeyStore, KeyStoreConfig, MetricsCollector,
@@ -61,7 +61,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{future::Future, net::SocketAddr};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use shph_obfuscation::ProfileTier;
 use ticket::{render_qr, JoinTicket};
@@ -247,7 +247,7 @@ enum Commands {
         /// Public host or host:port embedded in the join ticket
         #[arg(long)]
         advertise: Option<String>,
-        /// Transport override (tcp|quic)
+        /// Transport override (tcp|quic|quic-standard)
         #[arg(long, default_value = "tcp")]
         transport: String,
         /// Discrete traffic-shaping profile
@@ -262,6 +262,12 @@ enum Commands {
         /// Write the generated join ticket to an owner-only file
         #[arg(long, value_name = "PATH")]
         ticket_file: Option<PathBuf>,
+        /// Persistent standards-QUIC server certificate path
+        #[arg(long, value_name = "PATH")]
+        quic_cert: Option<PathBuf>,
+        /// Persistent standards-QUIC PKCS#8 private key path
+        #[arg(long, value_name = "PATH")]
+        quic_key: Option<PathBuf>,
     },
     /// Join a host from a shph://v1 ticket
     Join {
@@ -280,6 +286,9 @@ enum Commands {
         /// Optional outbound underlay (direct or socks5://host:port)
         #[arg(long)]
         underlay: Option<String>,
+        /// Trusted standards-QUIC server certificate path
+        #[arg(long, value_name = "PATH")]
+        quic_cert: Option<PathBuf>,
         /// Override only the socket destination; the ticket endpoint remains pinned
         #[arg(long, value_name = "HOST:PORT")]
         transport_peer: Option<String>,
@@ -316,6 +325,9 @@ enum Commands {
         /// DER certificate path for standards QUIC; servers write it and clients trust it out of band
         #[arg(long)]
         quic_cert: Option<PathBuf>,
+        /// PKCS#8 private key path for standards QUIC server mode
+        #[arg(long)]
+        quic_key: Option<PathBuf>,
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
@@ -421,6 +433,9 @@ enum Commands {
         /// DER certificate path for standards QUIC; clients must receive the server certificate out of band
         #[arg(long)]
         quic_cert: Option<PathBuf>,
+        /// PKCS#8 private key path for standards QUIC server mode
+        #[arg(long)]
+        quic_key: Option<PathBuf>,
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
@@ -477,6 +492,9 @@ enum Commands {
         /// DER certificate path for standards QUIC; clients must receive the server certificate out of band
         #[arg(long)]
         quic_cert: Option<PathBuf>,
+        /// PKCS#8 private key path for standards QUIC server mode
+        #[arg(long)]
+        quic_key: Option<PathBuf>,
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
@@ -547,6 +565,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             no_tun,
             no_nat,
             ticket_file,
+            quic_cert,
+            quic_key,
         } => handle_host(
             &config_path,
             &keystore_path,
@@ -557,12 +577,15 @@ fn run_cli(cli: Cli) -> Result<()> {
             no_tun,
             no_nat,
             ticket_file.as_deref(),
+            quic_cert.as_deref(),
+            quic_key.as_deref(),
         )?,
         Commands::Join {
             ticket,
             ticket_file,
             no_tun,
             underlay,
+            quic_cert,
             transport_peer,
             check,
         } => {
@@ -573,6 +596,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 &ticket,
                 no_tun,
                 underlay.as_deref(),
+                quic_cert.as_deref(),
                 transport_peer.as_deref(),
                 check,
             )?
@@ -587,6 +611,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             no_tun,
             underlay,
             quic_cert,
+            quic_key,
             handshake_profile,
             killswitch,
             killswitch_dry_run,
@@ -606,6 +631,8 @@ fn run_cli(cli: Cli) -> Result<()> {
                     timeout_secs: Some(5),
                     handshake_profile: None,
                     underlay: underlay.clone(),
+                    quic_cert: None,
+                    quic_key: None,
                     reconnect: None,
                     startup_payload: None,
                 });
@@ -634,6 +661,16 @@ fn run_cli(cli: Cli) -> Result<()> {
                     .as_ref()
                     .map(|stealth| stealth.shroud_profile.as_str()),
             )?;
+            let configured_quic_cert = config
+                .session
+                .as_ref()
+                .and_then(|session| session.quic_cert.as_deref())
+                .map(Path::new);
+            let configured_quic_key = config
+                .session
+                .as_ref()
+                .and_then(|session| session.quic_key.as_deref())
+                .map(Path::new);
             let path_keystore = keystore_path_from_config(&config_path);
             handle_up(
                 &config_path,
@@ -643,12 +680,12 @@ fn run_cli(cli: Cli) -> Result<()> {
                     transport: mode,
                     profile,
                     shroud_profile,
-                    quic_cert_path: quic_cert.as_deref(),
+                    quic_cert_path: quic_cert.as_deref().or(configured_quic_cert),
+                    quic_key_path: quic_key.as_deref().or(configured_quic_key),
                     killswitch,
                     killswitch_dry_run,
                     mss_clamp,
                     tun: !no_tun,
-                    host_bootstrap: false,
                     nat: false,
                     underlay,
                 },
@@ -706,6 +743,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             timeout_secs,
             transport,
             quic_cert,
+            quic_key,
             handshake_profile,
         } => {
             let config = load_config(&config_path)?;
@@ -715,6 +753,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 timeout_secs,
                 transport,
                 quic_cert.as_deref(),
+                quic_key.as_deref(),
                 resolve_handshake_profile(
                     handshake_profile.as_deref(),
                     config
@@ -797,6 +836,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             timeout_secs,
             transport,
             quic_cert,
+            quic_key,
             handshake_profile,
         } => {
             let config = load_config(&config_path)?;
@@ -806,6 +846,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 timeout_secs,
                 transport,
                 quic_cert.as_deref(),
+                quic_key.as_deref(),
                 resolve_handshake_profile(
                     handshake_profile.as_deref(),
                     config
@@ -917,10 +958,9 @@ fn read_ticket_source(inline: Option<&str>, ticket_file: Option<&Path>) -> Resul
     match (inline, ticket_file) {
         (Some(ticket), None) if !ticket.trim().is_empty() => Ok(ticket.trim().to_string()),
         (None, Some(path)) => {
-            ensure_no_reparse_components(path)?;
-            let file = fs::File::open(path).map_err(|error| {
+            let file = open_readonly_no_reparse(path).map_err(|error| {
                 ShphError::Config(format!(
-                    "unable to read ticket file {}: {error}",
+                    "unable to safely open ticket file {}: {error}",
                     path.display()
                 ))
             })?;
@@ -979,6 +1019,7 @@ fn handle_join_check(
     profile: &str,
     underlay: &TcpUnderlay,
     transport_peer: Option<&str>,
+    quic_cert_path: Option<&Path>,
 ) -> Result<()> {
     let policy_identity = decode_peer_key(&ticket.server_identity_b64, "ticket server identity")?;
     let policy_signing = decode_peer_key(&ticket.server_signing_b64, "ticket server signing key")?;
@@ -997,6 +1038,46 @@ fn handle_join_check(
     println!("  Shroud profile: {profile}");
     println!("  Underlay: {}", underlay.label());
     let started = std::time::Instant::now();
+    if mode == TransportMode::QuicStandard {
+        let cert_path = quic_cert_path.ok_or_else(|| {
+            ShphError::Config(
+                "--quic-cert is required for a quic-standard preflight; copy the host certificate out of band"
+                    .into(),
+            )
+        })?;
+        let certificate = read_quic_certificate(cert_path)?;
+        let peer_addr = parse_socket_addr(&actual_peer)?;
+        let state = run_async(async {
+            let endpoint = standards_quic::client_endpoint(
+                "0.0.0.0:0"
+                    .parse()
+                    .map_err(|_| ShphError::Internal("invalid ephemeral endpoint".into()))?,
+                &certificate,
+                standards_quic::StandardsQuicConfig::default(),
+            )?;
+            let connection = standards_quic::connect(
+                &endpoint,
+                peer_addr,
+                "localhost",
+                &keystore.identity,
+                &policy,
+                HandshakeProfile::SecureDefault,
+                bounded_cli_timeout(timeout_secs),
+            )
+            .await?;
+            let state = connection.handshake;
+            endpoint.close(0u32.into(), b"preflight complete");
+            endpoint.wait_idle().await;
+            Ok(state)
+        })?;
+        enforce_peer_policy(keystore_path, &ticket.endpoint, &state, true)?;
+        println!("  Handshake: authenticated");
+        println!("  Peer fingerprint: {}", state.peer_fingerprint_hex);
+        println!("  Transcript hash: {}", state.transcript_hash_hex);
+        println!("  Elapsed: {} ms", started.elapsed().as_millis());
+        println!("Result: preflight passed; no config, TUN, route, or DNS changes were made");
+        return Ok(());
+    }
     let (_session, state) = connect_secure_session_lab_with_profile_and_underlay(
         &actual_peer,
         &keystore.identity,
@@ -1026,6 +1107,8 @@ fn handle_host(
     no_tun: bool,
     no_nat: bool,
     ticket_file: Option<&Path>,
+    quic_cert_path: Option<&Path>,
+    quic_key_path: Option<&Path>,
 ) -> Result<()> {
     if port == 0 {
         return Err(ShphError::InvalidArgument(
@@ -1033,15 +1116,40 @@ fn handle_host(
         ));
     }
     let mode = TransportMode::parse(transport)?;
-    if !matches!(mode, TransportMode::Tcp | TransportMode::Quic) {
+    if !matches!(
+        mode,
+        TransportMode::Tcp | TransportMode::Quic | TransportMode::QuicStandard
+    ) {
         return Err(ShphError::InvalidArgument(
-            "host supports only tcp and quic transports".into(),
+            "host supports tcp, quic, and quic-standard transports".into(),
         ));
     }
+    if mode == TransportMode::QuicStandard && no_tun {
+        return Err(ShphError::Unsupported(
+            "quic-standard host mode requires native TUN; use `listen`/`recv-once` for a no-TUN lab handshake"
+                .into(),
+        ));
+    }
+    let (quic_cert_path, quic_key_path) = if mode == TransportMode::QuicStandard {
+        let certificate = quic_cert_path
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_quic_certificate_path(config_path));
+        let private_key = quic_key_path
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_quic_private_key_path(&certificate));
+        (Some(certificate), Some(private_key))
+    } else {
+        (None, None)
+    };
     let profile = resolve_shroud_profile(Some(shroud_profile), None)?;
     let advertised_endpoint = advertised_endpoint(advertise, port)?;
     let bind = format_endpoint("0.0.0.0", port);
     let (mut config, keystore) = ensure_workspace(config_path, keystore_path)?;
+    if keystore.contacts.is_empty() {
+        return Err(ShphError::Config(
+            "host requires at least one configured peer pin; initialize the client identity and add it with `shph add-peer` before starting the host".into(),
+        ));
+    }
 
     config.local_endpoint = bind.clone();
     config.stealth = Some(StealthConfig {
@@ -1056,6 +1164,12 @@ fn handle_host(
         timeout_secs: Some(300),
         handshake_profile: Some(HandshakeProfile::SecureDefault),
         underlay: None,
+        quic_cert: quic_cert_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        quic_key: quic_key_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
         reconnect: Some(ReconnectConfig {
             enabled: Some(true),
             max_attempts: Some(10),
@@ -1083,6 +1197,12 @@ fn handle_host(
     println!("  Identity: {}", keystore.fingerprint_hex());
     println!("  Transport: {}", transport_mode_to_str(mode));
     println!("  Shroud profile: {profile}");
+    if let Some(path) = quic_cert_path.as_deref() {
+        println!("  Standards QUIC certificate: {}", path.display());
+    }
+    if let Some(path) = quic_key_path.as_deref() {
+        println!("  Standards QUIC private key: {}", path.display());
+    }
     println!("  Join ticket: {ticket}");
     if let Some(ticket_file) = ticket_file {
         println!("  Ticket file: {}", ticket_file.display());
@@ -1101,24 +1221,26 @@ fn handle_host(
             transport: mode,
             profile: HandshakeProfile::SecureDefault,
             shroud_profile: profile,
-            quic_cert_path: None,
+            quic_cert_path: quic_cert_path.as_deref(),
+            quic_key_path: quic_key_path.as_deref(),
             killswitch: false,
             killswitch_dry_run: false,
             mss_clamp: false,
             tun: !no_tun,
-            host_bootstrap: true,
             nat: !no_nat,
             underlay: TcpUnderlay::Direct,
         },
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_join(
     config_path: &Path,
     keystore_path: &Path,
     ticket_value: &str,
     no_tun: bool,
     underlay_value: Option<&str>,
+    quic_cert_path: Option<&Path>,
     transport_peer_value: Option<&str>,
     check: bool,
 ) -> Result<()> {
@@ -1131,6 +1253,12 @@ fn handle_join(
     let transport_peer = transport_peer_value
         .map(validate_transport_peer)
         .transpose()?;
+    if mode == TransportMode::QuicStandard && quic_cert_path.is_none() {
+        return Err(ShphError::Config(
+            "--quic-cert is required when joining a quic-standard ticket; copy the host certificate out of band"
+                .into(),
+        ));
+    }
     if check {
         return handle_join_check(
             keystore_path,
@@ -1139,6 +1267,7 @@ fn handle_join(
             &profile,
             &underlay,
             transport_peer.as_deref(),
+            quic_cert_path,
         );
     }
     let (mut config, mut keystore) = ensure_workspace(config_path, keystore_path)?;
@@ -1159,6 +1288,8 @@ fn handle_join(
         timeout_secs: Some(10),
         handshake_profile: Some(HandshakeProfile::SecureDefault),
         underlay: underlay.config_value(),
+        quic_cert: quic_cert_path.map(|path| path.display().to_string()),
+        quic_key: None,
         reconnect: Some(ReconnectConfig {
             enabled: Some(true),
             max_attempts: Some(10),
@@ -1198,12 +1329,12 @@ fn handle_join(
             transport: mode,
             profile: HandshakeProfile::SecureDefault,
             shroud_profile: profile,
-            quic_cert_path: None,
+            quic_cert_path,
+            quic_key_path: None,
             killswitch: false,
             killswitch_dry_run: false,
             mss_clamp: false,
             tun: !no_tun,
-            host_bootstrap: false,
             nat: false,
             underlay,
         },
@@ -1231,7 +1362,10 @@ fn handle_id(
     )?;
     let endpoint = shareable_endpoint(&config)?;
     let mode = resolve_transport_mode(None, config.roadmap.as_ref())?;
-    let mode = if matches!(mode, TransportMode::Tcp | TransportMode::Quic) {
+    let mode = if matches!(
+        mode,
+        TransportMode::Tcp | TransportMode::Quic | TransportMode::QuicStandard
+    ) {
         mode
     } else {
         TransportMode::Tcp
@@ -1320,35 +1454,6 @@ fn ensure_peer_pin(
     Ok(())
 }
 
-fn enroll_inbound_peer(
-    config_path: &Path,
-    keystore_path: &Path,
-    endpoint: &str,
-    state: &HandshakeState,
-) -> Result<()> {
-    let mut config = load_config(config_path)?;
-    let mut keystore = KeyStore::load(keystore_path, None)?;
-    let alias = format!(
-        "peer-{}",
-        state
-            .peer_fingerprint_hex
-            .get(..12)
-            .unwrap_or(&state.peer_fingerprint_hex)
-    );
-    ensure_peer_pin(
-        &mut config,
-        &mut keystore,
-        &alias,
-        endpoint,
-        &state.peer_identity_pubkey_b64,
-        &state.peer_signing_pubkey_b64,
-    )?;
-    save_config(&config, config_path)?;
-    keystore.save(keystore_path)?;
-    println!("  Bootstrap enrollment: pinned {alias}");
-    Ok(())
-}
-
 fn advertised_endpoint(advertise: Option<&str>, port: u16) -> Result<String> {
     let raw = advertise.unwrap_or("127.0.0.1").trim();
     let endpoint = match Endpoint::parse(raw) {
@@ -1404,11 +1509,11 @@ struct UpOptions<'a> {
     profile: HandshakeProfile,
     shroud_profile: String,
     quic_cert_path: Option<&'a Path>,
+    quic_key_path: Option<&'a Path>,
     killswitch: bool,
     killswitch_dry_run: bool,
     mss_clamp: bool,
     tun: bool,
-    host_bootstrap: bool,
     nat: bool,
     underlay: TcpUnderlay,
 }
@@ -1424,11 +1529,11 @@ fn handle_up(
         profile,
         shroud_profile,
         quic_cert_path,
+        quic_key_path,
         killswitch,
         killswitch_dry_run,
         mss_clamp,
         tun,
-        host_bootstrap,
         nat,
         underlay,
     } = options;
@@ -1439,18 +1544,6 @@ fn handle_up(
         return Err(ShphError::Config(
             "recorded control-plane state exists; run `shph reconcile` or `shph undo` before `shph up`"
                 .into(),
-        ));
-    }
-    if transport == TransportMode::QuicStandard
-        && config
-            .session
-            .as_ref()
-            .and_then(|session| session.reconnect.as_ref())
-            .and_then(|reconnect| reconnect.enabled)
-            .unwrap_or(false)
-    {
-        return Err(ShphError::Config(
-            "quic-standard native TUN reconnect is not supported yet: the listener certificate must remain stable across reconnects".into(),
         ));
     }
     announce_handshake_profile(profile);
@@ -1595,6 +1688,7 @@ fn handle_up(
                             timeout_secs,
                             Some(transport_mode_to_str(transport).to_string()),
                             quic_cert_path,
+                            quic_key_path,
                             profile,
                             roadmap,
                         )?;
@@ -1607,7 +1701,6 @@ fn handle_up(
                             || {
                                 run_listen_loop(
                                     keystore_path,
-                                    config_path,
                                     &tun,
                                     bind,
                                     timeout_secs,
@@ -1615,7 +1708,7 @@ fn handle_up(
                                     profile,
                                     config.roadmap.as_ref(),
                                     quic_cert_path,
-                                    host_bootstrap,
+                                    quic_key_path,
                                 )
                             },
                         )?;
@@ -1661,6 +1754,7 @@ fn handle_up(
                                     profile,
                                     config.roadmap.as_ref(),
                                     quic_cert_path,
+                                    quic_key_path,
                                     &underlay,
                                 )
                             },
@@ -1738,6 +1832,7 @@ where
 }
 
 const MAX_QUIC_CERTIFICATE_BYTES: u64 = 64 * 1024;
+const MAX_QUIC_PRIVATE_KEY_BYTES: u64 = 64 * 1024;
 
 fn read_quic_certificate(path: &Path) -> Result<Vec<u8>> {
     ensure_no_reparse_components(path)?;
@@ -1799,6 +1894,105 @@ fn write_quic_certificate(path: &Path, certificate: &[u8]) -> Result<()> {
     }
     ensure_no_reparse_components(path)?;
     write_owner_only_file(path, certificate)
+}
+
+fn read_quic_private_key(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    shph_core::enforce_owner_only_file_permissions(path)?;
+    let file = open_readonly_no_reparse(path)?;
+    let metadata = file.metadata().map_err(ShphError::Io)?;
+    if metadata.len() == 0 || metadata.len() > MAX_QUIC_PRIVATE_KEY_BYTES {
+        return Err(ShphError::Config(format!(
+            "QUIC private key must be between 1 and {MAX_QUIC_PRIVATE_KEY_BYTES} bytes"
+        )));
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.take(MAX_QUIC_PRIVATE_KEY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ShphError::Io)?;
+    if bytes.len() as u64 > MAX_QUIC_PRIVATE_KEY_BYTES {
+        return Err(ShphError::Config(
+            "QUIC private key exceeds size limit".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn write_quic_private_key(path: &Path, private_key: &[u8]) -> Result<()> {
+    if private_key.is_empty() || private_key.len() as u64 > MAX_QUIC_PRIVATE_KEY_BYTES {
+        return Err(ShphError::Config(
+            "generated QUIC private key has an invalid size".into(),
+        ));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(ShphError::InvalidArgument(
+                "refusing to replace symlinked QUIC private key".into(),
+            ));
+        }
+    }
+    ensure_no_reparse_components(path)?;
+    write_owner_only_file(path, private_key)
+}
+
+fn default_quic_certificate_path(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("quic-server.der")
+}
+
+fn default_quic_private_key_path(certificate_path: &Path) -> PathBuf {
+    certificate_path.with_extension("key")
+}
+
+fn path_exists_without_following(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ShphError::Io(error)),
+    }
+}
+
+fn load_or_create_quic_server(
+    bind_addr: SocketAddr,
+    certificate_path: &Path,
+    private_key_path: &Path,
+) -> Result<standards_quic::StandardsQuicServer> {
+    ensure_no_reparse_components(certificate_path)?;
+    ensure_no_reparse_components(private_key_path)?;
+    let certificate_exists = path_exists_without_following(certificate_path)?;
+    let private_key_exists = path_exists_without_following(private_key_path)?;
+    let material = match (certificate_exists, private_key_exists) {
+        (true, true) => {
+            let certificate = read_quic_certificate(certificate_path)?;
+            let private_key = read_quic_private_key(private_key_path)?;
+            standards_quic::StandardsQuicServerMaterial::new(certificate, private_key.to_vec())?
+        }
+        (false, false) => {
+            let material = standards_quic::generate_server_material()?;
+            write_quic_certificate(certificate_path, material.certificate_der())?;
+            if let Err(error) = write_quic_private_key(private_key_path, material.private_key_der())
+            {
+                let _ = fs::remove_file(certificate_path);
+                return Err(error);
+            }
+            material
+        }
+        (true, false) => {
+            return Err(ShphError::Config(format!(
+                "QUIC certificate exists but private key is missing: {}",
+                private_key_path.display()
+            )))
+        }
+        (false, true) => {
+            return Err(ShphError::Config(format!(
+                "QUIC private key exists but certificate is missing: {}",
+                certificate_path.display()
+            )))
+        }
+    };
+    standards_quic::server_endpoint_with_material(
+        bind_addr,
+        &material,
+        standards_quic::StandardsQuicConfig::default(),
+    )
 }
 
 fn handle_down(config_path: &Path) -> Result<()> {
@@ -3337,12 +3531,14 @@ fn handle_handshake_sim(keystore_path: &Path, peer_pubkey_b64: &str) -> Result<(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_listen(
     keystore_path: &Path,
     bind: &str,
     timeout_secs: u64,
     transport: Option<String>,
     quic_cert_path: Option<&Path>,
+    quic_key_path: Option<&Path>,
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
@@ -3363,12 +3559,15 @@ fn handle_listen(
         let bind_addr = parse_socket_addr(bind)?;
         let timeout = bounded_cli_timeout(timeout_secs);
         let state = run_async(async {
-            let server = standards_quic::server_endpoint(
-                bind_addr,
-                standards_quic::StandardsQuicConfig::default(),
-            )?;
-            write_quic_certificate(cert_path, &server.certificate_der)?;
+            let private_key_path = quic_key_path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_quic_private_key_path(cert_path));
+            let server = load_or_create_quic_server(bind_addr, cert_path, &private_key_path)?;
             println!("  Standards QUIC certificate: {}", cert_path.display());
+            println!(
+                "  Standards QUIC private key: {}",
+                private_key_path.display()
+            );
             let connection =
                 standards_quic::accept(&server, &keystore.identity, &policy, profile, timeout)
                     .await?;
@@ -3676,12 +3875,14 @@ fn handle_send_once(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_recv_once(
     keystore_path: &Path,
     bind: &str,
     timeout_secs: u64,
     transport: Option<String>,
     quic_cert_path: Option<&Path>,
+    quic_key_path: Option<&Path>,
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
@@ -3708,12 +3909,15 @@ fn handle_recv_once(
         })?;
         let bind_addr = parse_socket_addr(bind)?;
         let result = run_async(async {
-            let server = standards_quic::server_endpoint(
-                bind_addr,
-                standards_quic::StandardsQuicConfig::default(),
-            )?;
-            write_quic_certificate(cert_path, &server.certificate_der)?;
+            let private_key_path = quic_key_path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_quic_private_key_path(cert_path));
+            let server = load_or_create_quic_server(bind_addr, cert_path, &private_key_path)?;
             println!("  Standards QUIC certificate: {}", cert_path.display());
+            println!(
+                "  Standards QUIC private key: {}",
+                private_key_path.display()
+            );
             let mut connection = standards_quic::accept(
                 &server,
                 &keystore.identity,
@@ -5538,6 +5742,7 @@ fn run_standards_quic_listen_loop(
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
+    quic_key_path: Option<&Path>,
     start_ms: u64,
 ) -> Result<()> {
     let cert_path = quic_cert_path.ok_or_else(|| {
@@ -5545,16 +5750,19 @@ fn run_standards_quic_listen_loop(
             "--quic-cert is required with --transport quic-standard on up listen".into(),
         )
     })?;
+    let private_key_path = quic_key_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_quic_private_key_path(cert_path));
     let bind_addr = parse_socket_addr(bind)?;
     let timeout_duration = bounded_cli_timeout(timeout_secs);
     let policy = peer_policy_for_endpoint(keystore, bind, false)?;
     run_async(async {
-        let server = standards_quic::server_endpoint(
-            bind_addr,
-            standards_quic::StandardsQuicConfig::default(),
-        )?;
-        write_quic_certificate(cert_path, &server.certificate_der)?;
+        let server = load_or_create_quic_server(bind_addr, cert_path, &private_key_path)?;
         println!("  Standards QUIC certificate: {}", cert_path.display());
+        println!(
+            "  Standards QUIC private key: {}",
+            private_key_path.display()
+        );
         loop {
             let connection = tokio::select! {
                 result = standards_quic::accept(
@@ -5566,6 +5774,13 @@ fn run_standards_quic_listen_loop(
                 ) => match result {
                     Ok(connection) => connection,
                     Err(ShphError::Timeout) => continue,
+                    Err(ShphError::Auth(error))
+                    | Err(ShphError::Handshake(error))
+                    | Err(ShphError::Protocol(error))
+                    | Err(ShphError::Transport(error)) => {
+                        println!("  Standards QUIC peer rejected: {error}");
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 },
                 _ = wait_for_native_shutdown() => {
@@ -5633,6 +5848,7 @@ fn run_standards_quic_connect_loop(
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
+    _quic_key_path: Option<&Path>,
     start_ms: u64,
 ) -> Result<()> {
     let cert_path = quic_cert_path.ok_or_else(|| {
@@ -5717,7 +5933,6 @@ fn print_standards_tun_stats(start_ms: u64, stats: &standards_tun::StandardsTunB
 #[allow(clippy::too_many_arguments)]
 fn run_listen_loop(
     keystore_path: &Path,
-    config_path: &Path,
     tun: &TunDevice,
     bind: &str,
     timeout_secs: u64,
@@ -5725,17 +5940,12 @@ fn run_listen_loop(
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
-    host_bootstrap: bool,
+    quic_key_path: Option<&Path>,
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
-    let bootstrap_unpinned = host_bootstrap && keystore.contacts.is_empty();
-    let policy = if bootstrap_unpinned {
-        PeerPolicy::allow_any()
-    } else {
-        peer_policy_for_endpoint(&keystore, bind, false)?
-    };
+    let policy = peer_policy_for_endpoint(&keystore, bind, false)?;
     announce_handshake_profile(profile);
     if mode == TransportMode::QuicStandard {
         #[cfg(target_os = "linux")]
@@ -5749,6 +5959,7 @@ fn run_listen_loop(
                 profile,
                 roadmap,
                 quic_cert_path,
+                quic_key_path,
                 start_ms,
             );
         }
@@ -5762,6 +5973,7 @@ fn run_listen_loop(
                 profile,
                 roadmap,
                 quic_cert_path,
+                quic_key_path,
                 start_ms,
             );
             return Err(ShphError::Unsupported(
@@ -5807,11 +6019,7 @@ fn run_listen_loop(
         }
     };
     let handshake_ms = handshake_started.elapsed().as_millis();
-    if bootstrap_unpinned {
-        enroll_inbound_peer(config_path, keystore_path, bind, &state)?;
-    } else {
-        enforce_peer_policy(keystore_path, bind, &state, false)?;
-    }
+    enforce_peer_policy(keystore_path, bind, &state, false)?;
     append_handshake_audit(
         roadmap,
         &keystore.identity,
@@ -5878,6 +6086,7 @@ fn run_connect_loop(
     profile: HandshakeProfile,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
+    quic_key_path: Option<&Path>,
     underlay: &TcpUnderlay,
 ) -> Result<()> {
     let start_ms = phase_a1_now_ms()?;
@@ -5898,6 +6107,7 @@ fn run_connect_loop(
                 profile,
                 roadmap,
                 quic_cert_path,
+                quic_key_path,
                 start_ms,
             );
         }
@@ -5911,6 +6121,7 @@ fn run_connect_loop(
                 profile,
                 roadmap,
                 quic_cert_path,
+                quic_key_path,
                 start_ms,
             );
             return Err(ShphError::Unsupported(
@@ -6552,15 +6763,16 @@ mod tests {
         build_route_add_command, build_route_delete_command, build_tun_mtu_commands,
         build_tun_route_priority_command, build_underlay_bypass_route_add_command,
         build_underlay_bypass_route_delete_command, cli_exit_code, control_plane_state_path,
-        enforce_peer_policy, handle_up, load_control_plane_state,
-        native_tun_mtu_for_shroud_profile, parse_shroud_profile_name, phase_a1_now_ms,
-        read_ticket_source, reconnect_delay_with_jitter, render_config_for_display,
-        resolve_killswitch_peers, resolve_shroud_profile, run_with_reconnect,
-        save_control_plane_state, transport_mode_to_str, validate_cidr,
-        validate_control_plane_underlay, validate_transport_peer, CliErrorOutput,
-        ControlPlaneGuard, ControlPlanePlan, HandshakeState, KeyStore, KeyStoreConfig,
-        PersistedControlPlaneState, TcpUnderlay, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES,
-        EXIT_CONFIG, EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
+        enforce_peer_policy, handle_host, handle_up, load_control_plane_state,
+        load_or_create_quic_server, native_tun_mtu_for_shroud_profile, parse_shroud_profile_name,
+        phase_a1_now_ms, read_quic_certificate, read_quic_private_key, read_ticket_source,
+        reconnect_delay_with_jitter, render_config_for_display, resolve_killswitch_peers,
+        resolve_shroud_profile, run_with_reconnect, save_control_plane_state,
+        transport_mode_to_str, validate_cidr, validate_control_plane_underlay,
+        validate_transport_peer, CliErrorOutput, ControlPlaneGuard, ControlPlanePlan,
+        HandshakeState, KeyStore, KeyStoreConfig, PersistedControlPlaneState, TcpUnderlay,
+        TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES, EXIT_CONFIG, EXIT_PERMISSION,
+        EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
     use shph_config::{
@@ -6587,6 +6799,93 @@ mod tests {
         );
         assert!(read_ticket_source(Some(""), None).is_err());
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn host_refuses_to_bootstrap_without_a_configured_client_pin() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-host-pin-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        fs::create_dir_all(&dir).expect("create test directory");
+        let error = handle_host(
+            &dir.join("config.toml"),
+            &dir.join("keystore.json"),
+            443,
+            Some("127.0.0.1"),
+            "tcp",
+            "medium",
+            true,
+            true,
+            None,
+            None,
+            None,
+        )
+        .expect_err("un-pinned host must fail closed");
+        assert!(matches!(
+            error,
+            ShphError::Config(message) if message.contains("peer pin")
+        ));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn standards_quic_server_material_persists_across_endpoint_recreation() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-quic-material-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        fs::create_dir_all(&dir).expect("create test directory");
+        let certificate_path = dir.join("server.der");
+        let private_key_path = dir.join("server.key");
+        let bind = "127.0.0.1:0".parse().expect("loopback address");
+
+        let first = load_or_create_quic_server(bind, &certificate_path, &private_key_path)
+            .expect("create QUIC server");
+        let first_certificate = read_quic_certificate(&certificate_path).expect("read cert");
+        let first_private_key = read_quic_private_key(&private_key_path).expect("read private key");
+        assert_eq!(first.certificate_der, first_certificate);
+        first.endpoint.close(0u32.into(), b"test complete");
+        first.endpoint.wait_idle().await;
+
+        let second = load_or_create_quic_server(bind, &certificate_path, &private_key_path)
+            .expect("recreate QUIC server");
+        assert_eq!(second.certificate_der, first_certificate);
+        assert_eq!(
+            read_quic_private_key(&private_key_path)
+                .expect("read persisted private key")
+                .as_slice(),
+            first_private_key.as_slice()
+        );
+        second.endpoint.close(0u32.into(), b"test complete");
+        second.endpoint.wait_idle().await;
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn standards_quic_server_material_rejects_partial_pair() {
+        let dir = std::env::temp_dir().join(format!(
+            "shph-quic-partial-{}-{}",
+            std::process::id(),
+            phase_a1_now_ms().unwrap()
+        ));
+        fs::create_dir_all(&dir).expect("create test directory");
+        let certificate_path = dir.join("server.der");
+        let private_key_path = dir.join("server.key");
+        fs::write(&certificate_path, [1u8]).expect("write certificate");
+        let result = load_or_create_quic_server(
+            "127.0.0.1:0".parse().expect("loopback address"),
+            &certificate_path,
+            &private_key_path,
+        );
+        match result {
+            Err(ShphError::Config(message)) => assert!(message.contains("private key")),
+            Err(error) => panic!("unexpected partial-material error: {error}"),
+            Ok(_) => panic!("partial QUIC material must fail closed"),
+        }
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -6782,6 +7081,8 @@ mod tests {
                 timeout_secs: None,
                 handshake_profile: None,
                 underlay: None,
+                quic_cert: None,
+                quic_key: None,
                 reconnect: None,
                 startup_payload: None,
             }),
@@ -6811,11 +7112,11 @@ mod tests {
                 profile: shph_core::HandshakeProfile::SecureDefault,
                 shroud_profile: "medium".into(),
                 quic_cert_path: None,
+                quic_key_path: None,
                 killswitch: true,
                 killswitch_dry_run: true,
                 mss_clamp: false,
                 tun: false,
-                host_bootstrap: false,
                 nat: false,
                 underlay: TcpUnderlay::Direct,
             },
@@ -6850,11 +7151,11 @@ mod tests {
                 profile: shph_core::HandshakeProfile::SecureDefault,
                 shroud_profile: "medium".into(),
                 quic_cert_path: None,
+                quic_key_path: None,
                 killswitch: false,
                 killswitch_dry_run: false,
                 mss_clamp: false,
                 tun: false,
-                host_bootstrap: false,
                 nat: false,
                 underlay: TcpUnderlay::Direct,
             },
@@ -6865,7 +7166,7 @@ mod tests {
     }
 
     #[test]
-    fn quic_standard_up_rejects_reconnect_before_opening_tun() {
+    fn quic_standard_up_reconnect_reaches_native_tun_gate() {
         let config = Config {
             session: Some(SessionConfig {
                 role: SessionRole::Connect,
@@ -6876,6 +7177,8 @@ mod tests {
                 startup_payload: None,
                 handshake_profile: None,
                 underlay: None,
+                quic_cert: None,
+                quic_key: None,
                 reconnect: Some(ReconnectConfig {
                     enabled: Some(true),
                     max_attempts: Some(2),
@@ -6894,17 +7197,17 @@ mod tests {
                 profile: shph_core::HandshakeProfile::SecureDefault,
                 shroud_profile: "medium".into(),
                 quic_cert_path: Some(std::path::Path::new("/tmp/server.der")),
+                quic_key_path: Some(std::path::Path::new("/tmp/server.key")),
                 killswitch: false,
                 killswitch_dry_run: false,
                 mss_clamp: false,
                 tun: false,
-                host_bootstrap: false,
                 nat: false,
                 underlay: TcpUnderlay::Direct,
             },
         )
-        .expect_err("standards QUIC reconnect must fail before native TUN setup");
-        assert!(matches!(error, ShphError::Config(message) if message.contains("reconnect")));
+        .expect_err("standards QUIC still requires native TUN in this test");
+        assert!(matches!(error, ShphError::Unsupported(message) if message.contains("native TUN")));
     }
 
     #[test]
@@ -7528,6 +7831,8 @@ mod tests {
                 timeout_secs: Some(5),
                 handshake_profile: None,
                 underlay: Some("socks5://127.0.0.1:10808".into()),
+                quic_cert: None,
+                quic_key: None,
                 reconnect: None,
                 startup_payload: None,
             }),
@@ -7558,6 +7863,8 @@ mod tests {
                 timeout_secs: Some(5),
                 handshake_profile: None,
                 underlay: Some("socks5://127.0.0.1:10808".into()),
+                quic_cert: None,
+                quic_key: None,
                 reconnect: None,
                 startup_payload: None,
             }),

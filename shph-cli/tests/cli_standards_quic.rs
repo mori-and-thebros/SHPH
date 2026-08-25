@@ -104,8 +104,10 @@ fn standards_quic_one_shot_cli_transfers_payload_and_receipt_ack() {
     add_peer(&client_config, "server", &bind, &server_config);
 
     let certificate = server_dir.join("server.der");
+    let private_key = server_dir.join("server.key");
     let server_config_for_thread = server_config.clone();
     let certificate_for_thread = certificate.clone();
+    let private_key_for_thread = private_key.clone();
     let server_bind = bind.clone();
     let receiver = thread::spawn(move || {
         command(
@@ -120,12 +122,14 @@ fn standards_quic_one_shot_cli_transfers_payload_and_receipt_ack() {
                 "quic-standard",
                 "--quic-cert",
                 certificate_for_thread.to_str().expect("certificate path"),
+                "--quic-key",
+                private_key_for_thread.to_str().expect("private key path"),
             ],
         )
     });
 
     for _ in 0..50 {
-        if certificate.exists() {
+        if certificate.exists() && private_key.exists() {
             break;
         }
         thread::sleep(Duration::from_millis(20));
@@ -133,6 +137,10 @@ fn standards_quic_one_shot_cli_transfers_payload_and_receipt_ack() {
     assert!(
         certificate.exists(),
         "server did not publish QUIC certificate"
+    );
+    assert!(
+        private_key.exists(),
+        "server did not persist QUIC private key"
     );
 
     let sender = command(

@@ -124,6 +124,8 @@ jobs:
         run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite identity --iterations 2 --frames 2
       - name: Run wire benchmark smoke
         run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite wire --iterations 2 --frames 2
+      - name: Run defensive rejection benchmark smoke
+        run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite defensive --iterations 2 --frames 2
 
   benchmark-linux:
     name: Full benchmark campaign (ubuntu-latest)

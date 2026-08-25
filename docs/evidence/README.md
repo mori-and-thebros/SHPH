@@ -6,9 +6,10 @@ This directory contains reproducibility artifacts, not source-of-truth code.
   the exact tree, toolchain, platform, validation gates, and demo result.
 - `CARGO_AUDIT.txt` is the last captured advisory output; regenerate it with
   `cargo audit --deny warnings` after dependency changes.
-- `WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` is the latest native
-  Windows workspace, Windows-only test, benchmark, and post-loader Wintun
-  host-gate record.
+- `WINDOWS_NATIVE_VALIDATION_2026-08-25.md` is the current elevated Windows
+  Wintun lifecycle, route/DNS rollback, and loopback WFP smoke record.
+- `WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` is retained as a
+  historical post-loader validation record.
 - `docs/SECURITY_EVIDENCE.md` defines the evidence tiers and redaction review
   required before publishing any generated record.
 - `docs/RELEASE_READINESS.md` defines the binding PASS/FAIL/SKIP semantics;

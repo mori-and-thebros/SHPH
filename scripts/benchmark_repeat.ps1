@@ -2,7 +2,7 @@
 param(
     [string]$Binary = "",
     [string]$OutputDirectory = ".\benchmark-runs\repeatability",
-    [ValidateSet("all", "core", "dataplane", "resource", "shroud", "quic", "scalability", "identity", "wire", "evidence", "extended")]
+    [ValidateSet("all", "core", "defensive", "dataplane", "resource", "shroud", "quic", "scalability", "identity", "wire", "evidence", "extended")]
     [string]$Suite = "extended",
     [ValidateRange(2, 100)]
     [int]$Runs = 5,

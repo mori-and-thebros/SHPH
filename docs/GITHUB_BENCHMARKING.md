@@ -5,7 +5,8 @@ SHPH publishes two complementary benchmark layers:
 1. The standalone runner in `benchmarks/src/main.rs` exercises longer local
    campaigns: crypto, framing, dataplane loops, Shroud profiles, Shroud2
    morphology, QUIC-shim loopback, identity/provider behavior, wire accounting,
-   replay/cookie evidence, and bounded impairment models.
+   replay/cookie evidence, bounded defensive rejection paths, and impairment
+   models.
 2. The Criterion harness in `benchmarks/benches/criterion.rs` measures focused
    microbenchmarks for the same core paths with statistical warmup and
    regression comparison.
@@ -27,7 +28,9 @@ Each full run uploads two artifacts:
 
 Artifacts contain the custom runner captures for `all` and `extended`, Criterion
 logs and reports, and a small provenance file with commit, runner, toolchain,
-campaign, scope, and determinism labels. The retention period is 30 days.
+campaign, scope, and determinism labels. The retention period is 30 days. The
+Windows smoke job also runs the focused `defensive` suite explicitly; the full
+`all` suite includes it as well.
 
 Equivalent local commands are:
 
@@ -37,6 +40,8 @@ cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml --locked
   --profile secure-default --suite all --iterations 100 --frames 10000
 ./benchmarks/target/release/shph-benchmarks \
   --profile secure-default --suite extended --iterations 100 --frames 10000
+./benchmarks/target/release/shph-benchmarks \
+  --profile secure-default --suite defensive --iterations 2000 --frames 1
 bash ./scripts/benchmark_criterion.sh
 ```
 
@@ -67,3 +72,8 @@ DPI evasion, censorship bypass, or DDoS capacity. Those require separately
 provisioned hosts, packet captures, network impairments, and independently
 reviewable methodology. The public result tables must keep local, GitHub-hosted,
 operator, and external measurements in separate rows.
+
+The defensive suite adds a narrower boundary: it proves that selected malformed
+or policy-disallowed inputs are rejected in the measured local code path. It
+does not establish flood capacity, distributed denial-of-service resistance, or
+listener behavior under adversarial network conditions.

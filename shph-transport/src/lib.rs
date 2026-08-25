@@ -29,8 +29,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +47,8 @@ const MAX_QUIC_INVALID_DATAGRAMS_PER_RECV: usize = 8;
 const MAX_QUIC_TRACKED_PEERS: usize = 1024;
 const MAX_QUIC_IDLE_TIMEOUT_SECS: u64 = 300;
 const TCP_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
+const TCP_PREAUTH_DEADLINE: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_TCP_HANDSHAKES: usize = 16;
 const MAX_DNS_RESOLVER_WORKERS: usize = 4;
 const MAX_DNS_RESOLVER_QUEUE: usize = 32;
 
@@ -222,6 +224,7 @@ struct ClaimedFile {
 #[derive(Debug)]
 struct OfflineMeshCandidate {
     path: PathBuf,
+    created_at_unix_ms: u64,
     sequence: u64,
 }
 
@@ -589,23 +592,44 @@ fn rename_without_replace_by_link(from: &std::ffi::CStr, to: &std::ffi::CStr) ->
 }
 
 #[cfg(windows)]
-fn rename_without_replace(from: &Path, to: &Path) -> io::Result<()> {
+fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
+
+    let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if value.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file adapter path contains an embedded NUL",
+        ));
+    }
+
+    // Win32 file APIs otherwise apply the legacy MAX_PATH limit. The
+    // filesystem adapter deliberately uses bounded but nested paths, so
+    // claims/rejections must opt into the extended-length namespace.
+    let unc_prefix = "\\\\".encode_utf16().collect::<Vec<_>>();
+    let extended_prefix = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
+    if path.is_absolute() && !value.starts_with(&extended_prefix) {
+        if value.starts_with(&unc_prefix) {
+            let mut prefixed = "\\\\?\\UNC\\".encode_utf16().collect::<Vec<_>>();
+            prefixed.extend_from_slice(&value[2..]);
+            value = prefixed;
+        } else {
+            let mut prefixed = extended_prefix;
+            prefixed.extend_from_slice(&value);
+            value = prefixed;
+        }
+    }
+
+    value.push(0);
+    Ok(value)
+}
+
+#[cfg(windows)]
+fn rename_without_replace(from: &Path, to: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
-    let wide = |path: &Path| {
-        let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if value.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file adapter path contains an embedded NUL",
-            ));
-        }
-        value.push(0);
-        Ok(value)
-    };
-    let from = wide(from)?;
-    let to = wide(to)?;
+    let from = windows_extended_path(from)?;
+    let to = windows_extended_path(to)?;
     let result = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
     if result == 0 {
         Err(io::Error::last_os_error())
@@ -641,11 +665,19 @@ fn ensure_no_reparse_components(path: &Path) -> io::Result<()> {
                     ),
                 ));
             }
-            Ok(_) => {
+            Ok(_) =>
+            {
                 #[cfg(windows)]
-                shph_core::ensure_not_reparse_point(component).map_err(|error| {
-                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
-                })?;
+                match shph_core::ensure_not_reparse_point(component) {
+                    Ok(()) => {}
+                    Err(ShphError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            error.to_string(),
+                        ))
+                    }
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -657,25 +689,13 @@ fn ensure_no_reparse_components(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn persist_file_over_windows(tmp: &Path, path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
         REPLACEFILE_WRITE_THROUGH,
     };
 
-    let wide = |value: &Path| {
-        let mut encoded: Vec<u16> = value.as_os_str().encode_wide().collect();
-        if encoded.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file adapter path contains an embedded NUL",
-            ));
-        }
-        encoded.push(0);
-        Ok(encoded)
-    };
-    let tmp_w = wide(tmp)?;
-    let path_w = wide(path)?;
+    let tmp_w = windows_extended_path(tmp)?;
+    let path_w = windows_extended_path(path)?;
     let result = if path.exists() {
         unsafe {
             ReplaceFileW(
@@ -2147,127 +2167,214 @@ pub fn tcp_accept_and_handshake_with_profile(
 ) -> Result<(TcpStream, HandshakeState)> {
     let listener = TcpListener::bind(bind_addr).map_err(|e| ShphError::Transport(e.to_string()))?;
     listener.set_nonblocking(true).map_err(ShphError::Io)?;
-    // Bound each listener invocation by a deadline, but do not let malformed
-    // unauthenticated peers consume a process-lifetime attempt budget.
     let mut last_err: Option<ShphError> = None;
     let mut rate_limiter = PeerRateLimiter::new();
-    let mut cookie_authority = StatelessCookieAuthority::new()?;
+    let cookie_authority = Arc::new(Mutex::new(StatelessCookieAuthority::new()?));
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let (result_sender, result_receiver) =
+        mpsc::sync_channel::<Result<(TcpStream, HandshakeState)>>(MAX_CONCURRENT_TCP_HANDSHAKES);
+    let mut active_workers = 0usize;
     let deadline = tcp_handshake_deadline(timeout_secs);
+
+    // Keep accepting while bounded worker threads perform socket reads and
+    // pre-authentication. A slow client can consume one short-lived worker
+    // instead of blocking the listener from accepting a legitimate peer.
     while Instant::now() < deadline {
-        let (mut stream, peer_addr) = loop {
-            match listener.accept() {
-                Ok(accepted) => break accepted,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        break Err(ShphError::Timeout)?;
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(err) => return Err(ShphError::Transport(err.to_string())),
+        if let Ok(result) = result_receiver.try_recv() {
+            if let Some(result) =
+                finish_tcp_worker(result, &mut active_workers, &mut last_err, &cancellation)
+            {
+                return result;
             }
-        };
-        stream.set_nonblocking(false).map_err(ShphError::Io)?;
-
-        // Per-source rate limit BEFORE any handshake work: a single host that
-        // is hammering the entry path is dropped immediately, so it cannot
-        // exhaust the attempt budget or burn CPU on hello parsing across
-        // repeated sessions.
-        if let Err(err) = rate_limiter.check_and_record(peer_addr) {
-            last_err = Some(err);
-            drop(stream);
             continue;
         }
 
-        if let Err(err) = refresh_deadline_timeout(&stream, deadline) {
-            last_err = Some(err);
+        if active_workers >= MAX_CONCURRENT_TCP_HANDSHAKES {
+            let wait =
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now()));
+            match result_receiver.recv_timeout(wait) {
+                Ok(result) => {
+                    if let Some(result) =
+                        finish_tcp_worker(result, &mut active_workers, &mut last_err, &cancellation)
+                    {
+                        return result;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(last_err.unwrap_or_else(|| {
+                        ShphError::Internal("TCP handshake workers exited".into())
+                    }));
+                }
+            }
             continue;
         }
 
-        match read_tcp_hello_with_deadline(&mut stream, deadline) {
-            Ok(peer_hello) => {
-                if rate_limiter.requires_cookie(peer_addr) {
-                    let cookie = cookie_authority.issue(peer_addr)?;
-                    if let Err(err) =
-                        write_tcp_cookie_challenge_with_deadline(&mut stream, &cookie, deadline)
-                    {
-                        last_err = Some(err);
-                        continue;
-                    }
-                    let response =
-                        match read_tcp_cookie_response_with_deadline(&mut stream, deadline) {
-                            Ok(response) => response,
-                            Err(err) => {
-                                last_err = Some(err);
-                                continue;
-                            }
-                        };
-                    match cookie_authority.verify(peer_addr, &response) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            last_err = Some(ShphError::Auth(
-                                "invalid or expired pre-authentication cookie".into(),
-                            ));
-                            continue;
-                        }
-                        Err(err) => {
-                            last_err = Some(err);
-                            continue;
-                        }
-                    }
-                }
-                let mut material = build_hello_with_profile(local_identity, profile)?;
-                if let Err(err) = shph_core::verify_hello_signature(
-                    local_identity,
-                    &material,
-                    &peer_hello,
-                    policy,
-                ) {
+        match listener.accept() {
+            Ok((stream, peer_addr)) => {
+                stream.set_nonblocking(false).map_err(ShphError::Io)?;
+
+                // Rate-limit before any handshake work so one source cannot
+                // fill the worker budget with repeated malformed sessions.
+                if let Err(err) = rate_limiter.check_and_record(peer_addr) {
                     last_err = Some(err);
                     continue;
                 }
-                if let Err(err) =
-                    write_tcp_hello_with_deadline(&mut stream, &material.local_hello, deadline)
-                {
-                    last_err = Some(err);
-                    continue;
-                }
-                if profile.uses_pqc() {
-                    let ct = match read_tcp_pq_ct_with_deadline(&mut stream, deadline) {
-                        Ok(ct) => ct,
-                        Err(err) => {
-                            last_err = Some(err);
-                            continue;
+
+                let requires_cookie = rate_limiter.requires_cookie(peer_addr);
+                let worker_sender = result_sender.clone();
+                let worker_cookie_authority = Arc::clone(&cookie_authority);
+                let worker_cancellation = Arc::clone(&cancellation);
+                let worker_identity = local_identity.clone();
+                let worker_policy = policy.clone();
+                active_workers += 1;
+                thread::spawn(move || {
+                    let result = TcpHandshakeWorker {
+                        stream,
+                        peer_addr,
+                        local_identity: worker_identity,
+                        policy: worker_policy,
+                        profile,
+                        aggregate_deadline: deadline,
+                        requires_cookie,
+                        cookie_authority: worker_cookie_authority,
+                        cancellation: Arc::clone(&worker_cancellation),
+                    }
+                    .run();
+                    if result.is_ok() {
+                        worker_cancellation.store(true, Ordering::Release);
+                    }
+                    let _ = worker_sender.send(result);
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let wait = Duration::from_millis(10)
+                    .min(deadline.saturating_duration_since(Instant::now()));
+                match result_receiver.recv_timeout(wait) {
+                    Ok(result) => {
+                        if let Some(result) = finish_tcp_worker(
+                            result,
+                            &mut active_workers,
+                            &mut last_err,
+                            &cancellation,
+                        ) {
+                            return result;
                         }
-                    };
-                    if let Err(err) =
-                        absorb_responder_pq(local_identity, &mut material, &peer_hello, &ct, policy)
-                    {
-                        last_err = Some(err);
-                        continue;
                     }
-                }
-                match verify_and_derive(local_identity, &material, &peer_hello, false, policy) {
-                    Ok(state) => return Ok((stream, state)),
-                    Err(err) => {
-                        // Signature/protocol failure: hostile or wrong-key peer.
-                        // Drop and keep listening for a legitimate one.
-                        last_err = Some(err);
-                        let _ = peer_addr;
-                        continue;
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(last_err.unwrap_or_else(|| {
+                            ShphError::Internal("TCP handshake workers exited".into())
+                        }));
                     }
                 }
             }
-            Err(err) => {
-                // Any per-connection read failure, including a timeout or an
-                // early close during cookie exchange, belongs to this peer.
-                // Drop it and keep the listener alive until the aggregate
-                // operator deadline expires.
-                last_err = Some(err);
-                continue;
-            }
+            Err(err) => return Err(ShphError::Transport(err.to_string())),
         }
     }
+    cancellation.store(true, Ordering::Release);
     Err(last_err.unwrap_or(ShphError::Timeout))
+}
+
+fn finish_tcp_worker(
+    result: Result<(TcpStream, HandshakeState)>,
+    active_workers: &mut usize,
+    last_err: &mut Option<ShphError>,
+    cancellation: &AtomicBool,
+) -> Option<Result<(TcpStream, HandshakeState)>> {
+    *active_workers = active_workers.saturating_sub(1);
+    match result {
+        Ok(session) => {
+            cancellation.store(true, Ordering::Release);
+            Some(Ok(session))
+        }
+        Err(error) => {
+            *last_err = Some(error);
+            None
+        }
+    }
+}
+
+struct TcpHandshakeWorker {
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    local_identity: IdentityKeyPair,
+    policy: PeerPolicy,
+    profile: HandshakeProfile,
+    aggregate_deadline: Instant,
+    requires_cookie: bool,
+    cookie_authority: Arc<Mutex<StatelessCookieAuthority>>,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl TcpHandshakeWorker {
+    fn run(mut self) -> Result<(TcpStream, HandshakeState)> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(ShphError::Timeout);
+        }
+        let preauth_deadline = std::cmp::min(
+            self.aggregate_deadline,
+            Instant::now() + TCP_PREAUTH_DEADLINE,
+        );
+        refresh_deadline_timeout(&self.stream, preauth_deadline)?;
+        let peer_hello = read_tcp_hello_with_deadline(&mut self.stream, preauth_deadline)?;
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(ShphError::Timeout);
+        }
+
+        if self.requires_cookie {
+            let cookie = {
+                let mut authority = self.cookie_authority.lock().map_err(|_| {
+                    ShphError::Internal("TCP cookie authority lock poisoned".into())
+                })?;
+                authority.issue(self.peer_addr)?
+            };
+            write_tcp_cookie_challenge_with_deadline(&mut self.stream, &cookie, preauth_deadline)?;
+            let response =
+                read_tcp_cookie_response_with_deadline(&mut self.stream, preauth_deadline)?;
+            let valid = {
+                let mut authority = self.cookie_authority.lock().map_err(|_| {
+                    ShphError::Internal("TCP cookie authority lock poisoned".into())
+                })?;
+                authority.verify(self.peer_addr, &response)?
+            };
+            if !valid {
+                return Err(ShphError::Auth(
+                    "invalid or expired pre-authentication cookie".into(),
+                ));
+            }
+        }
+
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(ShphError::Timeout);
+        }
+        let mut material = build_hello_with_profile(&self.local_identity, self.profile)?;
+        shph_core::verify_hello_signature(
+            &self.local_identity,
+            &material,
+            &peer_hello,
+            &self.policy,
+        )?;
+        write_tcp_hello_with_deadline(&mut self.stream, &material.local_hello, preauth_deadline)?;
+        if self.profile.uses_pqc() {
+            let ct = read_tcp_pq_ct_with_deadline(&mut self.stream, preauth_deadline)?;
+            absorb_responder_pq(
+                &self.local_identity,
+                &mut material,
+                &peer_hello,
+                &ct,
+                &self.policy,
+            )?;
+        }
+        let state = verify_and_derive(
+            &self.local_identity,
+            &material,
+            &peer_hello,
+            false,
+            &self.policy,
+        )?;
+        Ok((self.stream, state))
+    }
 }
 
 fn write_tcp_hello_with_deadline(
@@ -3701,8 +3808,8 @@ struct OfflineMeshReadState {
     local_node: String,
     peer_node: String,
     poll_interval: Duration,
-    seen_sequences: HashSet<u64>,
-    seen_order: VecDeque<u64>,
+    seen_frames: HashSet<(u64, u64)>,
+    seen_order: VecDeque<(u64, u64)>,
     max_seen: usize,
     max_file_bytes: u64,
 }
@@ -3716,7 +3823,7 @@ impl OfflineMeshReadState {
             poll_interval: Duration::from_millis(
                 cfg.poll_interval_ms.clamp(1, MAX_ADAPTER_POLL_INTERVAL_MS),
             ),
-            seen_sequences: HashSet::new(),
+            seen_frames: HashSet::new(),
             seen_order: VecDeque::new(),
             max_seen: cfg.max_idle_entries.clamp(1, 65_536) as usize,
             max_file_bytes: MAX_FILE_ADAPTER_BYTES,
@@ -3850,7 +3957,11 @@ impl OfflineMeshReadState {
             let entry = entry.map_err(ShphError::Io)?;
             let path = entry.path();
             ensure_no_reparse_components(&path).map_err(ShphError::Io)?;
-            let metadata = fs::symlink_metadata(&path).map_err(ShphError::Io)?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(ShphError::Io(error)),
+            };
             if !metadata.file_type().is_file() {
                 continue;
             }
@@ -3883,7 +3994,9 @@ impl OfflineMeshReadState {
             if envelope.session_id != expected_session
                 || envelope.from != self.peer_node
                 || envelope.to != self.local_node
-                || self.seen_sequences.contains(&envelope.sequence)
+                || self
+                    .seen_frames
+                    .contains(&(envelope.created_at_unix_ms, envelope.sequence))
             {
                 continue;
             }
@@ -3901,6 +4014,7 @@ impl OfflineMeshReadState {
             }
             candidates.push(OfflineMeshCandidate {
                 path,
+                created_at_unix_ms: envelope.created_at_unix_ms,
                 sequence: envelope.sequence,
             });
         }
@@ -3908,7 +4022,7 @@ impl OfflineMeshReadState {
             return Ok(None);
         }
 
-        candidates.sort_by_key(|candidate| candidate.sequence);
+        candidates.sort_by_key(|candidate| (candidate.created_at_unix_ms, candidate.sequence));
         for candidate in candidates {
             let Some(claimed) = claim_file(&candidate.path).map_err(ShphError::Io)? else {
                 continue;
@@ -3932,8 +4046,11 @@ impl OfflineMeshReadState {
             if envelope.session_id != expected_session
                 || envelope.from != self.peer_node
                 || envelope.to != self.local_node
+                || envelope.created_at_unix_ms != candidate.created_at_unix_ms
                 || envelope.sequence != candidate.sequence
-                || self.seen_sequences.contains(&envelope.sequence)
+                || self
+                    .seen_frames
+                    .contains(&(envelope.created_at_unix_ms, envelope.sequence))
             {
                 quarantine_claimed_file(claimed);
                 continue;
@@ -3945,6 +4062,7 @@ impl OfflineMeshReadState {
                     return Ok(Some(OfflineMeshFrame {
                         payload,
                         claimed,
+                        created_at_unix_ms: envelope.created_at_unix_ms,
                         sequence: envelope.sequence,
                     }))
                 }
@@ -3954,22 +4072,23 @@ impl OfflineMeshReadState {
         Ok(None)
     }
 
-    fn commit_payload(&mut self, sequence: u64) {
-        self.mark_seen(sequence);
+    fn commit_payload(&mut self, created_at_unix_ms: u64, sequence: u64) {
+        self.mark_seen(created_at_unix_ms, sequence);
     }
 
     fn commit_frame(&mut self, frame: &OfflineMeshFrame) {
-        self.commit_payload(frame.sequence);
+        self.commit_payload(frame.created_at_unix_ms, frame.sequence);
         let _ = fs::remove_file(&frame.claimed.path);
     }
 
-    fn mark_seen(&mut self, sequence: u64) {
-        if self.seen_sequences.insert(sequence) {
-            self.seen_order.push_back(sequence);
+    fn mark_seen(&mut self, created_at_unix_ms: u64, sequence: u64) {
+        let key = (created_at_unix_ms, sequence);
+        if self.seen_frames.insert(key) {
+            self.seen_order.push_back(key);
         }
         while self.seen_order.len() > self.max_seen.max(1) {
             if let Some(oldest) = self.seen_order.pop_front() {
-                self.seen_sequences.remove(&oldest);
+                self.seen_frames.remove(&oldest);
             }
         }
     }
@@ -3978,6 +4097,7 @@ impl OfflineMeshReadState {
 struct OfflineMeshFrame {
     payload: Vec<u8>,
     claimed: ClaimedFile,
+    created_at_unix_ms: u64,
     sequence: u64,
 }
 
@@ -4483,7 +4603,11 @@ fn collect_shph_files(
         let entry = entry.map_err(ShphError::Io)?;
         let path = entry.path();
         ensure_no_reparse_components(&path).map_err(ShphError::Io)?;
-        let metadata = fs::symlink_metadata(&path).map_err(ShphError::Io)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(ShphError::Io(error)),
+        };
         if metadata.file_type().is_symlink() {
             continue;
         }
@@ -4508,6 +4632,7 @@ fn collect_shph_files(
                 quarantine_file(&path);
                 continue;
             }
+            Err(ShphError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
         match serde_json::from_slice::<DataMuleEnvelope>(&bytes) {
@@ -4557,26 +4682,60 @@ fn collect_shph_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_secure_session_lab, connect_secure_session_lab, tcp_secure_receive, tcp_secure_send,
-        DataMuleConfig, DataMuleReadState, DataMuleSession, DataMuleWriteState, QuicLabConfig,
+        accept_secure_session_lab, connect_secure_session_lab,
+        data_mule_accept_secure_session_with_profile,
+        data_mule_connect_secure_session_with_profile,
+        offline_mesh_accept_secure_session_with_profile,
+        offline_mesh_connect_secure_session_with_profile, tcp_secure_receive, tcp_secure_send,
+        DataMuleConfig, DataMuleReadState, DataMuleSession, DataMuleWriteState, OfflineMeshConfig,
+        OfflineMeshReadState, OfflineMeshWriteState, QuicLabConfig,
     };
-    use super::{collect_shph_files, DataMuleScanContext, MAX_DATA_MULE_AGE_MS, TEMP_FILE_COUNTER};
+    use super::{
+        collect_shph_files, offline_session_id, DataMuleScanContext, MAX_DATA_MULE_AGE_MS,
+        TEMP_FILE_COUNTER,
+    };
     use super::{
         decode_encrypted_quic_frame, PeerRateLimiter, TcpUnderlay, TransportMode,
         COOKIE_CHALLENGE_THRESHOLD, MAX_CONNECTS_PER_PEER_PER_WINDOW, MAX_QUIC_TRACKED_PEERS,
     };
     use base64::Engine as _;
     use shph_core::{
-        HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy, ReceiveCipher, SendCipher,
-        ShphError,
+        HandshakeProfile, IdentityKeyPair, OfflineMeshEnvelope, PeerPin, PeerPolicy, ReceiveCipher,
+        SendCipher, ShphError,
     };
     use shph_obfuscation::ProfileTier;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    fn test_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).expect("create replication destination");
+        for entry in fs::read_dir(source).expect("read replication source") {
+            let entry = entry.expect("read replication entry");
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&source_path).expect("replication metadata");
+            if metadata.is_dir() {
+                copy_tree(&source_path, &destination_path);
+            } else {
+                fs::create_dir_all(destination_path.parent().expect("replication parent"))
+                    .expect("create replication parent");
+                fs::copy(&source_path, &destination_path).expect("copy replicated envelope");
+            }
+        }
+    }
 
     #[test]
     fn tcp_secure_helpers_preserve_aead_nonce_state_between_frames() {
@@ -4818,6 +4977,282 @@ mod tests {
     }
 
     #[test]
+    fn offline_mesh_secure_session_roundtrips_on_a_shared_spool() {
+        let root = test_root("shph-offline-session");
+        fs::create_dir_all(&root).expect("create offline spool");
+        let client = IdentityKeyPair::generate().expect("client identity");
+        let server = IdentityKeyPair::generate().expect("server identity");
+        let client_cfg = OfflineMeshConfig {
+            node_id: "client".into(),
+            peer_id: "server".into(),
+            spool_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_idle_entries: 64,
+        };
+        let server_cfg = OfflineMeshConfig {
+            node_id: "server".into(),
+            peer_id: "client".into(),
+            spool_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_idle_entries: 64,
+        };
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server));
+        let server_thread = thread::spawn(move || {
+            let result = offline_mesh_accept_secure_session_with_profile(
+                &server_cfg,
+                &server,
+                &server_policy,
+                10,
+                HandshakeProfile::SecureDefault,
+            );
+            if let Err(error) = &result {
+                eprintln!("offline-mesh server fixture failed: {error:?}");
+            }
+            result
+        });
+
+        let (mut client_session, client_state) = offline_mesh_connect_secure_session_with_profile(
+            &client_cfg,
+            &client,
+            &client_policy,
+            10,
+            HandshakeProfile::SecureDefault,
+        )
+        .expect("offline-mesh client handshake");
+        let (mut server_session, server_state) = server_thread
+            .join()
+            .expect("offline-mesh server thread")
+            .expect("offline-mesh server handshake");
+
+        assert_eq!(
+            client_state.transcript_hash_hex,
+            server_state.transcript_hash_hex
+        );
+        client_session
+            .send_frame(b"offline-mesh-client-to-server")
+            .expect("send client frame");
+        assert_eq!(
+            server_session.recv_frame().expect("receive client frame"),
+            b"offline-mesh-client-to-server"
+        );
+        server_session
+            .send_frame(b"offline-mesh-server-to-client")
+            .expect("send server frame");
+        assert_eq!(
+            client_session.recv_frame().expect("receive server frame"),
+            b"offline-mesh-server-to-client"
+        );
+        fs::remove_dir_all(root).expect("remove offline spool");
+    }
+
+    #[test]
+    fn data_mule_secure_session_roundtrips_between_paired_spools() {
+        let root = test_root("shph-data-mule-session");
+        let client_outbox = root.join("client-outbox");
+        let server_outbox = root.join("server-outbox");
+        fs::create_dir_all(&client_outbox).expect("create client outbox");
+        fs::create_dir_all(&server_outbox).expect("create server outbox");
+        let client = IdentityKeyPair::generate().expect("client identity");
+        let server = IdentityKeyPair::generate().expect("server identity");
+        let client_cfg = DataMuleConfig {
+            inbox_dir: server_outbox.to_string_lossy().into_owned(),
+            outbox_dir: client_outbox.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 256 * 1024,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
+        };
+        let server_cfg = DataMuleConfig {
+            inbox_dir: client_outbox.to_string_lossy().into_owned(),
+            outbox_dir: server_outbox.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 256 * 1024,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
+        };
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server));
+        let server_node = server.public_key_b64();
+        let server_thread = thread::spawn(move || {
+            let result = data_mule_accept_secure_session_with_profile(
+                &server_cfg,
+                &server,
+                &server_policy,
+                10,
+                HandshakeProfile::SecureDefault,
+            );
+            if let Err(error) = &result {
+                eprintln!("data-mule server fixture failed: {error:?}");
+            }
+            result
+        });
+
+        let (mut client_session, client_state) = data_mule_connect_secure_session_with_profile(
+            &client_cfg,
+            &client,
+            &server_node,
+            &client_policy,
+            10,
+            HandshakeProfile::SecureDefault,
+        )
+        .expect("data-mule client handshake");
+        let (mut server_session, server_state) = server_thread
+            .join()
+            .expect("data-mule server thread")
+            .expect("data-mule server handshake");
+
+        assert_eq!(
+            client_state.transcript_hash_hex,
+            server_state.transcript_hash_hex
+        );
+        client_session
+            .send_frame(b"data-mule-client-to-server")
+            .expect("send client frame");
+        assert_eq!(
+            server_session.recv_frame().expect("receive client frame"),
+            b"data-mule-client-to-server"
+        );
+        server_session
+            .send_frame(b"data-mule-server-to-client")
+            .expect("send server frame");
+        assert_eq!(
+            client_session.recv_frame().expect("receive server frame"),
+            b"data-mule-server-to-client"
+        );
+        fs::remove_dir_all(root).expect("remove data-mule spool");
+    }
+
+    #[test]
+    fn offline_mesh_replication_between_distinct_spools_preserves_aead_data() {
+        let source_root = test_root("shph-offline-source");
+        let destination_root = test_root("shph-offline-destination");
+        fs::create_dir_all(&source_root).expect("create source spool");
+        fs::create_dir_all(&destination_root).expect("create destination spool");
+        let writer_cfg = OfflineMeshConfig {
+            node_id: "courier".into(),
+            peer_id: "receiver".into(),
+            spool_dir: source_root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_idle_entries: 64,
+        };
+        let reader_cfg = OfflineMeshConfig {
+            node_id: "receiver".into(),
+            peer_id: "courier".into(),
+            spool_dir: destination_root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_idle_entries: 64,
+        };
+        let mut writer = OfflineMeshWriteState::new(&writer_cfg, "courier", "receiver");
+        let mut sender = SendCipher::new([0x71; 32]);
+        writer
+            .send_payload(
+                &sender
+                    .encrypt(b"replicated-offline-frame")
+                    .expect("encrypt"),
+            )
+            .expect("write source envelope");
+
+        copy_tree(&source_root, &destination_root);
+
+        let mut reader = OfflineMeshReadState::new(&reader_cfg, "receiver", "courier");
+        let mut receiver = ReceiveCipher::new([0x71; 32]);
+        assert_eq!(
+            reader
+                .receive_decrypted_frame(&mut receiver, Duration::from_secs(2))
+                .expect("receive replicated envelope"),
+            b"replicated-offline-frame"
+        );
+        let session_id = offline_session_id("courier", "receiver");
+        assert!(
+            source_root
+                .join(session_id)
+                .join("out")
+                .join(super::sanitize_component("courier"))
+                .join(super::sanitize_component("receiver"))
+                .read_dir()
+                .expect("read source queue")
+                .any(|entry| entry.is_ok()),
+            "replication source remains available after destination consumption"
+        );
+        fs::remove_dir_all(source_root).expect("remove source spool");
+        fs::remove_dir_all(destination_root).expect("remove destination spool");
+    }
+
+    #[test]
+    fn offline_mesh_replay_key_allows_new_timestamp_after_sequence_restart() {
+        let root = test_root("shph-offline-restart");
+        fs::create_dir_all(&root).expect("create restart spool");
+        let writer_cfg = OfflineMeshConfig {
+            node_id: "peer".into(),
+            peer_id: "local".into(),
+            spool_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_idle_entries: 64,
+        };
+        let reader_cfg = OfflineMeshConfig {
+            node_id: "local".into(),
+            peer_id: "peer".into(),
+            spool_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_idle_entries: 64,
+        };
+        let mut writer = OfflineMeshWriteState::new(&writer_cfg, "peer", "local");
+        let mut sender = SendCipher::new([0x72; 32]);
+        writer
+            .send_payload(&sender.encrypt(b"before-restart").expect("encrypt first"))
+            .expect("write first envelope");
+        let queue = root
+            .join(offline_session_id("peer", "local"))
+            .join("out")
+            .join(super::sanitize_component("peer"))
+            .join(super::sanitize_component("local"));
+        let first_path = fs::read_dir(&queue)
+            .expect("read first queue")
+            .next()
+            .expect("first envelope")
+            .expect("first envelope entry")
+            .path();
+        let first: OfflineMeshEnvelope =
+            serde_json::from_slice(&fs::read(&first_path).expect("read first envelope"))
+                .expect("decode first envelope");
+        let mut reader = OfflineMeshReadState::new(&reader_cfg, "local", "peer");
+        let mut receiver = ReceiveCipher::new([0x72; 32]);
+        assert_eq!(
+            reader
+                .receive_decrypted_frame(&mut receiver, Duration::from_secs(2))
+                .expect("receive first envelope"),
+            b"before-restart"
+        );
+
+        let second = OfflineMeshEnvelope {
+            session_id: first.session_id,
+            from: "peer".into(),
+            to: "local".into(),
+            created_at_unix_ms: first.created_at_unix_ms.saturating_add(1),
+            sequence: 0,
+            ciphertext_b64: base64::engine::general_purpose::STANDARD
+                .encode(sender.encrypt(b"after-restart").expect("encrypt second")),
+        };
+        let second_path = queue.join(format!(
+            "{}-{}.json",
+            second.created_at_unix_ms, second.sequence
+        ));
+        fs::write(
+            second_path,
+            serde_json::to_vec(&second).expect("serialize second envelope"),
+        )
+        .expect("write second envelope");
+        assert_eq!(
+            reader
+                .receive_decrypted_frame(&mut receiver, Duration::from_secs(2))
+                .expect("receive post-restart sequence"),
+            b"after-restart"
+        );
+        fs::remove_dir_all(root).expect("remove restart spool");
+    }
+
+    #[test]
     fn file_adapter_session_rejects_before_creating_an_envelope() {
         let root = std::env::temp_dir().join(format!(
             "shph-mule-capacity-{}-{}",
@@ -5044,6 +5479,67 @@ mod tests {
         assert!(
             accepted.is_ok(),
             "listener should remain alive after malformed peers"
+        );
+    }
+
+    #[test]
+    fn tcp_listener_accepts_legitimate_peer_while_slow_preauth_client_is_connected() {
+        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve TCP port");
+        let address = probe.local_addr().expect("probe address");
+        drop(probe);
+
+        let server_identity = IdentityKeyPair::generate().expect("server identity");
+        let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
+        let server_identity_for_thread = server_identity.clone();
+        let server_policy_for_thread = server_policy.clone();
+        let server_address = address.to_string();
+        let server = thread::spawn(move || {
+            super::tcp_accept_and_handshake_with_profile(
+                &server_address,
+                &server_identity_for_thread,
+                &server_policy_for_thread,
+                5,
+                HandshakeProfile::ClassicalLab,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let mut slow_client = TcpStream::connect(address).expect("slow client connection");
+        slow_client
+            .write_all(b"{")
+            .expect("slow client partial hello");
+        thread::sleep(Duration::from_millis(100));
+
+        let client_address = address.to_string();
+        let started = Instant::now();
+        let valid = thread::spawn(move || {
+            super::tcp_handshake_client_with_profile(
+                &client_address,
+                &client_identity,
+                &client_policy,
+                5,
+                HandshakeProfile::ClassicalLab,
+            )
+        })
+        .join()
+        .expect("valid client thread");
+        assert!(
+            valid.is_ok(),
+            "valid peer should not wait behind a slow pre-auth client: {valid:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "legitimate handshake was delayed by a slow pre-auth client"
+        );
+
+        slow_client
+            .shutdown(Shutdown::Both)
+            .expect("close slow client");
+        assert!(
+            server.join().expect("server thread").is_ok(),
+            "listener should return the legitimate session"
         );
     }
 

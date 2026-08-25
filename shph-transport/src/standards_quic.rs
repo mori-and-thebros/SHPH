@@ -27,6 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
+use zeroize::Zeroizing;
 
 const MAX_HANDSHAKE_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
@@ -109,6 +110,53 @@ pub struct StandardsQuicServer {
     pub certificate_der: Vec<u8>,
 }
 
+/// Persistent TLS material for a standards-QUIC server.
+///
+/// The certificate is public and may be distributed to clients out of band.
+/// The PKCS#8 private key must remain owner-controlled by the caller.
+pub struct StandardsQuicServerMaterial {
+    certificate_der: Vec<u8>,
+    private_key_der: Zeroizing<Vec<u8>>,
+}
+
+impl StandardsQuicServerMaterial {
+    pub fn new(certificate_der: Vec<u8>, private_key_der: Vec<u8>) -> Result<Self> {
+        if certificate_der.is_empty() {
+            return Err(ShphError::Config(
+                "QUIC server certificate cannot be empty".into(),
+            ));
+        }
+        if private_key_der.is_empty() {
+            return Err(ShphError::Config(
+                "QUIC server private key cannot be empty".into(),
+            ));
+        }
+        Ok(Self {
+            certificate_der,
+            private_key_der: Zeroizing::new(private_key_der),
+        })
+    }
+
+    pub fn certificate_der(&self) -> &[u8] {
+        &self.certificate_der
+    }
+
+    pub fn private_key_der(&self) -> &[u8] {
+        &self.private_key_der
+    }
+}
+
+/// Generate a self-signed certificate and PKCS#8 key for a controlled lab.
+///
+/// Callers should persist the returned material and reuse it for the
+/// lifetime of the deployment. Regenerating it on every reconnect invalidates
+/// clients that pin the certificate bytes.
+pub fn generate_server_material() -> Result<StandardsQuicServerMaterial> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .map_err(|err| ShphError::Config(format!("generate QUIC certificate: {err}")))?;
+    StandardsQuicServerMaterial::new(cert.cert.der().to_vec(), cert.key_pair.serialize_der())
+}
+
 /// An established standards QUIC session.
 pub struct StandardsQuicConnection {
     pub connection: Connection,
@@ -126,7 +174,23 @@ pub fn server_endpoint(
     bind_addr: SocketAddr,
     config: StandardsQuicConfig,
 ) -> Result<StandardsQuicServer> {
-    build_server_endpoint(bind_addr, config, None)
+    let material = generate_server_material()?;
+    server_endpoint_with_material(bind_addr, &material, config)
+}
+
+/// Create a standards QUIC server from stable, caller-managed TLS material.
+pub fn server_endpoint_with_material(
+    bind_addr: SocketAddr,
+    material: &StandardsQuicServerMaterial,
+    config: StandardsQuicConfig,
+) -> Result<StandardsQuicServer> {
+    build_server_endpoint(
+        bind_addr,
+        material.certificate_der.clone(),
+        material.private_key_der(),
+        config,
+        None,
+    )
 }
 
 /// Create a standards QUIC server with an optional passive JA4 observer.
@@ -141,20 +205,47 @@ pub fn server_endpoint_with_ja4_observer(
     observer: Arc<dyn Ja4Observer>,
     observer_config: Ja4ObserverConfig,
 ) -> Result<StandardsQuicServer> {
-    build_server_endpoint(bind_addr, config, Some((observer, observer_config)))
+    let material = generate_server_material()?;
+    server_endpoint_with_material_and_ja4_observer(
+        bind_addr,
+        &material,
+        config,
+        observer,
+        observer_config,
+    )
+}
+
+/// Create a standards QUIC server from stable TLS material with an observer.
+pub fn server_endpoint_with_material_and_ja4_observer(
+    bind_addr: SocketAddr,
+    material: &StandardsQuicServerMaterial,
+    config: StandardsQuicConfig,
+    observer: Arc<dyn Ja4Observer>,
+    observer_config: Ja4ObserverConfig,
+) -> Result<StandardsQuicServer> {
+    build_server_endpoint(
+        bind_addr,
+        material.certificate_der.clone(),
+        material.private_key_der(),
+        config,
+        Some((observer, observer_config)),
+    )
 }
 
 fn build_server_endpoint(
     bind_addr: SocketAddr,
+    certificate_der: Vec<u8>,
+    private_key_der: &[u8],
     config: StandardsQuicConfig,
     observer: Option<(Arc<dyn Ja4Observer>, Ja4ObserverConfig)>,
 ) -> Result<StandardsQuicServer> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .map_err(|err| ShphError::Config(format!("generate QUIC certificate: {err}")))?;
-    let certificate_der = cert.cert.der().to_vec();
+    if certificate_der.is_empty() || private_key_der.is_empty() {
+        return Err(ShphError::Config(
+            "QUIC server certificate and private key cannot be empty".into(),
+        ));
+    }
     let certificate = quinn::rustls::pki_types::CertificateDer::from(certificate_der.clone());
-    let private_key =
-        quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let private_key = quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(private_key_der.to_vec());
     let tls_config = build_server_tls_config(certificate, private_key.into(), observer)?;
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls_config))
         .map_err(|err| ShphError::Config(format!("configure QUIC TLS provider: {err}")))?;
@@ -638,8 +729,9 @@ async fn read_hello(stream: &mut RecvStream) -> Result<Hello> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept, client_endpoint, connect, server_endpoint, server_endpoint_with_ja4_observer,
-        StandardsQuicConfig, MAX_TUN_DATAGRAM_BYTES,
+        accept, client_endpoint, connect, generate_server_material, server_endpoint,
+        server_endpoint_with_ja4_observer, server_endpoint_with_material, StandardsQuicConfig,
+        MAX_TUN_DATAGRAM_BYTES,
     };
     use crate::ja4::{Ja4ObserverConfig, RecordingJa4Observer};
     use shph_core::{HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy};
@@ -681,6 +773,39 @@ mod tests {
         }
         .transport_config()
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn persistent_server_material_reuses_the_same_certificate() {
+        let material = generate_server_material().expect("generate server material");
+        assert!(!material.certificate_der().is_empty());
+        assert!(!material.private_key_der().is_empty());
+
+        let first = server_endpoint_with_material(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &material,
+            StandardsQuicConfig::default(),
+        )
+        .expect("first endpoint");
+        let second = server_endpoint_with_material(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &material,
+            StandardsQuicConfig::default(),
+        )
+        .expect("second endpoint");
+
+        assert_eq!(first.certificate_der, second.certificate_der);
+        assert_eq!(first.certificate_der, material.certificate_der());
+        first.endpoint.close(0u32.into(), b"test complete");
+        second.endpoint.close(0u32.into(), b"test complete");
+        first.endpoint.wait_idle().await;
+        second.endpoint.wait_idle().await;
+    }
+
+    #[test]
+    fn persistent_server_material_rejects_empty_parts() {
+        assert!(super::StandardsQuicServerMaterial::new(Vec::new(), vec![1]).is_err());
+        assert!(super::StandardsQuicServerMaterial::new(vec![1], Vec::new()).is_err());
     }
 
     #[test]

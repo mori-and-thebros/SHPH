@@ -36,6 +36,13 @@ scenarios are part of the `identity` suite in `benchmarks/src/main.rs`; this
 development snapshot does not publish a standalone numeric identity-capture
 report.
 
+The focused defensive rejection capture is
+`docs/BENCHMARK_RESULTS_2026-08-25.md`. It measures bounded local rejection
+paths for malformed cells, forged or source-mismatched cookies, duplicate
+nonces, and per-source rate limiting. It is intentionally separate from
+listener flood capacity, DDoS resistance, packet loss, DPI, or censorship
+evidence.
+
 ## Default Environment
 
 The primary baseline is a **native Linux host**. Record:
@@ -176,9 +183,14 @@ removes ML-KEM and therefore provides a different security contract.
 
 ## Expanded benchmark coverage
 
-The standalone runner now supports `--suite all|core|dataplane|resource|shroud|quic|scalability|identity|wire|evidence|extended`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2.0 morphology profiles, QUIC-shim loopback handshake timing, long-session replay/nonce behavior, identity/plugin-provider validation costs, explicit wire overhead/packet-rate metrics, and a fixed-size evidence campaign for Shroud2 overhead, pre-authentication CPU paths, and replay-window throughput.
+The standalone runner now supports `--suite all|core|defensive|dataplane|resource|shroud|quic|scalability|identity|wire|evidence|extended`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2.0 morphology profiles, QUIC-shim loopback handshake timing, long-session replay/nonce behavior, identity/plugin-provider validation costs, explicit wire overhead/packet-rate metrics, a fixed-size evidence campaign for Shroud2 overhead, pre-authentication CPU paths, and replay-window throughput, plus bounded defensive rejection-path measurements.
 
 These are local measurements, not proof of live VPN throughput, TUN performance, network RTT, reconnect recovery, or control-plane cost. Use `scripts/benchmark_operator.sh` for real-process lifecycle, reconnect, control-plane, and native-TUN prerequisite/timing checks. It emits explicit `SKIP` records when a host, privilege, peer, or tool is unavailable.
+
+The `defensive` suite is designed as a regression guard for fail-closed
+behavior. Every scenario must reject its intentionally invalid input; the
+reported latency is local operation time, not a claim about how many probes a
+network listener can process.
 
 ### Criterion and GitHub-hosted campaigns
 
@@ -189,6 +201,12 @@ stateless cookies, fixed-cell framing, shared TCP/QUIC profile envelopes,
 Shroud2 morphology and batching, histogram distance, and identity-record
 verification/serialization. Criterion results are microbenchmark results with
 statistical repetition; they are not socket, TUN, or Internet throughput.
+
+The harness also records the local cost of validating experimental filesystem
+adapter configurations, parsing a SOCKS5 underlay endpoint, and computing a
+complete JA4 fingerprint. These are parser/validation and observability
+microbenchmarks; they do not measure proxy reachability, TLS fingerprint
+mimicry, spool delivery time, or censorship resistance.
 
 Run the focused harness locally with:
 
@@ -214,9 +232,10 @@ Recommended commands:
 ```bash
 cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite all --iterations 10000 --frames 100000
 cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite identity --iterations 1000 --frames 1000
-cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite wire --iterations 1000 --frames 10000
-cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite evidence --iterations 1 --frames 1
-cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite extended --iterations 100 --frames 10000
+  cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite wire --iterations 1000 --frames 10000
+  cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite evidence --iterations 1 --frames 1
+  cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite defensive --iterations 2000 --frames 1
+  cargo run --manifest-path benchmarks/Cargo.toml --release -- --suite extended --iterations 100 --frames 10000
 cargo build --release --manifest-path benchmarks/Cargo.toml --locked
 ./benchmarks/target/release/shph-benchmarks --profile secure-default --suite all --iterations 5000 --frames 1000000
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\benchmark_repeat.ps1 `
@@ -251,9 +270,10 @@ configured as the Rust GNU target linker and record its exact linker/CRT
 versions. Do not force Rust's self-contained GNU CRT mode. The capture script
 performs a startup probe before writing evidence so a broken executable cannot
 be mistaken for a benchmark result.
-The latest native Windows validation record is
-`docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`; its raw
-captures are ignored local artifacts under `benchmark-runs/`.
+The latest native Windows lifecycle record is
+`docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`; its raw captures are
+ignored local artifacts under `benchmark-runs/`. It does not close the
+native packet-path or two-host gates.
 
 The namespace scripts run the Linux `AsyncTunDevice` probe inside an isolated
 user/network namespace. The lifecycle benchmark reports open/hold/close

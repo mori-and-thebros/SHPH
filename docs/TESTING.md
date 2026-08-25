@@ -43,15 +43,17 @@ runtime is installed. Linux-only scripts and fuzz campaigns require a native
 Linux environment; WSL is not assumed.
 
 Native Windows validation is maintained as a separate, date-stamped host
-campaign and is recorded in
-`docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`. That record
-should be used for platform-status review. Local workstation availability is
-intentionally not treated as release evidence.
+campaign. The current elevated lifecycle record is
+`docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`; the older
+`WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` record is historical.
+Local workstation availability is intentionally not treated as release
+evidence.
 
-Remaining product gates are still explicit: native TUN packet I/O, route/DNS
-rollback, reconnect, teardown, and two-host forwarding require the dedicated
-host campaigns described in `docs/SUPPORT_MATRIX.md` and
-`docs/RELEASE_READINESS.md`.
+Remaining product gates are still explicit: native TUN packet I/O, reconnect,
+Ctrl+C/forced-termination behavior, crash-time WFP cleanup, and two-host
+forwarding require the dedicated host campaigns described in
+`docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`. The current record
+does cover adapter/session lifecycle and temporary route/DNS rollback.
 
 ## Focused Test Runs
 
@@ -306,7 +308,7 @@ Graceful teardown evidence (SIGINT on a running connect-loop session):
 - The native Windows workspace test run reported **180 passed and 0 failed**.
   The focused Windows Wintun unit group reported 6 passed, and the Windows
   ACL keystore regression reported 1 passed.
-- The latest post-loader evidence is
+- The historical post-loader evidence is
   `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`.
 - The elevated post-loader validator accepted the same
   `wintun-0.14.1\wintun\bin\amd64\wintun.dll`, created a real adapter/session,

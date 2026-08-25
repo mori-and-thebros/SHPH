@@ -4,13 +4,16 @@ use shph_core::{
     finalize_initiator_pq, hkdf_sha256_into, HandshakeProfile, IdentityKeyPair, PeerPin,
     PeerPolicy, ReceiveCipher, ReplayWindow, SendCipher, StatelessCookieAuthority, BALANCED,
 };
+use shph_core::roadmap::TransportAdapterConfig;
 use shph_identity::{IdentityEndpoint, IdentityRecord, VerificationPolicy};
 use shph_obfuscation::{apply_profile, remove_profile, ProfilePadder, ProfileTier};
+use shph_transport::ja4::{Ja4ClientHello, Ja4TlsVersion, Ja4Transport};
 use shph_transport::shroud2::{
     decode_batched_datagram, decode_datagram, encode_batched_datagram, encode_datagram,
     wasserstein_distance, EmpiricalHistogram, MorphologyBatcher, MorphologyEngine,
     MorphologyProfile,
 };
+use shph_transport::{PeerRateLimiterProbe, TcpUnderlay};
 use std::hint::black_box;
 use std::net::SocketAddr;
 
@@ -151,6 +154,59 @@ fn bench_replay_and_cookie(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_defensive_rejections(c: &mut Criterion) {
+    let mut group = c.benchmark_group("defensive/rejections");
+    let valid_cell =
+        encode_data_cell(BALANCED, b"criterion-defensive").expect("defensive baseline cell");
+
+    let truncated = &valid_cell[..valid_cell.len() - 1];
+    group.bench_function("shroud_truncated_cell", |b| {
+        b.iter(|| black_box(decode_cell(BALANCED, black_box(truncated)).is_err()))
+    });
+
+    let mut noncanonical = valid_cell.clone();
+    let last = noncanonical.len() - 1;
+    noncanonical[last] = 1;
+    group.bench_function("shroud_noncanonical_padding", |b| {
+        b.iter(|| black_box(decode_cell(BALANCED, black_box(&noncanonical)).is_err()))
+    });
+
+    let oversized = vec![0u8; PATH_MTU + 1];
+    group.bench_function("shroud2_oversized_datagram", |b| {
+        b.iter(|| {
+            black_box(decode_datagram(
+                black_box(&oversized),
+                PATH_MTU,
+            )
+            .is_err())
+        })
+    });
+
+    let peer: SocketAddr = "198.51.100.42:443".parse().expect("defensive peer");
+    let mut authority = StatelessCookieAuthority::new().expect("cookie authority");
+    let mut forged = authority.issue(peer).expect("cookie issue");
+    forged[0] ^= 1;
+    group.bench_function("cookie_forged_tag", |b| {
+        b.iter(|| black_box(!authority.verify(peer, black_box(&forged)).expect("verify")))
+    });
+
+    let mut replay = ReplayWindow::new(128);
+    assert!(replay.check_and_insert(1));
+    group.bench_function("replay_duplicate_nonce", |b| {
+        b.iter(|| black_box(!replay.check_and_insert(1)))
+    });
+
+    let limiter_peer: SocketAddr = "198.51.100.44:443".parse().expect("limiter peer");
+    let mut limiter = PeerRateLimiterProbe::new();
+    for _ in 0..8 {
+        assert!(limiter.check(limiter_peer));
+    }
+    group.bench_function("per_source_rate_limit_after_cap", |b| {
+        b.iter(|| black_box(!limiter.check(limiter_peer)))
+    });
+    group.finish();
+}
+
 fn bench_handshake(c: &mut Criterion) {
     let mut group = c.benchmark_group("core/handshake");
     for profile in [
@@ -284,6 +340,61 @@ fn bench_morphology(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_adapter_validation_and_observability(c: &mut Criterion) {
+    let mut group = c.benchmark_group("transport/adapter-validation");
+    let offline = TransportAdapterConfig::OfflineMesh {
+        node_id: "node-a".into(),
+        peer_id: "node-b".into(),
+        spool_dir: "C:\\shph\\offline-spool".into(),
+        poll_interval_ms: 250,
+        max_idle_entries: 1_024,
+    };
+    group.bench_function("offline_mesh_config_validate", |b| {
+        b.iter(|| {
+            offline.validate().expect("validate offline-mesh config");
+            black_box(())
+        })
+    });
+
+    let data_mule = TransportAdapterConfig::DataMule {
+        inbox_dir: "C:\\shph\\data-mule\\inbox".into(),
+        outbox_dir: "C:\\shph\\data-mule\\outbox".into(),
+        poll_interval_ms: 250,
+        max_file_bytes: 32 * 1024,
+        max_total_bytes: 4 * 1024 * 1024,
+        max_age_ms: 24 * 60 * 60 * 1_000,
+    };
+    group.bench_function("data_mule_config_validate", |b| {
+        b.iter(|| {
+            data_mule.validate().expect("validate data-mule config");
+            black_box(())
+        })
+    });
+
+    group.bench_function("socks5_underlay_parse", |b| {
+        b.iter(|| {
+            black_box(
+                TcpUnderlay::parse(Some("socks5://127.0.0.1:10808"))
+                    .expect("parse SOCKS5 underlay"),
+            )
+        })
+    });
+
+    let hello = Ja4ClientHello {
+        transport: Ja4Transport::Tcp,
+        tls_version: Ja4TlsVersion::Tls1_3,
+        server_name_present: true,
+        cipher_suites: vec![0x1301, 0x1302, 0x0a0a],
+        extension_types: vec![0, 10, 16, 0x0a0a],
+        first_alpn: Some(b"h2".to_vec()),
+        signature_schemes: vec![0x0804, 0x0403],
+    };
+    group.bench_function("ja4_fingerprint", |b| {
+        b.iter(|| black_box(hello.fingerprint()))
+    });
+    group.finish();
+}
+
 fn bench_identity(c: &mut Criterion) {
     let (record, bytes) = identity_record();
     let policy = VerificationPolicy::at(BENCHMARK_NOW);
@@ -307,9 +418,11 @@ criterion_group!(
     benches,
     bench_core_crypto,
     bench_replay_and_cookie,
+    bench_defensive_rejections,
     bench_handshake,
     bench_framing_and_profiles,
     bench_morphology,
+    bench_adapter_validation_and_observability,
     bench_identity
 );
 criterion_main!(benches);

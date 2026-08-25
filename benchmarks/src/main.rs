@@ -93,6 +93,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 enum Suite {
     All,
     Core,
+    Defensive,
     DataPlane,
     Resource,
     Shroud,
@@ -190,6 +191,9 @@ fn main() {
         bench_latency_under_load(options);
         bench_replay(options);
     }
+    if matches!(options.suite, Suite::All | Suite::Defensive) {
+        bench_defensive(options);
+    }
     if matches!(options.suite, Suite::All | Suite::DataPlane) {
         for payload_bytes in [1024, 4096, 1400, 1500, 65536] {
             bench_dataplane(options, payload_bytes);
@@ -268,7 +272,7 @@ fn parse_options() -> Options {
                 println!("Usage: shph-benchmarks [OPTIONS]");
                 println!("  --profile secure-default|classical-lab");
                 println!(
-                    "  --suite all|core|dataplane|resource|shroud|quic|scalability|identity|wire|evidence|extended"
+                    "  --suite all|core|defensive|dataplane|resource|shroud|quic|scalability|identity|wire|evidence|extended"
                 );
                 println!("  --iterations N   latency samples (default: 100)");
                 println!("  --frames N       sustained/load frames (default: 10000)");
@@ -306,6 +310,7 @@ fn parse_suite(value: &str) -> Suite {
     match value.to_ascii_lowercase().as_str() {
         "all" => Suite::All,
         "core" => Suite::Core,
+        "defensive" | "defense" | "rejection" => Suite::Defensive,
         "dataplane" | "data-plane" => Suite::DataPlane,
         "resource" => Suite::Resource,
         "shroud" => Suite::Shroud,
@@ -316,7 +321,7 @@ fn parse_suite(value: &str) -> Suite {
         "evidence" => Suite::Evidence,
         "extended" => Suite::Extended,
         _ => usage(
-            "suite must be all, core, dataplane, resource, shroud, quic, scalability, identity, wire, evidence, or extended",
+            "suite must be all, core, defensive, dataplane, resource, shroud, quic, scalability, identity, wire, evidence, or extended",
         ),
     }
 }
@@ -1761,6 +1766,156 @@ fn bench_replay(options: Options) {
         &samples,
         finish_measurement(start),
         "nonce_window_state_transition",
+    );
+}
+
+fn bench_defensive(options: Options) {
+    let valid_cell = encode_cell(BALANCED, shph_core::SHROUD_FRAME_DATA, b"defensive");
+    let valid_cell = valid_cell.expect("defensive baseline cell");
+
+    let truncated_cell = &valid_cell[..valid_cell.len() - 1];
+    bench_rejection_path(
+        options,
+        "shroud_reject_truncated",
+        "shroud_reject_truncated_cell",
+        truncated_cell.len(),
+        || decode_cell(BALANCED, truncated_cell).is_err(),
+        "in_memory_malformed_cell_rejection;not_network_or_dpi_evidence",
+    );
+
+    let mut noncanonical_cell = valid_cell.clone();
+    let last = noncanonical_cell.len() - 1;
+    noncanonical_cell[last] = 1;
+    bench_rejection_path(
+        options,
+        "shroud_reject_noncanonical_padding",
+        "shroud_reject_noncanonical_padding",
+        noncanonical_cell.len(),
+        || decode_cell(BALANCED, &noncanonical_cell).is_err(),
+        "in_memory_noncanonical_padding_rejection;not_network_or_dpi_evidence",
+    );
+
+    let mut bad_header_cell = valid_cell.clone();
+    bad_header_cell[0] ^= 0xff;
+    bench_rejection_path(
+        options,
+        "shroud_reject_bad_header",
+        "shroud_reject_invalid_header",
+        bad_header_cell.len(),
+        || decode_cell(BALANCED, &bad_header_cell).is_err(),
+        "in_memory_invalid_header_rejection;not_network_or_dpi_evidence",
+    );
+
+    let oversized_datagram = vec![0u8; EVIDENCE_MORPHOLOGY_PATH_MTU + 1];
+    bench_rejection_path(
+        options,
+        "shroud2_reject_oversized_datagram",
+        "shroud2_reject_over_path_mtu",
+        oversized_datagram.len(),
+        || {
+            decode_datagram(&oversized_datagram, EVIDENCE_MORPHOLOGY_PATH_MTU).is_err()
+        },
+        "in_memory_path_mtu_bound_rejection;not_packet_loss_or_pmtu_evidence",
+    );
+
+    let peer: SocketAddr = "198.51.100.42:443".parse().expect("defensive peer");
+    let mut cookie_authority = StatelessCookieAuthority::new().expect("cookie authority");
+    bench_rejection_path(
+        options,
+        "cookie_reject_malformed",
+        "cookie_reject_malformed_length",
+        3,
+        || {
+            !cookie_authority
+                .verify(peer, &[0u8; 3])
+                .expect("malformed cookie verification")
+        },
+        "in_memory_pre_auth_rejection;constant_size_check;not_flood_capacity",
+    );
+
+    let mut forged_cookie = cookie_authority.issue(peer).expect("cookie issue");
+    forged_cookie[0] ^= 1;
+    bench_rejection_path(
+        options,
+        "cookie_reject_forged",
+        "cookie_reject_forged_tag",
+        forged_cookie.len(),
+        || {
+            !cookie_authority
+                .verify(peer, &forged_cookie)
+                .expect("forged cookie verification")
+        },
+        "in_memory_hmac_rejection;not_flood_capacity",
+    );
+
+    let other_peer: SocketAddr = "198.51.100.43:443".parse().expect("other peer");
+    let valid_cookie = cookie_authority.issue(peer).expect("valid cookie issue");
+    bench_rejection_path(
+        options,
+        "cookie_reject_wrong_source",
+        "cookie_reject_source_binding_mismatch",
+        valid_cookie.len(),
+        || {
+            !cookie_authority
+                .verify(other_peer, &valid_cookie)
+                .expect("wrong-source cookie verification")
+        },
+        "in_memory_source_address_binding_rejection;not_flood_capacity",
+    );
+
+    let mut replay_window = ReplayWindow::new(128);
+    assert!(replay_window.check_and_insert(1));
+    bench_rejection_path(
+        options,
+        "replay_reject_duplicate",
+        "replay_window_duplicate_nonce",
+        0,
+        || !replay_window.check_and_insert(1),
+        "in_memory_duplicate_nonce_rejection;128_bit_window;not_network_replay_rate",
+    );
+
+    let limiter_peer: SocketAddr = "198.51.100.44:443".parse().expect("limiter peer");
+    let mut limiter = shph_transport::PeerRateLimiterProbe::new();
+    for _ in 0..8 {
+        assert!(limiter.check(limiter_peer));
+    }
+    bench_rejection_path(
+        options,
+        "rate_limiter_reject_after_cap",
+        "per_source_connection_rate_limit",
+        0,
+        || !limiter.check(limiter_peer),
+        "in_memory_per_source_rejection;limit=8_per_10s;not_ddos_capacity",
+    );
+}
+
+fn bench_rejection_path<F>(
+    options: Options,
+    measurement: &str,
+    scenario: &str,
+    payload_bytes: usize,
+    mut operation: F,
+    notes: &str,
+) where
+    F: FnMut() -> bool,
+{
+    let mut samples = Vec::with_capacity(options.iterations);
+    let start = begin_measurement();
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        let rejected = operation();
+        assert!(rejected, "{measurement} unexpectedly accepted input");
+        black_box(rejected);
+        samples.push(sample_start.elapsed().as_nanos());
+    }
+    emit_latency(
+        measurement,
+        options,
+        scenario,
+        payload_bytes,
+        &samples,
+        finish_measurement(start),
+        notes,
     );
 }
 

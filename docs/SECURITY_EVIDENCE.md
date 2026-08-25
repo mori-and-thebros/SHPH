@@ -27,9 +27,9 @@ There is no S4 claim in this repository.
 | Malformed or oversized input | Bounded frames, payloads, files, and IP packets; fail-closed parsing | `cargo test -p shph-transport --lib --locked`; `cargo test -p shph-tun --lib --locked`; fuzz targets | Distributed DoS is not solved |
 | Slowloris or handshake flood | Aggregate deadlines, bounded hello reads, per-source limits | transport tests and source review | No distributed flood guarantee |
 | Local secret disclosure | Owner-only keystore, atomic writes, zeroizing key material | core keystore/crypto tests; secret-material scan | Host compromise and memory forensics remain out of scope |
-| File adapter traversal or aliasing | Bounded sanitized components and regular-file checks | roadmap adapter tests | Hostile filesystem TOCTOU remains out of scope |
-| Route/DNS residue | Preflight and rollback state machine | CLI control-plane tests | Live privileged rollback still needs S3 evidence |
-| Crash-time plaintext egress | Opt-in Linux nftables or Windows WFP policy | planner/unit tests | Privileged crash-leak and two-host evidence remain open |
+| File adapter traversal or aliasing | Bounded sanitized components, regular-file checks, restart-safe replay identity, and Windows extended-length path handling | roadmap/transport adapter tests, authenticated spool sessions, and distinct-root replication test | Hostile filesystem TOCTOU remains out of scope |
+| Route/DNS residue | Preflight and rollback state machine | CLI control-plane tests; elevated Windows lifecycle record | Broader host coverage and failure-interruption testing remain S3 work |
+| Crash-time plaintext egress | Opt-in Linux nftables or Windows WFP policy | planner/unit tests; elevated Windows loopback WFP smoke | Privileged crash-leak and two-host evidence remain open |
 | Native TUN packet corruption | IP header/length validation, packet bounds, complete writes, zeroized buffers | TUN unit tests | Native packet forwarding is host-gated |
 | Dependency compromise or known advisory | Locked manifests and blocking advisory job | `cargo audit --deny warnings`; CI workflow | Advisory database freshness depends on the audit run |
 

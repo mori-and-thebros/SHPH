@@ -31,7 +31,8 @@ pub use handshake::{
 };
 pub use keystore::{
     compute_fingerprint_hex, enforce_owner_only_file_permissions, ensure_no_reparse_components,
-    ensure_not_reparse_point, Contact, KeyStore, KeyStoreConfig,
+    ensure_not_reparse_point, ensure_open_handle_not_reparse, open_readonly_no_reparse, Contact,
+    KeyStore, KeyStoreConfig,
 };
 pub use metrics::{MetricsCollector, MetricsSnapshot};
 pub use net::{Endpoint, TransportType, TunnelConfig};

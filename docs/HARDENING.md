@@ -114,6 +114,15 @@ Files: `shph-cli/src/main.rs`, `shph-core/src/crypto.rs`,
   that are not present in the local keystore contact allowlist. The pinned
   X25519 identity and Ed25519 handshake-signing key must both match. Outbound
   sessions must also match the configured endpoint.
+- **No first-peer TOFU.** Host listeners require a configured client pin before
+  binding an exposed session; an attacker cannot race an empty host contact
+  store to become the first persisted peer.
+- **Bounded concurrent TCP pre-authentication.** Accepted sockets are handled
+  by a capped worker set with a short pre-auth deadline, so a slow partial
+  hello cannot serialize the listener or consume the full operator timeout.
+- **Instance-safe Windows killswitch ownership.** A named process-wide mutex
+  serializes WFP policy installation and stale-filter cleanup across SHPH
+  processes.
 - **Mandatory peer policy.** Empty contact stores no longer disable the
   allowlist; sessions fail closed until the expected peer is registered.
 - **Cross-platform graceful shutdown.** Unix signal handlers and Windows
@@ -133,6 +142,10 @@ Files: `shph-cli/src/main.rs`, `shph-core/src/crypto.rs`,
   endpoints are rejected.
 - **Bounded address fallback.** TCP hostname connection attempts try each
   resolved address under one overall deadline.
+- **Handle-aware local file opens.** Config, keystore, ticket, and Wintun
+  reads revalidate path components after opening; Unix uses `O_NOFOLLOW`, while
+  Windows opens the final component with reparse-point protection and checks
+  the resulting handle.
 - **Keystore loading.** Unix final-component symlinks are refused and
   encrypted PBKDF2 iteration counts are bounded before key derivation.
 - **Audit-journal loading.** Unix audit-journal reads and appends refuse a
@@ -213,11 +226,19 @@ than placeholder queues:
 - Offline-mesh validates the session identifier, bounds queue scans, quarantines
   malformed/oversized files, and acknowledges envelopes only after successful
   authenticated consumption.
+- Offline-mesh replay identity binds the creation timestamp and sequence
+  number, preventing a writer sequence reset after restart from colliding with
+  an older accepted envelope.
 - Data-mule uses unique temporary filenames, bounded recursive scans, symlink
   avoidance, quarantine for poison files, stable envelope replay identity, and
   post-authentication file removal.
+- Windows file-adapter claims, atomic writes, and reparse-point checks use
+  extended-length paths, preserving the confinement checks for nested spool
+  paths beyond the legacy `MAX_PATH` limit.
 - Offline-mesh configuration now bounds `max_idle_entries` to a practical
   replay-cache range.
+- Authenticated offline-mesh and data-mule session round trips and distinct-root
+  offline replication are covered by regression tests.
 - `docs/LAB_PROTOTYPES.md` documents setup, replication/courier workflows,
   failure behavior, and explicit non-claims.
 
@@ -650,9 +671,9 @@ Files: `shph-core/src/crypto.rs`, `shph-core/src/handshake.rs`,
 
 The source-level hardening is covered by focused regression and static
 validation records. Full workspace check/test/Clippy execution belongs to the
-dedicated native-platform campaigns; see
-`docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` and
-`docs/TESTING.md` for the evidence boundary.
+dedicated native-platform campaigns; see the current
+`docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md` record, the historical
+post-loader record, and `docs/TESTING.md` for the evidence boundary.
 
 ## Increment 26 — canonical wire boundaries, safe adapter paths, and listener resilience
 

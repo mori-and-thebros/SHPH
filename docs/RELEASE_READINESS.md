@@ -145,6 +145,8 @@ throughput evidence.
 Windows requires a complete MSVC toolchain, a valid Authenticode-verified and
 SHA-256-pinned Wintun runtime, elevation, adapter/session lifecycle, packet
 send/receive, route/DNS rollback, reconnect, teardown, and a two-node run.
+The dated August 25 record closes only the signed runtime, lifecycle,
+temporary route/DNS rollback, and loopback WFP smoke portions.
 The benchmark wrapper explicitly keeps native TUN disabled unless a prepared
 operator campaign supplies the missing evidence.
 

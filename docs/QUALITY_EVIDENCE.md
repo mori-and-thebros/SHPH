@@ -1,7 +1,7 @@
 # SHPH Quality, Tests, and Benchmark Evidence
 
-This document summarizes the validation available for the `v0.6.4-dev.4`
-follow-up candidate. The tag and commit attached to the GitHub publication are
+This document summarizes the validation available for the `v0.6.5-dev`
+prototype. The tag and commit attached to the GitHub publication are
 the final provenance record. Measurements are labeled carefully: local and
 GitHub-hosted benchmark results are not Internet throughput, and code-path
 tests are not independent security audits.
@@ -10,9 +10,9 @@ tests are not independent security audits.
 
 | Field | Value |
 | --- | --- |
-| Candidate tag | `v0.6.4-dev.4` |
-| Release commit | See the commit attached to the `v0.6.4-dev.4` tag |
-| Validation date | 2026-08-23 |
+| Candidate tag | `v0.6.5-dev` |
+| Release commit | See the commit attached to the `v0.6.5-dev` tag |
+| Validation date | 2026-08-25 |
 | Primary host | Windows |
 | Rust toolchain | `rustc 1.96.0 (ac68faa20 2026-05-25)` |
 | Main target | `x86_64-pc-windows-msvc` |
@@ -41,7 +41,7 @@ The following gates passed on the candidate tree:
 | Five-target fuzz smoke | PASS |
 | `cargo audit --deny warnings` | PASS |
 
-The workspace test run executed **304 tests with 0 failures** across the CLI,
+The workspace test run executed **315 tests with 0 failures** across the CLI,
 configuration, core cryptography/handshake, identity, obfuscation, transport,
 and TUN crates. The audit scanned 299 locked crate dependencies.
 
@@ -103,9 +103,10 @@ Git and are recorded here for provenance:
 
 | Capture | Scope | Result |
 | --- | --- | --- |
-| `benchmark-runs/readiness-full-20260823` | `all`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
-| `benchmark-runs/readiness-extended-20260823` | `extended`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
-| `benchmark-runs/readiness-criterion-20260823` | Criterion, 150 estimate files | PASS |
+| `benchmark-runs/readiness-full-20260823` | Historical `all`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
+| `benchmark-runs/readiness-extended-20260823` | Historical `extended`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
+| `benchmark-runs/readiness-criterion-20260823` | Historical Criterion, 150 estimate files | PASS |
+| `benchmark-runs/defensive-20260825` | Defensive rejection suite, Windows release, 2,000 samples per scenario | PASS |
 
 These are workstation-local engineering measurements. The corresponding
 GitHub-hosted Linux and Windows campaigns are configured in CI and will
@@ -181,7 +182,29 @@ For the standalone benchmark harness:
 cargo check --manifest-path benchmarks/Cargo.toml --all-targets --locked
 cargo run --manifest-path benchmarks/Cargo.toml --release -- `
   --profile secure-default --suite evidence --iterations 1 --frames 1
+cargo run --manifest-path benchmarks/Cargo.toml --release -- `
+  --profile secure-default --suite defensive --iterations 2000 --frames 1
 ```
 
 Run new measurements on a clean tree and record the commit, target, compiler,
 profile, iteration count, and host capability skips alongside the results.
+
+## Addendum — 2026-08-25 engineering pass
+
+The focused `defensive` suite was added to the standalone benchmark runner and
+Criterion harness. A Windows release capture ran 2,000 samples for each of
+nine malformed-input or policy-rejection scenarios; all samples rejected as
+expected. The detailed values and command are recorded in
+[`BENCHMARK_RESULTS_2026-08-25.md`](BENCHMARK_RESULTS_2026-08-25.md).
+
+An elevated Windows host also completed the signed/hash-pinned Wintun
+adapter/session lifecycle, temporary route/DNS apply-and-rollback, and
+loopback WFP install/teardown smoke. That evidence is recorded in
+[`evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`](evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md).
+These records are engineering snapshots from a dirty tree, not release
+evidence or an independent audit.
+
+The following gates remain open: real native packet send/receive through an
+authenticated peer, reconnect and Ctrl+C behavior during a native session,
+crash-time WFP leak testing, authenticated two-node Windows forwarding, and
+native Linux two-host forwarding.

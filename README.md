@@ -7,9 +7,9 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-08-23)
+## Current Status (2026-08-25)
 
-Workspace version `0.6.4-dev.4` (pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.5-dev` (prototype pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -25,18 +25,21 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
 ### Working today
 
 - Native Linux/Windows workspace validation is supported when the complete
-  toolchain is installed. Dedicated native Windows validation evidence is
-  recorded in `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`;
-  workstation-specific tool availability is not a project-status claim.
-  See `docs/TESTING.md` for the prerequisites and evidence boundary.
+  toolchain is installed. The current elevated Windows lifecycle evidence is
+  recorded in `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`; the
+  earlier post-loader record remains historical. Workstation-specific tool
+  availability is not a project-status claim. See `docs/TESTING.md` for the
+  prerequisites and evidence boundary.
 - Identity + keystore initialization (`init`) and peer/config workflows (`add-peer`, `list-peers`, `show-public-key`, `show-signing-public-key`, `show-config`).
 - Guided host/join flow:
-  - `shph host --port 443` creates missing local identity/config state,
-    prints a `shph://v1:` ticket, and bootstraps the first authenticated peer.
+  - `shph host --port 443` creates missing local identity/config state and
+    prints a `shph://v1:` ticket only after at least one client peer pin is
+    configured.
   - `shph join shph://v1:...` creates missing client state, pins the host
     identity from the ticket, and starts the session.
-  - The first host connection uses explicit TOFU enrollment; subsequent host
-    reconnects require the persisted peer pin.
+  - There is no unauthenticated first-connection or automatic TOFU enrollment;
+    exchange public identity keys and run `add-peer` on the host before sharing
+    the ticket.
 - `shph id --qr` combines identity inspection with a terminal QR rendering of
   the current shareable ticket.
 - Authenticated TCP handshake (`listen` / `connect`) with transcript-bound key derivation.
@@ -82,16 +85,19 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   elevation checks, pinned SHA-256 provenance, bounded rings, packet
   validation, shared-session cloning, bounded event waits, and RAII teardown.
   The operator validator additionally requires a valid Authenticode signature.
-  `SHPH_TUN_NATIVE=1` remains host-gated until a real elevated Windows host
-  verifies the runtime, adapter lifecycle, and packet path.
+  An elevated host has now verified the signed runtime, adapter/session
+  lifecycle, route/DNS rollback, and a loopback WFP install/teardown smoke.
+  `SHPH_TUN_NATIVE=1` remains host-gated for real packet forwarding,
+  reconnect, and two-node operation.
 - The historical native Windows validation snapshot records formatting, locked
   checks, strict Clippy, **180 workspace tests**, release builds, Windows-only
   Wintun unit tests, Windows ACL coverage, and both benchmark profiles. The
-  current release evidence records 304 workspace tests; these totals belong to
-  different snapshots and must not be conflated. The post-loader smoke reached
-  a real Wintun adapter/session and left no residue; a clean elevated rerun
-  after the route-rollback fix remains the final confirmation. See
-  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`.
+  the `v0.6.4-dev.4` release evidence records 304 workspace tests; these totals
+  belong to different snapshots and must not be conflated. The current dirty
+  engineering pass reached 315 workspace tests. The lifecycle record reports
+  clean adapter, route, DNS, WFP, process, and temporary-directory teardown.
+  See
+  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`.
 - Lab-only controls:
   - set `SHPH_KEYSTORE_PASSWORD` before `init` to encrypt the keystore at rest.
   - set `SHPH_SHROUD_PROFILE=off|low|medium|high|extreme-lab` with
@@ -110,12 +116,13 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
     unavailable; SHPH still performs its normal end-to-end handshake through
     the proxy. The adapter is TCP-only, supports unauthenticated local
     SOCKS5, and never exposes the proxy as a public SHPH endpoint.
-  - `quic-standard` requires `--quic-cert` and trusted out-of-band
-    certificate distribution. On Linux, `up --transport quic-standard` uses
-    the async standards-QUIC/native-TUN bridge and requires
-    `SHPH_TUN_NATIVE=1`; reconnect is intentionally rejected until persistent
-    server certificate/key support is implemented. Other platforms remain
-    host-gated.
+  - `quic-standard` uses Quinn/rustls TLS 1.3 and trusted out-of-band
+    certificate distribution. Server commands accept `--quic-cert` and
+    `--quic-key`; `host` persists the pair and `join` accepts the public
+    certificate path. On Linux, `up --transport quic-standard` uses the async
+    standards-QUIC/native-TUN bridge, requires `SHPH_TUN_NATIVE=1`, and reuses
+    stable server material across reconnects. Windows one-shot QUIC is
+    supported; Windows native-TUN forwarding remains host-gated.
 - Standalone fuzzing harnesses for Shroud-cell framing, TOML configuration,
   audit-record JSON, and replay-window state transitions live under `fuzz/`.
 - Explicit benchmark profiles are available:
@@ -149,9 +156,9 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   primitives, but are not production defaults or claims of live hardware/
   transport integrations. Hybrid PQC is shipped in v0.4.0.
 - Full production anti-observation claims are explicitly out of scope at this stage.
-- Elevated live Wintun adapter/packet I/O, route/DNS rollback, reconnect,
-  Ctrl+C teardown, two-node Windows forwarding, and native Linux two-host
-  evidence remain release gates.
+- Real Wintun packet I/O through an authenticated peer, reconnect and Ctrl+C
+  behavior during a native session, crash-time WFP leak testing, two-node
+  Windows forwarding, and native Linux two-host evidence remain release gates.
 
 The current development sequence is Shroud lab completion, hardening and
 optimization, release-readiness, then the remaining native Windows TUN gates.
@@ -189,9 +196,8 @@ as described in the testing documentation.
 # from workspace root
 cargo build
 
-# fastest guided flow (the host prints the one-line ticket)
-cargo run -p shph-cli -- host --port 443 --advertise 198.51.100.10
-cargo run -p shph-cli -- join 'shph://v1:...'
+# guided flow: initialize both sides and pre-pin the client before exposing host
+# (see the identity/key exchange commands below)
 
 # keep a changing relay ticket in a bounded owner-only file
 cargo run -p shph-cli -- host --port 443 \
@@ -213,6 +219,11 @@ server_sign_key="$(cargo run -q -p shph-cli -- --config /tmp/shph-a/config.toml 
 client_sign_key="$(cargo run -q -p shph-cli -- --config /tmp/shph-b/config.toml show-signing-public-key)"
 cargo run -q -p shph-cli -- --config /tmp/shph-a/config.toml add-peer client 127.0.0.1 7220 "$client_key" --sign-pubkey "$client_sign_key"
 cargo run -q -p shph-cli -- --config /tmp/shph-b/config.toml add-peer server 127.0.0.1 7220 "$server_key" --sign-pubkey "$server_sign_key"
+
+# now the host may be exposed; it refuses to start without the client pin
+cargo run -p shph-cli -- --config /tmp/shph-a/config.toml host \
+  --port 443 --advertise 198.51.100.10
+cargo run -p shph-cli -- --config /tmp/shph-b/config.toml join 'shph://v1:...'
 
 # one-shot encrypted payload demo (TCP default)
 cargo run -p shph-cli -- --config /tmp/shph-a/config.toml recv-once --bind 127.0.0.1:7220
@@ -335,17 +346,19 @@ loopback SOCKS5 listener without sending traffic to an arbitrary destination.
 
 ```text
 shph init --new
-shph host [--port 443] [--advertise <host[:port]>] [--transport tcp|quic]
+shph host [--port 443] [--advertise <host[:port]>] [--transport tcp|quic|quic-standard]
   [--shroud-profile medium] [--no-tun] [--no-nat]
-  [--ticket-file <path>]
+  [--ticket-file <path>] [--quic-cert <server.der>] [--quic-key <server.key>]
   [--underlay socks5://host:port]
 shph join <shph://v1:...> [--ticket-file <path>] [--no-tun]
-  [--underlay socks5://host:port] [--transport-peer <host:port>] [--check]
+  [--underlay socks5://host:port] [--quic-cert <server.der>]
+  [--transport-peer <host:port>] [--check]
 shph id [--qr] [--ticket-file <path>]
 shph up [--to <host:port>] [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
   [--shroud-profile off|low|medium|high|extreme-lab] [--no-tun]
   [--underlay socks5://host:port]
-  [--quic-cert <server.der>] [--killswitch] [--killswitch-dry-run] [--mss-clamp]
+  [--quic-cert <server.der>] [--quic-key <server.key>]
+  [--killswitch] [--killswitch-dry-run] [--mss-clamp]
 shph down
 shph apply
 shph reconcile
@@ -359,12 +372,14 @@ shph list-peers
 shph add-peer <alias> <host> <port> <pubkey> --sign-pubkey <ed25519-pubkey>
 shph show-config
 shph handshake-sim --peer-pubkey-b64 <key>
-shph listen --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
+shph listen --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
+  [--quic-cert <server.der>] [--quic-key <server.key>]
 shph connect --peer <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
   [--underlay socks5://host:port] [--quic-cert <server.der>]
 shph send-once --peer <addr> --text <msg> [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
   [--underlay socks5://host:port] [--quic-cert <server.der>]
-shph recv-once --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule] [--quic-cert <server.der>]
+shph recv-once --bind <addr> [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
+  [--quic-cert <server.der>] [--quic-key <server.key>]
 cargo run -p shph-tui -- --config <path>
 ```
 
@@ -415,6 +430,7 @@ Additional docs:
 - `docs/HARDENING.md` (security-hardening summary + threat impact)
 - `docs/BENCHMARKING.md` (Linux-first methodology, profiles, and benchmark plan)
 - `docs/GITHUB_BENCHMARKING.md` (hosted CI campaigns, artifacts, and evidence boundaries)
+- `docs/BENCHMARK_RESULTS_2026-08-25.md` (focused defensive rejection benchmark and scope)
 - `docs/BENCHMARK_RESULTS_2026-08-23.md` (current tuned-profile evidence and limits)
 - `docs/BENCHMARK_RESULTS_2026-08-22.md` (previous local candidate evidence and limits)
 - `docs/BENCHMARK_RESULTS_2026-08-17.md` (dated Shroud2/pre-authentication evidence baseline)
@@ -431,7 +447,7 @@ Additional docs:
 - `SECURITY.md` (vulnerability reporting, threat model, non-claims matrix)
 - `CONTRIBUTING.md` (build/test, release checklist, governance)
 - `.github/workflows/ci.yml` (Linux + Windows CI template)
-- `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` (latest native Windows evidence)
+- `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md` (current elevated Windows lifecycle evidence)
 
 ## Security Note
 

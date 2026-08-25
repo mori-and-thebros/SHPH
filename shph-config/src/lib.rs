@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{ConfigError, Result};
-use shph_core::ensure_no_reparse_components;
 pub use shph_core::roadmap::{
     IdentityProviderConfig, PqcConfig, RatchetAuditConfig, RoadmapConfig, ShamirConfig,
     TransportAdapterConfig,
 };
 pub use shph_core::HandshakeProfile;
+use shph_core::{ensure_no_reparse_components, open_readonly_no_reparse};
 
 static CONFIG_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
@@ -119,6 +119,12 @@ pub struct SessionConfig {
     /// `socks5://127.0.0.1:10808`. Direct TCP is the default.
     #[serde(default)]
     pub underlay: Option<String>,
+    /// Out-of-band trusted standards-QUIC server certificate path.
+    #[serde(default)]
+    pub quic_cert: Option<String>,
+    /// Owner-only standards-QUIC server private-key path.
+    #[serde(default)]
+    pub quic_key: Option<String>,
     pub reconnect: Option<ReconnectConfig>,
     pub startup_payload: Option<String>,
 }
@@ -273,19 +279,11 @@ impl Config {
 }
 
 fn open_config_readonly(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = open_readonly_no_reparse(path).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+    })?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "configuration path must reference a regular file",
-            ));
-        }
         use std::os::unix::fs::PermissionsExt;
         let mode = file.metadata()?.permissions().mode();
         if mode & 0o077 != 0 {
@@ -296,32 +294,12 @@ fn open_config_readonly(path: &Path) -> std::io::Result<std::fs::File> {
                 ),
             ));
         }
-        Ok(file)
     }
     #[cfg(not(unix))]
-    {
-        shph_core::ensure_not_reparse_point(path).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-        })?;
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "refusing to load a symlinked configuration",
-            ));
-        }
-        shph_core::enforce_owner_only_file_permissions(path).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
-        })?;
-        let file = std::fs::File::open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "configuration path must reference a regular file",
-            ));
-        }
-        Ok(file)
-    }
+    shph_core::enforce_owner_only_file_permissions(path).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+    })?;
+    Ok(file)
 }
 
 fn create_config_temp_file(path: &Path) -> Result<(std::fs::File, std::path::PathBuf)> {

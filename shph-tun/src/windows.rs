@@ -415,13 +415,16 @@ fn verify_runtime_hash(path: &Path) -> Result<File> {
     let expected = parse_sha256_hex(&expected_text)?;
 
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
 
     let file = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(ShphError::Io)?;
+    shph_core::ensure_open_handle_not_reparse(&file)?;
+    shph_core::ensure_no_reparse_components(path)?;
     let metadata = file.metadata().map_err(ShphError::Io)?;
     if !metadata.file_type().is_file() {
         return Err(ShphError::Unsupported(

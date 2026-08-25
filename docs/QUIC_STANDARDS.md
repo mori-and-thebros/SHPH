@@ -21,11 +21,13 @@ SHPH now contains an opt-in, standards-compliant QUIC transport in
 The existing `TransportMode::Quic` API is intentionally still the legacy
 experimental UDP shim. It is not silently redefined, because changing its wire
 format would break existing lab users and invalidate historical measurements.
-Use the explicit `quic-standard` CLI mode for one-shot, handshake, and Linux
-native-TUN session commands. Continuous `up` requires a real native TUN device
-and an operator-managed certificate path; the default stub TUN is rejected.
-The bridge is Linux-only for now because the asynchronous TUN implementation
-uses Tokio `AsyncFd`. Windows Wintun remains a separate host-validation gate.
+Use the explicit `quic-standard` CLI mode for host/join onboarding, one-shot
+handshakes, and Linux native-TUN sessions. Continuous `up` requires a real
+native TUN device and persistent server TLS material; the default stub TUN is
+rejected. The standards-QUIC native-TUN bridge is Linux-only for now because
+the asynchronous TUN implementation uses Tokio `AsyncFd`. Windows supports
+the standards-QUIC one-shot path, while Wintun forwarding remains a separate
+host-validation gate.
 
 ## Architecture Decision
 
@@ -45,15 +47,19 @@ TLS.
 
 The module provides:
 
-1. `server_endpoint(...)`, which creates a localhost self-signed lab endpoint
+1. `generate_server_material(...)`, which creates a self-signed lab
+   certificate and PKCS#8 private key that an operator can persist.
+2. `server_endpoint(...)`, which creates a localhost self-signed lab endpoint
    and returns the certificate bytes.
-2. `client_endpoint(...)`, which trusts exactly those certificate bytes.
-3. `connect(...)` and `accept(...)`, which perform the QUIC handshake followed
+3. `server_endpoint_with_material(...)`, which creates an endpoint from stable
+   caller-managed TLS material.
+4. `client_endpoint(...)`, which trusts exactly those certificate bytes.
+5. `connect(...)` and `accept(...)`, which perform the QUIC handshake followed
    by the selected SHPH handshake profile.
-4. `send_control`/`recv_control`, which use bounded reliable stream messages.
-5. `send_datagram`/`recv_datagram`, which use bounded unreliable QUIC
+6. `send_control`/`recv_control`, which use bounded reliable stream messages.
+7. `send_datagram`/`recv_datagram`, which use bounded unreliable QUIC
    datagrams.
-6. `shph_transport::standards_tun::run` on Linux, which connects two cloned
+8. `shph_transport::standards_tun::run` on Linux, which connects two cloned
    `AsyncTunDevice` handles to the QUIC DATAGRAM data plane.
 
 ### Optional passive JA4 observability
@@ -78,7 +84,10 @@ canonical hashed or raw-list form for offline lab analysis.
 
 The certificate helper is for controlled lab deployments. Production
 deployment still needs an operator-managed certificate and trust distribution
-path; the helper must not be mistaken for a public PKI workflow.
+path; the helper must not be mistaken for a public PKI workflow. The CLI
+persists the certificate as a public DER file and the PKCS#8 key as an
+owner-only file. It refuses to start with only one half of the pair and reuses
+the pair across reconnects.
 
 ## CLI Usage
 
@@ -88,15 +97,22 @@ from an out-of-band, trusted path:
 ```text
 # server
 shph listen --bind 127.0.0.1:7220 \
-  --transport quic-standard --quic-cert /path/server.der
+  --transport quic-standard --quic-cert /path/server.der \
+  --quic-key /path/server.key
 
 # client
 shph connect --peer 127.0.0.1:7220 \
   --transport quic-standard --quic-cert /path/server.der
 
+# persistent host/join flow
+shph host --port 7220 --transport quic-standard \
+  --quic-cert /path/server.der --quic-key /path/server.key
+shph join 'shph://v1:...' --quic-cert /path/server.der
+
 # one-shot receive/send
 shph recv-once --bind 127.0.0.1:7220 \
-  --transport quic-standard --quic-cert /path/server.der
+  --transport quic-standard --quic-cert /path/server.der \
+  --quic-key /path/server.key
 shph send-once --peer 127.0.0.1:7220 --text "hello" \
   --transport quic-standard --quic-cert /path/server.der
 
@@ -106,21 +122,21 @@ SHPH_TUN_NATIVE=1 shph up --config /path/client.toml \
 ```
 
 The client trusts exactly the certificate file supplied with `--quic-cert`;
-there is no public-CA fallback. Certificate files are size-bounded, read
-without following final-component symlinks, and server replacement refuses an
-existing symlink destination. Peer identity and signing-key pinning are still
-required by the SHPH application policy.
+there is no public-CA fallback. Certificate and private-key files are
+size-bounded, read without following final-component symlinks, and server
+replacement refuses an existing symlink destination. The private key is
+written with owner-only permissions. Peer identity and signing-key pinning are
+still required by the SHPH application policy.
 
 `up --transport quic-standard` fails closed unless native TUN is active and
-`--quic-cert` is supplied. The bridge uses unreliable QUIC DATAGRAM frames for
-IP packets, validates every received packet before TUN injection, drops
-oversized packets, and closes after a bounded number of malformed datagrams.
-This is Linux lab/controlled-deployment support, not a production VPN claim.
-The session reconnect option is intentionally rejected for this mode: a
-listener currently creates a self-signed certificate per process invocation,
-so automatic listener recreation would invalidate the connector's trusted DER
-certificate. Persistent server certificate/key support is required before
-standards-QUIC reconnect can be enabled safely.
+the client has a trusted `--quic-cert` path. Server mode uses the matching
+owner-only `--quic-key` path, or the adjacent `.key` default. The bridge uses
+unreliable QUIC DATAGRAM frames for IP packets, validates every received packet
+before TUN injection, drops oversized packets, and closes after a bounded
+number of malformed datagrams. Stable server material makes reconnect safe:
+the listener does not rotate the pinned certificate when it recreates its
+endpoint. This is Linux lab/controlled-deployment support, not a production
+VPN claim.
 
 ## Hardening
 
@@ -174,5 +190,7 @@ proves, on Linux loopback, that:
 
 This is transport interoperability evidence, not a claim that the legacy shim,
 two-host routing, or production VPN integration is complete. Continuous
-standards-QUIC `up` is implemented for Linux native TUN, but it still requires
-privileged host validation and live two-host throughput/latency evidence.
+standards-QUIC `up` is implemented for Linux native TUN with stable
+certificate/key reuse, but it still requires privileged host validation and
+live two-host throughput/latency evidence. Windows one-shot QUIC is covered by
+the CLI integration path; Windows native-TUN forwarding remains host-gated.

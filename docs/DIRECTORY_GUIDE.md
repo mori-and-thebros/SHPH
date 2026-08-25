@@ -26,6 +26,8 @@ This file maps the repository layout and the main public validation artifacts.
 - `docs/BENCHMARKING.md`: Linux-first benchmark methodology, profiles, and obstacles.
 - `docs/GITHUB_BENCHMARKING.md`: GitHub-hosted campaign triggers, artifacts,
   and evidence boundaries.
+- `docs/BENCHMARK_RESULTS_2026-08-25.md`: focused local defensive rejection
+  benchmark with exact provenance and non-claims.
 - `docs/BENCHMARK_RESULTS_2026-08-23.md`: current local development evidence
   for tuned profiles, validation gates, and benchmark boundaries.
 - `docs/BENCHMARK_RESULTS_2026-08-22.md`: previous local development evidence
@@ -42,9 +44,11 @@ This file maps the repository layout and the main public validation artifacts.
   full-suite benchmark baseline with both explicit profiles.
 - `docs/BENCHMARK_RESULTS_2026-08-05.md`: paired WSL2/Linux and native Windows
   benchmark scores captured during the prior `0.5.0-dev.0` development line.
-- `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`: latest
-  native Windows gates, elevated validator result, benchmark capture, and
-  remaining Wintun host evidence.
+- `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`: current elevated
+  Windows Wintun lifecycle, route/DNS rollback, WFP smoke, and remaining
+  packet-path gates.
+- `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`: historical
+  post-loader Windows validation record.
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`: versioned Shroud 2.0 morphology evidence.
 - `docs/BENCHMARK_RESULTS_2026-07-28.md`: historical WSL2 benchmark scores and
   the explicit list of measurements still requiring live/native infrastructure.
@@ -69,6 +73,8 @@ This file maps the repository layout and the main public validation artifacts.
 ## Evidence and Historical Artifacts
 
 - Current methodology: `docs/BENCHMARKING.md`.
+- Focused defensive rejection evidence:
+  `docs/BENCHMARK_RESULTS_2026-08-25.md`.
 - Current candidate evidence campaign:
   `docs/BENCHMARK_RESULTS_2026-08-23.md`.
 - Extended local evidence campaign:
@@ -79,8 +85,8 @@ This file maps the repository layout and the main public validation artifacts.
   `docs/BENCHMARK_RESULTS_2026-08-14.md`.
 - Current paired platform scores:
   `docs/BENCHMARK_RESULTS_2026-08-05.md`.
-- Current native Windows validation:
-  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`.
+- Current native Windows lifecycle validation:
+  `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`.
 - Current Shroud report: `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`.
 - Historical benchmark reports remain in `docs/` for regression comparison and
   are labeled by date; they are not the current score source.
