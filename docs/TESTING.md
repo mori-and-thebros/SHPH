@@ -49,11 +49,17 @@ campaign. The current elevated lifecycle record is
 Local workstation availability is intentionally not treated as release
 evidence.
 
-Remaining product gates are still explicit: native TUN packet I/O, reconnect,
-Ctrl+C/forced-termination behavior, crash-time WFP cleanup, and two-host
-forwarding require the dedicated host campaigns described in
-`docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`. The current record
-does cover adapter/session lifecycle and temporary route/DNS rollback.
+Remaining product gates are still explicit: broader native TUN packet I/O,
+reconnect, Ctrl+C/forced-termination behavior, crash-time WFP cleanup, and
+additional two-host campaigns require the dedicated host procedures described
+in `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`. The
+cross-platform Windows-to-Linux direct-TCP run is recorded in
+`docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`; it covers
+one IPv4 forwarding lane, external egress, a bounded 64 MiB transfer,
+reconnect, controlled impairment, an MTU boundary check, session hold, and
+teardown, but not DNS, IPv6, UDP, standards-QUIC, or crash containment.
+The optional SOCKS5/Xray underlay is recorded separately and is not part of
+the direct-TCP release profile.
 
 ## Focused Test Runs
 

@@ -8,7 +8,8 @@ development line. If another page makes a broader claim, this matrix wins.
 The SHPH release-readiness profile is intentionally narrow:
 
 1. Authenticated TCP transport is the default control/data path.
-2. One OS-native TUN path is validated per host campaign.
+2. One cross-platform OS-native TUN path is now validated for direct TCP; other
+   host pairings remain separate campaigns.
 3. Linux native TUN and Windows Wintun are separate acceptance lanes.
 4. Alternate transports and morphology features remain laboratory or research
    surfaces until they have their own interoperability, host, and security
@@ -24,14 +25,16 @@ claim.
 | --- | --- | --- | --- |
 | TCP `listen` / `connect` / `send-once` / `recv-once` | Supported for controlled lab use | In scope | CLI integration tests, demo, and locked workspace gates |
 | Session `up` without native TUN | Supported for controlled lab use | In scope | Session, shutdown, reconnect, and control-plane tests |
-| Linux native TUN | Implemented and capability-gated | In scope for a Linux host campaign | `/dev/net/tun`, privilege, route/DNS, killswitch, packet, and two-host evidence are separate gates |
-| Windows Wintun | Wired; elevated adapter/session and control-plane lifecycle smoke validated | In scope for a Windows host campaign only after packet evidence | Signed/hash-pinned runtime, elevation, packet I/O, reconnect, and two-host evidence remain required; see `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md` |
+| Cross-platform Windows Wintun ↔ Linux TUN over direct TCP | Validated for controlled IPv4 forwarding | Evidence-backed engineering lane; not a production guarantee | Authenticated two-host route, external egress, bounded 64 MiB transfer, reconnect, impairment, MTU boundary, session hold, and teardown passed; see `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md` |
+| Linux native TUN | Implemented and capability-gated | In scope for a Linux host campaign | The cross-platform lane passed; dedicated Linux/Linux forwarding, throughput, PMTU, DNS/IPv6, killswitch crash, and long-soak evidence remain |
+| Windows Wintun | Wired; lifecycle and one cross-platform peer-forwarding run validated | In scope for the validated direct-TCP lane only | Signed/hash-pinned runtime, elevation, packet I/O, reconnect, Windows/Windows forwarding, and crash-time WFP evidence remain; see the Windows lifecycle and cross-platform reports |
 | Linux/Windows control-plane dry run | Supported | In scope | Planner and CLI tests; no host mutation is implied |
-| Live route/DNS mutation | Implemented with rollback paths | Host-gated | Requires an isolated privileged operator campaign |
+| Live route/DNS mutation | Implemented with rollback paths | Partially evidenced | Windows lifecycle rollback and cross-platform IPv4 route teardown passed; DNS, failure interruption, and broader host coverage remain |
 | Linux killswitch and MSS clamp | Implemented as opt-in controls | Host-gated | Unit/planner tests exist; privileged crash-leak and rollback evidence remain open |
-| Windows WFP killswitch | Implemented as an opt-in policy backend | Host-gated | Elevated loopback install/teardown smoke validated; crash-leak, packet-path, and two-host policy evidence remain open |
+| Windows WFP killswitch | Implemented as an opt-in policy backend | Host-gated | Elevated loopback install/teardown smoke validated; cross-platform forwarding did not exercise crash containment, so crash-leak and policy packet-path evidence remain open |
+| Optional SOCKS5/Xray underlay | Bounded experimental add-on | Out of release profile | Authorized no-TUN preflight and one-shot payload passed through a local SOCKS5/Xray and Quick Tunnel path; full-route, long-duration, and hostile-network evidence remain open |
 | Legacy `quic` UDP shim | Experimental | Out of release profile | Lab round trips and malformed-input tests only; not conformant QUIC |
-| `quic-standard` | Experimental, host-gated | Out of release profile | Quinn/rustls, RFC 9221, persistent certificate/key reuse, host/join onboarding, and Linux native-TUN bridge exist; privileged two-host forwarding and Windows native-TUN evidence remain open |
+| `quic-standard` | Experimental, host-gated | Out of release profile | Quinn/rustls, RFC 9221, persistent certificate/key reuse, host/join onboarding, and Linux native-TUN bridge exist; standards-QUIC two-host forwarding and Windows standards-QUIC evidence remain open |
 | Shroud morphology profiles | Experimental lab instrumentation | Out of release profile | Benchmark and framing evidence only; no fingerprint or stealth claim |
 | `offline-mesh` | Experimental filesystem adapter | Out of release profile | Authenticated shared-spool session, distinct-root copy/replication, bounded scan/quarantine, restart-safe replay, and Windows long-path tests; no wireless discovery or delivery guarantee |
 | `data-mule` | Experimental filesystem courier adapter | Out of release profile | Authenticated shared-spool session, bounded file-envelope/quarantine/quota tests, and Windows long-path coverage; no courier or hostile-filesystem guarantee |

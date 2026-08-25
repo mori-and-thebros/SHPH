@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.5-dev.1] - 2026-08-25
+
+This documentation and evidence follow-up records the current controlled
+cross-platform validation work and a transport reliability fix. It remains a
+prototype release for controlled lab environments; it does not claim
+production VPN performance, censorship resistance, anonymity, or independent
+security-audit status.
+
+- Fixed established TCP sessions inheriting the short handshake read/write
+  deadlines after successful authentication, with focused regression coverage.
+- Added sanitized Windows-to-Linux native-TUN evidence covering authenticated
+  IPv4 forwarding, bounded transfer, reconnect, impairment, MTU boundaries,
+  session hold, and teardown.
+- Added a separately scoped optional SOCKS5/Xray underlay evidence report
+  covering an authorized no-TUN handshake and one-shot payload.
+- Updated the public README, security boundary, support matrix, hardening
+  notes, testing guidance, release-readiness rules, and evidence index.
+- Corrected current evidence counts and documented Criterion performance
+  follow-up signals without presenting them as correctness failures.
+- Kept host-pair, crash-containment, DNS/IPv6/UDP, standards-QUIC, and
+  long-duration gaps explicit; no production or censorship-resistance claim
+  is added.
+
 ## [0.6.5-dev] - 2026-08-25
 
 This prototype release packages security hardening, transport reliability

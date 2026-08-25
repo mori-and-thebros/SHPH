@@ -594,8 +594,9 @@ Files: `shph-core/src/cookie.rs`, `shph-core/src/handshake.rs`,
 Regression coverage includes cookie rotation/address binding, bounded TCP
 challenge framing, pressure-threshold selection, deterministic role
 complementarity, histogram-backed morphology bounds, and MTU command
-validation. Native firewall execution and privileged two-host evidence remain
-platform-gated.
+validation. Native firewall execution and broader host campaigns remain
+platform-gated; one Windows-to-Linux direct-TCP forwarding campaign is recorded
+in the dated cross-platform evidence report.
 
 ## Increment 24 — Opt-in host leak containment and transcript framing
 
@@ -671,7 +672,8 @@ Files: `shph-core/src/crypto.rs`, `shph-core/src/handshake.rs`,
 
 The source-level hardening is covered by focused regression and static
 validation records. Full workspace check/test/Clippy execution belongs to the
-dedicated native-platform campaigns; see the current
+dedicated native-platform campaigns; the cross-platform direct-TCP forwarding
+result and its boundaries are recorded separately. See the current
 `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md` record, the historical
 post-loader record, and `docs/TESTING.md` for the evidence boundary.
 

@@ -2,15 +2,18 @@
 
 This is an engineering snapshot from an elevated Windows host. It records
 native Wintun adapter/session lifecycle, route/DNS rollback, and the opt-in
-Windows Filtering Platform killswitch smoke. It does not claim packet
-forwarding, two-host throughput, reconnect reliability, or production VPN
-readiness.
+Windows Filtering Platform killswitch smoke. Packet forwarding was validated
+separately in the cross-platform report
+`CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`. This record alone does
+not claim two-host throughput, reconnect reliability, crash-time containment,
+or production VPN readiness.
 
 ## Provenance
 
 | Field | Value |
 | --- | --- |
-| Workspace base | `v0.6.4-dev.4`, `HEAD=ade2c8355d34312cd528b4c0fa8578df9dd9de2d` |
+| Validation base | `v0.6.5-dev`, `HEAD=e44483897574d39a550b2c145d47fc480ffa4e5b` |
+| Publication ref | `v0.6.5-dev.1` follow-up |
 | Date | August 25, 2026 |
 | Host | Windows 11 workstation |
 | Target | `x86_64-pc-windows-msvc` |
@@ -18,10 +21,10 @@ readiness.
 | Wintun | Application-local AMD64 runtime |
 | Authenticode | Valid; signer reported as WireGuard LLC |
 | Wintun SHA-256 | `E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE` |
-| Working tree | Dirty engineering tree; this record is not a release snapshot |
+| Capture timing | Pre-publication engineering run; sanitized and published with the follow-up |
 
-The benchmark commit field identifies `HEAD`; it does not imply that the
-working-tree changes were committed or published.
+The validation base identifies the source revision used for the run; the
+sanitized report is published with the `v0.6.5-dev.1` follow-up.
 
 ## Gate results
 
@@ -35,7 +38,7 @@ working-tree changes were committed or published.
 | Elevated WFP killswitch install | PASS |
 | WFP policy teardown | PASS |
 | Post-run residue audit | PASS |
-| Workspace tests, final pre-doc pass | PASS — 315 tests, 0 failures |
+| Workspace tests, final pre-doc pass | PASS — 316 tests, 0 failures |
 | Workspace strict Clippy | PASS |
 | Release CLI build | PASS |
 
@@ -54,8 +57,9 @@ The post-run audit found:
 - no temporary `1.1.1.1` DNS entry; and
 - no temporary SHPH phase directory.
 
-This validates lifecycle and control-plane rollback. The validator did not
-inject packets through a peer or measure forwarding throughput.
+This validates lifecycle and control-plane rollback. The validator itself did
+not inject packets through a peer; forwarding, throughput, reconnect, and
+impairment results are recorded separately in the cross-platform report.
 
 ## Windows WFP smoke
 
@@ -84,10 +88,10 @@ two-node killswitch effectiveness.
 
 ## Remaining host gates
 
-Still open for a broader native Windows claim:
+Still open beyond the separately recorded cross-platform direct-TCP lane:
 
-1. real Wintun packet send/receive through a configured peer;
+1. a Windows-to-Windows native Wintun forwarding campaign;
 2. reconnect and Ctrl+C behavior during a live native session;
-3. authenticated two-node Windows forwarding and throughput;
+3. authenticated two-node throughput and packet-loss measurements;
 4. crash/forced-termination leak behavior under the persistent WFP policy; and
-5. native Linux two-host forwarding.
+5. native Linux-to-Linux forwarding and standards-QUIC host evidence.

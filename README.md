@@ -9,7 +9,7 @@ anti-censorship guarantees.
 
 ## Current Status (2026-08-25)
 
-Workspace version `0.6.5-dev` (prototype pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.5-dev.1` (prototype pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -86,15 +86,17 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   validation, shared-session cloning, bounded event waits, and RAII teardown.
   The operator validator additionally requires a valid Authenticode signature.
   An elevated host has now verified the signed runtime, adapter/session
-  lifecycle, route/DNS rollback, and a loopback WFP install/teardown smoke.
-  `SHPH_TUN_NATIVE=1` remains host-gated for real packet forwarding,
-  reconnect, and two-node operation.
+  lifecycle, route/DNS rollback, and a loopback WFP install/teardown smoke. A
+  separate controlled Windows-to-Linux direct-TCP campaign also validated native
+  IPv4 forwarding, Linux-host egress, bounded throughput, reconnect, session
+  hold, and teardown. This does not close Windows-to-Windows, Linux-to-Linux,
+  DNS/IPv6, UDP/QUIC, or crash-time WFP gates.
 - The historical native Windows validation snapshot records formatting, locked
   checks, strict Clippy, **180 workspace tests**, release builds, Windows-only
   Wintun unit tests, Windows ACL coverage, and both benchmark profiles. The
-  the `v0.6.4-dev.4` release evidence records 304 workspace tests; these totals
-  belong to different snapshots and must not be conflated. The current dirty
-  engineering pass reached 315 workspace tests. The lifecycle record reports
+  The `v0.6.4-dev.4` release evidence records 304 workspace tests; these totals
+  belong to different snapshots and must not be conflated. The current
+  engineering pass reached 316 workspace tests. The lifecycle record reports
   clean adapter, route, DNS, WFP, process, and temporary-directory teardown.
   See
   `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`.
@@ -156,9 +158,10 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   primitives, but are not production defaults or claims of live hardware/
   transport integrations. Hybrid PQC is shipped in v0.4.0.
 - Full production anti-observation claims are explicitly out of scope at this stage.
-- Real Wintun packet I/O through an authenticated peer, reconnect and Ctrl+C
-  behavior during a native session, crash-time WFP leak testing, two-node
-  Windows forwarding, and native Linux two-host evidence remain release gates.
+- Broader native-TUN coverage remains open: Ctrl+C and forced-termination
+  behavior during a native session, crash-time WFP leak testing,
+  Windows-to-Windows and Linux-to-Linux campaigns, UDP/QUIC, PMTU/DNS/IPv6
+  coverage, and standards-QUIC host validation.
 
 The current development sequence is Shroud lab completion, hardening and
 optimization, release-readiness, then the remaining native Windows TUN gates.
@@ -448,6 +451,8 @@ Additional docs:
 - `CONTRIBUTING.md` (build/test, release checklist, governance)
 - `.github/workflows/ci.yml` (Linux + Windows CI template)
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md` (current elevated Windows lifecycle evidence)
+- `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md` (Windows-to-Linux direct-TCP IPv4 forwarding evidence)
+- `docs/evidence/OPTIONAL_XRAY_UNDERLAY_VALIDATION_2026-08-25.md` (bounded optional SOCKS5/Xray underlay evidence)
 
 ## Security Note
 

@@ -8,6 +8,13 @@ This directory contains reproducibility artifacts, not source-of-truth code.
   `cargo audit --deny warnings` after dependency changes.
 - `WINDOWS_NATIVE_VALIDATION_2026-08-25.md` is the current elevated Windows
   Wintun lifecycle, route/DNS rollback, and loopback WFP smoke record.
+- `CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md` records the separate
+  Windows-Wintun to Linux-TUN direct-TCP IPv4 forwarding campaign, including
+  external egress, throughput, reconnect, impairment, MTU boundary, session
+  hold, and teardown.
+- `OPTIONAL_XRAY_UNDERLAY_VALIDATION_2026-08-25.md` records the separate,
+  bounded SOCKS5/Xray and Quick Tunnel interoperability checks. It does not
+  promote the optional add-on into the direct release profile.
 - `WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md` is retained as a
   historical post-loader validation record.
 - `docs/SECURITY_EVIDENCE.md` defines the evidence tiers and redaction review

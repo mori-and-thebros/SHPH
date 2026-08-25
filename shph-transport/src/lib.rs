@@ -2047,6 +2047,7 @@ pub fn tcp_connect_and_handshake_with_profile_and_underlay(
         write_tcp_pq_ct_with_deadline(&mut stream, &ct, deadline)?;
     }
     let state = verify_and_derive(local_identity, &material, &peer_hello, true, policy)?;
+    clear_deadline_timeout(&stream)?;
     Ok((stream, state))
 }
 
@@ -2373,6 +2374,7 @@ impl TcpHandshakeWorker {
             false,
             &self.policy,
         )?;
+        clear_deadline_timeout(&self.stream)?;
         Ok((self.stream, state))
     }
 }
@@ -2645,6 +2647,12 @@ fn refresh_deadline_timeout(stream: &TcpStream, deadline: Instant) -> Result<()>
     }
     stream.set_read_timeout(Some(remaining))?;
     stream.set_write_timeout(Some(remaining))?;
+    Ok(())
+}
+
+fn clear_deadline_timeout(stream: &TcpStream) -> Result<()> {
+    stream.set_read_timeout(None).map_err(ShphError::Io)?;
+    stream.set_write_timeout(None).map_err(ShphError::Io)?;
     Ok(())
 }
 
@@ -5540,6 +5548,61 @@ mod tests {
         assert!(
             server.join().expect("server thread").is_ok(),
             "listener should return the legitimate session"
+        );
+    }
+
+    #[test]
+    fn tcp_established_session_outlives_handshake_deadline() {
+        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve TCP port");
+        let address = probe.local_addr().expect("probe address");
+        drop(probe);
+
+        let server_identity = IdentityKeyPair::generate().expect("server identity");
+        let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
+        let server_address = address.to_string();
+        let server_identity_for_thread = server_identity.clone();
+        let server_policy_for_thread = server_policy.clone();
+        let client_handle = thread::spawn(move || {
+            super::connect_secure_session_with_profile(
+                &server_address,
+                &client_identity,
+                &client_policy,
+                1,
+                TransportMode::Tcp,
+                HandshakeProfile::ClassicalLab,
+            )
+        });
+
+        let (mut server_session, _) = super::accept_secure_session_with_profile(
+            &address.to_string(),
+            &server_identity_for_thread,
+            &server_policy_for_thread,
+            1,
+            TransportMode::Tcp,
+            HandshakeProfile::ClassicalLab,
+        )
+        .expect("server handshake");
+        let (mut client_session, _) = client_handle
+            .join()
+            .expect("client thread")
+            .expect("client handshake");
+
+        thread::sleep(Duration::from_millis(1_200));
+        client_session
+            .send_frame(b"post-handshake-client-frame")
+            .expect("send client frame after handshake deadline");
+        assert_eq!(
+            server_session.recv_frame().expect("receive client frame"),
+            b"post-handshake-client-frame"
+        );
+        server_session
+            .send_frame(b"post-handshake-server-frame")
+            .expect("send server frame after handshake deadline");
+        assert_eq!(
+            client_session.recv_frame().expect("receive server frame"),
+            b"post-handshake-server-frame"
         );
     }
 

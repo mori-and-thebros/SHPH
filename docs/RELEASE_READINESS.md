@@ -131,6 +131,10 @@ close the other.
 
 Linux requires `/dev/net/tun`, `CAP_NET_ADMIN` or root, an isolated namespace
 or dedicated host, packet injection, route/DNS checks, and two-host forwarding.
+The cross-platform Windows-to-Linux direct-TCP campaign is now recorded in
+`docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`; it closes
+that specific IPv4 forwarding lane, but not the dedicated Linux/Linux campaign
+or the standards-QUIC lane.
 The available helpers are:
 
 ```bash
@@ -145,10 +149,15 @@ throughput evidence.
 Windows requires a complete MSVC toolchain, a valid Authenticode-verified and
 SHA-256-pinned Wintun runtime, elevation, adapter/session lifecycle, packet
 send/receive, route/DNS rollback, reconnect, teardown, and a two-node run.
+The cross-platform report closes packet forwarding and one service-restart
+reconnect path for one direct-TCP IPv4 configuration; it does not close
+Windows-to-Windows operation, forced-termination, or WFP crash-leak evidence.
 The dated August 25 record closes only the signed runtime, lifecycle,
 temporary route/DNS rollback, and loopback WFP smoke portions.
 The benchmark wrapper explicitly keeps native TUN disabled unless a prepared
-operator campaign supplies the missing evidence.
+operator campaign supplies the missing evidence. Do not merge the
+cross-platform direct-TCP result with standards-QUIC, Xray, IPv6, DNS, PMTU, or
+long-duration performance claims.
 
 ### 5. Security evidence gates
 

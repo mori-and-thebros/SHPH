@@ -1,71 +1,93 @@
 # SHPH Quality, Tests, and Benchmark Evidence
 
-This document summarizes the validation available for the `v0.6.5-dev`
-prototype. The tag and commit attached to the GitHub publication are
-the final provenance record. Measurements are labeled carefully: local and
-GitHub-hosted benchmark results are not Internet throughput, and code-path
-tests are not independent security audits.
+This document summarizes the validation available for the `v0.6.5-dev.1`
+development line. The detailed collector capture was made before publication
+from the working tree based on `e44483897574d39a550b2c145d47fc480ffa4e5b`;
+the versioned follow-up was then checked from a clean candidate tree. Local
+and GitHub-hosted benchmark results are not Internet throughput, and code-path
+tests are not an independent security audit.
 
-## Release provenance
+## Provenance
 
 | Field | Value |
 | --- | --- |
-| Candidate tag | `v0.6.5-dev` |
-| Release commit | See the commit attached to the `v0.6.5-dev` tag |
+| Development line | `v0.6.5-dev.1` |
+| Source base revision | `e44483897574d39a550b2c145d47fc480ffa4e5b` |
+| Publication ref | `v0.6.5-dev.1` |
 | Validation date | 2026-08-25 |
-| Primary host | Windows |
+| Primary host | Windows 11 |
 | Rust toolchain | `rustc 1.96.0 (ac68faa20 2026-05-25)` |
 | Main target | `x86_64-pc-windows-msvc` |
 | Additional target | `i686-pc-windows-msvc` |
-| Build mode | locked release/debug validation |
-| Local capture provenance | pre-publication candidate tree; commit recorded in each raw capture |
+| Final candidate tree | Clean before publication |
 
-## Release validation results
+## Automated gate capture
 
-The following gates passed on the candidate tree:
+The strict release-readiness collector was run with dirty-tree evidence
+allowed during the pre-publication engineering capture. The final candidate
+was separately rerun through the locked code gates from a clean tree. The
+privileged native-host gate remains host-gated in the collector because its
+dedicated operator evidence is captured separately.
 
 | Gate | Result |
 | --- | --- |
 | `cargo fmt --all -- --check` | PASS |
-| `cargo check --workspace --locked` | PASS |
+| `cargo metadata --format-version 1 --no-deps --locked` | PASS |
+| `cargo check --workspace --all-targets --locked` | PASS |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS |
-| `cargo test --workspace --locked -- --test-threads=1` | PASS |
-| Workspace release/all-target build | PASS |
-| `shph-cli` release build for 32-bit MSVC | PASS |
-| Standalone benchmark format/check gates | PASS |
-| Standalone fuzz-manifest format/check gates | PASS |
-| Windows benchmark identity smoke | PASS |
-| Windows benchmark wire smoke | PASS |
-| Windows full `all` and `extended` campaigns | PASS |
-| Criterion capture | PASS — 150 estimate files |
-| Five-target fuzz smoke | PASS |
+| `cargo test --workspace --all-targets --locked` | PASS |
+| Workspace release build | PASS |
+| Benchmark manifest check | PASS |
+| Fuzz manifest check | PASS |
 | `cargo audit --deny warnings` | PASS |
+| Clean-tree gate | PASS on the final candidate; the historical collector capture was WARN because it preceded publication |
+| Dedicated native host toolchain gate | SKIP in collector; covered by operator evidence |
+| Dedicated native TUN two-host gate | SKIP in collector; covered by operator evidence |
+| Collector release eligibility | Host-gated; direct two-host evidence is recorded separately |
 
-The workspace test run executed **315 tests with 0 failures** across the CLI,
-configuration, core cryptography/handshake, identity, obfuscation, transport,
-and TUN crates. The audit scanned 299 locked crate dependencies.
+The workspace test run executed **316 tests with 0 failures** across the CLI,
+configuration, core cryptography and handshake, identity, obfuscation,
+transport, and TUN crates. The advisory scan covered 299 locked crate
+dependencies.
 
-The standalone benchmark crate ran **7 tests with 0 failures**, then completed
-both `secure-default` and explicit benchmark-only `classical-lab` captures for
-the `all` and `extended` suites at 100 latency iterations and 10,000 frames.
-The Criterion harness completed **150 estimate files** across the crypto,
-defensive-path, handshake, framing, Shroud2, identity-record, and tuned
-session-padding groups. Criterion comparison output includes ordinary
-performance-regression signals for some microbenchmarks; those are engineering
-signals, not correctness failures.
+## Fuzz smoke
 
-The transport regression coverage includes a test for a length-prefixed TCP
-frame split across polling timeouts. The receiver now preserves partial
-prefix/ciphertext state instead of attempting to parse the next read as a new
-frame.
+The five checked-in fuzz targets completed 1,000 executions each, for 5,000
+requested executions total, using the installed MSVC sanitizer runtime:
 
-## Local benchmark results
+| Target | Runs | Result |
+| --- | ---: | --- |
+| `frame_decode` | 1,000 | PASS |
+| `config_parse` | 1,000 | PASS |
+| `audit_record` | 1,000 | PASS |
+| `replay_window` | 1,000 | PASS |
+| `shroud2_datagram` | 1,000 | PASS |
 
-The current values come from the dated tuned-profile campaign in
-[`docs/BENCHMARK_RESULTS_2026-08-23.md`](BENCHMARK_RESULTS_2026-08-23.md).
-They measure the current Shroud2 implementation in memory on a Windows
-workstation; IP, UDP, Ethernet, socket, TUN, and Internet overhead are
-excluded unless stated.
+This is smoke evidence. It is not a 20-million or 100-million iteration
+campaign and does not replace an independent audit.
+
+## Criterion capture
+
+The Windows Criterion harness generated 536 report files covering crypto,
+defensive paths, handshakes, framing, Shroud2, identity records, adapters,
+and tuned session-padding groups.
+
+The capture completed successfully, but stored-baseline comparisons reported
+performance follow-up signals:
+
+- identity record verification: approximately +5-10%;
+- JSON parse and verification: approximately +3-9%;
+- JSON serialization: approximately +21-33%; and
+- Shroud2 batch push/flush: approximately +6-12%.
+
+These are microbenchmark comparison signals, not correctness failures. They
+should be investigated before calling the prototype performance-optimized.
+
+## Local Shroud and defensive measurements
+
+The following values are local in-memory measurements from the existing
+benchmark campaign. IP, UDP, Ethernet, socket, TUN, and Internet overhead are
+excluded unless explicitly stated.
 
 ### Shroud2 wire overhead
 
@@ -79,7 +101,7 @@ excluded unless stated.
 
 The overhead is relative to plaintext payload bytes. Small interactive
 payloads remain expensive because the smallest low-latency wire class is much
-larger than a keystroke-sized payload. These figures do not prove traffic
+larger than a keystroke-sized payload. These values do not prove traffic
 indistinguishability, browser similarity, or DPI classifier failure.
 
 ### Pre-authentication and replay measurements
@@ -92,119 +114,66 @@ indistinguishability, browser similarity, or DPI classifier failure.
 | 128-bit replay-window validation | 17,490,222 validations/sec |
 
 These are single-process or in-memory measurements. They are not network
-flood capacity, DDoS protection, line-rate throughput, or a guarantee for a
-different CPU or compiler.
+flood capacity, DDoS protection, line-rate throughput, or a guarantee for
+another CPU or compiler.
 
-### Candidate capture layers
+## Privileged host evidence
 
-The candidate capture was executed on Windows 11 with Rust 1.96.0 and the
-release benchmark binary. The raw directories are intentionally ignored from
-Git and are recorded here for provenance:
+The elevated Windows validator passed signed/hash-pinned Wintun lifecycle,
+temporary route and DNS rollback, loopback WFP install/teardown, and residue
+checks. See
+[`evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`](evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md).
 
-| Capture | Scope | Result |
-| --- | --- | --- |
-| `benchmark-runs/readiness-full-20260823` | Historical `all`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
-| `benchmark-runs/readiness-extended-20260823` | Historical `extended`, secure-default + classical-lab, 100 iterations, 10,000 frames | PASS |
-| `benchmark-runs/readiness-criterion-20260823` | Historical Criterion, 150 estimate files | PASS |
-| `benchmark-runs/defensive-20260825` | Defensive rejection suite, Windows release, 2,000 samples per scenario | PASS |
+A separate Windows-to-Linux native-TUN campaign passed:
 
-These are workstation-local engineering measurements. The corresponding
-GitHub-hosted Linux and Windows campaigns are configured in CI and will
-produce separate 30-day artifacts after the follow-up commit is pushed.
-GitHub-hosted values must not be merged with this workstation capture.
+- authenticated direct-TCP handshake;
+- native adapter and Linux TUN setup;
+- default-route forwarding and Linux-host egress;
+- 10/10 initial pings and 5/5 post-reconnect pings;
+- a controlled 64 MiB transfer at approximately 1.27 MB/s;
+- a 90-second six-sample soak;
+- bounded impairment, DF/MTU-boundary, and teardown checks.
 
-### Local scaling and MTU/loss modeling
+The complete scope and limitations are in
+[`evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`](evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md).
 
-The extended campaign in
-[`docs/BENCHMARK_EXTENDED_RESULTS_2026-08-18.md`](BENCHMARK_EXTENDED_RESULTS_2026-08-18.md)
-reported the following in-memory concurrent Shroud2 results:
+The optional local SOCKS5/Xray-compatible underlay also completed an
+authorized no-TUN SHPH preflight and one-shot payload test. It is not part of
+the direct-TCP release profile; see
+[`evidence/OPTIONAL_XRAY_UNDERLAY_VALIDATION_2026-08-25.md`](evidence/OPTIONAL_XRAY_UNDERLAY_VALIDATION_2026-08-25.md).
 
-| Workers | Goodput | Wire rate | Packets/sec |
-| ---: | ---: | ---: | ---: |
-| 1 | 52.451 Mbps | 590.366 Mbps | 858,649 |
-| 2 | 98.168 Mbps | 1,102.398 Mbps | 1,602,487 |
-| 4 | 163.014 Mbps | 1,836.431 Mbps | 2,665,387 |
-| 8 | 216.828 Mbps | 2,448.797 Mbps | 3,548,553 |
+## What the evidence proves
 
-The same campaign generated valid local Shroud2 datagrams across path-MTU
-values from 1,200 to 1,472 bytes. With deterministic packet drops injected,
-delivery was approximately 89–90% at 10% loss and approximately 95% at 5%
-loss; all non-dropped datagrams decoded successfully. This is a local model,
-not PMTU discovery or real-network loss recovery.
-
-## What the evidence does prove
-
-- The candidate workspace compiles with locked dependencies on the tested
-  Windows MSVC targets.
+- The workspace builds and passes the locked automated gates on the tested
+  Windows MSVC environment.
 - The exercised cryptographic, identity, framing, replay, transport, CLI,
-  configuration, and TUN unit/integration paths pass the recorded tests.
-- The TCP receiver handles partial frame delivery across polling timeouts.
-- The benchmark harness can reproduce bounded local morphology, crypto,
-  replay, scaling, and MTU/loss measurements.
-- The dependency advisory scan passed for the committed lockfile.
+  configuration, and TUN paths pass the recorded tests.
+- Established TCP sessions no longer inherit handshake read/write deadlines.
+- One controlled Windows-to-Linux direct-TCP native-TUN IPv4 lane carried
+  external traffic and completed reconnect and teardown checks.
+- One authorized no-TUN payload crossed the optional SOCKS5/Xray underlay.
 
 ## What the evidence does not prove
 
 This document does not establish:
 
-- production VPN readiness or an uptime/SLA guarantee;
-- live Internet throughput, two-host forwarding, or 10/40-Gbps saturation;
+- production VPN readiness, an uptime/SLA guarantee, or a stable Quick Tunnel;
+- anonymity or an anonymity set;
 - DPI evasion, censorship resistance, browser/TLS fingerprint parity, or
   traffic indistinguishability;
 - DDoS capacity from local cryptographic operation rates;
-- native Linux TUN or elevated Windows Wintun packet-path completion;
-- route/DNS/killswitch crash-leak behavior on every supported host; or
+- generalized Linux/Linux or Windows/Windows native-TUN operation;
+- IPv6, DNS, UDP, standards-QUIC, crash-time killswitch containment, or
+  full-route/long-duration Xray behavior; or
 - independent cryptographic or security-audit certification.
 
-The local Windows fuzz wrapper completed one smoke run for each of the five
-checked-in fuzz targets. This does not replace a long-duration fuzz campaign,
-Linux namespace validation, native TUN acceptance, or an independent audit.
-Those remain separate evidence layers in
-[`docs/RELEASE_READINESS.md`](RELEASE_READINESS.md).
+## Remaining release gates
 
-## Reproduce the core checks
+Before a release claim, SHPH still needs a clean-tree capture with complete
+provenance, dedicated Linux/Linux and Windows/Windows campaigns, forced
+termination and WFP crash-leak evidence, explicit DNS/IPv6/UDP and
+standards-QUIC validation, and follow-up on the Criterion regressions.
 
-From the repository root:
-
-```powershell
-cargo fmt --all -- --check
-cargo check --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked -- --test-threads=1
-cargo build --release --workspace --all-targets --locked
-cargo build --release --target i686-pc-windows-msvc -p shph-cli --locked
-cargo audit --deny warnings
-```
-
-For the standalone benchmark harness:
-
-```powershell
-cargo check --manifest-path benchmarks/Cargo.toml --all-targets --locked
-cargo run --manifest-path benchmarks/Cargo.toml --release -- `
-  --profile secure-default --suite evidence --iterations 1 --frames 1
-cargo run --manifest-path benchmarks/Cargo.toml --release -- `
-  --profile secure-default --suite defensive --iterations 2000 --frames 1
-```
-
-Run new measurements on a clean tree and record the commit, target, compiler,
-profile, iteration count, and host capability skips alongside the results.
-
-## Addendum — 2026-08-25 engineering pass
-
-The focused `defensive` suite was added to the standalone benchmark runner and
-Criterion harness. A Windows release capture ran 2,000 samples for each of
-nine malformed-input or policy-rejection scenarios; all samples rejected as
-expected. The detailed values and command are recorded in
-[`BENCHMARK_RESULTS_2026-08-25.md`](BENCHMARK_RESULTS_2026-08-25.md).
-
-An elevated Windows host also completed the signed/hash-pinned Wintun
-adapter/session lifecycle, temporary route/DNS apply-and-rollback, and
-loopback WFP install/teardown smoke. That evidence is recorded in
-[`evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`](evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md).
-These records are engineering snapshots from a dirty tree, not release
-evidence or an independent audit.
-
-The following gates remain open: real native packet send/receive through an
-authenticated peer, reconnect and Ctrl+C behavior during a native session,
-crash-time WFP leak testing, authenticated two-node Windows forwarding, and
-native Linux two-host forwarding.
+The binding gate definitions are in
+[`RELEASE_READINESS.md`](RELEASE_READINESS.md), with the support boundary in
+[`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md).

@@ -47,6 +47,11 @@ This file maps the repository layout and the main public validation artifacts.
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`: current elevated
   Windows Wintun lifecycle, route/DNS rollback, WFP smoke, and remaining
   packet-path gates.
+- `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`:
+  current Windows-to-Linux direct-TCP IPv4 forwarding evidence and its
+  remaining coverage limits.
+- `docs/evidence/OPTIONAL_XRAY_UNDERLAY_VALIDATION_2026-08-25.md`:
+  bounded optional SOCKS5/Xray and Quick Tunnel interoperability evidence.
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`: historical
   post-loader Windows validation record.
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`: versioned Shroud 2.0 morphology evidence.
@@ -87,6 +92,8 @@ This file maps the repository layout and the main public validation artifacts.
   `docs/BENCHMARK_RESULTS_2026-08-05.md`.
 - Current native Windows lifecycle validation:
   `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`.
+- Current cross-platform native-TUN forwarding validation:
+  `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`.
 - Current Shroud report: `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`.
 - Historical benchmark reports remain in `docs/` for regression comparison and
   are labeled by date; they are not the current score source.

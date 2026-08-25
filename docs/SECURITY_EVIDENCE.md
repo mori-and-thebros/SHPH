@@ -14,8 +14,9 @@ the full stack, or production security.
 | S3 | Host or two-node evidence | native TUN, packet path, route/DNS rollback, killswitch crash test |
 | S4 | Independent review | external code or security review with scope and findings |
 
-Most current SHPH evidence is S0-S2. Native host work is a separate S3 gate.
-There is no S4 claim in this repository.
+Most current SHPH evidence is S0-S2. One S3 cross-platform native-TUN
+campaign is now recorded, but broader S3 host gates remain open. There is no S4
+claim in this repository.
 
 ## Threat-to-evidence map
 
@@ -29,8 +30,10 @@ There is no S4 claim in this repository.
 | Local secret disclosure | Owner-only keystore, atomic writes, zeroizing key material | core keystore/crypto tests; secret-material scan | Host compromise and memory forensics remain out of scope |
 | File adapter traversal or aliasing | Bounded sanitized components, regular-file checks, restart-safe replay identity, and Windows extended-length path handling | roadmap/transport adapter tests, authenticated spool sessions, and distinct-root replication test | Hostile filesystem TOCTOU remains out of scope |
 | Route/DNS residue | Preflight and rollback state machine | CLI control-plane tests; elevated Windows lifecycle record | Broader host coverage and failure-interruption testing remain S3 work |
-| Crash-time plaintext egress | Opt-in Linux nftables or Windows WFP policy | planner/unit tests; elevated Windows loopback WFP smoke | Privileged crash-leak and two-host evidence remain open |
-| Native TUN packet corruption | IP header/length validation, packet bounds, complete writes, zeroized buffers | TUN unit tests | Native packet forwarding is host-gated |
+| Crash-time plaintext egress | Opt-in Linux nftables or Windows WFP policy | planner/unit tests; elevated Windows loopback WFP smoke | Privileged crash-leak, failure-interruption, and broader host evidence remain open |
+| Native TUN packet forwarding | IP header/length validation, packet bounds, complete writes, zeroized buffers | `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md` | One direct-TCP Windows-to-Linux IPv4 lane passed, including bounded throughput, reconnect, impairment, MTU-boundary, and soak checks; Linux/Linux, Windows/Windows, IPv6, DNS, UDP, crash containment, and production performance remain open |
+| Optional SOCKS5/Xray underlay | Authenticated SHPH framing remains end-to-end through a local SOCKS5 relay | `docs/evidence/OPTIONAL_XRAY_UNDERLAY_VALIDATION_2026-08-25.md` | One authorized no-TUN preflight and payload path passed; full-route, long-duration, provider, and hostile-network behavior remain open |
+| Established-session timeout inheritance | Clear transport deadlines after successful handshake | focused transport regression plus cross-platform session hold | Longer reconnect and underlay coverage remain open |
 | Dependency compromise or known advisory | Locked manifests and blocking advisory job | `cargo audit --deny warnings`; CI workflow | Advisory database freshness depends on the audit run |
 
 ## Required automated checks

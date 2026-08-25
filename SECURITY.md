@@ -102,7 +102,10 @@ independent third-party security audit.
   `up --killswitch` installs a dedicated Linux nftables policy or elevated
   Windows WFP connection policy before native TUN setup. It is not enabled by
   default, requires literal peer IP/port allowlists, and still needs
-  privileged crash-leak and two-host validation. `up --mss-clamp` adds Linux
+  privileged crash-leak validation. A controlled Windows-to-Linux native-TUN
+  campaign has now validated normal IPv4 forwarding and Linux-host egress;
+  this does not validate crash behavior or every supported host pairing.
+  `up --mss-clamp` adds Linux
   TCP SYN MSS clamping for the 1360-byte native TUN MTU; Windows reports this
   option as unsupported.
 - Graceful SIGINT/SIGTERM shutdown on Unix and console-control shutdown on Windows.
@@ -179,7 +182,9 @@ evidence, and receives appropriate external review:
 | Endpoint compromise / key theft | Out of scope: no HSM/TPM binding yet. |
 | Traffic-analysis / DPI | Out of scope: no fingerprint parity yet. |
 | Host privilege escalation via control-plane apply | Mitigated by dry-run default, preflight validation, and OS privilege requirements. |
-| Plaintext route/DNS egress after process crash | Partial: opt-in native killswitch policy exists for Linux nftables and Windows WFP, but privileged crash-leak and two-host evidence remain open. |
+| Native TUN IPv4 forwarding between distinct hosts | Validated for one Windows-Wintun to Linux-TUN direct-TCP campaign; see `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`. This is not a general platform or protocol guarantee. |
+| Plaintext route/DNS egress after process crash | Partial: normal route/NAT teardown was observed in the cross-platform campaign, but privileged crash-leak behavior, DNS, and broader host coverage remain open. |
+| Established-session lifetime after handshake deadline | Mitigated: handshake socket deadlines are cleared after successful authentication; focused regression and live two-host validation passed. |
 
 ## Cryptographic Dependencies
 
