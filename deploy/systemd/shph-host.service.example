@@ -1,0 +1,50 @@
+[Unit]
+Description=SHPH authenticated host (operator template)
+Documentation=https://github.com/mori-and-thebros/SHPH
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/local/bin/shph
+ConditionPathExists=/etc/shph/host.toml
+ConditionPathExists=/etc/shph/keystore.json
+
+[Service]
+Type=simple
+User=shph
+Group=shph
+UMask=0077
+EnvironmentFile=-/etc/shph/host.env
+
+# host.env must define SHPH_ADVERTISE, SHPH_PORT, SHPH_TRANSPORT, and
+# SHPH_SHROUD_PROFILE. Keep SHPH_KEYSTORE_PASSWORD in that file only when the
+# keystore is encrypted; never place it in this unit or in source control.
+ExecStart=/usr/local/bin/shph --config /etc/shph/host.toml host --port ${SHPH_PORT} --advertise ${SHPH_ADVERTISE} --transport ${SHPH_TRANSPORT} --shroud-profile ${SHPH_SHROUD_PROFILE} --no-tun --no-nat
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+KillMode=mixed
+LimitNOFILE=65536
+
+# This template is for the stable authenticated TCP/no-TUN host lane. Native
+# TUN/NAT requires a separately reviewed unit with narrowly scoped privileges.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=/run/shph
+RuntimeDirectory=shph
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

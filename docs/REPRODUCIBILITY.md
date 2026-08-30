@@ -99,6 +99,24 @@ evidence.
    `cargo test --workspace` pass on both Linux and Windows.
 4. Compare the produced binary checksum against the published checksum.
 
+For a small distribution directory containing only reviewed public material,
+use the repository packager after building the target binary:
+
+```bash
+python scripts/package_release.py \
+  --binary target/release/shph \
+  --output dist/shph-package
+```
+
+Use `target/release/shph.exe` for a Windows build. The packager records the
+source revision, dirty-tree state, lockfile checksums, payload checksums, and
+platform metadata in `manifest.json`, and writes a `SHA256SUMS` file. It uses
+an explicit public-document allowlist and refuses symlinks, oversized files,
+and common private-key or token markers. `--allow-dirty` is available for
+engineering snapshots, but a release package must be made from a clean tree.
+This is packaging and provenance evidence; it is not artifact signing,
+byte-for-byte reproducibility, or an independent security review.
+
 ## Known reproducibility caveats
 
 - `ring` includes pre-generated assembly/C and its build detection can vary by

@@ -171,9 +171,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -871,7 +871,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20 0.10.1",
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -1095,7 +1095,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shph-config"
-version = "0.6.5-dev.1"
+version = "0.6.6-dev"
 dependencies = [
  "anyhow",
  "clap",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "shph-core"
-version = "0.6.5-dev.1"
+version = "0.6.6-dev"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1142,20 +1142,22 @@ dependencies = [
  "serde_json",
  "shph-config",
  "shph-core",
+ "shph-obfuscation",
  "shph-transport",
 ]
 
 [[package]]
 name = "shph-obfuscation"
-version = "0.6.5-dev.1"
+version = "0.6.6-dev"
 dependencies = [
  "rand 0.8.7",
  "shph-core",
+ "zeroize",
 ]
 
 [[package]]
 name = "shph-transport"
-version = "0.6.5-dev.1"
+version = "0.6.6-dev"
 dependencies = [
  "base64 0.21.7",
  "bytes",
@@ -1169,13 +1171,14 @@ dependencies = [
  "shph-obfuscation",
  "shph-tun",
  "tokio",
+ "tracing",
  "windows-sys 0.61.2",
  "zeroize",
 ]
 
 [[package]]
 name = "shph-tun"
-version = "0.6.5-dev.1"
+version = "0.6.6-dev"
 dependencies = [
  "libc",
  "sha2",

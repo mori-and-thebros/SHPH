@@ -1,0 +1,59 @@
+[package]
+name = "shph-edge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Owned-domain Phantom One opaque edge relay prototype"
+
+[workspace]
+
+[lib]
+name = "shph_edge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shph-edge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-core = "0.3"
+http = "1.3"
+http-body-util = "0.1"
+hyper = { version = "1.7", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "server", "tokio"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.14", features = ["std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["full"] }
+tokio-stream = "0.1"
+tokio-rustls = "0.26"
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2.5"
+
+# HTTP/3 is kept as a real opt-in carrier. The upstream APIs are experimental;
+# build and exercise it explicitly with `cargo test --features http3`.
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+
+[features]
+# Keep the HTTP/3 carrier out of the default build so deployments opt in
+# deliberately to the experimental upstream h3 API and QUIC surface.
+default = []
+http3 = ["dep:h3", "dep:h3-quinn"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

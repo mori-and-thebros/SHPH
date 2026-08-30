@@ -8,10 +8,45 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use shph_core::{Result, ShphError, ShroudProfile, StealthProfile};
 use std::str::FromStr;
+use zeroize::Zeroize;
 
 const PROFILE_MAGIC: &[u8; 4] = b"SPAD";
 pub const PROFILE_HEADER_BYTES: usize = 7;
 const LOW_JITTER_BYTES: usize = 7;
+
+struct WipeBufferOnError<'a> {
+    buffer: &'a mut Vec<u8>,
+    committed: bool,
+}
+
+impl<'a> WipeBufferOnError<'a> {
+    fn new(buffer: &'a mut Vec<u8>) -> Self {
+        Self {
+            buffer,
+            committed: false,
+        }
+    }
+
+    fn prepare(&mut self, target_len: usize) {
+        if self.buffer.len() > target_len {
+            self.buffer[target_len..].zeroize();
+        }
+        self.buffer.clear();
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for WipeBufferOnError<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.buffer.zeroize();
+            self.buffer.clear();
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ObfuscationPreset {
@@ -61,6 +96,22 @@ impl ProfileTier {
         }
     }
 
+    /// Decode the stable wire identifier used by Phantom One.
+    ///
+    /// Values outside the six assigned tiers are deliberately rejected rather
+    /// than mapped to a default profile.
+    pub const fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::Low),
+            1 => Some(Self::Medium),
+            2 => Some(Self::High),
+            3 => Some(Self::TunedLow),
+            4 => Some(Self::TunedMedium),
+            5 => Some(Self::TunedHigh),
+            _ => None,
+        }
+    }
+
     pub const fn base_tiers(self) -> &'static [usize] {
         match self {
             Self::Low => &[128, 256],
@@ -94,7 +145,10 @@ impl ProfileTier {
         }
     }
 
-    fn accepts_frame_len(self, len: usize) -> bool {
+    /// Return whether a frame length belongs to this profile's canonical
+    /// discrete-size set, including the intentionally bounded low-profile
+    /// jitter.
+    pub fn accepts_frame_len(self, len: usize) -> bool {
         match self {
             Self::Low => {
                 (128..=128 + LOW_JITTER_BYTES).contains(&len)
@@ -107,6 +161,16 @@ impl ProfileTier {
             Self::Medium | Self::High | Self::TunedMedium | Self::TunedHigh => {
                 self.base_tiers().contains(&len)
             }
+        }
+    }
+
+    /// Largest canonical frame length for this profile.
+    pub const fn max_canonical_frame_len(self) -> usize {
+        let base = self.base_tiers()[self.base_tiers().len() - 1];
+        base + match self {
+            Self::Low => LOW_JITTER_BYTES,
+            Self::TunedLow => 3,
+            _ => 0,
         }
     }
 
@@ -186,6 +250,7 @@ fn apply_profile_into_with_rng(
     framed: &mut Vec<u8>,
     rng: &mut impl RngCore,
 ) -> Result<()> {
+    let mut cleanup = WipeBufferOnError::new(framed);
     let minimum = PROFILE_HEADER_BYTES
         .checked_add(payload.len())
         .ok_or_else(|| ShphError::Obfuscation("profile payload length overflow".into()))?;
@@ -201,35 +266,59 @@ fn apply_profile_into_with_rng(
                 payload.len()
             ))
         })?;
+    let payload_len = u16::try_from(payload.len())
+        .map_err(|_| ShphError::Obfuscation("profile payload exceeds u16".into()))?;
     let jitter = if matches!(profile, ProfileTier::Low | ProfileTier::TunedLow) {
         let jitter_bound = if matches!(profile, ProfileTier::TunedLow) {
             3
         } else {
             LOW_JITTER_BYTES
         };
-        usize::from((rng.next_u32() & 0xff) as u8) % (jitter_bound + 1)
+        sample_uniform_below(rng, (jitter_bound + 1) as u32)
     } else {
         0
     };
     let frame_len = base
         .checked_add(jitter)
         .ok_or_else(|| ShphError::Obfuscation("profile frame length overflow".into()))?;
-
-    framed.clear();
-    framed.resize(frame_len, 0);
-    framed[..PROFILE_MAGIC.len()].copy_from_slice(PROFILE_MAGIC);
-    framed[PROFILE_MAGIC.len()] = profile.id();
-    framed[5..7].copy_from_slice(
-        &u16::try_from(payload.len())
-            .map_err(|_| ShphError::Obfuscation("profile payload exceeds u16".into()))?
-            .to_be_bytes(),
-    );
-    framed[PROFILE_HEADER_BYTES..PROFILE_HEADER_BYTES + payload.len()].copy_from_slice(payload);
-    if PROFILE_HEADER_BYTES + payload.len() < framed.len() {
-        rng.try_fill_bytes(&mut framed[PROFILE_HEADER_BYTES + payload.len()..])
-            .map_err(|_| ShphError::Crypto("OS randomness unavailable".into()))?;
+    if frame_len > u16::MAX as usize {
+        return Err(ShphError::Obfuscation(
+            "profile frame length exceeds u16".into(),
+        ));
     }
+
+    cleanup.prepare(frame_len);
+    cleanup.buffer.resize(frame_len, 0);
+    cleanup.buffer[..PROFILE_MAGIC.len()].copy_from_slice(PROFILE_MAGIC);
+    cleanup.buffer[PROFILE_MAGIC.len()] = profile.id();
+    cleanup.buffer[5..7].copy_from_slice(&payload_len.to_be_bytes());
+    cleanup.buffer[PROFILE_HEADER_BYTES..PROFILE_HEADER_BYTES + payload.len()]
+        .copy_from_slice(payload);
+    if PROFILE_HEADER_BYTES + payload.len() < cleanup.buffer.len()
+        && rng
+            .try_fill_bytes(&mut cleanup.buffer[PROFILE_HEADER_BYTES + payload.len()..])
+            .is_err()
+    {
+        return Err(ShphError::Crypto("OS randomness unavailable".into()));
+    }
+    cleanup.commit();
     Ok(())
+}
+
+fn sample_uniform_below(rng: &mut impl RngCore, upper: u32) -> usize {
+    debug_assert!(upper > 0);
+    if upper <= 1 {
+        return 0;
+    }
+
+    let range = u64::from(u32::MAX) + 1;
+    let limit = range - range % u64::from(upper);
+    loop {
+        let sample = u64::from(rng.next_u32());
+        if sample < limit {
+            return (sample % u64::from(upper)) as usize;
+        }
+    }
 }
 
 /// Apply a bounded, authenticated profile envelope to an application payload.
@@ -239,10 +328,22 @@ fn apply_profile_into_with_rng(
 /// decryption. A caller should treat the returned bytes as opaque transport
 /// plaintext rather than application data.
 pub fn apply_profile(profile: ProfileTier, payload: &[u8]) -> Result<Vec<u8>> {
-    let mut rng = rand::rngs::OsRng;
     let mut framed = Vec::new();
-    apply_profile_into_with_rng(profile, payload, &mut framed, &mut rng)?;
+    apply_profile_into(profile, payload, &mut framed)?;
     Ok(framed)
+}
+
+/// Apply a profile envelope into a caller-owned reusable buffer.
+///
+/// Rejected requests clear the buffer. Successful reuse overwrites the new
+/// envelope and wipes bytes retired by a shrink.
+pub fn apply_profile_into(
+    profile: ProfileTier,
+    payload: &[u8],
+    framed: &mut Vec<u8>,
+) -> Result<()> {
+    let mut rng = rand::rngs::OsRng;
+    apply_profile_into_with_rng(profile, payload, framed, &mut rng)
 }
 
 /// Remove a profile envelope after transport AEAD decryption.
@@ -251,31 +352,60 @@ pub fn apply_profile(profile: ProfileTier, payload: &[u8]) -> Result<Vec<u8>> {
 /// receivers tolerant of legacy unprofiled peers. A present but malformed
 /// marker fails closed.
 pub fn remove_profile(profile: ProfileTier, framed: &[u8]) -> Result<Vec<u8>> {
-    if framed.len() < PROFILE_HEADER_BYTES || &framed[..PROFILE_MAGIC.len()] != PROFILE_MAGIC {
-        return Ok(framed.to_vec());
+    let mut reusable = framed.to_vec();
+    remove_profile_in_place(profile, &mut reusable)?;
+    Ok(reusable)
+}
+
+/// Remove a profile envelope in the caller-owned decrypted buffer.
+///
+/// The payload is moved to the front and the vector is truncated, so callers
+/// that already own the decrypted transport buffer avoid a second allocation.
+pub fn remove_profile_in_place(profile: ProfileTier, framed: &mut Vec<u8>) -> Result<()> {
+    let cleanup = WipeBufferOnError::new(framed);
+    if cleanup.buffer.len() < PROFILE_MAGIC.len()
+        || &cleanup.buffer[..PROFILE_MAGIC.len()] != PROFILE_MAGIC
+    {
+        cleanup.commit();
+        return Ok(());
     }
-    if framed[PROFILE_MAGIC.len()] != profile.id() {
+    if cleanup.buffer.len() < PROFILE_HEADER_BYTES {
+        return Err(ShphError::Obfuscation(
+            "profile envelope is truncated".into(),
+        ));
+    }
+    if cleanup.buffer[PROFILE_MAGIC.len()] != profile.id() {
         return Err(ShphError::Obfuscation(
             "profile envelope tier mismatch".into(),
         ));
     }
-    if !profile.accepts_frame_len(framed.len()) {
+    if !profile.accepts_frame_len(cleanup.buffer.len()) {
         return Err(ShphError::Obfuscation(
             "profile envelope size is not a canonical tier".into(),
         ));
     }
-    let payload_len = u16::from_be_bytes([framed[5], framed[6]]) as usize;
-    if payload_len > framed.len() - PROFILE_HEADER_BYTES {
+    let payload_len = u16::from_be_bytes([cleanup.buffer[5], cleanup.buffer[6]]) as usize;
+    if payload_len > cleanup.buffer.len() - PROFILE_HEADER_BYTES {
         return Err(ShphError::Obfuscation(
             "profile envelope payload length exceeds frame".into(),
         ));
     }
-    Ok(framed[PROFILE_HEADER_BYTES..PROFILE_HEADER_BYTES + payload_len].to_vec())
+    let payload_end = PROFILE_HEADER_BYTES + payload_len;
+    cleanup
+        .buffer
+        .copy_within(PROFILE_HEADER_BYTES..payload_end, 0);
+    cleanup.buffer[payload_len..].zeroize();
+    cleanup.buffer.truncate(payload_len);
+    cleanup.commit();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_profile, remove_profile, ProfilePadder, ProfileTier};
+    use super::{
+        apply_profile, remove_profile, remove_profile_in_place, ProfilePadder, ProfileTier,
+        PROFILE_HEADER_BYTES,
+    };
 
     #[test]
     fn profile_tiers_match_the_declared_discrete_mapping() {
@@ -346,6 +476,25 @@ mod tests {
     }
 
     #[test]
+    fn profile_ids_are_strict_and_stable() {
+        let profiles = [
+            ProfileTier::Low,
+            ProfileTier::Medium,
+            ProfileTier::High,
+            ProfileTier::TunedLow,
+            ProfileTier::TunedMedium,
+            ProfileTier::TunedHigh,
+        ];
+
+        for (id, profile) in profiles.into_iter().enumerate() {
+            assert_eq!(profile.id(), id as u8);
+            assert_eq!(ProfileTier::from_id(id as u8), Some(profile));
+        }
+        assert_eq!(ProfileTier::from_id(6), None);
+        assert_eq!(ProfileTier::from_id(u8::MAX), None);
+    }
+
+    #[test]
     fn every_profile_round_trips_and_stays_bounded() {
         for profile in [
             ProfileTier::Low,
@@ -405,10 +554,47 @@ mod tests {
     }
 
     #[test]
+    fn reusable_profile_encode_clears_buffer_on_rejection() {
+        let mut padder = ProfilePadder::from_seed(ProfileTier::Low, [8; 32]);
+        let mut framed = Vec::new();
+        padder
+            .apply_into(b"previous", &mut framed)
+            .expect("initial envelope");
+        assert!(padder.apply_into(&[0u8; 2_000], &mut framed).is_err());
+        assert!(framed.is_empty());
+    }
+
+    #[test]
     fn malformed_profile_marker_fails_closed() {
         let mut framed = apply_profile(ProfileTier::Medium, b"payload").expect("apply profile");
         framed[5..7].copy_from_slice(&u16::MAX.to_be_bytes());
         assert!(remove_profile(ProfileTier::Medium, &framed).is_err());
+    }
+
+    #[test]
+    fn malformed_profile_removal_clears_reusable_buffer() {
+        let mut framed = apply_profile(ProfileTier::Medium, b"payload").expect("apply profile");
+        framed[5..7].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(remove_profile_in_place(ProfileTier::Medium, &mut framed).is_err());
+        assert!(framed.is_empty());
+    }
+
+    #[test]
+    fn truncated_profile_marker_fails_closed() {
+        for length in 4..PROFILE_HEADER_BYTES {
+            let mut framed = b"SPAD".to_vec();
+            framed.resize(length, 0);
+            assert!(remove_profile(ProfileTier::Medium, &framed).is_err());
+        }
+    }
+
+    #[test]
+    fn profile_removal_can_reuse_the_decrypted_buffer() {
+        let framed = apply_profile(ProfileTier::Medium, b"payload").expect("apply profile");
+        let expected = remove_profile(ProfileTier::Medium, &framed).expect("remove profile");
+        let mut reusable = framed;
+        remove_profile_in_place(ProfileTier::Medium, &mut reusable).expect("remove in place");
+        assert_eq!(reusable, expected);
     }
 
     #[test]

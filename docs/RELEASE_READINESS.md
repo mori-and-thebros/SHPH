@@ -63,6 +63,12 @@ cargo build --workspace --release --locked
 cargo check --manifest-path benchmarks/Cargo.toml --all-targets --locked
 cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
 cargo audit --deny warnings
+cargo test -p shph-cli --test cli_reliability --locked -- --test-threads=1
+
+# standalone owned-domain edge relay prototype
+cargo test --manifest-path shph-edge/Cargo.toml --all-targets --locked
+cargo clippy --manifest-path shph-edge/Cargo.toml --all-targets --locked -- -D warnings
+cargo build --manifest-path shph-edge/Cargo.toml --release --locked
 ```
 
 On a disconnected workstation, `--offline` may be added only when the local
@@ -79,8 +85,28 @@ Use the collector to record the result without hiding failures:
 pwsh -File .\scripts\release_readiness.ps1 -AllowDirty
 ```
 
+On a Windows host with only Windows PowerShell 5.1 installed, use:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\release_readiness.ps1 -AllowDirty
+```
+
 `-AllowDirty` is for an engineering snapshot only; it deliberately leaves the
 result ineligible for release.
+
+For a release candidate, build the platform binary and create a sanitized
+package without `--allow-dirty`:
+
+```text
+python scripts/package_release.py --binary target/release/shph \
+  --output dist/shph-package
+```
+
+Use `target/release/shph.exe` for Windows. The package manifest and
+`SHA256SUMS` file are provenance/integrity evidence for the selected payload.
+The packager's allowlist is intentionally narrower than the repository and
+does not include deployment files, scratch output, raw evidence, keystores, or
+internal maintainer guidance.
 
 ### 2. Functional controlled-lab gates
 
@@ -93,6 +119,7 @@ The TCP release lane must show:
 5. malformed configuration rejection without partial control-plane apply;
 6. reconnect behavior with an isolated peer;
 7. no secret material in the captured output.
+8. repeated fresh-process sessions complete under the bounded reliability test.
 
 The no-privilege starting point is:
 
@@ -123,6 +150,31 @@ The operator campaign must separately record:
 - exact privilege and host-tool prerequisites.
 
 No planner or dry-run result is evidence that a privileged host policy worked.
+
+The control-plane planner also rejects semantically duplicate routes,
+underlay-bypass routes, and DNS servers before applying any host mutation.
+This is a deterministic safety property; it does not prove that an operating
+system, network manager, or firewall will accept or retain the resulting
+policy.
+
+### 3.5 Owned edge relay prototype
+
+`shph-edge/` is a standalone, opt-in prototype and is validated independently
+from the SHPH workspace. Its checks include:
+
+- numeric, non-zero backend socket addresses;
+- paired TLS certificate/key configuration;
+- bounded capability tokens, replay state, streams, connections, and relay
+  bytes;
+- loopback-only unauthenticated SOCKS5 listening;
+- bounded HTTP/2 and optional HTTP/3 carrier behavior;
+- graceful cancellation and task reaping on Ctrl+C/SIGTERM.
+
+The edge process must use an owned TLS endpoint and an explicitly configured
+backend. It is not a public proxy, does not impersonate third-party sites,
+and does not establish browser fingerprint parity, anonymity, or
+censorship-resistance claims. The standalone test suite is code-path evidence,
+not two-host or hostile-network evidence.
 
 ### 4. Native TUN gates
 
@@ -165,6 +217,12 @@ Run:
 
 ```powershell
 pwsh -File .\scripts\security_evidence.ps1 -AllowDirty
+```
+
+The Windows PowerShell 5.1 equivalent is:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\security_evidence.ps1 -AllowDirty
 ```
 
 Then review `docs/SECURITY_EVIDENCE.md` and attach:

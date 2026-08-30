@@ -131,6 +131,45 @@ function Invoke-CargoGate {
     }
 }
 
+function Find-MsvcLinker {
+    $linker = Get-Command link.exe -ErrorAction SilentlyContinue
+    if ($linker) {
+        return $linker
+    }
+
+    $installer = if (${env:ProgramFiles(x86)}) {
+        Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    } else {
+        $null
+    }
+    $installations = @()
+    if ($installer -and (Test-Path -LiteralPath $installer)) {
+        $installations += @(& $installer -products * -property installationPath 2>$null)
+    }
+    $installations += @(
+        "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools",
+        "C:\Program Files\Microsoft Visual Studio\18\BuildTools"
+    )
+
+    foreach ($installation in ($installations | Where-Object { $_ } | Select-Object -Unique)) {
+        $msvcRoot = Join-Path ([string]$installation) "VC\Tools\MSVC"
+        if (-not (Test-Path -LiteralPath $msvcRoot)) {
+            continue
+        }
+        foreach ($toolset in (Get-ChildItem -LiteralPath $msvcRoot -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($candidate in @(
+                (Join-Path $toolset.FullName "bin\Hostx64\x64\link.exe"),
+                (Join-Path $toolset.FullName "bin\Hostx86\x64\link.exe")
+            )) {
+                if (Test-Path -LiteralPath $candidate) {
+                    return Get-Item -LiteralPath $candidate
+                }
+            }
+        }
+    }
+    return $null
+}
+
 Write-RunLog "# SHPH release-readiness collector"
 Write-RunLog "generated_utc=$((Get-Date).ToUniversalTime().ToString("o"))"
 Write-RunLog "repository=$repoRoot"
@@ -214,15 +253,25 @@ if ($null -eq $cargo) {
 
     Invoke-CargoGate -Id "benchmark-manifest" -Arguments (@("check", "--manifest-path", "benchmarks/Cargo.toml", "--all-targets") + $cargoFlags)
     Invoke-CargoGate -Id "fuzz-manifest" -Arguments (@("check", "--manifest-path", "fuzz/Cargo.toml", "--all-targets") + $cargoFlags)
+    if (Test-Path -LiteralPath (Join-Path $repoRoot "shph-edge/Cargo.toml")) {
+        Invoke-CargoGate -Id "edge-tests" `
+            -Arguments (@("test", "--manifest-path", "shph-edge/Cargo.toml", "--all-targets") + $cargoFlags)
+        Invoke-CargoGate -Id "edge-clippy" `
+            -Arguments (@("clippy", "--manifest-path", "shph-edge/Cargo.toml", "--all-targets") + $cargoFlags + @("--", "-D", "warnings"))
+    }
 
     if ($SkipAudit) {
         Add-SyntheticResult -Id "cargo-audit" -Status "SKIP" -Class "required" `
             -Command "cargo audit --deny warnings" -Detail "explicitly skipped"
     } elseif ($null -eq (Get-Command cargo-audit -ErrorAction SilentlyContinue)) {
-        Add-SyntheticResult -Id "cargo-audit" -Status "SKIP" -Class "required" `
+            Add-SyntheticResult -Id "cargo-audit" -Status "SKIP" -Class "required" `
             -Command "cargo audit --deny warnings" -Detail "cargo-audit is not installed"
     } else {
-        Invoke-CargoGate -Id "cargo-audit" -Arguments @("audit", "--deny", "warnings")
+        $auditArguments = @("audit", "--deny", "warnings")
+        if (-not $AllowNetwork) {
+            $auditArguments += "--no-fetch"
+        }
+        Invoke-CargoGate -Id "cargo-audit" -Arguments $auditArguments
     }
 }
 
@@ -231,13 +280,13 @@ if ($SkipNative) {
     Add-SyntheticResult -Id "native-host-toolchain" -Status "SKIP" -Class "host" `
         -Command "native host preflight" -Detail "explicitly skipped"
 } elseif ($isWindowsHost) {
-    $linker = Get-Command link.exe -ErrorAction SilentlyContinue
+    $linker = Find-MsvcLinker
     if ($null -eq $linker) {
         Add-SyntheticResult -Id "native-host-toolchain" -Status "SKIP" -Class "host" `
             -Command "Get-Command link.exe" -Detail "MSVC link.exe is unavailable"
     } else {
         Add-SyntheticResult -Id "native-host-toolchain" -Status "PASS" -Class "host" `
-            -Command "Get-Command link.exe" -Detail $linker.Source
+            -Command "Get-Command link.exe" -Detail $linker.FullName
     }
 } else {
     Add-SyntheticResult -Id "native-host-toolchain" -Status "SKIP" -Class "host" `

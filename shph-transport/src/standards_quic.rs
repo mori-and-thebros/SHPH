@@ -8,9 +8,13 @@
 //! explicitly.
 
 use crate::ja4::{self, Ja4Observer, Ja4ObserverConfig};
+use crate::phantom_one::{
+    PhantomOneConfig, PhantomOneDecoder, PhantomOneEncoder, PhantomOneFrameType,
+    PHANTOM_ONE_HEADER_BYTES,
+};
 use crate::shroud2::{
-    decode_batched_datagram, decode_datagram, encode_batched_datagram, MorphologyBatchPushResult,
-    MorphologyBatcher, MorphologyEngine,
+    decode_batched_datagram, decode_datagram_in_place, encode_batched_datagram,
+    MorphologyBatchPushResult, MorphologyBatcher, MorphologyEngine,
 };
 use bytes::Bytes;
 use quinn::rustls::server::ResolvesServerCert;
@@ -21,17 +25,27 @@ use quinn::{
 use shph_core::{
     absorb_responder_pq, build_hello_with_profile, finalize_initiator_pq, verify_and_derive,
     verify_hello_signature, HandshakeProfile, HandshakeState, Hello, IdentityKeyPair, PeerPolicy,
-    Result, ShphError,
+    ReceiveCipher, Result, SendCipher, ShphError,
 };
+use shph_obfuscation::ProfileTier;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_HANDSHAKE_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_TUN_DATAGRAM_BYTES: usize = 65_535;
+const SHPH_AEAD_OVERHEAD_BYTES: usize = 12 + 16;
+const MAX_PHANTOM_ONE_STREAM_ENVELOPE_BYTES: usize = 16 * 1024;
+const MAX_PHANTOM_ONE_STREAM_RECORD_BYTES: usize =
+    MAX_PHANTOM_ONE_STREAM_ENVELOPE_BYTES + SHPH_AEAD_OVERHEAD_BYTES;
+const PHANTOM_ONE_STREAM_INTRO: &[u8] = b"SHPH/phantom-one-stream/1";
+const PHANTOM_ONE_STREAM_RESET_CODE: VarInt = VarInt::from_u32(0x100);
+const PHANTOM_ONE_CAPABILITY_MAGIC: &[u8] = b"SHPH-PH1-CAP/1";
+const PHANTOM_ONE_CAPABILITY_DISABLED: u8 = u8::MAX;
+const PHANTOM_ONE_CAPABILITY_BYTES: usize = PHANTOM_ONE_CAPABILITY_MAGIC.len() + 1;
 const MAX_DATAGRAM_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_CONCURRENT_STREAMS: u64 = 1024;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -163,6 +177,18 @@ pub struct StandardsQuicConnection {
     pub handshake: HandshakeState,
     control_send: SendStream,
     control_recv: RecvStream,
+    phantom_one: Option<PhantomOneState>,
+    phantom_one_negotiated: bool,
+}
+
+struct PhantomOneState {
+    profile: ProfileTier,
+    send_cipher: SendCipher,
+    recv_cipher: ReceiveCipher,
+    encoder: PhantomOneEncoder,
+    decoder: PhantomOneDecoder,
+    application_send: Option<SendStream>,
+    application_recv: Option<RecvStream>,
 }
 
 /// Create a self-signed server endpoint for lab or controlled deployments.
@@ -392,6 +418,8 @@ async fn connect_inner(
         handshake,
         control_send,
         control_recv,
+        phantom_one: None,
+        phantom_one_negotiated: false,
     })
 }
 
@@ -465,6 +493,8 @@ async fn accept_inner(
         handshake,
         control_send,
         control_recv,
+        phantom_one: None,
+        phantom_one_negotiated: false,
     })
 }
 
@@ -477,6 +507,361 @@ impl StandardsQuicConnection {
     /// Receive one bounded reliable control-plane message.
     pub async fn recv_control(&mut self) -> Result<Vec<u8>> {
         read_message(&mut self.control_recv, MAX_CONTROL_MESSAGE_BYTES).await
+    }
+
+    /// Negotiate the optional authenticated Phantom One data plane.
+    ///
+    /// Both peers send a bounded capability record on the already-authenticated
+    /// QUIC control stream, then verify that the exact profile agrees. A
+    /// profile mismatch or an unsupported wire identifier fails closed; there
+    /// is no implicit upgrade, downgrade, or profile substitution.
+    pub async fn negotiate_phantom_one(
+        &mut self,
+        requested: Option<ProfileTier>,
+        negotiation_timeout: Duration,
+    ) -> Result<Option<ProfileTier>> {
+        if let Some(state) = &self.phantom_one {
+            let negotiated = if self.phantom_one_negotiated {
+                Some(state.profile)
+            } else {
+                None
+            };
+            if negotiated != requested {
+                return Err(ShphError::Protocol(
+                    "Phantom One capability was already configured with a different profile".into(),
+                ));
+            }
+            return Ok(negotiated);
+        }
+        if self.phantom_one_negotiated {
+            return Err(ShphError::Protocol(
+                "Phantom One capability was already negotiated without an enabled profile".into(),
+            ));
+        }
+        if negotiation_timeout.is_zero() {
+            return Err(ShphError::Config(
+                "Phantom One capability timeout must be greater than zero".into(),
+            ));
+        }
+
+        let result = timeout(
+            negotiation_timeout,
+            self.negotiate_phantom_one_inner(requested),
+        )
+        .await
+        .map_err(|_| ShphError::Timeout)
+        .and_then(|result| result);
+        match result {
+            Ok(profile) => Ok(profile),
+            Err(error) => {
+                self.connection
+                    .close(0u32.into(), b"Phantom One capability negotiation failed");
+                Err(error)
+            }
+        }
+    }
+
+    async fn negotiate_phantom_one_inner(
+        &mut self,
+        requested: Option<ProfileTier>,
+    ) -> Result<Option<ProfileTier>> {
+        let mut capability = Vec::with_capacity(PHANTOM_ONE_CAPABILITY_BYTES);
+        capability.extend_from_slice(PHANTOM_ONE_CAPABILITY_MAGIC);
+        capability.push(
+            requested
+                .map(ProfileTier::id)
+                .unwrap_or(PHANTOM_ONE_CAPABILITY_DISABLED),
+        );
+        self.send_control(&capability).await?;
+        let peer_capability = self.recv_control().await?;
+        let peer_profile = decode_phantom_one_capability(&peer_capability)?;
+        if peer_profile != requested {
+            self.connection
+                .close(0u32.into(), b"Phantom One capability mismatch");
+            return Err(ShphError::Protocol(format!(
+                "Phantom One profile mismatch (local {}, peer {})",
+                profile_label(requested),
+                profile_label(peer_profile)
+            )));
+        }
+
+        if let Some(profile) = requested {
+            self.enable_phantom_one(profile)?;
+        }
+        self.phantom_one_negotiated = true;
+        Ok(requested)
+    }
+
+    /// Enable the authenticated Phantom One data-plane on this connection.
+    ///
+    /// Phantom One shares the handshake-derived SHPH key material and one
+    /// directional sequence space across DATAGRAM and application-stream
+    /// records. The control stream remains unwrapped.
+    pub fn enable_phantom_one(&mut self, profile: ProfileTier) -> Result<()> {
+        if let Some(state) = &self.phantom_one {
+            if state.profile != profile {
+                return Err(ShphError::Protocol(
+                    "Phantom One profile cannot change after enablement".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let generation =
+            crate::phantom_one_generation_from_transcript(&self.handshake.transcript_hash_hex)?;
+        let config = PhantomOneConfig::for_profile(profile);
+        let decoder = PhantomOneDecoder::with_config_and_window(generation, config, 64)?;
+        self.phantom_one = Some(PhantomOneState {
+            profile,
+            send_cipher: SendCipher::new(self.handshake.session_keys.send_key),
+            recv_cipher: ReceiveCipher::new_with_replay_window(
+                self.handshake.session_keys.recv_key,
+                128,
+            ),
+            encoder: PhantomOneEncoder::with_profile(generation, profile),
+            decoder,
+            application_send: None,
+            application_recv: None,
+        });
+        Ok(())
+    }
+
+    /// Return the enabled Phantom One profile, if this connection uses it.
+    pub fn phantom_one_profile(&self) -> Option<ProfileTier> {
+        self.phantom_one.as_ref().map(|state| state.profile)
+    }
+
+    /// Return whether Phantom One was enabled through the authenticated
+    /// standards-QUIC capability exchange.
+    pub fn phantom_one_negotiated(&self) -> bool {
+        self.phantom_one_negotiated
+    }
+
+    /// Send one authenticated Phantom One DATAGRAM.
+    ///
+    /// This uses RFC 9221 QUIC DATAGRAM delivery semantics. Loss remains
+    /// possible by design; callers needing reliability should use the
+    /// dedicated Phantom One application stream.
+    pub async fn send_phantom_one_datagram(&mut self, payload: &[u8]) -> Result<()> {
+        let path_mtu = self.phantom_one_datagram_path_mtu()?;
+        let state = self.phantom_one_state_mut()?;
+        let mut envelope = Zeroizing::new(state.encoder.encode(
+            PhantomOneFrameType::Data,
+            payload,
+            path_mtu,
+        )?);
+        let ciphertext = state.send_cipher.encrypt(envelope.as_slice())?;
+        envelope.zeroize();
+        self.connection
+            .send_datagram_wait(Bytes::from(ciphertext))
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))
+    }
+
+    /// Receive and authenticate one Phantom One DATAGRAM.
+    pub async fn recv_phantom_one_datagram(&mut self) -> Result<Vec<u8>> {
+        let path_mtu = self.phantom_one_datagram_path_mtu()?;
+        let ciphertext = self
+            .connection
+            .read_datagram()
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))?;
+        let state = self.phantom_one_state_mut()?;
+        if ciphertext.len() > path_mtu + SHPH_AEAD_OVERHEAD_BYTES {
+            return Err(ShphError::Protocol(
+                "Phantom One QUIC DATAGRAM exceeds the negotiated bound".into(),
+            ));
+        }
+        let mut plaintext = Zeroizing::new(state.recv_cipher.decrypt(&ciphertext)?);
+        let frame = state.decoder.decode(&plaintext, path_mtu)?;
+        if frame.frame_type != PhantomOneFrameType::Data {
+            plaintext.zeroize();
+            return Err(ShphError::Protocol(
+                "unexpected Phantom One frame type on DATAGRAM".into(),
+            ));
+        }
+        Ok(frame.payload.to_vec())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_phantom_one_datagram_bridge(self) -> Result<PhantomOneDatagramBridge> {
+        let state = self
+            .phantom_one
+            .ok_or_else(|| ShphError::Unsupported("Phantom One is not enabled".into()))?;
+        if state.application_send.is_some() || state.application_recv.is_some() {
+            return Err(ShphError::Protocol(
+                "Phantom One application stream cannot coexist with the native-TUN datagram bridge"
+                    .into(),
+            ));
+        }
+        Ok(PhantomOneDatagramBridge {
+            connection: self.connection,
+            send_cipher: state.send_cipher,
+            recv_cipher: state.recv_cipher,
+            encoder: state.encoder,
+            decoder: state.decoder,
+        })
+    }
+
+    /// Open the one dedicated Phantom One bidirectional application stream.
+    ///
+    /// The stream starts with an authenticated Phantom One control record.
+    /// The handshake control stream is never wrapped or reused for this path.
+    pub async fn open_phantom_one_stream(&mut self) -> Result<()> {
+        if self
+            .phantom_one
+            .as_ref()
+            .ok_or_else(|| ShphError::Unsupported("Phantom One is not enabled".into()))?
+            .application_send
+            .is_some()
+            || self
+                .phantom_one
+                .as_ref()
+                .and_then(|state| state.application_recv.as_ref())
+                .is_some()
+        {
+            return Err(ShphError::Protocol(
+                "Phantom One application stream is already open".into(),
+            ));
+        }
+        let (mut send, recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))?;
+        let result = {
+            let state = self.phantom_one_state_mut()?;
+            write_phantom_one_stream_record(
+                &mut send,
+                &mut state.send_cipher,
+                &mut state.encoder,
+                PhantomOneFrameType::Control,
+                PHANTOM_ONE_STREAM_INTRO,
+            )
+            .await
+        };
+        if let Err(error) = result {
+            let _ = send.reset(PHANTOM_ONE_STREAM_RESET_CODE);
+            return Err(error);
+        }
+        self.phantom_one_state_mut()?.application_send = Some(send);
+        self.phantom_one_state_mut()?.application_recv = Some(recv);
+        Ok(())
+    }
+
+    /// Accept and authenticate the one dedicated Phantom One application stream.
+    ///
+    /// If the stream has already been claimed, the newly accepted stream is
+    /// reset immediately and an error is returned. This keeps unexpected
+    /// application streams from being silently treated as data.
+    pub async fn accept_phantom_one_stream(&mut self) -> Result<()> {
+        if self
+            .phantom_one
+            .as_ref()
+            .ok_or_else(|| ShphError::Unsupported("Phantom One is not enabled".into()))?
+            .application_recv
+            .is_some()
+            || self
+                .phantom_one
+                .as_ref()
+                .and_then(|state| state.application_send.as_ref())
+                .is_some()
+        {
+            let (mut send, mut recv) = self
+                .connection
+                .accept_bi()
+                .await
+                .map_err(|err| ShphError::Transport(err.to_string()))?;
+            let _ = send.reset(PHANTOM_ONE_STREAM_RESET_CODE);
+            let _ = recv.stop(PHANTOM_ONE_STREAM_RESET_CODE);
+            return Err(ShphError::Protocol(
+                "unexpected additional Phantom One application stream".into(),
+            ));
+        }
+        let (mut send, mut recv) = self
+            .connection
+            .accept_bi()
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))?;
+        let result = {
+            let state = self.phantom_one_state_mut()?;
+            read_phantom_one_stream_record(&mut recv, &mut state.recv_cipher, &mut state.decoder)
+                .await
+                .and_then(|frame| {
+                    if frame.frame_type == PhantomOneFrameType::Control
+                        && frame.payload.as_slice() == PHANTOM_ONE_STREAM_INTRO
+                    {
+                        Ok(())
+                    } else {
+                        Err(ShphError::Protocol(
+                            "invalid Phantom One application stream introduction".into(),
+                        ))
+                    }
+                })
+        };
+        if let Err(error) = result {
+            let _ = send.reset(PHANTOM_ONE_STREAM_RESET_CODE);
+            let _ = recv.stop(PHANTOM_ONE_STREAM_RESET_CODE);
+            return Err(error);
+        }
+        self.phantom_one_state_mut()?.application_send = Some(send);
+        self.phantom_one_state_mut()?.application_recv = Some(recv);
+        Ok(())
+    }
+
+    /// Send one bounded, reliable Phantom One application-stream record.
+    pub async fn send_phantom_one_stream_record(&mut self, payload: &[u8]) -> Result<()> {
+        let state = self.phantom_one_state_mut()?;
+        let send = state.application_send.as_mut().ok_or_else(|| {
+            ShphError::Unsupported("Phantom One application stream is not open".into())
+        })?;
+        write_phantom_one_stream_record(
+            send,
+            &mut state.send_cipher,
+            &mut state.encoder,
+            PhantomOneFrameType::Data,
+            payload,
+        )
+        .await
+    }
+
+    /// Receive one bounded, reliable Phantom One application-stream record.
+    pub async fn recv_phantom_one_stream_record(&mut self) -> Result<Vec<u8>> {
+        let state = self.phantom_one_state_mut()?;
+        let recv = state.application_recv.as_mut().ok_or_else(|| {
+            ShphError::Unsupported("Phantom One application stream is not open".into())
+        })?;
+        let frame =
+            read_phantom_one_stream_record(recv, &mut state.recv_cipher, &mut state.decoder)
+                .await?;
+        if frame.frame_type != PhantomOneFrameType::Data {
+            return Err(ShphError::Protocol(
+                "unexpected Phantom One frame type on application stream".into(),
+            ));
+        }
+        Ok(frame.payload.to_vec())
+    }
+
+    /// Finish the local send side of the Phantom One application stream.
+    pub fn finish_phantom_one_stream(&mut self) -> Result<()> {
+        let state = self.phantom_one_state_mut()?;
+        let send = state.application_send.as_mut().ok_or_else(|| {
+            ShphError::Unsupported("Phantom One application stream is not open".into())
+        })?;
+        send.finish()
+            .map_err(|err| ShphError::Transport(err.to_string()))
+    }
+
+    /// Accept and immediately reset one unexpected application stream.
+    pub async fn reject_unexpected_application_stream(&self) -> Result<()> {
+        let (mut send, mut recv) = self
+            .connection
+            .accept_bi()
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))?;
+        let _ = send.reset(PHANTOM_ONE_STREAM_RESET_CODE);
+        let _ = recv.stop(PHANTOM_ONE_STREAM_RESET_CODE);
+        Ok(())
     }
 
     /// Send one unreliable, congestion-controlled QUIC DATAGRAM.
@@ -629,12 +1014,14 @@ impl StandardsQuicConnection {
             .connection
             .max_datagram_size()
             .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
-        let datagram = self
+        let mut datagram = self
             .connection
             .read_datagram()
             .await
-            .map_err(|err| ShphError::Transport(err.to_string()))?;
-        decode_datagram(&datagram, path_mtu)
+            .map_err(|err| ShphError::Transport(err.to_string()))?
+            .to_vec();
+        decode_datagram_in_place(&mut datagram, path_mtu)?;
+        Ok(datagram)
     }
 
     /// Receive and split one authenticated Shroud2 application batch.
@@ -665,6 +1052,160 @@ impl StandardsQuicConnection {
         }
         Ok(datagram)
     }
+
+    fn phantom_one_state_mut(&mut self) -> Result<&mut PhantomOneState> {
+        self.phantom_one
+            .as_mut()
+            .ok_or_else(|| ShphError::Unsupported("Phantom One is not enabled".into()))
+    }
+
+    fn phantom_one_datagram_path_mtu(&self) -> Result<usize> {
+        let max_datagram = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let path_mtu = max_datagram
+            .checked_sub(SHPH_AEAD_OVERHEAD_BYTES)
+            .ok_or_else(|| {
+                ShphError::Protocol("QUIC DATAGRAM is too small for SHPH AEAD".into())
+            })?;
+        if path_mtu < PHANTOM_ONE_HEADER_BYTES {
+            return Err(ShphError::Protocol(
+                "QUIC DATAGRAM is too small for a Phantom One header".into(),
+            ));
+        }
+        Ok(path_mtu)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PhantomOneDatagramBridge {
+    connection: Connection,
+    send_cipher: SendCipher,
+    recv_cipher: ReceiveCipher,
+    encoder: PhantomOneEncoder,
+    decoder: PhantomOneDecoder,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PhantomOneDatagramSender {
+    connection: Connection,
+    send_cipher: SendCipher,
+    encoder: PhantomOneEncoder,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PhantomOneDatagramReceiver {
+    connection: Connection,
+    recv_cipher: ReceiveCipher,
+    decoder: PhantomOneDecoder,
+}
+
+#[cfg(target_os = "linux")]
+impl PhantomOneDatagramBridge {
+    pub(crate) fn split(self) -> (PhantomOneDatagramSender, PhantomOneDatagramReceiver) {
+        let sender_connection = self.connection.clone();
+        (
+            PhantomOneDatagramSender {
+                connection: sender_connection,
+                send_cipher: self.send_cipher,
+                encoder: self.encoder,
+            },
+            PhantomOneDatagramReceiver {
+                connection: self.connection,
+                recv_cipher: self.recv_cipher,
+                decoder: self.decoder,
+            },
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PhantomOneDatagramSender {
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    pub(crate) async fn send(&mut self, payload: &[u8]) -> Result<()> {
+        let path_mtu = phantom_one_path_mtu(&self.connection)?;
+        let mut envelope = Zeroizing::new(self.encoder.encode(
+            PhantomOneFrameType::Data,
+            payload,
+            path_mtu,
+        )?);
+        let ciphertext = self.send_cipher.encrypt(envelope.as_slice())?;
+        envelope.zeroize();
+        self.connection
+            .send_datagram_wait(Bytes::from(ciphertext))
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PhantomOneDatagramReceiver {
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    pub(crate) async fn recv(&mut self) -> Result<Vec<u8>> {
+        let path_mtu = phantom_one_path_mtu(&self.connection)?;
+        let ciphertext = self
+            .connection
+            .read_datagram()
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))?;
+        if ciphertext.len() > path_mtu + SHPH_AEAD_OVERHEAD_BYTES {
+            return Err(ShphError::Protocol(
+                "Phantom One QUIC DATAGRAM exceeds the negotiated bound".into(),
+            ));
+        }
+        let mut plaintext = Zeroizing::new(self.recv_cipher.decrypt(&ciphertext)?);
+        let frame = self.decoder.decode(&plaintext, path_mtu)?;
+        if frame.frame_type != PhantomOneFrameType::Data {
+            plaintext.zeroize();
+            return Err(ShphError::Protocol(
+                "unexpected Phantom One frame type on DATAGRAM".into(),
+            ));
+        }
+        Ok(frame.payload.to_vec())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn phantom_one_path_mtu(connection: &Connection) -> Result<usize> {
+    let max_datagram = connection
+        .max_datagram_size()
+        .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+    let path_mtu = max_datagram
+        .checked_sub(SHPH_AEAD_OVERHEAD_BYTES)
+        .ok_or_else(|| ShphError::Protocol("QUIC DATAGRAM is too small for SHPH AEAD".into()))?;
+    if path_mtu < PHANTOM_ONE_HEADER_BYTES {
+        return Err(ShphError::Protocol(
+            "QUIC DATAGRAM is too small for a Phantom One header".into(),
+        ));
+    }
+    Ok(path_mtu)
+}
+
+fn decode_phantom_one_capability(payload: &[u8]) -> Result<Option<ProfileTier>> {
+    if payload.len() != PHANTOM_ONE_CAPABILITY_BYTES
+        || !payload.starts_with(PHANTOM_ONE_CAPABILITY_MAGIC)
+    {
+        return Err(ShphError::Protocol(
+            "invalid Phantom One capability record".into(),
+        ));
+    }
+    match payload[PHANTOM_ONE_CAPABILITY_MAGIC.len()] {
+        PHANTOM_ONE_CAPABILITY_DISABLED => Ok(None),
+        id => ProfileTier::from_id(id)
+            .map(Some)
+            .ok_or_else(|| ShphError::Protocol("unknown Phantom One capability profile".into())),
+    }
+}
+
+fn profile_label(profile: Option<ProfileTier>) -> &'static str {
+    profile.map(ProfileTier::as_str).unwrap_or("disabled")
 }
 
 #[cfg(target_os = "linux")]
@@ -726,6 +1267,67 @@ async fn read_hello(stream: &mut RecvStream) -> Result<Hello> {
     serde_json::from_slice(&payload).map_err(ShphError::Serialization)
 }
 
+async fn write_phantom_one_stream_record(
+    stream: &mut SendStream,
+    cipher: &mut SendCipher,
+    encoder: &mut PhantomOneEncoder,
+    frame_type: PhantomOneFrameType,
+    payload: &[u8],
+) -> Result<()> {
+    let mut envelope = Zeroizing::new(encoder.encode(
+        frame_type,
+        payload,
+        MAX_PHANTOM_ONE_STREAM_ENVELOPE_BYTES,
+    )?);
+    let ciphertext = Zeroizing::new(cipher.encrypt(envelope.as_slice())?);
+    envelope.zeroize();
+    write_message(
+        stream,
+        ciphertext.as_slice(),
+        MAX_PHANTOM_ONE_STREAM_RECORD_BYTES,
+    )
+    .await
+}
+
+async fn read_phantom_one_stream_record(
+    stream: &mut RecvStream,
+    cipher: &mut ReceiveCipher,
+    decoder: &mut PhantomOneDecoder,
+) -> Result<crate::phantom_one::PhantomOneFrame> {
+    let ciphertext = read_message_eof_aware(stream, MAX_PHANTOM_ONE_STREAM_RECORD_BYTES).await?;
+    let mut envelope = Zeroizing::new(cipher.decrypt(&ciphertext)?);
+    let frame = decoder.decode(&envelope, MAX_PHANTOM_ONE_STREAM_ENVELOPE_BYTES)?;
+    envelope.zeroize();
+    Ok(frame)
+}
+
+async fn read_message_eof_aware(stream: &mut RecvStream, max: usize) -> Result<Zeroizing<Vec<u8>>> {
+    let mut length_bytes = [0u8; 4];
+    stream
+        .read_exact(&mut length_bytes)
+        .await
+        .map_err(map_stream_read_error)?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    if length == 0 || length > max {
+        return Err(ShphError::Protocol(
+            "Phantom One stream record length invalid".into(),
+        ));
+    }
+    let mut payload = Zeroizing::new(vec![0u8; length]);
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(map_stream_read_error)?;
+    Ok(payload)
+}
+
+fn map_stream_read_error(error: quinn::ReadExactError) -> ShphError {
+    match error {
+        quinn::ReadExactError::FinishedEarly(_) => ShphError::ConnectionClosed,
+        quinn::ReadExactError::ReadError(error) => ShphError::Transport(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -735,6 +1337,7 @@ mod tests {
     };
     use crate::ja4::{Ja4ObserverConfig, RecordingJa4Observer};
     use shph_core::{HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy};
+    use shph_obfuscation::ProfileTier;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
@@ -997,6 +1600,272 @@ mod tests {
         .expect("morphology batch timeout")
         .expect("morphology batch receive");
         assert_eq!(received, messages);
+
+        client_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        server_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    async fn established_pair(
+        handshake_profile: HandshakeProfile,
+    ) -> (
+        quinn::Endpoint,
+        super::StandardsQuicConnection,
+        super::StandardsQuicConnection,
+    ) {
+        let server_identity = IdentityKeyPair::generate().expect("server identity");
+        let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
+        let server = server_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            StandardsQuicConfig::default(),
+        )
+        .expect("server endpoint");
+        let server_addr = server.endpoint.local_addr().expect("server address");
+        let client = client_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &server.certificate_der,
+            StandardsQuicConfig::default(),
+        )
+        .expect("client endpoint");
+        let server_task = tokio::spawn(async move {
+            accept(
+                &server,
+                &server_identity,
+                &server_policy,
+                handshake_profile,
+                Duration::from_secs(10),
+            )
+            .await
+        });
+        let client_connection = connect(
+            &client,
+            server_addr,
+            "localhost",
+            &client_identity,
+            &client_policy,
+            handshake_profile,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("client QUIC/SHPH handshake");
+        let server_connection = server_task
+            .await
+            .expect("server task")
+            .expect("server QUIC/SHPH handshake");
+        (client, client_connection, server_connection)
+    }
+
+    #[tokio::test]
+    async fn phantom_one_datagrams_bind_all_profiles() {
+        let profiles = [
+            ProfileTier::Low,
+            ProfileTier::Medium,
+            ProfileTier::High,
+            ProfileTier::TunedLow,
+            ProfileTier::TunedMedium,
+            ProfileTier::TunedHigh,
+        ];
+        for profile in profiles {
+            let (client, mut client_connection, mut server_connection) =
+                established_pair(HandshakeProfile::SecureDefault).await;
+            client_connection
+                .enable_phantom_one(profile)
+                .expect("enable client Phantom One");
+            server_connection
+                .enable_phantom_one(profile)
+                .expect("enable server Phantom One");
+            assert_eq!(client_connection.phantom_one_profile(), Some(profile));
+            assert_eq!(server_connection.phantom_one_profile(), Some(profile));
+
+            client_connection
+                .send_phantom_one_datagram(b"authenticated-datagram")
+                .await
+                .expect("send Phantom One datagram");
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    server_connection.recv_phantom_one_datagram()
+                )
+                .await
+                .expect("Phantom One datagram timeout")
+                .expect("receive Phantom One datagram"),
+                b"authenticated-datagram"
+            );
+
+            client_connection
+                .connection
+                .close(0u32.into(), b"test complete");
+            server_connection
+                .connection
+                .close(0u32.into(), b"test complete");
+            client.wait_idle().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn phantom_one_capability_negotiation_is_symmetric_and_bounded() {
+        let (client, mut client_connection, mut server_connection) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        let (client_result, server_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client_connection
+                    .negotiate_phantom_one(Some(ProfileTier::TunedMedium), Duration::from_secs(2),),
+                server_connection
+                    .negotiate_phantom_one(Some(ProfileTier::TunedMedium), Duration::from_secs(2),),
+            )
+        })
+        .await
+        .expect("capability negotiation timeout");
+
+        assert_eq!(
+            client_result.expect("client capability negotiation"),
+            Some(ProfileTier::TunedMedium)
+        );
+        assert_eq!(
+            server_result.expect("server capability negotiation"),
+            Some(ProfileTier::TunedMedium)
+        );
+        assert!(client_connection.phantom_one_negotiated());
+        assert!(server_connection.phantom_one_negotiated());
+
+        client_connection
+            .send_phantom_one_datagram(b"negotiated-datagram")
+            .await
+            .expect("send negotiated datagram");
+        assert_eq!(
+            server_connection
+                .recv_phantom_one_datagram()
+                .await
+                .expect("receive negotiated datagram"),
+            b"negotiated-datagram"
+        );
+
+        client_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        server_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn phantom_one_capability_mismatch_fails_closed() {
+        let (client, mut client_connection, mut server_connection) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        let (client_result, server_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client_connection
+                    .negotiate_phantom_one(Some(ProfileTier::Medium), Duration::from_secs(2),),
+                server_connection
+                    .negotiate_phantom_one(Some(ProfileTier::High), Duration::from_secs(2),),
+            )
+        })
+        .await
+        .expect("capability mismatch timeout");
+
+        assert!(client_result.is_err());
+        assert!(server_result.is_err());
+        assert!(!client_connection.phantom_one_negotiated());
+        assert!(!server_connection.phantom_one_negotiated());
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn phantom_one_stream_is_authenticated_bounded_and_singleton() {
+        let (client, mut client_connection, mut server_connection) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        client_connection
+            .enable_phantom_one(ProfileTier::TunedMedium)
+            .expect("enable client Phantom One");
+        server_connection
+            .enable_phantom_one(ProfileTier::TunedMedium)
+            .expect("enable server Phantom One");
+
+        client_connection
+            .open_phantom_one_stream()
+            .await
+            .expect("open Phantom One application stream");
+        server_connection
+            .accept_phantom_one_stream()
+            .await
+            .expect("accept Phantom One application stream");
+        assert!(client_connection.open_phantom_one_stream().await.is_err());
+
+        client_connection
+            .send_phantom_one_stream_record(b"client-stream-record")
+            .await
+            .expect("send client stream record");
+        assert_eq!(
+            server_connection
+                .recv_phantom_one_stream_record()
+                .await
+                .expect("receive client stream record"),
+            b"client-stream-record"
+        );
+
+        server_connection
+            .send_phantom_one_stream_record(b"server-stream-record")
+            .await
+            .expect("send server stream record");
+        assert_eq!(
+            client_connection
+                .recv_phantom_one_stream_record()
+                .await
+                .expect("receive server stream record"),
+            b"server-stream-record"
+        );
+
+        client_connection
+            .finish_phantom_one_stream()
+            .expect("finish client stream");
+        assert!(matches!(
+            server_connection.recv_phantom_one_stream_record().await,
+            Err(shph_core::ShphError::ConnectionClosed)
+        ));
+
+        client_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        server_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn phantom_one_rejects_unexpected_stream_introduction() {
+        let (client, mut client_connection, mut server_connection) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        client_connection
+            .enable_phantom_one(ProfileTier::Medium)
+            .expect("enable client Phantom One");
+        server_connection
+            .enable_phantom_one(ProfileTier::Medium)
+            .expect("enable server Phantom One");
+
+        let (mut raw_send, mut raw_recv) = client_connection
+            .connection
+            .open_bi()
+            .await
+            .expect("open unexpected stream");
+        raw_send
+            .write_all(&1u32.to_be_bytes())
+            .await
+            .expect("write malformed introduction length");
+        raw_send
+            .write_all(&[0])
+            .await
+            .expect("write malformed introduction");
+        assert!(server_connection.accept_phantom_one_stream().await.is_err());
+        let _ = raw_send.reset(super::PHANTOM_ONE_STREAM_RESET_CODE);
+        let _ = raw_recv.stop(super::PHANTOM_ONE_STREAM_RESET_CODE);
 
         client_connection
             .connection

@@ -6,7 +6,9 @@
 //! bridge. Every received datagram is validated before it reaches the TUN
 //! device.
 
-use crate::standards_quic::StandardsQuicConnection;
+use crate::standards_quic::{
+    PhantomOneDatagramReceiver, PhantomOneDatagramSender, StandardsQuicConnection,
+};
 use quinn::Connection;
 use shph_core::{Result, ShphError};
 use shph_tun::{AsyncTunDevice, TUN_READ_BUFFER_BYTES};
@@ -95,6 +97,16 @@ pub async fn run(
     config: StandardsTunBridgeConfig,
 ) -> Result<StandardsTunBridgeStats> {
     let config = config.validate()?;
+    if connection.phantom_one_profile().is_some() {
+        let bridge = connection.into_phantom_one_datagram_bridge()?;
+        let (sender, receiver) = bridge.split();
+        let (sender, receiver) = tokio::try_join!(
+            phantom_one_tun_to_quic_loop(sender, tun_to_quic),
+            phantom_one_quic_to_tun_loop(receiver, quic_to_tun, config),
+        )?;
+        return Ok(sender.combine(receiver));
+    }
+
     let connection = connection.connection;
     let sender_connection = connection.clone();
     let receiver_connection = connection.clone();
@@ -105,6 +117,102 @@ pub async fn run(
     )?;
 
     Ok(sender.combine(receiver))
+}
+
+async fn phantom_one_tun_to_quic_loop(
+    mut sender: PhantomOneDatagramSender,
+    mut tun: AsyncTunDevice,
+) -> Result<StandardsTunBridgeStats> {
+    let connection = sender.connection().clone();
+    let mut stats = StandardsTunBridgeStats::default();
+    let mut packet = Zeroizing::new(vec![0u8; TUN_READ_BUFFER_BYTES]);
+
+    loop {
+        tokio::select! {
+            _ = connection.closed() => return Err(ShphError::ConnectionClosed),
+            result = tun.recv_packet(&mut packet) => {
+                match result {
+                    Ok(length) => {
+                        if length == 0 {
+                            close_connection(&connection);
+                            return Ok(stats);
+                        }
+                        if let Err(error) = sender.send(&packet[..length]).await {
+                            close_connection(&connection);
+                            return Err(error);
+                        }
+                        stats.tun_to_quic_packets =
+                            stats.tun_to_quic_packets.saturating_add(1);
+                        stats.tun_to_quic_bytes =
+                            stats.tun_to_quic_bytes.saturating_add(length as u64);
+                        packet[..length].zeroize();
+                    }
+                    Err(ShphError::ConnectionClosed) => {
+                        close_connection(&connection);
+                        return Err(ShphError::ConnectionClosed);
+                    }
+                    Err(error) => {
+                        close_connection(&connection);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn phantom_one_quic_to_tun_loop(
+    mut receiver: PhantomOneDatagramReceiver,
+    mut tun: AsyncTunDevice,
+    config: StandardsTunBridgeConfig,
+) -> Result<StandardsTunBridgeStats> {
+    let connection = receiver.connection().clone();
+    let mut stats = StandardsTunBridgeStats::default();
+    let mut invalid_datagrams = 0usize;
+
+    loop {
+        tokio::select! {
+            _ = connection.closed() => return Err(ShphError::ConnectionClosed),
+            result = receiver.recv() => {
+                let datagram = match result {
+                    Ok(datagram) => datagram,
+                    Err(error) => {
+                        close_connection(&connection);
+                        return Err(error);
+                    }
+                };
+
+                if is_oversized_tun_datagram(&datagram) {
+                    invalid_datagrams = invalid_datagrams.saturating_add(1);
+                    stats.dropped_oversized_packets =
+                        stats.dropped_oversized_packets.saturating_add(1);
+                } else if is_invalid_tun_datagram(&datagram) {
+                    invalid_datagrams = invalid_datagrams.saturating_add(1);
+                    stats.dropped_invalid_datagrams =
+                        stats.dropped_invalid_datagrams.saturating_add(1);
+                } else {
+                    let datagram = Zeroizing::new(datagram);
+                    let length = datagram.len();
+                    if let Err(error) = tun.send_packet(&datagram).await {
+                        close_connection(&connection);
+                        return Err(error);
+                    }
+                    stats.quic_to_tun_packets =
+                        stats.quic_to_tun_packets.saturating_add(1);
+                    stats.quic_to_tun_bytes =
+                        stats.quic_to_tun_bytes.saturating_add(length as u64);
+                }
+
+                if invalid_datagrams >= config.max_invalid_datagrams {
+                    close_connection(&connection);
+                    return Err(ShphError::Protocol(format!(
+                        "received {} malformed Phantom One datagrams",
+                        invalid_datagrams
+                    )));
+                }
+            }
+        }
+    }
 }
 
 async fn tun_to_quic_loop(

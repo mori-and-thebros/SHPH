@@ -18,8 +18,10 @@ cargo install cargo-fuzz --locked
 - `audit_record`: JSONL ratchet-audit record deserialization.
 - `replay_window`: replay-window state transitions over arbitrary nonce
   sequences.
-- `shroud2_datagram`: bounded Shroud 2.0 lab-envelope parsing and
+- `shroud2_datagram`: bounded Shroud 2 lab-envelope parsing and
   morphology-size selection.
+- `phantom_one_envelope`: versioned Phantom One envelope parsing, bounded
+  configuration, replay-window behavior, and sequence exhaustion.
 
 ## Run
 
@@ -33,6 +35,7 @@ cargo fuzz run config_parse -- -max_total_time=60
 cargo fuzz run audit_record -- -max_total_time=60
 cargo fuzz run replay_window -- -max_total_time=60
 cargo fuzz run shroud2_datagram -- -max_total_time=60
+cargo fuzz run phantom_one_envelope -- -max_total_time=60
 ```
 
 For a pinned Windows campaign, use the repository wrapper after installing
@@ -43,7 +46,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_fuzz_campa
   -RunsPerTarget 20000000
 ```
 
-The default is five targets times 20,000,000 executions (100,000,000 total).
+The default is six targets times 20,000,000 executions (120,000,000 total).
 The wrapper records one log and one summary row per target. On Windows with
 the MSVC AddressSanitizer runtime, it discovers
 `clang_rt.asan_dynamic-x86_64.dll` under the installed Visual Studio tree and

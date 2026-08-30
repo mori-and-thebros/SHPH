@@ -398,7 +398,7 @@ pub fn open_readonly_no_reparse(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(ShphError::Io)?
     };
@@ -537,7 +537,7 @@ pub fn ensure_no_reparse_components(path: &Path) -> Result<()> {
 }
 
 /// Cross-platform persist with crash-safe replacement semantics.
-fn persist_over(target: &Path, tmp: &Path) -> Result<()> {
+pub(crate) fn persist_over(target: &Path, tmp: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         std::fs::rename(tmp, target)?;

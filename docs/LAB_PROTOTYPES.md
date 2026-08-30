@@ -31,7 +31,7 @@ SHPH_SHROUD_PROFILE=randomized-lab
 fixed-size cell. This is useful for measuring framing behavior; it is not
 traffic-analysis resistance or browser/TLS/QUIC fingerprint mimicry.
 
-## Shroud 2.0 morphology lab
+## Shroud 2 morphology lab
 
 The standards-QUIC API also exposes an explicit morphology experiment under
 `shph_transport::shroud2`. It selects bounded payload-size classes and bounded
@@ -58,6 +58,36 @@ DATAGRAM loss would discard the entire batch.
 This is an opt-in lab morphology tool. It does not provide browser fingerprint
 parity, active-probe deflection, censorship bypass, or a stealth guarantee.
 See `docs/SHROUD_2_IMPLEMENTATION.md` for the implementation disposition.
+
+## Phantom One authenticated TCP envelope
+
+Phantom One is a separate, versioned, opt-in inner envelope for authenticated
+TCP sessions. It is selected explicitly with `--phantom-one` and an optional
+`--phantom-one-profile` on `host`, or through a join ticket that carries the
+same mode and profile:
+
+```text
+shph host --transport tcp --phantom-one --phantom-one-profile medium --no-tun
+shph join 'shph://v1:...' --no-tun
+```
+
+Phantom One uses bounded session-scoped padding, an explicit generation, frame types,
+and a bounded replay window inside the existing SHPH AEAD. It is available on
+authenticated TCP and, with explicit capability negotiation, the opt-in
+standards-QUIC path. It is not available on the legacy QUIC shim or filesystem
+adapters. Its TCP size limit is a logical encrypted-frame budget, not a physical
+path MTU. On standards QUIC, DATAGRAM mode is used for native-TUN packets and a
+dedicated reliable stream is available for ordered records. Phantom One does not provide
+browser/TLS/QUIC fingerprint parity, active-probe deflection, anonymity, or a
+censorship-resistance guarantee.
+
+The separate `shph-edge/` crate is an owned-domain HTTP/2 relay prototype for
+forwarding opaque bytes with short-lived signed capabilities. It is not part
+of the workspace release profile. Its HTTP/3 carrier is feature-gated and
+opt-in; it requires operator-owned TLS material and remains experimental with
+no recorded two-host HTTP/3 campaign. See `docs/PHANTOM_ONE_DESIGN.md`,
+`docs/PHANTOM_ONE_OPERATOR.md`, and
+`docs/PHANTOM_ONE_TESTING.md`.
 
 ## Standards QUIC module
 

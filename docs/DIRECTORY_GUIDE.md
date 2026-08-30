@@ -13,6 +13,8 @@ This file maps the repository layout and the main public validation artifacts.
 - `shph-core/`: handshake, framing, transport negotiation primitives.
 - `shph-obfuscation/`: protocol-shaping extension surface.
 - `shph-transport/`: transport enum and socket/parsing support.
+- `shph-edge/`: standalone owned-domain Phantom One HTTP/2 relay prototype;
+  separate manifest and lockfile, outside the workspace release profile.
 - `shph-identity/`: isolated experimental signed identity records,
   provider-independent local discovery.
 - `shph-tun/`: TUN abstraction crate.
@@ -55,6 +57,15 @@ This file maps the repository layout and the main public validation artifacts.
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`: historical
   post-loader Windows validation record.
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`: versioned Shroud 2.0 morphology evidence.
+- `docs/MORPHOLOGY_PERFORMANCE.md`: adaptive morphology, reusable-buffer
+  tuning, owned-edge relay measurement, and explicit performance boundaries.
+- `docs/PHANTOM_ONE_DESIGN.md`: versioned Phantom One boundary, edge separation, and
+  explicit non-claims.
+- `docs/PHANTOM_ONE_OPERATOR.md`: opt-in TCP operator workflow and edge-prototype
+  limitations.
+- `docs/PHANTOM_ONE_TESTING.md`: Phantom One testing and evidence taxonomy.
+- `docs/PHANTOM_ONE_RELIABILITY.md`: Phantom One lifecycle, cleanup, and bounded-failure
+  hardening goals.
 - `docs/BENCHMARK_RESULTS_2026-07-28.md`: historical WSL2 benchmark scores and
   the explicit list of measurements still requiring live/native infrastructure.
 - `docs/PHASE_D_HARDENING_2026-07-28.md`: fuzzing, QUIC-shim repeatability,

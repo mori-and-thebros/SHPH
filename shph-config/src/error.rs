@@ -12,6 +12,9 @@ pub enum ConfigError {
 
     #[error("Serialize error: {0}")]
     Serialize(#[from] toml::ser::Error),
+
+    #[error("Invalid configuration: {0}")]
+    Invalid(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;

@@ -8,8 +8,9 @@
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 use shph_core::{Result, ShphError};
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
 pub const MORPHOLOGY_MAGIC: [u8; 2] = *b"S2";
 pub const MORPHOLOGY_VERSION: u8 = 1;
@@ -18,8 +19,49 @@ pub const MAX_MORPHOLOGY_DATAGRAM_BYTES: usize = 65_535;
 pub const BATCH_MESSAGE_LENGTH_BYTES: usize = 2;
 pub const MAX_BATCH_MESSAGES: usize = 32;
 pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(1);
+/// Maximum number of bins retained by the optional empirical sampler.
+///
+/// Sampling uses a precomputed CDF, so this bound also limits configuration
+/// validation and the amount of distribution state held by one engine.
+pub const MAX_HISTOGRAM_BINS: usize = 4_096;
+/// Maximum number of samples accepted by the offline histogram builder.
+pub const MAX_HISTOGRAM_SAMPLES: usize = 1_000_000;
 const MAX_BATCH_PAYLOAD_BYTES: usize = MAX_MORPHOLOGY_DATAGRAM_BYTES - MORPHOLOGY_HEADER_BYTES;
 const MAX_PROFILE_SIZE_CLASSES: usize = 8;
+
+struct WipeBufferOnError<'a> {
+    buffer: &'a mut Vec<u8>,
+    committed: bool,
+}
+
+impl<'a> WipeBufferOnError<'a> {
+    fn new(buffer: &'a mut Vec<u8>) -> Self {
+        Self {
+            buffer,
+            committed: false,
+        }
+    }
+
+    fn prepare(&mut self, target_len: usize) {
+        if self.buffer.len() > target_len {
+            self.buffer[target_len..].zeroize();
+        }
+        self.buffer.clear();
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for WipeBufferOnError<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.buffer.zeroize();
+            self.buffer.clear();
+        }
+    }
+}
 
 /// A normalized one-dimensional empirical distribution.
 ///
@@ -31,6 +73,7 @@ const MAX_PROFILE_SIZE_CLASSES: usize = 8;
 pub struct EmpiricalHistogram {
     bins: Vec<u64>,
     weights: Vec<f64>,
+    cdf: Vec<f64>,
 }
 
 impl EmpiricalHistogram {
@@ -40,6 +83,11 @@ impl EmpiricalHistogram {
             return Err(ShphError::InvalidArgument(
                 "histogram bins and weights must be non-empty and have equal length".into(),
             ));
+        }
+        if bins.len() > MAX_HISTOGRAM_BINS {
+            return Err(ShphError::ResourceExhausted(format!(
+                "histogram exceeds the {MAX_HISTOGRAM_BINS}-bin limit"
+            )));
         }
         if bins.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(ShphError::InvalidArgument(
@@ -60,10 +108,20 @@ impl EmpiricalHistogram {
                 "histogram weights must have a positive finite sum".into(),
             ));
         }
-        Ok(Self {
-            bins,
-            weights: weights.into_iter().map(|weight| weight / total).collect(),
-        })
+        let weights = weights
+            .into_iter()
+            .map(|weight| weight / total)
+            .collect::<Vec<_>>();
+        let mut cdf = Vec::with_capacity(weights.len());
+        let mut cumulative = 0.0;
+        for weight in &weights {
+            cumulative += *weight;
+            cdf.push(cumulative);
+        }
+        // Make the final interval closed against accumulated floating-point
+        // rounding without changing the normalized public weights.
+        *cdf.last_mut().expect("histogram is non-empty") = 1.0;
+        Ok(Self { bins, weights, cdf })
     }
 
     /// Build a normalized histogram from observed integer samples.
@@ -73,12 +131,30 @@ impl EmpiricalHistogram {
                 "histogram samples must not be empty".into(),
             ));
         }
+        if samples.len() > MAX_HISTOGRAM_SAMPLES {
+            return Err(ShphError::ResourceExhausted(format!(
+                "histogram exceeds the {MAX_HISTOGRAM_SAMPLES}-sample limit"
+            )));
+        }
         let mut counts = BTreeMap::<u64, u64>::new();
         for sample in samples {
-            let count = counts.entry(*sample).or_default();
-            *count = count.checked_add(1).ok_or_else(|| {
-                ShphError::ResourceExhausted("histogram sample count overflow".into())
-            })?;
+            let at_bin_limit = counts.len() >= MAX_HISTOGRAM_BINS;
+            match counts.entry(*sample) {
+                Entry::Occupied(entry) => {
+                    let count = entry.into_mut();
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        ShphError::ResourceExhausted("histogram sample count overflow".into())
+                    })?;
+                }
+                Entry::Vacant(_entry) if at_bin_limit => {
+                    return Err(ShphError::ResourceExhausted(format!(
+                        "histogram exceeds the {MAX_HISTOGRAM_BINS}-bin limit"
+                    )));
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(1);
+                }
+            }
         }
         let (bins, counts): (Vec<_>, Vec<_>) = counts.into_iter().unzip();
         Self::new(bins, counts.into_iter().map(|count| count as f64).collect())
@@ -95,14 +171,11 @@ impl EmpiricalHistogram {
     /// Sample one bin according to its normalized weight.
     pub fn sample_bin(&self, rng: &mut impl Rng) -> u64 {
         let target = rng.gen::<f64>();
-        let mut cumulative = 0.0;
-        for (bin, weight) in self.bins.iter().zip(&self.weights) {
-            cumulative += weight;
-            if target < cumulative {
-                return *bin;
-            }
-        }
-        *self.bins.last().expect("histogram is non-empty")
+        let index = self.cdf.partition_point(|bound| *bound <= target);
+        self.bins
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| *self.bins.last().expect("histogram is non-empty"))
     }
 }
 
@@ -219,11 +292,190 @@ impl MorphologyProfile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MorphologyEngine {
     profile: MorphologyProfile,
     rng: StdRng,
     size_histogram: Option<EmpiricalHistogram>,
+    metrics: MorphologyMetrics,
+    metrics_enabled: bool,
+}
+
+impl Clone for MorphologyEngine {
+    /// Clone the configuration and counters, but never duplicate the live
+    /// morphology RNG stream. A cloned engine starts with fresh entropy.
+    fn clone(&self) -> Self {
+        Self {
+            profile: self.profile,
+            rng: StdRng::from_entropy(),
+            size_histogram: self.size_histogram.clone(),
+            metrics: self.metrics,
+            metrics_enabled: self.metrics_enabled,
+        }
+    }
+}
+
+/// Counters for one morphology engine's encoded frames.
+///
+/// These counters are local instrumentation only. They do not infer
+/// classifier success, browser similarity, or censorship resistance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MorphologyMetrics {
+    frames: u64,
+    payload_bytes: u64,
+    wire_bytes: u64,
+    padding_bytes: u64,
+    min_wire_bytes: Option<usize>,
+    max_wire_bytes: Option<usize>,
+}
+
+impl MorphologyMetrics {
+    pub const fn frames(self) -> u64 {
+        self.frames
+    }
+
+    pub const fn payload_bytes(self) -> u64 {
+        self.payload_bytes
+    }
+
+    pub const fn wire_bytes(self) -> u64 {
+        self.wire_bytes
+    }
+
+    pub const fn padding_bytes(self) -> u64 {
+        self.padding_bytes
+    }
+
+    pub const fn min_wire_bytes(self) -> Option<usize> {
+        self.min_wire_bytes
+    }
+
+    pub const fn max_wire_bytes(self) -> Option<usize> {
+        self.max_wire_bytes
+    }
+
+    pub fn average_wire_bytes(self) -> Option<f64> {
+        (self.frames > 0).then(|| self.wire_bytes as f64 / self.frames as f64)
+    }
+
+    pub fn overhead_pct(self) -> Option<f64> {
+        (self.payload_bytes > 0)
+            .then(|| self.padding_bytes as f64 / self.payload_bytes as f64 * 100.0)
+    }
+
+    fn record(&mut self, payload_bytes: usize, wire_bytes: usize) {
+        self.frames = self.frames.saturating_add(1);
+        self.payload_bytes = self.payload_bytes.saturating_add(payload_bytes as u64);
+        self.wire_bytes = self.wire_bytes.saturating_add(wire_bytes as u64);
+        self.padding_bytes = self
+            .padding_bytes
+            .saturating_add(wire_bytes.saturating_sub(payload_bytes) as u64);
+        self.min_wire_bytes = Some(
+            self.min_wire_bytes
+                .map_or(wire_bytes, |current| current.min(wire_bytes)),
+        );
+        self.max_wire_bytes = Some(
+            self.max_wire_bytes
+                .map_or(wire_bytes, |current| current.max(wire_bytes)),
+        );
+    }
+}
+
+/// Bounded thresholds for the session-local adaptive morphology experiment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveMorphologyConfig {
+    interactive_enter: usize,
+    interactive_exit: usize,
+    video_enter: usize,
+    video_exit: usize,
+    bulk_enter: usize,
+    bulk_exit: usize,
+}
+
+impl AdaptiveMorphologyConfig {
+    pub fn new(
+        interactive_enter: usize,
+        interactive_exit: usize,
+        video_enter: usize,
+        video_exit: usize,
+        bulk_enter: usize,
+        bulk_exit: usize,
+    ) -> Result<Self> {
+        let config = Self {
+            interactive_enter,
+            interactive_exit,
+            video_enter,
+            video_exit,
+            bulk_enter,
+            bulk_exit,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub const fn interactive_enter(self) -> usize {
+        self.interactive_enter
+    }
+
+    pub const fn interactive_exit(self) -> usize {
+        self.interactive_exit
+    }
+
+    pub const fn video_enter(self) -> usize {
+        self.video_enter
+    }
+
+    pub const fn video_exit(self) -> usize {
+        self.video_exit
+    }
+
+    pub const fn bulk_enter(self) -> usize {
+        self.bulk_enter
+    }
+
+    pub const fn bulk_exit(self) -> usize {
+        self.bulk_exit
+    }
+
+    fn validate(self) -> Result<()> {
+        if self.interactive_exit >= self.interactive_enter
+            || self.interactive_enter >= self.video_exit
+            || self.video_exit >= self.video_enter
+            || self.video_enter >= self.bulk_exit
+            || self.bulk_exit >= self.bulk_enter
+        {
+            return Err(ShphError::Config(
+                "adaptive morphology thresholds must be ordered with hysteresis".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for AdaptiveMorphologyConfig {
+    fn default() -> Self {
+        Self {
+            interactive_enter: 192,
+            interactive_exit: 128,
+            video_enter: 900,
+            video_exit: 640,
+            bulk_enter: 1_350,
+            bulk_exit: 1_100,
+        }
+    }
+}
+
+/// Session-scoped adaptive morphology over the existing tuned profiles.
+///
+/// The classifier is intentionally simple and bounded: it uses an integer
+/// EWMA of payload sizes and hysteresis, not browser classification or hidden
+/// background work.
+#[derive(Debug)]
+pub struct AdaptiveMorphologyEngine {
+    engine: MorphologyEngine,
+    config: AdaptiveMorphologyConfig,
+    ewma_payload: usize,
+    switches: u64,
 }
 
 /// Result of adding one application message to a bounded morphology batch.
@@ -348,6 +600,14 @@ pub struct MorphologyBatcher {
     first_message_at: Option<Instant>,
 }
 
+impl Drop for MorphologyBatcher {
+    fn drop(&mut self) {
+        for message in &mut self.messages {
+            message.zeroize();
+        }
+    }
+}
+
 impl MorphologyBatcher {
     pub fn new() -> Self {
         Self::default()
@@ -355,8 +615,10 @@ impl MorphologyBatcher {
 
     pub fn with_policy(policy: MorphologyBatchPolicy) -> Self {
         Self {
+            messages: Vec::new(),
+            encoded_payload_bytes: 0,
             policy,
-            ..Self::default()
+            first_message_at: None,
         }
     }
 
@@ -422,19 +684,23 @@ impl MorphologyBatcher {
         let batch_is_due = self
             .first_message_at
             .is_some_and(|started_at| self.is_due_at(now, started_at));
+        let next_payload_bytes = self
+            .encoded_payload_bytes
+            .checked_add(message_bytes)
+            .ok_or_else(|| ShphError::Protocol("morphology batch length overflow".into()))?;
         if !self.messages.is_empty()
             && (batch_is_due
                 || self.messages.len() >= self.policy.max_messages
-                || self.encoded_payload_bytes.saturating_add(message_bytes) > maximum_payload_bytes)
+                || next_payload_bytes > maximum_payload_bytes)
         {
             let flushed = self.flush().ok_or_else(|| {
                 ShphError::Protocol("morphology batch state became inconsistent".into())
             })?;
-            self.push_without_flush(message, now);
+            self.push_without_flush(message, now)?;
             return Ok(MorphologyBatchPushResult::Flush(flushed));
         }
 
-        self.push_without_flush(message, now);
+        self.push_without_flush(message, now)?;
         Ok(MorphologyBatchPushResult::Buffered)
     }
 
@@ -447,14 +713,20 @@ impl MorphologyBatcher {
         Some(std::mem::take(&mut self.messages))
     }
 
-    fn push_without_flush(&mut self, message: &[u8], now: Instant) {
+    fn push_without_flush(&mut self, message: &[u8], now: Instant) -> Result<()> {
         if self.messages.is_empty() {
             self.first_message_at = Some(now);
         }
         self.encoded_payload_bytes = self
             .encoded_payload_bytes
-            .saturating_add(BATCH_MESSAGE_LENGTH_BYTES + message.len());
+            .checked_add(
+                BATCH_MESSAGE_LENGTH_BYTES
+                    .checked_add(message.len())
+                    .ok_or_else(|| ShphError::Protocol("batch message length overflow".into()))?,
+            )
+            .ok_or_else(|| ShphError::Protocol("morphology batch length overflow".into()))?;
         self.messages.push(message.to_vec());
+        Ok(())
     }
 
     fn is_due_at(&self, now: Instant, started_at: Instant) -> bool {
@@ -464,7 +736,13 @@ impl MorphologyBatcher {
 
 impl MorphologyEngine {
     pub fn new(profile: MorphologyProfile) -> Self {
-        Self::from_seed(profile, rand::random())
+        Self {
+            profile,
+            rng: StdRng::from_entropy(),
+            size_histogram: None,
+            metrics: MorphologyMetrics::default(),
+            metrics_enabled: false,
+        }
     }
 
     pub fn from_seed(profile: MorphologyProfile, seed: u64) -> Self {
@@ -472,6 +750,8 @@ impl MorphologyEngine {
             profile,
             rng: StdRng::seed_from_u64(seed),
             size_histogram: None,
+            metrics: MorphologyMetrics::default(),
+            metrics_enabled: false,
         }
     }
 
@@ -490,11 +770,48 @@ impl MorphologyEngine {
             profile,
             rng: StdRng::seed_from_u64(seed),
             size_histogram: Some(histogram),
+            metrics: MorphologyMetrics::default(),
+            metrics_enabled: false,
         }
     }
 
     pub fn profile(&self) -> MorphologyProfile {
         self.profile
+    }
+
+    pub fn metrics(&self) -> MorphologyMetrics {
+        self.metrics
+    }
+
+    /// Enable local morphology counters for a measurement or diagnostic run.
+    ///
+    /// Counters are disabled by default so steady-state transport does not pay
+    /// for instrumentation it does not consume.
+    pub fn enable_metrics(&mut self) {
+        self.metrics_enabled = true;
+    }
+
+    /// Enable local morphology counters and return the engine.
+    pub fn with_metrics(mut self) -> Self {
+        self.enable_metrics();
+        self
+    }
+
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics_enabled
+    }
+
+    pub fn set_metrics_enabled(&mut self, enabled: bool) {
+        self.metrics_enabled = enabled;
+    }
+
+    pub fn reset_metrics(&mut self) {
+        self.metrics = MorphologyMetrics::default();
+    }
+
+    fn set_profile(&mut self, profile: MorphologyProfile) {
+        self.profile = profile;
+        self.size_histogram = None;
     }
 
     /// Select an outer datagram size without exceeding the negotiated path MTU.
@@ -503,25 +820,16 @@ impl MorphologyEngine {
     /// A caller must still use the negotiated QUIC datagram limit, not a guessed
     /// Ethernet MTU, as the `path_mtu` argument.
     pub fn target_size(&mut self, payload_len: usize, path_mtu: usize) -> Result<usize> {
-        validate_path_mtu(path_mtu)?;
-        let minimum = payload_len
-            .checked_add(MORPHOLOGY_HEADER_BYTES)
-            .ok_or_else(|| ShphError::Protocol("morphology payload length overflow".into()))?;
-        if minimum > path_mtu {
-            return Err(ShphError::Protocol(
-                "morphology payload exceeds negotiated datagram limit".into(),
-            ));
-        }
+        let minimum = validate_payload_for_path(payload_len, path_mtu)?;
 
         let sampled = if let Some(histogram) = &self.size_histogram {
-            histogram.sample_bin(&mut self.rng) as usize
+            usize::try_from(histogram.sample_bin(&mut self.rng)).unwrap_or(usize::MAX)
         } else {
             let classes = self.profile.size_classes();
-            debug_assert!(classes.len() <= MAX_PROFILE_SIZE_CLASSES);
             if let Some(weights) = self.profile.size_class_weights() {
                 self.sample_weighted_size_class(classes, weights, minimum, path_mtu)
             } else {
-                classes[self.rng.gen_range(0..classes.len())]
+                self.sample_uniform_size_class(classes, minimum, path_mtu)
             }
         };
         Ok(sampled.max(minimum).min(path_mtu))
@@ -533,8 +841,34 @@ impl MorphologyEngine {
     /// avoids an OS-randomness request for every datagram while preserving
     /// unpredictable wire padding for engines created with [`Self::new`].
     pub fn encode_datagram(&mut self, payload: &[u8], path_mtu: usize) -> Result<Vec<u8>> {
-        let target_size = self.target_size(payload.len(), path_mtu)?;
-        encode_datagram_with_rng(payload, target_size, path_mtu, &mut self.rng)
+        let mut datagram = Vec::new();
+        self.encode_datagram_into(payload, path_mtu, &mut datagram)?;
+        Ok(datagram)
+    }
+
+    /// Encode one morphology datagram into a caller-owned buffer.
+    ///
+    /// The buffer is cleared and reused. This is the preferred steady-state
+    /// API for transport loops that already own a reusable frame buffer.
+    pub fn encode_datagram_into(
+        &mut self,
+        payload: &[u8],
+        path_mtu: usize,
+        datagram: &mut Vec<u8>,
+    ) -> Result<()> {
+        let target_size = match self.target_size(payload.len(), path_mtu) {
+            Ok(target_size) => target_size,
+            Err(error) => {
+                datagram.zeroize();
+                datagram.clear();
+                return Err(error);
+            }
+        };
+        encode_datagram_with_rng_into(payload, target_size, path_mtu, &mut self.rng, datagram)?;
+        if self.metrics_enabled {
+            self.metrics.record(payload.len(), target_size);
+        }
+        Ok(())
     }
 
     fn sample_weighted_size_class(
@@ -544,7 +878,6 @@ impl MorphologyEngine {
         minimum: usize,
         path_mtu: usize,
     ) -> usize {
-        debug_assert_eq!(classes.len(), weights.len());
         let mut eligible = [(0usize, 0u32); MAX_PROFILE_SIZE_CLASSES];
         let mut eligible_len = 0usize;
         for (class, weight) in classes.iter().copied().zip(weights) {
@@ -556,16 +889,20 @@ impl MorphologyEngine {
                 continue;
             }
             if eligible_len > 0 && eligible[eligible_len - 1].0 == effective_class {
-                eligible[eligible_len - 1].1 += *weight;
+                eligible[eligible_len - 1].1 = eligible[eligible_len - 1].1.saturating_add(*weight);
             } else {
+                if eligible_len == MAX_PROFILE_SIZE_CLASSES {
+                    break;
+                }
                 eligible[eligible_len] = (effective_class, *weight);
                 eligible_len += 1;
             }
         }
         let total_weight = eligible[..eligible_len]
             .iter()
-            .map(|(_, weight)| *weight)
-            .sum::<u32>();
+            .fold(0u64, |total, (_, weight)| {
+                total.saturating_add(u64::from(*weight))
+            });
 
         if total_weight == 0 {
             return minimum;
@@ -573,12 +910,37 @@ impl MorphologyEngine {
 
         let mut selection = self.rng.gen_range(0..total_weight);
         for (class, weight) in eligible[..eligible_len].iter().copied() {
-            if selection < weight {
+            if selection < u64::from(weight) {
                 return class;
             }
-            selection -= weight;
+            selection -= u64::from(weight);
         }
-        unreachable!("weighted class selection must choose an eligible class")
+        // Keep this path total even if a future profile changes its static
+        // weights without keeping the sum and ranges perfectly aligned.
+        eligible[eligible_len.saturating_sub(1)].0
+    }
+
+    fn sample_uniform_size_class(
+        &mut self,
+        classes: &[usize],
+        minimum: usize,
+        path_mtu: usize,
+    ) -> usize {
+        let mut eligible = [0usize; MAX_PROFILE_SIZE_CLASSES];
+        let mut eligible_len = 0usize;
+        for class in classes.iter().copied() {
+            if (minimum..=path_mtu).contains(&class) {
+                if eligible_len == MAX_PROFILE_SIZE_CLASSES {
+                    break;
+                }
+                eligible[eligible_len] = class;
+                eligible_len += 1;
+            }
+        }
+        if eligible_len == 0 {
+            return minimum;
+        }
+        eligible[self.rng.gen_range(0..eligible_len)]
     }
 
     pub fn next_delay(&mut self) -> Duration {
@@ -589,6 +951,134 @@ impl MorphologyEngine {
         let min_nanos = minimum.as_nanos() as u64;
         let max_nanos = maximum.as_nanos() as u64;
         Duration::from_nanos(self.rng.gen_range(min_nanos..=max_nanos))
+    }
+}
+
+impl AdaptiveMorphologyEngine {
+    pub fn new(config: AdaptiveMorphologyConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            engine: MorphologyEngine::new(MorphologyProfile::TunedLowLatency),
+            config,
+            ewma_payload: 0,
+            switches: 0,
+        })
+    }
+
+    pub fn from_seed(config: AdaptiveMorphologyConfig, seed: u64) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            engine: MorphologyEngine::from_seed(MorphologyProfile::TunedLowLatency, seed),
+            config,
+            ewma_payload: 0,
+            switches: 0,
+        })
+    }
+
+    pub fn config(&self) -> AdaptiveMorphologyConfig {
+        self.config
+    }
+
+    pub fn profile(&self) -> MorphologyProfile {
+        self.engine.profile()
+    }
+
+    pub fn ewma_payload_bytes(&self) -> usize {
+        self.ewma_payload
+    }
+
+    pub fn profile_switches(&self) -> u64 {
+        self.switches
+    }
+
+    pub fn metrics(&self) -> MorphologyMetrics {
+        self.engine.metrics()
+    }
+
+    pub fn enable_metrics(&mut self) {
+        self.engine.enable_metrics();
+    }
+
+    pub fn with_metrics(mut self) -> Self {
+        self.enable_metrics();
+        self
+    }
+
+    pub fn metrics_enabled(&self) -> bool {
+        self.engine.metrics_enabled()
+    }
+
+    pub fn set_metrics_enabled(&mut self, enabled: bool) {
+        self.engine.set_metrics_enabled(enabled);
+    }
+
+    pub fn encode_datagram(&mut self, payload: &[u8], path_mtu: usize) -> Result<Vec<u8>> {
+        let mut datagram = Vec::new();
+        self.encode_datagram_into(payload, path_mtu, &mut datagram)?;
+        Ok(datagram)
+    }
+
+    pub fn encode_datagram_into(
+        &mut self,
+        payload: &[u8],
+        path_mtu: usize,
+        datagram: &mut Vec<u8>,
+    ) -> Result<()> {
+        if let Err(error) = validate_payload_for_path(payload.len(), path_mtu) {
+            datagram.zeroize();
+            datagram.clear();
+            return Err(error);
+        }
+        self.observe_payload(payload.len());
+        self.engine
+            .encode_datagram_into(payload, path_mtu, datagram)
+    }
+
+    fn observe_payload(&mut self, payload_len: usize) {
+        const EWMA_DIVISOR: usize = 4;
+        let delta = payload_len.abs_diff(self.ewma_payload);
+        let adjustment = delta.div_ceil(EWMA_DIVISOR);
+        if payload_len >= self.ewma_payload {
+            self.ewma_payload = self.ewma_payload.saturating_add(adjustment);
+        } else {
+            self.ewma_payload = self.ewma_payload.saturating_sub(adjustment);
+        }
+
+        let next = match self.profile() {
+            MorphologyProfile::TunedLowLatency
+                if self.ewma_payload >= self.config.interactive_enter =>
+            {
+                Some(MorphologyProfile::TunedWebBrowsingLab)
+            }
+            MorphologyProfile::TunedWebBrowsingLab
+                if self.ewma_payload <= self.config.interactive_exit =>
+            {
+                Some(MorphologyProfile::TunedLowLatency)
+            }
+            MorphologyProfile::TunedWebBrowsingLab
+                if self.ewma_payload >= self.config.video_enter =>
+            {
+                Some(MorphologyProfile::TunedVideoStreamingLab)
+            }
+            MorphologyProfile::TunedVideoStreamingLab
+                if self.ewma_payload <= self.config.video_exit =>
+            {
+                Some(MorphologyProfile::TunedWebBrowsingLab)
+            }
+            MorphologyProfile::TunedVideoStreamingLab
+                if self.ewma_payload >= self.config.bulk_enter =>
+            {
+                Some(MorphologyProfile::TunedBulkLab)
+            }
+            MorphologyProfile::TunedBulkLab if self.ewma_payload <= self.config.bulk_exit => {
+                Some(MorphologyProfile::TunedVideoStreamingLab)
+            }
+            _ => None,
+        };
+        if let Some(profile) = next {
+            self.engine.set_profile(profile);
+            self.switches = self.switches.saturating_add(1);
+        }
     }
 }
 
@@ -607,31 +1097,35 @@ pub fn validate_path_mtu(path_mtu: usize) -> Result<()> {
 /// returns. Padding bytes therefore do not carry unauthenticated control data;
 /// the fixed envelope header is only interpreted after QUIC authentication.
 pub fn encode_datagram(payload: &[u8], target_size: usize, path_mtu: usize) -> Result<Vec<u8>> {
-    encode_datagram_with_rng(payload, target_size, path_mtu, &mut rand::rngs::OsRng)
+    let mut datagram = Vec::new();
+    encode_datagram_with_rng_into(
+        payload,
+        target_size,
+        path_mtu,
+        &mut rand::rngs::OsRng,
+        &mut datagram,
+    )?;
+    Ok(datagram)
 }
 
-fn encode_datagram_with_rng(
+fn encode_datagram_with_rng_into(
     payload: &[u8],
     target_size: usize,
     path_mtu: usize,
     rng: &mut impl RngCore,
-) -> Result<Vec<u8>> {
-    validate_path_mtu(path_mtu)?;
-    if payload.is_empty() {
-        return Err(ShphError::Protocol(
-            "morphology payload must not be empty".into(),
-        ));
-    }
+    datagram: &mut Vec<u8>,
+) -> Result<()> {
+    // Rejected requests wipe the previous payload through the guard.
+    // Successful requests overwrite every byte in the new envelope and only
+    // wipe bytes retired by a shrink, keeping steady-state reuse bounded.
+    let mut cleanup = WipeBufferOnError::new(datagram);
+    let minimum = validate_payload_for_path(payload.len(), path_mtu)?;
     if target_size > path_mtu || target_size > MAX_MORPHOLOGY_DATAGRAM_BYTES {
         return Err(ShphError::Protocol(
             "morphology target exceeds negotiated datagram limit".into(),
         ));
     }
-    let minimum = payload
-        .len()
-        .checked_add(MORPHOLOGY_HEADER_BYTES)
-        .ok_or_else(|| ShphError::Protocol("morphology payload length overflow".into()))?;
-    if target_size < minimum || payload.len() > u16::MAX as usize {
+    if target_size < minimum {
         return Err(ShphError::Protocol(
             "morphology target is smaller than the payload".into(),
         ));
@@ -639,14 +1133,43 @@ fn encode_datagram_with_rng(
 
     let target_size_u16 = u16::try_from(target_size)
         .map_err(|_| ShphError::Protocol("morphology target length overflow".into()))?;
-    let mut datagram = vec![0u8; target_size];
-    datagram[..2].copy_from_slice(&MORPHOLOGY_MAGIC);
-    datagram[2] = MORPHOLOGY_VERSION;
-    datagram[3..5].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-    datagram[5..7].copy_from_slice(&target_size_u16.to_be_bytes());
-    datagram[7..minimum].copy_from_slice(payload);
-    rng.fill_bytes(&mut datagram[minimum..]);
-    Ok(datagram)
+    cleanup.prepare(target_size);
+    cleanup.buffer.resize(target_size, 0);
+    cleanup.buffer[..2].copy_from_slice(&MORPHOLOGY_MAGIC);
+    cleanup.buffer[2] = MORPHOLOGY_VERSION;
+    cleanup.buffer[3..5].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    cleanup.buffer[5..7].copy_from_slice(&target_size_u16.to_be_bytes());
+    cleanup.buffer[7..minimum].copy_from_slice(payload);
+    if rng.try_fill_bytes(&mut cleanup.buffer[minimum..]).is_err() {
+        return Err(ShphError::Crypto(
+            "morphology padding randomness failed".into(),
+        ));
+    }
+    cleanup.commit();
+    Ok(())
+}
+
+fn validate_payload_for_path(payload_len: usize, path_mtu: usize) -> Result<usize> {
+    validate_path_mtu(path_mtu)?;
+    if payload_len == 0 {
+        return Err(ShphError::Protocol(
+            "morphology payload must not be empty".into(),
+        ));
+    }
+    if payload_len > u16::MAX as usize {
+        return Err(ShphError::Protocol(
+            "morphology payload exceeds the length field".into(),
+        ));
+    }
+    let minimum = payload_len
+        .checked_add(MORPHOLOGY_HEADER_BYTES)
+        .ok_or_else(|| ShphError::Protocol("morphology payload length overflow".into()))?;
+    if minimum > path_mtu {
+        return Err(ShphError::Protocol(
+            "morphology payload exceeds negotiated datagram limit".into(),
+        ));
+    }
+    Ok(minimum)
 }
 
 fn validate_batch_message(message: &[u8]) -> Result<()> {
@@ -682,19 +1205,22 @@ pub fn encode_batch_payload<M: AsRef<[u8]>>(messages: &[M], path_mtu: usize) -> 
     }
 
     let maximum_payload_bytes = path_mtu - MORPHOLOGY_HEADER_BYTES;
-    let mut payload = Vec::new();
-    for message in messages {
+    let expected_payload_bytes = messages.iter().try_fold(0usize, |total, message| {
         let message = message.as_ref();
         validate_batch_message(message)?;
-        let next_len = BATCH_MESSAGE_LENGTH_BYTES
-            .checked_add(message.len())
-            .and_then(|length| payload.len().checked_add(length))
-            .ok_or_else(|| ShphError::Protocol("morphology batch length overflow".into()))?;
-        if next_len > maximum_payload_bytes {
-            return Err(ShphError::Protocol(
-                "morphology batch exceeds the negotiated datagram limit".into(),
-            ));
-        }
+        total
+            .checked_add(BATCH_MESSAGE_LENGTH_BYTES)
+            .and_then(|length| length.checked_add(message.len()))
+            .ok_or_else(|| ShphError::Protocol("morphology batch length overflow".into()))
+    })?;
+    if expected_payload_bytes > maximum_payload_bytes {
+        return Err(ShphError::Protocol(
+            "morphology batch exceeds the negotiated datagram limit".into(),
+        ));
+    }
+    let mut payload = Vec::with_capacity(expected_payload_bytes);
+    for message in messages {
+        let message = message.as_ref();
         payload.extend_from_slice(&(message.len() as u16).to_be_bytes());
         payload.extend_from_slice(message);
     }
@@ -755,8 +1281,7 @@ pub fn encode_batched_datagram<M: AsRef<[u8]>>(
     path_mtu: usize,
 ) -> Result<Vec<u8>> {
     let payload = encode_batch_payload(messages, path_mtu)?;
-    let target_size = morphology.target_size(payload.len(), path_mtu)?;
-    encode_datagram_with_rng(&payload, target_size, path_mtu, &mut morphology.rng)
+    morphology.encode_datagram(&payload, path_mtu)
 }
 
 /// Decode and split one authenticated Shroud2 batch datagram.
@@ -766,6 +1291,22 @@ pub fn decode_batched_datagram(datagram: &[u8], path_mtu: usize) -> Result<Vec<V
 }
 
 pub fn decode_datagram(datagram: &[u8], path_mtu: usize) -> Result<Vec<u8>> {
+    let mut decoded = datagram.to_vec();
+    match decode_datagram_in_place(&mut decoded, path_mtu) {
+        Ok(()) => Ok(decoded),
+        Err(error) => {
+            decoded.zeroize();
+            Err(error)
+        }
+    }
+}
+
+/// Validate and remove one morphology envelope in a caller-owned buffer.
+///
+/// The payload is moved to the front and all retired envelope bytes are
+/// cleared before truncation. This is useful for receive loops that already
+/// own a mutable datagram buffer and avoids a second payload allocation.
+pub fn decode_datagram_in_place(datagram: &mut Vec<u8>, path_mtu: usize) -> Result<()> {
     validate_path_mtu(path_mtu)?;
     if datagram.len() < MORPHOLOGY_HEADER_BYTES || datagram.len() > path_mtu {
         return Err(ShphError::Protocol(
@@ -792,16 +1333,21 @@ pub fn decode_datagram(datagram: &[u8], path_mtu: usize) -> Result<Vec<u8>> {
             "morphology payload length is invalid".into(),
         ));
     }
-    Ok(datagram[MORPHOLOGY_HEADER_BYTES..payload_end].to_vec())
+    datagram.copy_within(MORPHOLOGY_HEADER_BYTES..payload_end, 0);
+    datagram[payload_len..].zeroize();
+    datagram.truncate(payload_len);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         decode_batch_payload, decode_batched_datagram, decode_datagram, encode_batch_payload,
-        encode_batched_datagram, encode_datagram, wasserstein_distance, EmpiricalHistogram,
-        MorphologyBatchPolicy, MorphologyBatchPushResult, MorphologyBatcher, MorphologyEngine,
-        MorphologyProfile, MAX_BATCH_MESSAGES, MAX_BATCH_WAIT, MORPHOLOGY_HEADER_BYTES,
+        encode_batched_datagram, encode_datagram, wasserstein_distance, AdaptiveMorphologyConfig,
+        AdaptiveMorphologyEngine, EmpiricalHistogram, MorphologyBatchPolicy,
+        MorphologyBatchPushResult, MorphologyBatcher, MorphologyEngine, MorphologyProfile,
+        MAX_BATCH_MESSAGES, MAX_BATCH_WAIT, MAX_HISTOGRAM_BINS, MAX_HISTOGRAM_SAMPLES,
+        MORPHOLOGY_HEADER_BYTES,
     };
     use rand::SeedableRng;
     use std::time::{Duration, Instant};
@@ -814,6 +1360,128 @@ mod tests {
             assert!(target >= payload_len + MORPHOLOGY_HEADER_BYTES);
             assert!(target <= 2_000);
         }
+    }
+
+    #[test]
+    fn reusable_encode_buffer_records_bounded_metrics() {
+        let mut engine =
+            MorphologyEngine::from_seed(MorphologyProfile::TunedWebBrowsingLab, 7).with_metrics();
+        let mut buffer = Vec::with_capacity(2_000);
+        engine
+            .encode_datagram_into(b"payload", 1_472, &mut buffer)
+            .expect("encode into buffer");
+        let first_capacity = buffer.capacity();
+        let first_len = buffer.len();
+        engine
+            .encode_datagram_into(b"second", 1_472, &mut buffer)
+            .expect("reuse buffer");
+        assert!(buffer.capacity() >= first_capacity);
+        assert_ne!(buffer.len(), 0);
+        assert_ne!(first_len, 0);
+        assert_eq!(engine.metrics().frames(), 2);
+        assert_eq!(engine.metrics().payload_bytes(), 13);
+        assert!(engine.metrics().wire_bytes() >= engine.metrics().payload_bytes());
+        assert!(engine.metrics().overhead_pct().is_some());
+    }
+
+    #[test]
+    fn reusable_encode_buffer_is_cleared_when_validation_rejects_input() {
+        let mut engine = MorphologyEngine::from_seed(MorphologyProfile::LowLatency, 7);
+        let mut buffer = vec![0xa5; 128];
+        assert!(engine
+            .encode_datagram_into(&[0u8; 512], 128, &mut buffer)
+            .is_err());
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn in_place_decode_reuses_storage_and_preserves_payload() {
+        let payload = b"in-place morphology payload";
+        let encoded = encode_datagram(payload, 256, 512).expect("encode");
+        let capacity = encoded.capacity();
+        let mut reusable = encoded;
+        super::decode_datagram_in_place(&mut reusable, 512).expect("decode in place");
+        assert_eq!(reusable, payload);
+        assert!(reusable.capacity() >= capacity);
+    }
+
+    #[test]
+    fn bulk_profile_does_not_collapse_ineligible_classes_to_the_mtu() {
+        let mut engine = MorphologyEngine::from_seed(MorphologyProfile::BulkLab, 7);
+        for _ in 0..128 {
+            assert_eq!(engine.target_size(1, 1_472).expect("target"), 1_280);
+        }
+    }
+
+    #[test]
+    fn weighted_sampler_bounds_future_profile_shape_changes() {
+        let mut engine = MorphologyEngine::from_seed(MorphologyProfile::BulkLab, 7);
+        let classes = [128, 256, 384, 512, 640, 768, 896, 1_024, 1_152, 1_280];
+        let weights = [1u32; 10];
+        let target = engine.sample_weighted_size_class(&classes, &weights, 7, 1_472);
+        assert!((128..=1_024).contains(&target));
+    }
+
+    #[test]
+    fn adaptive_morphology_switches_with_hysteresis() {
+        let mut adaptive =
+            AdaptiveMorphologyEngine::from_seed(AdaptiveMorphologyConfig::default(), 11)
+                .expect("adaptive engine");
+        assert_eq!(adaptive.profile(), MorphologyProfile::TunedLowLatency);
+        adaptive
+            .encode_datagram(&[0u8; 1_024], 1_472)
+            .expect("interactive-to-web transition");
+        assert_eq!(adaptive.profile(), MorphologyProfile::TunedWebBrowsingLab);
+
+        for _ in 0..8 {
+            adaptive
+                .encode_datagram(&[0u8; 1_400], 1_472)
+                .expect("web-to-video transition");
+        }
+        assert_eq!(
+            adaptive.profile(),
+            MorphologyProfile::TunedVideoStreamingLab
+        );
+        assert!(adaptive.profile_switches() >= 2);
+    }
+
+    #[test]
+    fn adaptive_rejection_does_not_advance_classifier_state() {
+        let mut adaptive =
+            AdaptiveMorphologyEngine::from_seed(AdaptiveMorphologyConfig::default(), 11)
+                .expect("adaptive engine");
+        let before = (
+            adaptive.profile(),
+            adaptive.ewma_payload_bytes(),
+            adaptive.profile_switches(),
+        );
+        let mut buffer = Vec::new();
+
+        assert!(adaptive
+            .encode_datagram_into(&[0u8; 1_024], 512, &mut buffer)
+            .is_err());
+        assert_eq!(
+            (
+                adaptive.profile(),
+                adaptive.ewma_payload_bytes(),
+                adaptive.profile_switches()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn adaptive_thresholds_require_ordered_hysteresis() {
+        assert!(AdaptiveMorphologyConfig::new(128, 192, 900, 640, 1_350, 1_100).is_err());
+    }
+
+    #[test]
+    fn histogram_targets_are_safely_clamped() {
+        let histogram =
+            EmpiricalHistogram::new(vec![u64::MAX], vec![1.0]).expect("large histogram bin");
+        let mut engine =
+            MorphologyEngine::from_histogram(MorphologyProfile::WebBrowsingLab, histogram, 3);
+        assert_eq!(engine.target_size(1, 1_400).expect("clamped target"), 1_400);
     }
 
     #[test]
@@ -1156,6 +1824,24 @@ mod tests {
         assert!(EmpiricalHistogram::new(vec![1], vec![f64::NAN]).is_err());
         assert!(EmpiricalHistogram::new(vec![1], vec![0.0]).is_err());
         assert!(EmpiricalHistogram::from_samples(&[]).is_err());
+    }
+
+    #[test]
+    fn empirical_histogram_bounds_bins_and_skips_zero_weight_intervals() {
+        let oversized_bins = (0..=MAX_HISTOGRAM_BINS)
+            .map(|bin| bin as u64)
+            .collect::<Vec<_>>();
+        let oversized_weights = vec![1.0; oversized_bins.len()];
+        assert!(EmpiricalHistogram::new(oversized_bins, oversized_weights).is_err());
+        let oversized_samples = vec![0u64; MAX_HISTOGRAM_SAMPLES + 1];
+        assert!(EmpiricalHistogram::from_samples(&oversized_samples).is_err());
+
+        let histogram =
+            EmpiricalHistogram::new(vec![10, 20, 30], vec![0.0, 1.0, 0.0]).expect("histogram");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(91);
+        for _ in 0..64 {
+            assert_eq!(histogram.sample_bin(&mut rng), 20);
+        }
     }
 
     #[test]

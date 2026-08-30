@@ -7,9 +7,9 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-08-25)
+## Current Status (2026-08-30)
 
-Workspace version `0.6.5-dev.1` (prototype pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.6-dev` (prototype pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -93,12 +93,13 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   DNS/IPv6, UDP/QUIC, or crash-time WFP gates.
 - The historical native Windows validation snapshot records formatting, locked
   checks, strict Clippy, **180 workspace tests**, release builds, Windows-only
-  Wintun unit tests, Windows ACL coverage, and both benchmark profiles. The
-  The `v0.6.4-dev.4` release evidence records 304 workspace tests; these totals
-  belong to different snapshots and must not be conflated. The current
-  engineering pass reached 316 workspace tests. The lifecycle record reports
-  clean adapter, route, DNS, WFP, process, and temporary-directory teardown.
-  See
+   Wintun unit tests, Windows ACL coverage, and both benchmark profiles. The
+   `v0.6.4-dev.4` release evidence records 304 workspace tests; these totals
+   belong to different snapshots and must not be conflated. The current
+   working-tree verification pass reached 379 workspace tests with 0 failures,
+   plus 38 passing tests in the standalone edge workspace. These are separate
+   engineering snapshots, not a new release claim. The lifecycle record reports
+   clean adapter, route, DNS, WFP, process, and temporary-directory teardown. See
   `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`.
 - Lab-only controls:
   - set `SHPH_KEYSTORE_PASSWORD` before `init` to encrypt the keystore at rest.
@@ -350,7 +351,8 @@ loopback SOCKS5 listener without sending traffic to an arbitrary destination.
 ```text
 shph init --new
 shph host [--port 443] [--advertise <host[:port]>] [--transport tcp|quic|quic-standard]
-  [--shroud-profile medium] [--no-tun] [--no-nat]
+  [--shroud-profile medium] [--phantom-one] [--phantom-one-profile medium]
+  [--no-tun] [--no-nat]
   [--ticket-file <path>] [--quic-cert <server.der>] [--quic-key <server.key>]
   [--underlay socks5://host:port]
 shph join <shph://v1:...> [--ticket-file <path>] [--no-tun]
@@ -358,7 +360,8 @@ shph join <shph://v1:...> [--ticket-file <path>] [--no-tun]
   [--transport-peer <host:port>] [--check]
 shph id [--qr] [--ticket-file <path>]
 shph up [--to <host:port>] [--transport tcp|quic|quic-standard|offline-mesh|data-mule]
-  [--shroud-profile off|low|medium|high|extreme-lab] [--no-tun]
+  [--shroud-profile off|low|medium|high|extreme-lab] [--phantom-one]
+  [--phantom-one-profile medium] [--no-tun]
   [--underlay socks5://host:port]
   [--quic-cert <server.der>] [--quic-key <server.key>]
   [--killswitch] [--killswitch-dry-run] [--mss-clamp]
@@ -442,8 +445,13 @@ Additional docs:
 - `docs/BENCHMARK_RESULTS_2026-08-14.md` (historical Windows-local `0.6.1-dev`
   benchmark baseline)
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md` (latest Shroud 2.0 morphology report)
+- `docs/MORPHOLOGY_PERFORMANCE.md` (adaptive morphology and bounded performance tuning)
 - `docs/BENCHMARK_RESULTS_2026-07-28.md` (historical WSL2 benchmark scores and evidence limits)
 - `docs/LAB_PROTOTYPES.md` (operational guide for QUIC-shim, offline-mesh, and data-mule labs)
+- `docs/PHANTOM_ONE_OPERATOR.md` (opt-in Phantom One TCP and owned-edge prototype notes)
+- `docs/PHANTOM_ONE_DESIGN.md` (Phantom One design boundary and explicit non-claims)
+- `docs/PHANTOM_ONE_TESTING.md` (Phantom One test and evidence taxonomy)
+- `docs/PHANTOM_ONE_RELIABILITY.md` (Phantom One lifecycle, cleanup, and bounded-failure goals)
 - `docs/QUIC_STANDARDS.md` (RFC QUIC architecture, usage, and verification)
 - `docs/evidence/CARGO_AUDIT.txt` (regenerable advisory-scan output)
 - `CHANGELOG.md` (phase-anchored changelog)

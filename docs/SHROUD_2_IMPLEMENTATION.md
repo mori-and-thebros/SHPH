@@ -27,10 +27,12 @@ to native TUN, but does not turn morphology into a stealth or fallback router.
 - Low-latency, web-browsing, and video-streaming selection prefer the smallest
   fitting profile class with bounded 65/25/8/2, 45/30/15/8/2, and 45/30/15/8/2
   weights respectively. Larger classes remain available for shape diversity
-  without making them the common case; `BulkLab` retains uniform class
-  selection for comparison.
-- Profile classes above the negotiated path limit fold into one explicit
-  path-MTU bucket instead of creating arbitrary clipped sizes.
+  without making them the common case. The unweighted `BulkLab` profile
+  selects uniformly from classes that already fit the path; if no class fits,
+  it falls back to the payload minimum.
+- Weighted classes above the negotiated path limit fold into one explicit
+  path-MTU bucket. Unweighted classes are filtered before selection, avoiding
+  an artificial pile-up at the MTU ceiling.
 - Seeded morphology selection for deterministic tests and reproducible
   benchmarks.
 - Negotiated QUIC DATAGRAM limit enforcement.
@@ -51,6 +53,16 @@ to native TUN, but does not turn morphology into a stealth or fallback router.
 - Explicit histogram-backed empirical-CDF size sampling through
   `MorphologyEngine::from_histogram`; the negotiated path limit and envelope
   minimum remain enforced after sampling.
+- Session-scoped `AdaptiveMorphologyEngine` over the tuned low-latency, web,
+  video, and bulk profiles. Its integer EWMA and ordered hysteresis thresholds
+  are bounded, synchronous, and explicit; it is not enabled by default and
+  does not perform browser or DPI classification.
+- Caller-owned encode buffers through `MorphologyEngine::encode_datagram_into`
+  and pre-sized batch payload construction, reducing steady-state allocation
+  pressure without changing the envelope format.
+- Opt-in local `MorphologyMetrics` counters for frame count, payload bytes,
+  wire bytes, total morphology overhead, and observed wire-size bounds; the
+  default transport path does not pay for that bookkeeping.
 - Standards-QUIC send/receive helpers using Quinn RFC 9221 DATAGRAM support.
 - Unit, loopback, negative, and fuzz-manifest coverage.
 
@@ -74,6 +86,15 @@ one.
   an error instead of panicking or silently emitting predictable padding.
 - Every profile has bounded size classes and bounded delay ranges. The engine
   has no retry loop, unbounded allocation policy, or unbounded sleep.
+- Morphology and Phantom One padding use fallible random filling; an entropy-source
+  failure returns an error rather than emitting a predictable tail.
+- TCP receive framing decrypts directly from its retained frame buffer and
+  clears that buffer after successful extraction, avoiding an unnecessary
+  ciphertext copy in the steady-state receive path.
+- `decode_datagram_in_place` removes a Shroud 2.0 envelope from an owned
+  receive buffer without a second payload allocation. Rejected reusable
+  encode operations clear the caller-owned buffer, while successful encodes
+  overwrite the new envelope and wipe retired bytes when shrinking.
 - Batch payloads reject empty messages, truncated prefixes, zero-length
   messages, oversized messages, excess message counts, and batches that exceed
   the negotiated path-MTU budget.
@@ -177,9 +198,15 @@ cargo run --manifest-path benchmarks/Cargo.toml --release --offline -- \
 The benchmark emits `shroud2_morphology` rows for all six morphology
 profiles. Each row includes p50/p95/p99/p99.9 latency, allocation/RSS
 observations, and the observed target-size range under a 1,450-byte datagram
-budget. The current workspace version is `0.6.5-dev.1`; benchmark reports must
+budget. The current workspace version is `0.6.6-dev`; benchmark reports must
 also record the exact commit, platform, toolchain, and whether the run is
 native Linux or WSL2.
+
+The same suite emits `shroud2_adaptive` for a fixed, synthetic workload that
+exercises the integer-EWMA profile transitions and reports final profile,
+profile-switch count, and morphology overhead. The row is local instrumentation
+evidence only. The reusable-buffer and edge-relay measurements are described
+in `docs/MORPHOLOGY_PERFORMANCE.md`.
 
 The captured WSL2 results are recorded in
 `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`.

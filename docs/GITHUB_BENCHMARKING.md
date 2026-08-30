@@ -4,18 +4,21 @@ SHPH publishes two complementary benchmark layers:
 
 1. The standalone runner in `benchmarks/src/main.rs` exercises longer local
    campaigns: crypto, framing, dataplane loops, Shroud profiles, Shroud2
-   morphology, QUIC-shim loopback, identity/provider behavior, wire accounting,
-   replay/cookie evidence, bounded defensive rejection paths, and impairment
-   models.
+   morphology, Phantom One authenticated-inner-envelope framing, QUIC-shim
+   loopback, identity/provider behavior, wire accounting, replay/cookie
+   evidence, bounded defensive rejection paths, and impairment models.
 2. The Criterion harness in `benchmarks/benches/criterion.rs` measures focused
-   microbenchmarks for the same core paths with statistical warmup and
-   regression comparison.
+   microbenchmarks for the same core paths, including Phantom One framing, with
+   statistical warmup and regression comparison.
 
 The CI workflow runs both layers on `ubuntu-latest` and `windows-latest` for
 pushes to `main`, version tags, manual dispatches, and the scheduled campaign.
-Pull requests retain the short benchmark smoke job; the full campaign is kept
-out of pull requests so review feedback is not delayed by long-running
-measurements.
+Pull requests retain short Linux and Windows benchmark smoke jobs; the full
+campaign is kept out of pull requests so review feedback is not delayed by
+long-running measurements. The standalone edge-relay crate also has separate
+Linux and Windows format, Clippy, and test gates; those gates validate bounded
+file inputs, configurable paths, token-bundle parsing, and lifecycle code, but
+are not a claim that the relay is production ready.
 
 ## Triggering a campaign
 

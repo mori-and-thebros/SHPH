@@ -1687,41 +1687,13 @@ fn read_bounded_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
 }
 
 fn open_readonly(path: &Path) -> io::Result<fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "provider record path must reference a regular file",
-            ));
+    shph_core::open_readonly_no_reparse(path).map_err(|error| match error {
+        shph_core::ShphError::Io(error) => error,
+        shph_core::ShphError::InvalidArgument(message) => {
+            io::Error::new(io::ErrorKind::InvalidInput, message)
         }
-        Ok(file)
-    }
-    #[cfg(not(unix))]
-    {
-        shph_core::ensure_not_reparse_point(path)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "refusing to read a symlinked provider file",
-            ));
-        }
-        let file = OpenOptions::new().read(true).open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "provider record path must reference a regular file",
-            ));
-        }
-        Ok(file)
-    }
+        error => io::Error::other(error.to_string()),
+    })
 }
 
 fn ensure_no_symlink_components(path: &Path) -> io::Result<()> {

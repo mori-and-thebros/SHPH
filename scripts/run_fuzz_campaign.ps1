@@ -21,7 +21,8 @@ $targets = @(
     "config_parse",
     "audit_record",
     "replay_window",
-    "shroud2_datagram"
+    "shroud2_datagram",
+    "phantom_one_envelope"
 )
 
 $resolvedOutput = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {

@@ -49,16 +49,17 @@ use shph_tun::{
 };
 #[cfg(target_os = "windows")]
 use shph_tun::{WindowsFirewallTransport, WindowsKillswitchGuard};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{future::Future, net::SocketAddr};
 use zeroize::{Zeroize, Zeroizing};
@@ -123,11 +124,12 @@ impl LiveStatusBar {
                     break;
                 }
                 let current = metrics.snapshot();
-                let tx_rate = current.bytes_sent.saturating_sub(previous.bytes_sent) as f64;
-                let rx_rate = current.bytes_recv.saturating_sub(previous.bytes_recv) as f64;
-                previous = current.clone();
+                let delta = current.delta_since(previous);
+                let tx_rate = delta.bytes_sent as f64;
+                let rx_rate = delta.bytes_recv as f64;
+                previous = current;
                 let line = format!(
-                    "[✓] SHPH v{} | CONNECTED TO {} | SECURE ({}) | Interface: {} | Handshake: {} ms | Tx: {} (↑ {}/s) | Rx: {} (↓ {}/s) | Ctrl+C to disconnect",
+                    "[OK] SHPH v{} | CONNECTED TO {} | SECURE ({}) | Interface: {} | Handshake: {} ms | TX: {} (+{}/s) | RX: {} (-{}/s) | Ctrl+C to disconnect",
                     env!("CARGO_PKG_VERSION"),
                     endpoint,
                     if profile.uses_pqc() {
@@ -142,10 +144,6 @@ impl LiveStatusBar {
                     format_bytes(current.bytes_recv),
                     format_bytes(rx_rate as u64),
                 );
-                let line = line
-                    .replace("âœ“", "OK")
-                    .replace("â†‘", "up")
-                    .replace("â†“", "down");
                 let _ = write!(io::stderr(), "\r{line}\x1b[K");
                 let _ = io::stderr().flush();
             }
@@ -250,9 +248,15 @@ enum Commands {
         /// Transport override (tcp|quic|quic-standard)
         #[arg(long, default_value = "tcp")]
         transport: String,
-        /// Discrete traffic-shaping profile
-        #[arg(long, default_value = "medium")]
-        shroud_profile: String,
+        /// Discrete Shroud 2 traffic-shaping profile
+        #[arg(long)]
+        shroud_profile: Option<String>,
+        /// Use the separate Phantom One morphology envelope
+        #[arg(long)]
+        phantom_one: bool,
+        /// Phantom One profile
+        #[arg(long)]
+        phantom_one_profile: Option<String>,
         /// Run without opening a native TUN interface
         #[arg(long)]
         no_tun: bool,
@@ -313,9 +317,15 @@ enum Commands {
         /// Optional transport override (tcp|quic|quic-standard|offline-mesh|data-mule)
         #[arg(long)]
         transport: Option<String>,
-        /// Discrete traffic-shaping profile (off|low|medium|high|extreme-lab)
+        /// Discrete Shroud 2 traffic-shaping profile
         #[arg(long)]
         shroud_profile: Option<String>,
+        /// Use the separate Phantom One morphology envelope
+        #[arg(long)]
+        phantom_one: bool,
+        /// Phantom One profile
+        #[arg(long)]
+        phantom_one_profile: Option<String>,
         /// Run without opening a native TUN interface
         #[arg(long)]
         no_tun: bool,
@@ -562,6 +572,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             advertise,
             transport,
             shroud_profile,
+            phantom_one,
+            phantom_one_profile,
             no_tun,
             no_nat,
             ticket_file,
@@ -573,7 +585,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             port,
             advertise.as_deref(),
             &transport,
-            &shroud_profile,
+            shroud_profile.as_deref(),
+            phantom_one,
+            phantom_one_profile.as_deref(),
             no_tun,
             no_nat,
             ticket_file.as_deref(),
@@ -608,6 +622,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             to,
             transport,
             shroud_profile,
+            phantom_one,
+            phantom_one_profile,
             no_tun,
             underlay,
             quic_cert,
@@ -623,6 +639,12 @@ fn run_cli(cli: Cli) -> Result<()> {
                 load_config(&config_path)?
             };
             if let Some(peer) = to {
+                let morphology = resolve_morphology(
+                    shroud_profile.as_deref(),
+                    phantom_one,
+                    phantom_one_profile.as_deref(),
+                    &config,
+                )?;
                 config.session = Some(SessionConfig {
                     role: SessionRole::Connect,
                     bind: None,
@@ -633,6 +655,8 @@ fn run_cli(cli: Cli) -> Result<()> {
                     underlay: underlay.clone(),
                     quic_cert: None,
                     quic_key: None,
+                    phantom_one: morphology.phantom_one,
+                    phantom_one_profile: morphology.phantom_one_profile,
                     reconnect: None,
                     startup_payload: None,
                 });
@@ -654,12 +678,11 @@ fn run_cli(cli: Cli) -> Result<()> {
                     .as_ref()
                     .and_then(|session| session.handshake_profile),
             )?;
-            let shroud_profile = resolve_shroud_profile(
+            let morphology = resolve_morphology(
                 shroud_profile.as_deref(),
-                config
-                    .stealth
-                    .as_ref()
-                    .map(|stealth| stealth.shroud_profile.as_str()),
+                phantom_one,
+                phantom_one_profile.as_deref(),
+                &config,
             )?;
             let configured_quic_cert = config
                 .session
@@ -679,7 +702,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 UpOptions {
                     transport: mode,
                     profile,
-                    shroud_profile,
+                    shroud_profile: morphology.shroud_profile,
+                    phantom_one: morphology.phantom_one,
+                    phantom_one_profile: morphology.phantom_one_profile,
                     quic_cert_path: quic_cert.as_deref().or(configured_quic_cert),
                     quic_key_path: quic_key.as_deref().or(configured_quic_key),
                     killswitch,
@@ -747,6 +772,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             handshake_profile,
         } => {
             let config = load_config(&config_path)?;
+            set_morphology_from_config(&config)?;
             handle_listen(
                 &keystore_path,
                 &bind,
@@ -773,6 +799,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             underlay,
         } => {
             let config = load_config(&config_path)?;
+            set_morphology_from_config(&config)?;
             let underlay = underlay.as_deref().or_else(|| {
                 config
                     .session
@@ -806,6 +833,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             underlay,
         } => {
             let config = load_config(&config_path)?;
+            set_morphology_from_config(&config)?;
             let underlay = underlay.as_deref().or_else(|| {
                 config
                     .session
@@ -840,6 +868,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             handshake_profile,
         } => {
             let config = load_config(&config_path)?;
+            set_morphology_from_config(&config)?;
             handle_recv_once(
                 &keystore_path,
                 &bind,
@@ -1016,7 +1045,6 @@ fn handle_join_check(
     keystore_path: &Path,
     ticket: &JoinTicket,
     mode: TransportMode,
-    profile: &str,
     underlay: &TcpUnderlay,
     transport_peer: Option<&str>,
     quic_cert_path: Option<&Path>,
@@ -1027,15 +1055,28 @@ fn handle_join_check(
     let keystore = KeyStore::load(keystore_path, None)?;
     let actual_peer = transport_peer.unwrap_or(&ticket.endpoint);
     let actual_peer = validate_transport_peer(actual_peer)?;
-    let shroud_profile = parse_shroud_profile_name(profile)?;
-    let lab = QuicLabConfig { shroud_profile };
+    let morphology = morphology_from_ticket(ticket)?;
+    validate_morphology_transport(mode, morphology.phantom_one)?;
+    set_morphology_env(&morphology)?;
+    let lab = QuicLabConfig {
+        shroud_profile: (!morphology.phantom_one)
+            .then(|| parse_shroud_profile_name(&morphology.shroud_profile))
+            .transpose()?
+            .flatten(),
+        phantom_one_profile: morphology
+            .phantom_one
+            .then(|| parse_phantom_one_profile(&morphology.phantom_one_profile))
+            .transpose()?,
+    };
+    let phantom_one_profile = lab.phantom_one_profile;
     let timeout_secs = 10;
 
     println!("SHPH join preflight");
     println!("  Policy peer: {}", ticket.endpoint);
     println!("  Transport peer: {actual_peer}");
     println!("  Transport: {}", transport_mode_to_str(mode));
-    println!("  Shroud profile: {profile}");
+    println!("  Morphology: {}", morphology.label());
+    println!("  Profile: {}", morphology.profile_name());
     println!("  Underlay: {}", underlay.label());
     let started = std::time::Instant::now();
     if mode == TransportMode::QuicStandard {
@@ -1055,7 +1096,7 @@ fn handle_join_check(
                 &certificate,
                 standards_quic::StandardsQuicConfig::default(),
             )?;
-            let connection = standards_quic::connect(
+            let mut connection = standards_quic::connect(
                 &endpoint,
                 peer_addr,
                 "localhost",
@@ -1065,6 +1106,14 @@ fn handle_join_check(
                 bounded_cli_timeout(timeout_secs),
             )
             .await?;
+            if let Some(phantom_one_profile) = phantom_one_profile {
+                connection
+                    .negotiate_phantom_one(
+                        Some(phantom_one_profile),
+                        bounded_cli_timeout(timeout_secs),
+                    )
+                    .await?;
+            }
             let state = connection.handshake;
             endpoint.close(0u32.into(), b"preflight complete");
             endpoint.wait_idle().await;
@@ -1103,7 +1152,9 @@ fn handle_host(
     port: u16,
     advertise: Option<&str>,
     transport: &str,
-    shroud_profile: &str,
+    shroud_profile: Option<&str>,
+    phantom_one: bool,
+    phantom_one_profile: Option<&str>,
     no_tun: bool,
     no_nat: bool,
     ticket_file: Option<&Path>,
@@ -1141,7 +1192,14 @@ fn handle_host(
     } else {
         (None, None)
     };
-    let profile = resolve_shroud_profile(Some(shroud_profile), None)?;
+    let empty_config = Config::default();
+    let morphology = resolve_morphology(
+        shroud_profile,
+        phantom_one,
+        phantom_one_profile,
+        &empty_config,
+    )?;
+    validate_morphology_transport(mode, morphology.phantom_one)?;
     let advertised_endpoint = advertised_endpoint(advertise, port)?;
     let bind = format_endpoint("0.0.0.0", port);
     let (mut config, keystore) = ensure_workspace(config_path, keystore_path)?;
@@ -1154,7 +1212,7 @@ fn handle_host(
     config.local_endpoint = bind.clone();
     config.stealth = Some(StealthConfig {
         profile: "steady".into(),
-        shroud_profile: profile.clone(),
+        shroud_profile: morphology.shroud_profile.clone(),
     });
     config.session = Some(SessionConfig {
         role: SessionRole::Listen,
@@ -1170,6 +1228,8 @@ fn handle_host(
         quic_key: quic_key_path
             .as_ref()
             .map(|path| path.display().to_string()),
+        phantom_one: morphology.phantom_one,
+        phantom_one_profile: morphology.phantom_one_profile.clone(),
         reconnect: Some(ReconnectConfig {
             enabled: Some(true),
             max_attempts: Some(10),
@@ -1179,12 +1239,16 @@ fn handle_host(
         startup_payload: None,
     });
     save_config(&config, config_path)?;
-    std::env::set_var("SHPH_SHROUD_PROFILE", &profile);
+    set_morphology_env(&morphology)?;
 
     let ticket = JoinTicket {
         endpoint: advertised_endpoint,
         transport: transport_mode_to_str(mode).into(),
-        shroud_profile: profile.clone(),
+        shroud_profile: (!morphology.phantom_one).then(|| morphology.shroud_profile.clone()),
+        phantom_one: morphology.phantom_one,
+        phantom_one_profile: morphology
+            .phantom_one
+            .then(|| morphology.profile_name().to_owned()),
         server_identity_b64: keystore.identity.public_key_b64(),
         server_signing_b64: keystore.identity.signing_public_b64(),
     }
@@ -1196,7 +1260,8 @@ fn handle_host(
     println!("SHPH host ready");
     println!("  Identity: {}", keystore.fingerprint_hex());
     println!("  Transport: {}", transport_mode_to_str(mode));
-    println!("  Shroud profile: {profile}");
+    println!("  Morphology: {}", morphology.label());
+    println!("  Profile: {}", morphology.profile_name());
     if let Some(path) = quic_cert_path.as_deref() {
         println!("  Standards QUIC certificate: {}", path.display());
     }
@@ -1220,7 +1285,9 @@ fn handle_host(
         UpOptions {
             transport: mode,
             profile: HandshakeProfile::SecureDefault,
-            shroud_profile: profile,
+            shroud_profile: morphology.shroud_profile,
+            phantom_one: morphology.phantom_one,
+            phantom_one_profile: morphology.phantom_one_profile,
             quic_cert_path: quic_cert_path.as_deref(),
             quic_key_path: quic_key_path.as_deref(),
             killswitch: false,
@@ -1246,7 +1313,8 @@ fn handle_join(
 ) -> Result<()> {
     let ticket = JoinTicket::decode(ticket_value)?;
     let mode = TransportMode::parse(&ticket.transport)?;
-    let profile = resolve_shroud_profile(Some(&ticket.shroud_profile), None)?;
+    let morphology = morphology_from_ticket(&ticket)?;
+    validate_morphology_transport(mode, morphology.phantom_one)?;
     let underlay = parse_tcp_underlay_for_mode(underlay_value, mode)?;
     let endpoint = Endpoint::parse(&ticket.endpoint)
         .map_err(|error| ShphError::InvalidArgument(format!("invalid ticket endpoint: {error}")))?;
@@ -1264,7 +1332,6 @@ fn handle_join(
             keystore_path,
             &ticket,
             mode,
-            &profile,
             &underlay,
             transport_peer.as_deref(),
             quic_cert_path,
@@ -1290,6 +1357,8 @@ fn handle_join(
         underlay: underlay.config_value(),
         quic_cert: quic_cert_path.map(|path| path.display().to_string()),
         quic_key: None,
+        phantom_one: morphology.phantom_one,
+        phantom_one_profile: morphology.phantom_one_profile.clone(),
         reconnect: Some(ReconnectConfig {
             enabled: Some(true),
             max_attempts: Some(10),
@@ -1300,11 +1369,11 @@ fn handle_join(
     });
     config.stealth = Some(StealthConfig {
         profile: "steady".into(),
-        shroud_profile: profile.clone(),
+        shroud_profile: morphology.shroud_profile.clone(),
     });
     save_config(&config, config_path)?;
     keystore.save(keystore_path)?;
-    std::env::set_var("SHPH_SHROUD_PROFILE", &profile);
+    set_morphology_env(&morphology)?;
 
     println!(
         "SHPH joining {}",
@@ -1315,7 +1384,8 @@ fn handle_join(
         shorten_key(&ticket.server_identity_b64)
     );
     println!("  Transport: {}", transport_mode_to_str(mode));
-    println!("  Shroud profile: {profile}");
+    println!("  Morphology: {}", morphology.label());
+    println!("  Profile: {}", morphology.profile_name());
     println!("  Underlay: {}", underlay.label());
     if let Some(transport_peer) = transport_peer_value {
         println!("  Transport peer: {transport_peer}");
@@ -1328,7 +1398,9 @@ fn handle_join(
         UpOptions {
             transport: mode,
             profile: HandshakeProfile::SecureDefault,
-            shroud_profile: profile,
+            shroud_profile: morphology.shroud_profile,
+            phantom_one: morphology.phantom_one,
+            phantom_one_profile: morphology.phantom_one_profile,
             quic_cert_path,
             quic_key_path: None,
             killswitch: false,
@@ -1360,6 +1432,7 @@ fn handle_id(
             .as_ref()
             .map(|stealth| stealth.shroud_profile.as_str()),
     )?;
+    let morphology = resolve_morphology(None, false, None, &config)?;
     let endpoint = shareable_endpoint(&config)?;
     let mode = resolve_transport_mode(None, config.roadmap.as_ref())?;
     let mode = if matches!(
@@ -1373,7 +1446,11 @@ fn handle_id(
     let ticket = JoinTicket {
         endpoint,
         transport: transport_mode_to_str(mode).into(),
-        shroud_profile: profile,
+        shroud_profile: (!morphology.phantom_one).then_some(profile),
+        phantom_one: morphology.phantom_one,
+        phantom_one_profile: morphology
+            .phantom_one
+            .then(|| morphology.profile_name().to_owned()),
         server_identity_b64: keystore.identity.public_key_b64(),
         server_signing_b64: keystore.identity.signing_public_b64(),
     }
@@ -1508,6 +1585,8 @@ struct UpOptions<'a> {
     transport: TransportMode,
     profile: HandshakeProfile,
     shroud_profile: String,
+    phantom_one: bool,
+    phantom_one_profile: String,
     quic_cert_path: Option<&'a Path>,
     quic_key_path: Option<&'a Path>,
     killswitch: bool,
@@ -1528,6 +1607,8 @@ fn handle_up(
         transport,
         profile,
         shroud_profile,
+        phantom_one,
+        phantom_one_profile,
         quic_cert_path,
         quic_key_path,
         killswitch,
@@ -1537,7 +1618,12 @@ fn handle_up(
         nat,
         underlay,
     } = options;
+    let phantom_one_wire_profile = phantom_one
+        .then(|| parse_phantom_one_profile(&phantom_one_profile))
+        .transpose()?;
     std::env::set_var("SHPH_SHROUD_PROFILE", &shroud_profile);
+    std::env::set_var("SHPH_PHANTOM_ONE", if phantom_one { "1" } else { "0" });
+    std::env::set_var("SHPH_PHANTOM_ONE_PROFILE", &phantom_one_profile);
     validate_config_roadmap(config)?;
     validate_tun_name(&config.interface_name)?;
     if control_plane_state_path(config_path).exists() {
@@ -1559,52 +1645,113 @@ fn handle_up(
     } {
         Ok(tun) => tun,
         Err(error) => {
-            let _ = killswitch_guard.cleanup();
-            return Err(error);
+            return Err(error_with_cleanup(
+                "native TUN open",
+                error,
+                vec![("killswitch", killswitch_guard.cleanup())],
+            ));
         }
     };
+    let mut tun_mutation_guard = if tun.is_native() {
+        match NativeTunMutationGuard::capture(tun.name()) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let cleanup_errors = vec![("killswitch", killswitch_guard.cleanup())];
+                return Err(error_with_cleanup(
+                    "native TUN state capture",
+                    error,
+                    cleanup_errors,
+                ));
+            }
+        }
+    } else {
+        NativeTunMutationGuard::default()
+    };
     if transport == TransportMode::QuicStandard && !tun.is_native() {
-        let _ = killswitch_guard.cleanup();
-        return Err(ShphError::Unsupported(
-            "quic-standard up requires native TUN; set SHPH_TUN_NATIVE=1".into(),
+        return Err(error_with_cleanup(
+            "quic-standard startup",
+            ShphError::Unsupported(
+                "quic-standard up requires native TUN; set SHPH_TUN_NATIVE=1".into(),
+            ),
+            vec![("killswitch", killswitch_guard.cleanup())],
         ));
     }
     if killswitch && !tun.is_native() && !killswitch_dry_run {
-        let _ = killswitch_guard.cleanup();
-        return Err(ShphError::Unsupported(
-            "the host killswitch requires native TUN; set SHPH_TUN_NATIVE=1".into(),
+        return Err(error_with_cleanup(
+            "killswitch startup",
+            ShphError::Unsupported(
+                "the host killswitch requires native TUN; set SHPH_TUN_NATIVE=1".into(),
+            ),
+            vec![("killswitch", killswitch_guard.cleanup())],
         ));
     }
     if mss_clamp && !tun.is_native() && !killswitch_dry_run {
-        let _ = killswitch_guard.cleanup();
-        return Err(ShphError::Unsupported(
-            "MSS clamping requires native TUN; set SHPH_TUN_NATIVE=1".into(),
+        return Err(error_with_cleanup(
+            "MSS-clamp startup",
+            ShphError::Unsupported(
+                "MSS clamping requires native TUN; set SHPH_TUN_NATIVE=1".into(),
+            ),
+            vec![("killswitch", killswitch_guard.cleanup())],
         ));
     }
     if killswitch {
-        killswitch_guard.allow_interface(tun.name())?;
+        if let Err(error) = killswitch_guard.allow_interface(tun.name()) {
+            let cleanup_errors = vec![("killswitch", killswitch_guard.cleanup())];
+            return Err(error_with_cleanup(
+                "killswitch interface allowance",
+                error,
+                cleanup_errors,
+            ));
+        }
     }
     let native_tun_mtu = if tun.is_native() {
         match native_tun_mtu_for_shroud_profile(&shroud_profile) {
             Ok(mtu) => mtu,
             Err(error) => {
-                let _ = killswitch_guard.cleanup();
-                return Err(error);
+                let cleanup_errors = vec![("killswitch", killswitch_guard.cleanup())];
+                return Err(error_with_cleanup(
+                    "native TUN MTU selection",
+                    error,
+                    cleanup_errors,
+                ));
             }
         }
     } else {
         DEFAULT_TUN_MTU_BYTES
     };
     if tun.is_native() {
-        configure_native_tun_mtu(tun.name(), native_tun_mtu)?;
-        configure_native_tun_route_priority(tun.name())?;
+        if let Err(error) = configure_native_tun_mtu(tun.name(), native_tun_mtu) {
+            let cleanup_errors = vec![
+                ("native TUN mutations", tun_mutation_guard.cleanup()),
+                ("killswitch", killswitch_guard.cleanup()),
+            ];
+            return Err(error_with_cleanup(
+                "native TUN MTU configuration",
+                error,
+                cleanup_errors,
+            ));
+        }
+        if let Err(error) = configure_native_tun_route_priority(tun.name()) {
+            let cleanup_errors = vec![
+                ("native TUN mutations", tun_mutation_guard.cleanup()),
+                ("killswitch", killswitch_guard.cleanup()),
+            ];
+            return Err(error_with_cleanup(
+                "native TUN route-priority configuration",
+                error,
+                cleanup_errors,
+            ));
+        }
     }
     let mut nat_guard = if nat && tun.is_native() {
         match apply_nat(tun.name(), killswitch_dry_run) {
             Ok(guard) => guard,
             Err(error) => {
-                let _ = killswitch_guard.cleanup();
-                return Err(error);
+                let cleanup_errors = vec![
+                    ("native TUN mutations", tun_mutation_guard.cleanup()),
+                    ("killswitch", killswitch_guard.cleanup()),
+                ];
+                return Err(error_with_cleanup("NAT setup", error, cleanup_errors));
             }
         }
     } else {
@@ -1617,8 +1764,12 @@ fn handle_up(
         match apply_mss_clamp(tun.name(), native_tun_mtu, killswitch_dry_run) {
             Ok(guard) => guard,
             Err(error) => {
-                let _ = killswitch_guard.cleanup();
-                return Err(error);
+                let cleanup_errors = vec![
+                    ("native TUN mutations", tun_mutation_guard.cleanup()),
+                    ("NAT", nat_guard.cleanup()),
+                    ("killswitch", killswitch_guard.cleanup()),
+                ];
+                return Err(error_with_cleanup("MSS-clamp setup", error, cleanup_errors));
             }
         }
     } else {
@@ -1630,7 +1781,22 @@ fn handle_up(
     println!("  Peer count: {}", config.peers.len());
     println!("  Underlay: {}", underlay.label());
     print_control_plane_status(config);
-    let mut control_guard = apply_control_plane(config, tun.name())?;
+    let mut control_guard = match apply_control_plane(config, tun.name(), Some(config_path)) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let cleanup_errors = vec![
+                ("native TUN mutations", tun_mutation_guard.cleanup()),
+                ("MSS-clamp", mss_guard.cleanup()),
+                ("NAT", nat_guard.cleanup()),
+                ("killswitch", killswitch_guard.cleanup()),
+            ];
+            return Err(error_with_cleanup(
+                "control-plane setup",
+                error,
+                cleanup_errors,
+            ));
+        }
+    };
     let interface_name = tun.name().to_string();
     let control_state_recorded = !control_guard.dry_run
         && (control_guard.interface_cidr.is_some()
@@ -1641,13 +1807,19 @@ fn handle_up(
             config_path,
             &state_from_guard(&interface_name, &control_guard),
         ) {
-            let cleanup_result = control_guard.cleanup();
-            return match cleanup_result {
-                Ok(()) => Err(err),
-                Err(clean_err) => Err(ShphError::Internal(format!(
-                    "control-plane state save error: {err}; rollback error: {clean_err}"
-                ))),
-            };
+            return finish_up_cleanup(
+                UpCleanupContext {
+                    config_path,
+                    interface_name: &interface_name,
+                    control_state_recorded,
+                    control_guard: &mut control_guard,
+                    mss_guard: &mut mss_guard,
+                    nat_guard: &mut nat_guard,
+                    killswitch_guard: &mut killswitch_guard,
+                    tun_mutation_guard: &mut tun_mutation_guard,
+                },
+                Some(("control-plane state save", err)),
+            );
         }
     }
     let session_result = (|| -> Result<()> {
@@ -1706,6 +1878,7 @@ fn handle_up(
                                     timeout_secs,
                                     transport,
                                     profile,
+                                    phantom_one_wire_profile,
                                     config.roadmap.as_ref(),
                                     quic_cert_path,
                                     quic_key_path,
@@ -1752,6 +1925,7 @@ fn handle_up(
                                     timeout_secs,
                                     transport,
                                     profile,
+                                    phantom_one_wire_profile,
                                     config.roadmap.as_ref(),
                                     quic_cert_path,
                                     quic_key_path,
@@ -1766,45 +1940,32 @@ fn handle_up(
         Ok(())
     })();
     match session_result {
-        Ok(()) => {
-            control_guard.cleanup()?;
-            mss_guard.cleanup()?;
-            nat_guard.cleanup()?;
-            killswitch_guard.cleanup()?;
-            if control_state_recorded {
-                remove_control_plane_state(config_path)?;
-            }
-            Ok(())
-        }
-        Err(err) => {
-            let cleanup_result = control_guard.cleanup();
-            let mss_cleanup_result = mss_guard.cleanup();
-            let killswitch_cleanup_result = killswitch_guard.cleanup();
-            if let Err(clean_err) = cleanup_result {
-                return Err(ShphError::Internal(format!(
-                    "session error: {err}; control-plane cleanup error: {clean_err}"
-                )));
-            }
-            if let Err(clean_err) = mss_cleanup_result {
-                return Err(ShphError::Internal(format!(
-                    "session error: {err}; MSS-clamp cleanup error: {clean_err}"
-                )));
-            }
-            if let Err(clean_err) = nat_guard.cleanup() {
-                return Err(ShphError::Internal(format!(
-                    "session error: {err}; NAT cleanup error: {clean_err}"
-                )));
-            }
-            if let Err(clean_err) = killswitch_cleanup_result {
-                return Err(ShphError::Internal(format!(
-                    "session error: {err}; killswitch cleanup error: {clean_err}"
-                )));
-            }
-            if control_state_recorded {
-                remove_control_plane_state(config_path)?;
-            }
-            Err(err)
-        }
+        Ok(()) => finish_up_cleanup(
+            UpCleanupContext {
+                config_path,
+                interface_name: &interface_name,
+                control_state_recorded,
+                control_guard: &mut control_guard,
+                mss_guard: &mut mss_guard,
+                nat_guard: &mut nat_guard,
+                killswitch_guard: &mut killswitch_guard,
+                tun_mutation_guard: &mut tun_mutation_guard,
+            },
+            None,
+        ),
+        Err(err) => finish_up_cleanup(
+            UpCleanupContext {
+                config_path,
+                interface_name: &interface_name,
+                control_state_recorded,
+                control_guard: &mut control_guard,
+                mss_guard: &mut mss_guard,
+                nat_guard: &mut nat_guard,
+                killswitch_guard: &mut killswitch_guard,
+                tun_mutation_guard: &mut tun_mutation_guard,
+            },
+            Some(("session", err)),
+        ),
     }
 }
 
@@ -1835,26 +1996,7 @@ const MAX_QUIC_CERTIFICATE_BYTES: u64 = 64 * 1024;
 const MAX_QUIC_PRIVATE_KEY_BYTES: u64 = 64 * 1024;
 
 fn read_quic_certificate(path: &Path) -> Result<Vec<u8>> {
-    ensure_no_reparse_components(path)?;
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .map_err(ShphError::Io)?
-    };
-    #[cfg(not(unix))]
-    let file = {
-        let metadata = fs::symlink_metadata(path).map_err(ShphError::Io)?;
-        if metadata.file_type().is_symlink() {
-            return Err(ShphError::InvalidArgument(
-                "refusing to read symlinked QUIC certificate".into(),
-            ));
-        }
-        fs::File::open(path).map_err(ShphError::Io)?
-    };
+    let file = open_readonly_no_reparse(path)?;
 
     let metadata = file.metadata().map_err(ShphError::Io)?;
     if !metadata.file_type().is_file() {
@@ -2691,6 +2833,23 @@ fn append_deep_doctor_checks(
         .handshake_profile
         .unwrap_or(HandshakeProfile::SecureDefault);
     let timeout_secs = session.timeout_secs.unwrap_or(5);
+    let phantom_one_profile = if session.phantom_one {
+        match parse_phantom_one_profile(&session.phantom_one_profile) {
+            Ok(profile) => Some(profile),
+            Err(error) => {
+                doctor_check(
+                    checks,
+                    "session-handshake",
+                    "fail",
+                    error.to_string(),
+                    Some("set a valid [session].phantom_one_profile".into()),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
     match connect_secure_session_lab_with_profile_and_underlay(
         &transport_peer,
         &keystore.identity,
@@ -2698,7 +2857,8 @@ fn append_deep_doctor_checks(
         timeout_secs,
         mode,
         QuicLabConfig {
-            shroud_profile: profile,
+            shroud_profile: (!session.phantom_one).then_some(profile).flatten(),
+            phantom_one_profile,
         },
         handshake_profile,
         &underlay,
@@ -2743,6 +2903,15 @@ struct PersistedControlPlaneState {
     dns_servers: Vec<String>,
 }
 
+impl PersistedControlPlaneState {
+    fn is_empty(&self) -> bool {
+        self.interface_cidr.is_none()
+            && self.routes.is_empty()
+            && self.underlay_bypass_routes.is_empty()
+            && self.dns_servers.is_empty()
+    }
+}
+
 fn control_plane_state_path(config_path: &Path) -> PathBuf {
     let mut state_path = config_path.to_path_buf();
     state_path.set_extension("control-plane.json");
@@ -2773,22 +2942,14 @@ fn load_control_plane_state(config_path: &Path) -> Result<PersistedControlPlaneS
 }
 
 fn open_control_plane_state_readonly(path: &Path) -> io::Result<fs::File> {
-    shph_core::ensure_no_reparse_components(path)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let file = shph_core::open_readonly_no_reparse(path).map_err(|error| match error {
+        ShphError::Io(error) => error,
+        ShphError::InvalidArgument(message) => io::Error::new(io::ErrorKind::InvalidInput, message),
+        error => io::Error::other(error.to_string()),
+    })?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "control-plane state path must reference a regular file",
-            ));
-        }
         let mode = file.metadata()?.permissions().mode();
         if mode & 0o077 != 0 {
             return Err(io::Error::new(
@@ -2802,26 +2963,10 @@ fn open_control_plane_state_readonly(path: &Path) -> io::Result<fs::File> {
     }
     #[cfg(not(unix))]
     {
-        shph_core::ensure_not_reparse_point(path)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "refusing to load a symlinked control-plane state",
-            ));
-        }
         shph_core::enforce_owner_only_file_permissions(path)
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
-        let file = fs::File::open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "control-plane state path must reference a regular file",
-            ));
-        }
-        Ok(file)
     }
+    Ok(file)
 }
 
 fn save_control_plane_state(config_path: &Path, state: &PersistedControlPlaneState) -> Result<()> {
@@ -2925,6 +3070,23 @@ fn state_from_guard(interface_name: &str, guard: &ControlPlaneGuard) -> Persiste
     }
 }
 
+fn save_remaining_control_plane_state(
+    config_path: &Path,
+    interface_name: &str,
+    recorded: bool,
+    guard: &ControlPlaneGuard,
+) -> Result<()> {
+    if recorded {
+        let state = state_from_guard(interface_name, guard);
+        if state.is_empty() {
+            remove_control_plane_state(config_path)?;
+        } else {
+            save_control_plane_state(config_path, &state)?;
+        }
+    }
+    Ok(())
+}
+
 fn guard_from_state(state: &PersistedControlPlaneState) -> ControlPlaneGuard {
     ControlPlaneGuard {
         interface_cidr: state
@@ -2977,11 +3139,29 @@ fn handle_control_plane_apply(config_path: &Path) -> Result<()> {
         ));
     }
 
-    let guard = apply_control_plane(&config, interface_name)?;
+    let mut guard = apply_control_plane(&config, interface_name, Some(config_path))?;
     if control.dry_run.unwrap_or(true) {
         return Ok(());
     }
-    save_control_plane_state(config_path, &state_from_guard(interface_name, &guard))?;
+    if let Err(error) =
+        save_control_plane_state(config_path, &state_from_guard(interface_name, &guard))
+    {
+        return match guard.cleanup() {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => {
+                let state = state_from_guard(interface_name, &guard);
+                let persistence_error = save_control_plane_state(config_path, &state).err();
+                let mut details = vec![format!("control-plane state save error: {error}")];
+                details.push(format!("control-plane rollback error: {cleanup_error}"));
+                if let Some(persistence_error) = persistence_error {
+                    details.push(format!(
+                        "control-plane state persistence error: {persistence_error}"
+                    ));
+                }
+                Err(ShphError::Internal(details.join("; ")))
+            }
+        };
+    }
     println!(
         "Control plane: applied routes={} dns={}",
         desired.routes.len(),
@@ -3368,49 +3548,7 @@ fn read_shamir_secret(
 }
 
 fn open_secret_input(path: &Path) -> Result<fs::File> {
-    ensure_no_reparse_components(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .map_err(ShphError::Io)?;
-        if !file
-            .metadata()
-            .map_err(ShphError::Io)?
-            .file_type()
-            .is_file()
-        {
-            return Err(ShphError::InvalidArgument(
-                "secret input path must reference a regular file".into(),
-            ));
-        }
-        Ok(file)
-    }
-    #[cfg(not(unix))]
-    {
-        shph_core::ensure_not_reparse_point(path)?;
-        let metadata = fs::symlink_metadata(path).map_err(ShphError::Io)?;
-        if metadata.file_type().is_symlink() {
-            return Err(ShphError::InvalidArgument(
-                "refusing to read a symlinked secret input".into(),
-            ));
-        }
-        let file = fs::File::open(path).map_err(ShphError::Io)?;
-        if !file
-            .metadata()
-            .map_err(ShphError::Io)?
-            .file_type()
-            .is_file()
-        {
-            return Err(ShphError::InvalidArgument(
-                "secret input path must reference a regular file".into(),
-            ));
-        }
-        Ok(file)
-    }
+    open_readonly_no_reparse(path)
 }
 
 fn write_shamir_shares(output_dir: &Path, shares: &[ShamirShare]) -> Result<()> {
@@ -3558,6 +3696,7 @@ fn handle_listen(
         })?;
         let bind_addr = parse_socket_addr(bind)?;
         let timeout = bounded_cli_timeout(timeout_secs);
+        let phantom_one_profile = quic_lab_config()?.phantom_one_profile;
         let state = run_async(async {
             let private_key_path = quic_key_path
                 .map(PathBuf::from)
@@ -3568,9 +3707,14 @@ fn handle_listen(
                 "  Standards QUIC private key: {}",
                 private_key_path.display()
             );
-            let connection =
+            let mut connection =
                 standards_quic::accept(&server, &keystore.identity, &policy, profile, timeout)
                     .await?;
+            if let Some(phantom_one_profile) = phantom_one_profile {
+                connection
+                    .negotiate_phantom_one(Some(phantom_one_profile), timeout)
+                    .await?;
+            }
             Ok(connection.handshake)
         })?;
         enforce_peer_policy(keystore_path, bind, &state, false)?;
@@ -3658,13 +3802,14 @@ fn handle_connect(
         let certificate = read_quic_certificate(cert_path)?;
         let peer_addr = parse_socket_addr(peer)?;
         let timeout_duration = bounded_cli_timeout(timeout_secs);
+        let phantom_one_profile = quic_lab_config()?.phantom_one_profile;
         let state = run_async(async {
             let endpoint = standards_quic::client_endpoint(
                 "0.0.0.0:0".parse().expect("valid ephemeral endpoint"),
                 &certificate,
                 standards_quic::StandardsQuicConfig::default(),
             )?;
-            let connection = standards_quic::connect(
+            let mut connection = standards_quic::connect(
                 &endpoint,
                 peer_addr,
                 "localhost",
@@ -3674,6 +3819,11 @@ fn handle_connect(
                 timeout_duration,
             )
             .await?;
+            if let Some(phantom_one_profile) = phantom_one_profile {
+                connection
+                    .negotiate_phantom_one(Some(phantom_one_profile), timeout_duration)
+                    .await?;
+            }
             let state = connection.handshake;
             endpoint.close(0u32.into(), b"handshake complete");
             endpoint.wait_idle().await;
@@ -3774,6 +3924,7 @@ fn handle_send_once(
         })?;
         let certificate = read_quic_certificate(cert_path)?;
         let peer_addr = parse_socket_addr(transport_peer)?;
+        let phantom_one_profile = lab.phantom_one_profile;
         let state = run_async(async {
             let endpoint = standards_quic::client_endpoint(
                 "0.0.0.0:0".parse().expect("valid ephemeral endpoint"),
@@ -3790,8 +3941,22 @@ fn handle_send_once(
                 bounded_cli_timeout(timeout_secs),
             )
             .await?;
+            if let Some(phantom_one_profile) = phantom_one_profile {
+                connection
+                    .negotiate_phantom_one(
+                        Some(phantom_one_profile),
+                        bounded_cli_timeout(timeout_secs),
+                    )
+                    .await?;
+            }
             enforce_peer_policy(keystore_path, peer, &connection.handshake, true)?;
-            connection.send_datagram_wait(text.as_bytes()).await?;
+            if phantom_one_profile.is_some() {
+                connection
+                    .send_phantom_one_datagram(text.as_bytes())
+                    .await?;
+            } else {
+                connection.send_datagram_wait(text.as_bytes()).await?;
+            }
             let ack =
                 tokio::time::timeout(bounded_cli_timeout(timeout_secs), connection.recv_control())
                     .await
@@ -3908,6 +4073,7 @@ fn handle_recv_once(
             )
         })?;
         let bind_addr = parse_socket_addr(bind)?;
+        let phantom_one_profile = lab.phantom_one_profile;
         let result = run_async(async {
             let private_key_path = quic_key_path
                 .map(PathBuf::from)
@@ -3926,14 +4092,26 @@ fn handle_recv_once(
                 bounded_cli_timeout(timeout_secs),
             )
             .await?;
+            if let Some(phantom_one_profile) = phantom_one_profile {
+                connection
+                    .negotiate_phantom_one(
+                        Some(phantom_one_profile),
+                        bounded_cli_timeout(timeout_secs),
+                    )
+                    .await?;
+            }
             enforce_peer_policy(keystore_path, bind, &connection.handshake, false)?;
-            let payload = connection.recv_datagram().await?;
+            let payload = if phantom_one_profile.is_some() {
+                connection.recv_phantom_one_datagram().await?
+            } else {
+                connection.recv_datagram().await?.to_vec()
+            };
             connection.send_control(QUIC_PAYLOAD_ACK).await?;
             let peer_connection = connection.connection.clone();
             let _ =
                 tokio::time::timeout(bounded_cli_timeout(timeout_secs), peer_connection.closed())
                     .await;
-            Ok((connection.handshake, payload.to_vec()))
+            Ok((connection.handshake, payload))
         })?;
         let (state, payload) = result;
         append_handshake_audit(roadmap, &keystore.identity, bind, &state, "recv", mode)?;
@@ -4064,6 +4242,148 @@ fn resolve_handshake_profile(
     Ok(profile)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MorphologySelection {
+    shroud_profile: String,
+    phantom_one: bool,
+    phantom_one_profile: String,
+}
+
+impl MorphologySelection {
+    fn shroud_two(profile: String) -> Self {
+        Self {
+            shroud_profile: profile,
+            phantom_one: false,
+            phantom_one_profile: "medium".into(),
+        }
+    }
+
+    fn phantom_one(profile: ProfileTier) -> Self {
+        Self {
+            shroud_profile: profile.as_str().into(),
+            phantom_one: true,
+            phantom_one_profile: profile.as_str().into(),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        if self.phantom_one {
+            "Phantom One"
+        } else {
+            "Shroud 2"
+        }
+    }
+
+    fn profile_name(&self) -> &str {
+        if self.phantom_one {
+            &self.phantom_one_profile
+        } else {
+            &self.shroud_profile
+        }
+    }
+}
+
+fn parse_phantom_one_profile(value: &str) -> Result<ProfileTier> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => Ok(ProfileTier::Low),
+        "medium" => Ok(ProfileTier::Medium),
+        "high" => Ok(ProfileTier::High),
+        "tuned-low" => Ok(ProfileTier::TunedLow),
+        "tuned-medium" => Ok(ProfileTier::TunedMedium),
+        "tuned-high" => Ok(ProfileTier::TunedHigh),
+        _ => Err(ShphError::InvalidArgument(
+            "Phantom One profile must be low, medium, high, tuned-low, tuned-medium, or tuned-high"
+                .into(),
+        )),
+    }
+}
+
+fn resolve_morphology(
+    shroud_profile: Option<&str>,
+    phantom_one: bool,
+    phantom_one_profile: Option<&str>,
+    config: &Config,
+) -> Result<MorphologySelection> {
+    let configured_phantom_one = config
+        .session
+        .as_ref()
+        .map(|session| session.phantom_one)
+        .unwrap_or(false);
+    let configured_phantom_profile = config
+        .session
+        .as_ref()
+        .map(|session| session.phantom_one_profile.as_str());
+    let phantom_one = phantom_one || phantom_one_profile.is_some() || configured_phantom_one;
+
+    if phantom_one && shroud_profile.is_some() {
+        return Err(ShphError::InvalidArgument(
+            "--phantom-one and --shroud-profile are mutually exclusive".into(),
+        ));
+    }
+
+    if phantom_one {
+        let profile = phantom_one_profile
+            .or(configured_phantom_profile)
+            .unwrap_or("medium");
+        return Ok(MorphologySelection::phantom_one(parse_phantom_one_profile(
+            profile,
+        )?));
+    }
+
+    Ok(MorphologySelection::shroud_two(resolve_shroud_profile(
+        shroud_profile,
+        config
+            .stealth
+            .as_ref()
+            .map(|stealth| stealth.shroud_profile.as_str()),
+    )?))
+}
+
+fn morphology_from_ticket(ticket: &JoinTicket) -> Result<MorphologySelection> {
+    if ticket.phantom_one {
+        let profile = ticket.phantom_one_profile.as_deref().ok_or_else(|| {
+            ShphError::InvalidArgument("Phantom One ticket is missing its profile".into())
+        })?;
+        return Ok(MorphologySelection::phantom_one(parse_phantom_one_profile(
+            profile,
+        )?));
+    }
+
+    let profile = ticket.shroud_profile.as_deref().ok_or_else(|| {
+        ShphError::InvalidArgument("Shroud 2 ticket is missing its profile".into())
+    })?;
+    Ok(MorphologySelection::shroud_two(resolve_shroud_profile(
+        Some(profile),
+        None,
+    )?))
+}
+
+fn validate_morphology_transport(mode: TransportMode, phantom_one: bool) -> Result<()> {
+    if phantom_one && !matches!(mode, TransportMode::Tcp | TransportMode::QuicStandard) {
+        return Err(ShphError::Unsupported(
+            "Phantom One currently supports authenticated TCP and standards-compliant QUIC only; use Shroud 2 for the experimental QUIC shim or other transports"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn set_morphology_env(selection: &MorphologySelection) -> Result<()> {
+    std::env::set_var("SHPH_SHROUD_PROFILE", &selection.shroud_profile);
+    std::env::set_var(
+        "SHPH_PHANTOM_ONE",
+        if selection.phantom_one { "1" } else { "0" },
+    );
+    std::env::set_var("SHPH_PHANTOM_ONE_PROFILE", &selection.phantom_one_profile);
+    Ok(())
+}
+
+fn set_morphology_from_config(config: &Config) -> Result<MorphologySelection> {
+    let selection = resolve_morphology(None, false, None, config)?;
+    set_morphology_env(&selection)?;
+    Ok(selection)
+}
+
 fn announce_handshake_profile(profile: HandshakeProfile) {
     println!("  Handshake profile: {}", profile.as_str());
     if profile == HandshakeProfile::ClassicalLab {
@@ -4126,12 +4446,31 @@ fn resolve_shroud_profile(cli_value: Option<&str>, config_value: Option<&str>) -
 }
 
 fn quic_lab_config() -> Result<QuicLabConfig> {
-    let Some(name) = std::env::var("SHPH_SHROUD_PROFILE").ok() else {
-        return Ok(QuicLabConfig::default());
+    let phantom_one = matches!(
+        std::env::var("SHPH_PHANTOM_ONE").as_deref(),
+        Ok("1" | "true" | "yes")
+    );
+    let profile_name = if phantom_one {
+        std::env::var("SHPH_PHANTOM_ONE_PROFILE").unwrap_or_else(|_| "medium".into())
+    } else {
+        std::env::var("SHPH_SHROUD_PROFILE").unwrap_or_else(|_| "medium".into())
     };
-    let profile = parse_shroud_profile_name(&name)?;
+    let profile_name = if phantom_one {
+        parse_phantom_one_profile(&profile_name)?
+            .as_str()
+            .to_owned()
+    } else {
+        profile_name
+    };
+    let profile = (!phantom_one)
+        .then(|| parse_shroud_profile_name(&profile_name))
+        .transpose()?
+        .flatten();
     Ok(QuicLabConfig {
         shroud_profile: profile,
+        phantom_one_profile: phantom_one
+            .then(|| parse_phantom_one_profile(&profile_name))
+            .transpose()?,
     })
 }
 
@@ -4332,7 +4671,11 @@ fn print_control_plane_status(config: &Config) {
     }
 }
 
-fn apply_control_plane(config: &Config, interface_name: &str) -> Result<ControlPlaneGuard> {
+fn apply_control_plane(
+    config: &Config,
+    interface_name: &str,
+    state_config_path: Option<&Path>,
+) -> Result<ControlPlaneGuard> {
     let Some(control) = &config.control_plane else {
         return Ok(ControlPlaneGuard::default());
     };
@@ -4408,14 +4751,208 @@ fn apply_control_plane(config: &Config, interface_name: &str) -> Result<ControlP
         // while still surfacing any rollback failure for diagnostics.
         let cleanup_result = guard.cleanup();
         if let Err(clean_err) = cleanup_result {
-            return Err(ShphError::Internal(format!(
-                "control-plane apply error: {err}; rollback error: {clean_err}"
-            )));
+            let state_persistence_error = if !guard.dry_run
+                && (guard.interface_cidr.is_some()
+                    || !guard.added_routes.is_empty()
+                    || !guard.added_underlay_bypass_routes.is_empty()
+                    || !guard.applied_dns_servers.is_empty())
+            {
+                state_config_path.and_then(|path| {
+                    save_remaining_control_plane_state(path, interface_name, true, &guard).err()
+                })
+            } else {
+                None
+            };
+            let mut details = vec![
+                format!("control-plane apply error: {err}"),
+                format!("control-plane rollback error: {clean_err}"),
+            ];
+            if let Some(state_persistence_error) = state_persistence_error {
+                details.push(format!(
+                    "control-plane state persistence error: {state_persistence_error}"
+                ));
+            }
+            return Err(ShphError::Internal(details.join("; ")));
         }
         return Err(err);
     }
 
     Ok(guard)
+}
+
+#[derive(Default)]
+struct NativeTunMutationGuard {
+    cleanup_commands: Vec<Vec<String>>,
+}
+
+impl NativeTunMutationGuard {
+    fn capture(interface_name: &str) -> Result<Self> {
+        validate_tun_name(interface_name)?;
+        let mut guard = Self::default();
+
+        #[cfg(target_os = "linux")]
+        {
+            let output = run_shell_command_capture(&[
+                "ip".into(),
+                "-o".into(),
+                "link".into(),
+                "show".into(),
+                "dev".into(),
+                interface_name.into(),
+            ])?;
+            let mtu = output
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find_map(|parts| (parts[0] == "mtu").then(|| parts[1]))
+                .ok_or_else(|| ShphError::Internal("unable to determine native TUN MTU".into()))?
+                .parse::<usize>()
+                .map_err(|_| ShphError::Internal("native TUN MTU was not numeric".into()))?;
+            guard.cleanup_commands = build_tun_mtu_commands(interface_name, mtu)?;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let output = run_shell_command_capture(&windows_tun_state_query(interface_name)?)?;
+            let values = output
+                .trim()
+                .split(',')
+                .map(str::trim)
+                .map(str::parse::<u32>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    ShphError::Internal("native TUN state query returned invalid values".into())
+                })?;
+            if values.len() != 4 {
+                return Err(ShphError::Internal(
+                    "native TUN state query returned an unexpected field count".into(),
+                ));
+            }
+            let ipv4_mtu = usize::try_from(values[0])
+                .map_err(|_| ShphError::Internal("native IPv4 MTU is out of range".into()))?;
+            let ipv6_mtu = usize::try_from(values[1])
+                .map_err(|_| ShphError::Internal("native IPv6 MTU is out of range".into()))?;
+            guard.cleanup_commands =
+                build_windows_tun_mtu_restore_commands(interface_name, ipv4_mtu, ipv6_mtu)?;
+            guard
+                .cleanup_commands
+                .push(build_tun_route_priority_restore_command(
+                    interface_name,
+                    values[2],
+                    values[3],
+                )?);
+        }
+
+        Ok(guard)
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        let pending = std::mem::take(&mut self.cleanup_commands);
+        let mut remaining = Vec::new();
+        let mut first_error = None;
+        for command in pending {
+            if command.is_empty() {
+                continue;
+            }
+            if let Err(error) = run_shell_command(&command) {
+                remaining.push(command);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        self.cleanup_commands = remaining;
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for NativeTunMutationGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_tun_state_query(interface_name: &str) -> Result<Vec<String>> {
+    validate_tun_name(interface_name)?;
+    Ok(vec![
+        "powershell.exe".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-ExecutionPolicy".into(),
+        "Bypass".into(),
+        "-Command".into(),
+        format!(
+            "$name = '{interface_name}'; \
+             $v4 = @(Get-NetIPInterface -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction Stop); \
+             $v6 = @(Get-NetIPInterface -InterfaceAlias $name -AddressFamily IPv6 -ErrorAction Stop); \
+             if ($v4.Count -ne 1 -or $v6.Count -ne 1) {{ throw \"expected one IPv4 and one IPv6 interface: $name\" }}; \
+             Write-Output \"$($v4[0].NlMtu),$($v6[0].NlMtu),$($v4[0].InterfaceMetric),$($v6[0].InterfaceMetric)\"",
+        ),
+    ])
+}
+
+fn build_windows_tun_mtu_restore_commands(
+    interface_name: &str,
+    ipv4_mtu: usize,
+    ipv6_mtu: usize,
+) -> Result<Vec<Vec<String>>> {
+    validate_tun_name(interface_name)?;
+    validate_tun_mtu(ipv4_mtu)?;
+    validate_tun_mtu(ipv6_mtu)?;
+    if cfg!(target_os = "windows") {
+        return Ok(vec![
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv4".into(),
+                "set".into(),
+                "subinterface".into(),
+                format!("interface={interface_name}"),
+                format!("mtu={ipv4_mtu}"),
+                "store=active".into(),
+            ],
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "set".into(),
+                "subinterface".into(),
+                format!("interface={interface_name}"),
+                format!("mtu={ipv6_mtu}"),
+                "store=active".into(),
+            ],
+        ]);
+    }
+    Ok(Vec::new())
+}
+
+fn build_tun_route_priority_restore_command(
+    interface_name: &str,
+    ipv4_metric: u32,
+    ipv6_metric: u32,
+) -> Result<Vec<String>> {
+    validate_tun_name(interface_name)?;
+    if cfg!(target_os = "windows") {
+        let script = format!(
+            "$name = '{interface_name}'; \
+             $v4 = @(Get-NetIPInterface -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction Stop); \
+             $v6 = @(Get-NetIPInterface -InterfaceAlias $name -AddressFamily IPv6 -ErrorAction Stop); \
+             if ($v4.Count -ne 1 -or $v6.Count -ne 1) {{ throw \"expected one IPv4 and one IPv6 interface: $name\" }}; \
+             $v4[0] | Set-NetIPInterface -InterfaceMetric {ipv4_metric} -PolicyStore ActiveStore -ErrorAction Stop; \
+             $v6[0] | Set-NetIPInterface -InterfaceMetric {ipv6_metric} -PolicyStore ActiveStore -ErrorAction Stop",
+        );
+        return Ok(vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-Command".into(),
+            script,
+        ]);
+    }
+    Ok(Vec::new())
 }
 
 fn configure_native_tun_mtu(interface_name: &str, mtu: usize) -> Result<()> {
@@ -4467,21 +5004,26 @@ impl FirewallGuard {
         let mut first_error = None;
 
         #[cfg(target_os = "windows")]
-        if let Some(mut guard) = self.windows.take() {
+        if let Some(guard) = self.windows.as_mut() {
             if let Err(error) = guard.cleanup() {
                 first_error = Some(error);
             }
         }
 
-        let dry_run = self.dry_run;
-        for command in self.cleanup_commands.drain(..) {
-            if !dry_run {
+        if self.dry_run {
+            self.cleanup_commands.clear();
+        } else {
+            let pending = std::mem::take(&mut self.cleanup_commands);
+            let mut remaining = Vec::new();
+            for command in pending {
                 if let Err(error) = run_shell_command(&command) {
+                    remaining.push(command);
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
                 }
             }
+            self.cleanup_commands = remaining;
         }
 
         match first_error {
@@ -4519,18 +5061,24 @@ struct NatGuard {
 impl NatGuard {
     fn cleanup(&mut self) -> Result<()> {
         let mut first_error = None;
-        for command in self.cleanup_commands.drain(..) {
-            if !self.dry_run {
+        if self.dry_run {
+            self.cleanup_commands.clear();
+        } else {
+            let pending = std::mem::take(&mut self.cleanup_commands);
+            let mut remaining = Vec::new();
+            for command in pending {
                 if let Err(error) = run_shell_command(&command) {
+                    remaining.push(command);
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
                 }
             }
+            self.cleanup_commands = remaining;
         }
 
         if !self.dry_run {
-            if let Some(previous) = self.previous_forwarding.take() {
+            if let Some(previous) = self.previous_forwarding.as_deref() {
                 if let Err(error) = run_shell_command(&[
                     "sysctl".into(),
                     "-w".into(),
@@ -4539,6 +5087,8 @@ impl NatGuard {
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
+                } else {
+                    self.previous_forwarding = None;
                 }
             }
         } else {
@@ -4968,21 +5518,37 @@ fn build_control_plane_plan(
     }
 
     if control.apply_routes.unwrap_or(false) {
+        let mut seen_routes = HashSet::new();
         for route in control.route_cidrs.as_deref().unwrap_or(&[]) {
-            validate_cidr(route)?;
+            let key = canonical_cidr_key(route)?;
+            if !seen_routes.insert(key) {
+                return Err(ShphError::Config(format!(
+                    "duplicate control-plane route: {route}"
+                )));
+            }
             plan.routes.push(route.to_string());
         }
         for route in control.underlay_bypass_cidrs.as_deref().unwrap_or(&[]) {
+            let key = canonical_cidr_key(route)?;
             validate_underlay_bypass_cidr(route)?;
+            if !seen_routes.insert(key) {
+                return Err(ShphError::Config(format!(
+                    "duplicate control-plane route or underlay bypass: {route}"
+                )));
+            }
             plan.underlay_bypass_routes.push(route.to_string());
         }
     }
 
     if control.apply_dns.unwrap_or(false) {
+        let mut seen_dns = HashSet::new();
         for server in control.dns_servers.as_deref().unwrap_or(&[]) {
-            server
+            let address = server
                 .parse::<IpAddr>()
                 .map_err(|_| ShphError::Config(format!("invalid DNS server IP: {server}")))?;
+            if !seen_dns.insert(address) {
+                return Err(ShphError::Config(format!("duplicate DNS server: {server}")));
+            }
             plan.dns_servers.push(server.to_string());
         }
         plan.apply_dns = !plan.dns_servers.is_empty();
@@ -5014,6 +5580,31 @@ fn validate_control_plane_underlay(config: &Config, plan: &ControlPlanePlan) -> 
 fn validate_cidr(cidr: &str) -> Result<()> {
     parse_cidr(cidr)?;
     Ok(())
+}
+
+fn canonical_cidr_key(cidr: &str) -> Result<String> {
+    let (ip_addr, prefix) = parse_cidr(cidr)?;
+    let network = match ip_addr {
+        IpAddr::V4(address) => {
+            let bits = u32::from(address);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix))
+            };
+            IpAddr::V4(Ipv4Addr::from(bits & mask))
+        }
+        IpAddr::V6(address) => {
+            let bits = u128::from(address);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(prefix))
+            };
+            IpAddr::V6(Ipv6Addr::from(bits & mask))
+        }
+    };
+    Ok(format!("{network}/{prefix}"))
 }
 
 fn validate_underlay_bypass_cidr(cidr: &str) -> Result<()> {
@@ -5101,31 +5692,44 @@ impl ControlPlaneGuard {
             } else {
                 println!("  dns restore");
             }
-            self.applied_dns_servers.clear();
-            self.dns_interface_name = None;
+            if rollback_errors.is_empty() {
+                self.applied_dns_servers.clear();
+                self.dns_interface_name = None;
+            }
         }
 
-        while let Some((route, interface_name)) = self.added_routes.pop() {
+        let pending_routes = std::mem::take(&mut self.added_routes);
+        let mut remaining_routes = Vec::new();
+        for (route, interface_name) in pending_routes.into_iter().rev() {
             if let Err(err) = delete_route(&route, &interface_name) {
                 rollback_errors.push(err);
+                remaining_routes.push((route, interface_name));
             } else {
                 println!("  route del {route}");
             }
         }
+        remaining_routes.reverse();
+        self.added_routes = remaining_routes;
 
-        while let Some(route) = self.added_underlay_bypass_routes.pop() {
+        let pending_bypass = std::mem::take(&mut self.added_underlay_bypass_routes);
+        let mut remaining_bypass = Vec::new();
+        for route in pending_bypass.into_iter().rev() {
             if let Err(err) = delete_underlay_bypass_route(&route) {
                 rollback_errors.push(err);
+                remaining_bypass.push(route);
             } else {
                 println!("  underlay bypass del {route}");
             }
         }
+        remaining_bypass.reverse();
+        self.added_underlay_bypass_routes = remaining_bypass;
 
-        if let Some((interface_cidr, interface_name)) = self.interface_cidr.take() {
-            if let Err(err) = delete_interface_address(&interface_cidr, &interface_name) {
+        if let Some((interface_cidr, interface_name)) = self.interface_cidr.as_ref() {
+            if let Err(err) = delete_interface_address(interface_cidr, interface_name) {
                 rollback_errors.push(err);
             } else {
                 println!("  address del {interface_cidr}");
+                self.interface_cidr = None;
             }
         }
 
@@ -5134,6 +5738,103 @@ impl ControlPlaneGuard {
         }
         Ok(())
     }
+}
+
+fn error_with_cleanup(
+    operation: &str,
+    error: ShphError,
+    cleanup_results: Vec<(&str, Result<()>)>,
+) -> ShphError {
+    let cleanup_errors = cleanup_results
+        .into_iter()
+        .filter_map(|(label, result)| result.err().map(|error| format!("{label}: {error}")))
+        .collect::<Vec<_>>();
+    if cleanup_errors.is_empty() {
+        error
+    } else {
+        ShphError::Internal(format!(
+            "{operation} error: {error}; cleanup errors: {}",
+            cleanup_errors.join("; ")
+        ))
+    }
+}
+
+struct UpCleanupContext<'a> {
+    config_path: &'a Path,
+    interface_name: &'a str,
+    control_state_recorded: bool,
+    control_guard: &'a mut ControlPlaneGuard,
+    mss_guard: &'a mut FirewallGuard,
+    nat_guard: &'a mut NatGuard,
+    killswitch_guard: &'a mut FirewallGuard,
+    tun_mutation_guard: &'a mut NativeTunMutationGuard,
+}
+
+fn finish_up_cleanup(
+    context: UpCleanupContext<'_>,
+    primary_error: Option<(&str, ShphError)>,
+) -> Result<()> {
+    let UpCleanupContext {
+        config_path,
+        interface_name,
+        control_state_recorded,
+        control_guard,
+        mss_guard,
+        nat_guard,
+        killswitch_guard,
+        tun_mutation_guard,
+    } = context;
+    let mut cleanup_errors = Vec::new();
+    match control_guard.cleanup() {
+        Ok(()) => {
+            if control_state_recorded {
+                if let Err(error) = remove_control_plane_state(config_path) {
+                    cleanup_errors.push(("control-plane state removal", error));
+                }
+            }
+        }
+        Err(error) => {
+            cleanup_errors.push(("control-plane rollback", error));
+            if control_state_recorded {
+                if let Err(error) = save_remaining_control_plane_state(
+                    config_path,
+                    interface_name,
+                    true,
+                    control_guard,
+                ) {
+                    cleanup_errors.push(("control-plane state persistence", error));
+                }
+            }
+        }
+    }
+
+    if let Err(error) = mss_guard.cleanup() {
+        cleanup_errors.push(("MSS-clamp rollback", error));
+    }
+    if let Err(error) = nat_guard.cleanup() {
+        cleanup_errors.push(("NAT rollback", error));
+    }
+    if let Err(error) = killswitch_guard.cleanup() {
+        cleanup_errors.push(("killswitch rollback", error));
+    }
+    if let Err(error) = tun_mutation_guard.cleanup() {
+        cleanup_errors.push(("native TUN mutation rollback", error));
+    }
+
+    if cleanup_errors.is_empty() {
+        return primary_error.map_or(Ok(()), |(_, error)| Err(error));
+    }
+
+    let mut details = Vec::new();
+    if let Some((label, error)) = primary_error {
+        details.push(format!("{label} error: {error}"));
+    }
+    details.extend(
+        cleanup_errors
+            .into_iter()
+            .map(|(label, error)| format!("{label}: {error}")),
+    );
+    Err(ShphError::Internal(details.join("; ")))
 }
 
 fn add_route(cidr: &str, interface_name: &str) -> Result<()> {
@@ -5610,27 +6311,25 @@ fn run_shell_command(command: &[String]) -> Result<()> {
     if command.is_empty() {
         return Err(ShphError::InvalidArgument("empty command".into()));
     }
+    let program = &command[0];
     let status = Command::new(&command[0]).args(&command[1..]).status();
     let status = match status {
         Ok(status) => status,
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
             return Err(ShphError::PermissionDenied(format!(
-                "failed to run {:?}: {}",
-                command, err
+                "failed to run '{program}': {err}"
             )));
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Err(ShphError::Unsupported(format!(
-                "required command not found: {}",
-                command[0]
+                "required command not found: {program}"
             )));
         }
         Err(err) => return Err(ShphError::Io(err)),
     };
     if !status.success() {
         return Err(ShphError::Internal(format!(
-            "command failed with status {}: {:?}",
-            status, command
+            "command '{program}' failed with status {status}"
         )));
     }
     Ok(())
@@ -5641,33 +6340,26 @@ fn run_shell_command_capture(command: &[String]) -> Result<String> {
     if command.is_empty() {
         return Err(ShphError::InvalidArgument("empty command".into()));
     }
+    let program = &command[0];
     let output = Command::new(&command[0]).args(&command[1..]).output();
     let output = match output {
         Ok(output) => output,
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
             return Err(ShphError::PermissionDenied(format!(
-                "failed to run {:?}: {}",
-                command, err
+                "failed to run '{program}': {err}"
             )));
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Err(ShphError::Unsupported(format!(
-                "required command not found: {}",
-                command[0]
+                "required command not found: {program}"
             )));
         }
         Err(err) => return Err(ShphError::Io(err)),
     };
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let suffix = if detail.is_empty() {
-            String::new()
-        } else {
-            format!(": {detail}")
-        };
         return Err(ShphError::Internal(format!(
-            "command failed with status {}{suffix}: {:?}",
-            output.status, command
+            "command '{program}' failed with status {}",
+            output.status
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -5687,6 +6379,24 @@ fn reconnect_delay_with_jitter(base_delay_ms: u64) -> u64 {
     let base_delay_ms = base_delay_ms.max(1);
     let lower_bound = base_delay_ms.div_ceil(2);
     rand::thread_rng().gen_range(lower_bound..=base_delay_ms)
+}
+
+fn sleep_with_shutdown(duration: Duration) -> bool {
+    sleep_with_shutdown_with_probe(duration, shutdown::shutdown_requested)
+}
+
+fn sleep_with_shutdown_with_probe(duration: Duration, is_shutdown: impl Fn() -> bool) -> bool {
+    let mut remaining = duration;
+    while remaining > Duration::ZERO {
+        if is_shutdown() {
+            return false;
+        }
+        let slice = remaining.min(Duration::from_millis(100));
+        let started = Instant::now();
+        thread::sleep(slice);
+        remaining = remaining.saturating_sub(started.elapsed());
+    }
+    !is_shutdown()
 }
 
 fn run_with_reconnect<F>(
@@ -5722,7 +6432,9 @@ where
                     "  Reconnect: attempt {}/{} failed ({:?}), retrying in {}ms",
                     attempts, max_attempts, err, sleep_ms
                 );
-                thread::sleep(Duration::from_millis(sleep_ms));
+                if !sleep_with_shutdown(Duration::from_millis(sleep_ms)) {
+                    return Ok(());
+                }
                 delay_ms = delay_ms
                     .saturating_mul(2)
                     .min(max_delay_ms.max(initial_delay_ms));
@@ -5740,6 +6452,7 @@ fn run_standards_quic_listen_loop(
     bind: &str,
     timeout_secs: u64,
     profile: HandshakeProfile,
+    phantom_one_profile: Option<ProfileTier>,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
     quic_key_path: Option<&Path>,
@@ -5764,7 +6477,7 @@ fn run_standards_quic_listen_loop(
             private_key_path.display()
         );
         loop {
-            let connection = tokio::select! {
+            let mut connection = tokio::select! {
                 result = standards_quic::accept(
                     &server,
                     &keystore.identity,
@@ -5789,6 +6502,11 @@ fn run_standards_quic_listen_loop(
                     return Ok(());
                 }
             };
+            if let Some(phantom_one_profile) = phantom_one_profile {
+                connection
+                    .negotiate_phantom_one(Some(phantom_one_profile), timeout_duration)
+                    .await?;
+            }
             let state = connection.handshake.clone();
             enforce_peer_policy(keystore_path, bind, &state, false)?;
             append_handshake_audit(
@@ -5846,6 +6564,7 @@ fn run_standards_quic_connect_loop(
     transport_peer: &str,
     timeout_secs: u64,
     profile: HandshakeProfile,
+    phantom_one_profile: Option<ProfileTier>,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
     _quic_key_path: Option<&Path>,
@@ -5870,7 +6589,7 @@ fn run_standards_quic_connect_loop(
             &certificate,
             standards_quic::StandardsQuicConfig::default(),
         )?;
-        let connection = standards_quic::connect(
+        let mut connection = standards_quic::connect(
             &endpoint,
             peer_addr,
             "localhost",
@@ -5880,6 +6599,11 @@ fn run_standards_quic_connect_loop(
             timeout_duration,
         )
         .await?;
+        if let Some(phantom_one_profile) = phantom_one_profile {
+            connection
+                .negotiate_phantom_one(Some(phantom_one_profile), timeout_duration)
+                .await?;
+        }
         let state = connection.handshake.clone();
         enforce_peer_policy(keystore_path, peer, &state, true)?;
         append_handshake_audit(
@@ -5938,10 +6662,13 @@ fn run_listen_loop(
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
+    phantom_one_profile: Option<ProfileTier>,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
     quic_key_path: Option<&Path>,
 ) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = phantom_one_profile;
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
@@ -5957,6 +6684,7 @@ fn run_listen_loop(
                 bind,
                 timeout_secs,
                 profile,
+                phantom_one_profile,
                 roadmap,
                 quic_cert_path,
                 quic_key_path,
@@ -6084,11 +6812,14 @@ fn run_connect_loop(
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
+    phantom_one_profile: Option<ProfileTier>,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
     quic_key_path: Option<&Path>,
     underlay: &TcpUnderlay,
 ) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = phantom_one_profile;
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
@@ -6105,6 +6836,7 @@ fn run_connect_loop(
                 transport_peer,
                 timeout_secs,
                 profile,
+                phantom_one_profile,
                 roadmap,
                 quic_cert_path,
                 quic_key_path,
@@ -6756,23 +7488,26 @@ fn record_data_plane_error(metrics: &MetricsCollector, error: &ShphError) {
 
 #[cfg(test)]
 mod tests {
+    use super::ticket::JoinTicket;
     use super::{
         advertised_endpoint, apply_control_plane, build_control_plane_plan,
         build_dns_apply_command, build_dns_apply_commands, build_dns_restore_command,
         build_interface_address_add_command, build_interface_address_delete_command,
         build_route_add_command, build_route_delete_command, build_tun_mtu_commands,
-        build_tun_route_priority_command, build_underlay_bypass_route_add_command,
-        build_underlay_bypass_route_delete_command, cli_exit_code, control_plane_state_path,
+        build_tun_route_priority_command, build_tun_route_priority_restore_command,
+        build_underlay_bypass_route_add_command, build_underlay_bypass_route_delete_command,
+        build_windows_tun_mtu_restore_commands, cli_exit_code, control_plane_state_path,
         enforce_peer_policy, handle_host, handle_up, load_control_plane_state,
-        load_or_create_quic_server, native_tun_mtu_for_shroud_profile, parse_shroud_profile_name,
-        phase_a1_now_ms, read_quic_certificate, read_quic_private_key, read_ticket_source,
+        load_or_create_quic_server, morphology_from_ticket, native_tun_mtu_for_shroud_profile,
+        parse_phantom_one_profile, parse_shroud_profile_name, phase_a1_now_ms,
+        read_quic_certificate, read_quic_private_key, read_ticket_source,
         reconnect_delay_with_jitter, render_config_for_display, resolve_killswitch_peers,
-        resolve_shroud_profile, run_with_reconnect, save_control_plane_state,
+        resolve_morphology, resolve_shroud_profile, run_with_reconnect, save_control_plane_state,
         transport_mode_to_str, validate_cidr, validate_control_plane_underlay,
         validate_transport_peer, CliErrorOutput, ControlPlaneGuard, ControlPlanePlan,
-        HandshakeState, KeyStore, KeyStoreConfig, PersistedControlPlaneState, TcpUnderlay,
-        TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES, EXIT_CONFIG, EXIT_PERMISSION,
-        EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
+        HandshakeState, KeyStore, KeyStoreConfig, MorphologySelection, NativeTunMutationGuard,
+        PersistedControlPlaneState, TcpUnderlay, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES,
+        EXIT_CONFIG, EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
     };
     use shph_config::RoadmapConfig;
     use shph_config::{
@@ -6780,10 +7515,12 @@ mod tests {
     };
     use shph_core::roadmap::{IdentityProviderConfig, TransportAdapterConfig};
     use shph_core::{Result, ShphError};
+    use shph_obfuscation::ProfileTier;
     use std::fs;
     use std::io;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn ticket_source_reads_bounded_trimmed_files() {
@@ -6815,7 +7552,9 @@ mod tests {
             443,
             Some("127.0.0.1"),
             "tcp",
-            "medium",
+            Some("medium"),
+            false,
+            None,
             true,
             true,
             None,
@@ -6981,6 +7720,14 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_sleep_helper_stops_without_waiting_after_shutdown() {
+        assert!(!super::sleep_with_shutdown_with_probe(
+            Duration::from_secs(60),
+            || true
+        ));
+    }
+
+    #[test]
     fn cli_exit_codes_distinguish_automation_failures() {
         assert_eq!(
             cli_exit_code(&ShphError::InvalidArgument("bad".into())),
@@ -7083,6 +7830,8 @@ mod tests {
                 underlay: None,
                 quic_cert: None,
                 quic_key: None,
+                phantom_one: false,
+                phantom_one_profile: "medium".into(),
                 reconnect: None,
                 startup_payload: None,
             }),
@@ -7111,6 +7860,8 @@ mod tests {
                 transport: TransportMode::Tcp,
                 profile: shph_core::HandshakeProfile::SecureDefault,
                 shroud_profile: "medium".into(),
+                phantom_one: false,
+                phantom_one_profile: "medium".into(),
                 quic_cert_path: None,
                 quic_key_path: None,
                 killswitch: true,
@@ -7150,6 +7901,8 @@ mod tests {
                 transport: TransportMode::Tcp,
                 profile: shph_core::HandshakeProfile::SecureDefault,
                 shroud_profile: "medium".into(),
+                phantom_one: false,
+                phantom_one_profile: "medium".into(),
                 quic_cert_path: None,
                 quic_key_path: None,
                 killswitch: false,
@@ -7179,6 +7932,8 @@ mod tests {
                 underlay: None,
                 quic_cert: None,
                 quic_key: None,
+                phantom_one: false,
+                phantom_one_profile: "medium".into(),
                 reconnect: Some(ReconnectConfig {
                     enabled: Some(true),
                     max_attempts: Some(2),
@@ -7196,6 +7951,8 @@ mod tests {
                 transport: TransportMode::QuicStandard,
                 profile: shph_core::HandshakeProfile::SecureDefault,
                 shroud_profile: "medium".into(),
+                phantom_one: false,
+                phantom_one_profile: "medium".into(),
                 quic_cert_path: Some(std::path::Path::new("/tmp/server.der")),
                 quic_key_path: Some(std::path::Path::new("/tmp/server.key")),
                 killswitch: false,
@@ -7259,6 +8016,64 @@ mod tests {
             parse_shroud_profile_name("tuned-high").unwrap(),
             Some(shph_core::TUNED_HIGH)
         );
+    }
+
+    #[test]
+    fn phantom_one_profile_accepts_exact_wire_tiers_only() {
+        let expected = [
+            ("low", ProfileTier::Low),
+            ("medium", ProfileTier::Medium),
+            ("high", ProfileTier::High),
+            ("tuned-low", ProfileTier::TunedLow),
+            ("tuned-medium", ProfileTier::TunedMedium),
+            ("tuned-high", ProfileTier::TunedHigh),
+        ];
+        for (name, profile) in expected {
+            assert_eq!(parse_phantom_one_profile(name).expect("profile"), profile);
+        }
+        assert!(parse_phantom_one_profile("optimized").is_err());
+        assert!(parse_phantom_one_profile("extreme-lab").is_err());
+    }
+
+    #[test]
+    fn phantom_one_conflict_is_rejected_before_any_mutation() {
+        let error = resolve_morphology(Some("medium"), true, None, &Config::default())
+            .expect_err("conflicting morphology flags");
+        assert!(matches!(
+            error,
+            ShphError::InvalidArgument(message)
+                if message.contains("mutually exclusive")
+        ));
+    }
+
+    #[test]
+    fn phantom_one_profile_implies_phantom_one_and_uses_its_profile() {
+        let morphology = resolve_morphology(None, false, Some("tuned-high"), &Config::default())
+            .expect("resolve Phantom One");
+        assert_eq!(
+            morphology,
+            MorphologySelection {
+                shroud_profile: "tuned-high".into(),
+                phantom_one: true,
+                phantom_one_profile: "tuned-high".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn join_ticket_is_authoritative_for_morphology() {
+        let ticket = JoinTicket {
+            endpoint: "198.51.100.10:443".into(),
+            transport: "tcp".into(),
+            shroud_profile: None,
+            phantom_one: true,
+            phantom_one_profile: Some("tuned-medium".into()),
+            server_identity_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            server_signing_b64: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
+        };
+        let morphology = morphology_from_ticket(&ticket).expect("ticket morphology");
+        assert!(morphology.phantom_one);
+        assert_eq!(morphology.profile_name(), "tuned-medium");
     }
 
     #[test]
@@ -7517,6 +8332,43 @@ mod tests {
         assert!(build_tun_route_priority_command("").is_err());
     }
 
+    #[test]
+    fn native_tun_restore_builders_validate_saved_state() {
+        let mtu_commands = build_windows_tun_mtu_restore_commands(
+            "shph0",
+            DEFAULT_TUN_MTU_BYTES,
+            DEFAULT_TUN_MTU_BYTES,
+        )
+        .expect("MTU restore commands");
+        if cfg!(target_os = "windows") {
+            assert_eq!(mtu_commands.len(), 2);
+            assert!(mtu_commands
+                .iter()
+                .all(|command| command.contains(&"store=active".to_string())));
+        } else {
+            assert!(mtu_commands.is_empty());
+        }
+
+        let metric_command =
+            build_tun_route_priority_restore_command("shph0", 25, 25).expect("metric restore");
+        if cfg!(target_os = "windows") {
+            assert!(metric_command.iter().any(|part| part.contains("25")));
+        } else {
+            assert!(metric_command.is_empty());
+        }
+
+        assert!(build_windows_tun_mtu_restore_commands("shph0", 575, 1500).is_err());
+        assert!(build_windows_tun_mtu_restore_commands("", 1500, 1500).is_err());
+        assert!(build_tun_route_priority_restore_command("", 25, 25).is_err());
+    }
+
+    #[test]
+    fn native_tun_mutation_guard_cleanup_is_idempotent_when_empty() {
+        let mut guard = NativeTunMutationGuard::default();
+        assert!(guard.cleanup().is_ok());
+        assert!(guard.cleanup().is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn control_plane_state_loader_rejects_final_component_symlink() {
@@ -7664,7 +8516,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let guard = apply_control_plane(&cfg, "shph0").expect("apply control plane");
+        let guard = apply_control_plane(&cfg, "shph0", None).expect("apply control plane");
         assert!(guard.added_routes.is_empty());
         assert!(guard.applied_dns_servers.is_empty());
     }
@@ -7684,7 +8536,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        assert!(apply_control_plane(&cfg, "shph0").is_err());
+        assert!(apply_control_plane(&cfg, "shph0", None).is_err());
     }
 
     #[test]
@@ -7722,6 +8574,37 @@ mod tests {
         assert_eq!(plan.routes, vec!["10.20.0.0/16", "2001:db8::/32"]);
         assert!(plan.apply_dns);
         assert_eq!(plan.dns_servers, vec!["1.1.1.1", "8.8.8.8"]);
+    }
+
+    #[test]
+    fn control_plane_plan_rejects_duplicate_routes_and_dns() {
+        let duplicate_routes = ControlPlaneConfig {
+            apply_interface_address: Some(false),
+            interface_cidr: None,
+            apply_routes: Some(true),
+            route_cidrs: Some(vec!["10.20.0.1/16".to_string(), "10.20.0.0/16".to_string()]),
+            underlay_bypass_cidrs: None,
+            apply_dns: None,
+            dns_servers: None,
+            dry_run: Some(true),
+        };
+        let error = build_control_plane_plan(&duplicate_routes, "shph0")
+            .expect_err("duplicate routes must be rejected");
+        assert!(error.to_string().contains("duplicate control-plane route"));
+
+        let duplicate_dns = ControlPlaneConfig {
+            apply_interface_address: Some(false),
+            interface_cidr: None,
+            apply_routes: Some(false),
+            route_cidrs: None,
+            underlay_bypass_cidrs: None,
+            apply_dns: Some(true),
+            dns_servers: Some(vec!["1.1.1.1".to_string(), "1.1.1.1".to_string()]),
+            dry_run: Some(true),
+        };
+        let error =
+            build_control_plane_plan(&duplicate_dns, "shph0").expect_err("duplicate DNS must fail");
+        assert!(error.to_string().contains("duplicate DNS server"));
     }
 
     #[test]
@@ -7772,7 +8655,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let guard = apply_control_plane(&cfg, "shph0").expect("apply");
+        let guard = apply_control_plane(&cfg, "shph0", None).expect("apply");
         assert!(guard.dry_run);
         assert!(guard.added_routes.is_empty());
     }
@@ -7833,6 +8716,8 @@ mod tests {
                 underlay: Some("socks5://127.0.0.1:10808".into()),
                 quic_cert: None,
                 quic_key: None,
+                phantom_one: false,
+                phantom_one_profile: "medium".into(),
                 reconnect: None,
                 startup_payload: None,
             }),
@@ -7865,6 +8750,8 @@ mod tests {
                 underlay: Some("socks5://127.0.0.1:10808".into()),
                 quic_cert: None,
                 quic_key: None,
+                phantom_one: false,
+                phantom_one_profile: "medium".into(),
                 reconnect: None,
                 startup_payload: None,
             }),

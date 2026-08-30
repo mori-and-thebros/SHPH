@@ -14,7 +14,9 @@ use shph_core::{Result, ShphError};
 use std::net::{IpAddr, SocketAddr};
 use std::ptr::{null, null_mut};
 use windows_sys::core::GUID;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND, HANDLE,
+};
 use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceAliasToLuid;
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
@@ -99,7 +101,7 @@ impl WindowsKillswitchGuard {
             mutex,
             keys: Vec::new(),
         };
-        guard.remove_stale_filters();
+        guard.remove_stale_filters()?;
 
         guard.add_filter(
             filter_key("block-v4", 0),
@@ -128,8 +130,8 @@ impl WindowsKillswitchGuard {
 
     pub fn allow_interface(&mut self, interface_name: &str) -> Result<()> {
         let luid = interface_luid(interface_name)?;
-        self.remove_key(&filter_key("interface-v4", 0));
-        self.remove_key(&filter_key("interface-v6", 0));
+        self.remove_key(&filter_key("interface-v4", 0))?;
+        self.remove_key(&filter_key("interface-v6", 0))?;
         self.add_interface(luid, FWPM_LAYER_ALE_AUTH_CONNECT_V4, "v4")?;
         self.add_interface(luid, FWPM_LAYER_ALE_AUTH_CONNECT_V6, "v6")?;
         Ok(())
@@ -141,22 +143,32 @@ impl WindowsKillswitchGuard {
         }
         let mut first_error = None;
         if !self.engine.is_null() {
-            for key in self.keys.drain(..) {
+            let pending_keys = std::mem::take(&mut self.keys);
+            let mut remaining_keys = Vec::new();
+            for key in pending_keys {
                 let status = unsafe { FwpmFilterDeleteByKey0(self.engine, &key) };
-                if status != 0 && first_error.is_none() {
-                    first_error = Some(wfp_error("FwpmFilterDeleteByKey0", status));
+                if status != 0 && !is_filter_absent_status(status) {
+                    remaining_keys.push(key);
+                    if first_error.is_none() {
+                        first_error = Some(wfp_error("FwpmFilterDeleteByKey0", status));
+                    }
                 }
             }
-            let status = unsafe { FwpmEngineClose0(self.engine) };
-            self.engine = null_mut();
-            if status != 0 && first_error.is_none() {
-                first_error = Some(wfp_error("FwpmEngineClose0", status));
+            self.keys = remaining_keys;
+            if self.keys.is_empty() {
+                let status = unsafe { FwpmEngineClose0(self.engine) };
+                if status == 0 {
+                    self.engine = null_mut();
+                } else if first_error.is_none() {
+                    first_error = Some(wfp_error("FwpmEngineClose0", status));
+                }
             }
         }
-        if !self.mutex.is_null() {
+        if self.engine.is_null() && !self.mutex.is_null() {
             let closed = unsafe { CloseHandle(self.mutex) };
-            self.mutex = null_mut();
-            if closed == 0 && first_error.is_none() {
+            if closed != 0 {
+                self.mutex = null_mut();
+            } else if first_error.is_none() {
                 first_error = Some(wfp_error("CloseHandle(WFP mutex)", unsafe {
                     GetLastError()
                 }));
@@ -181,11 +193,11 @@ impl WindowsKillswitchGuard {
             mutex,
             keys: Vec::new(),
         };
-        guard.remove_stale_filters();
+        guard.remove_stale_filters()?;
         guard.cleanup()
     }
 
-    fn remove_stale_filters(&self) {
+    fn remove_stale_filters(&self) -> Result<()> {
         let mut keys = vec![
             filter_key("block-v4", 0),
             filter_key("block-v6", 0),
@@ -197,13 +209,24 @@ impl WindowsKillswitchGuard {
         for index in 0..MAX_PEER_SLOTS {
             keys.push(filter_key("peer", index as u32));
         }
-        for key in keys {
-            self.remove_key(&key);
+        let mut first_error = None;
+        for key in keys.drain(..) {
+            if let Err(error) = self.remove_key(&key) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
-    fn remove_key(&self, key: &GUID) {
-        let _ = unsafe { FwpmFilterDeleteByKey0(self.engine, key) };
+    fn remove_key(&self, key: &GUID) -> Result<()> {
+        let status = unsafe { FwpmFilterDeleteByKey0(self.engine, key) };
+        if status == 0 || is_filter_absent_status(status) {
+            Ok(())
+        } else {
+            Err(wfp_error("FwpmFilterDeleteByKey0", status))
+        }
     }
 
     fn add_loopback(&mut self, address: IpAddr, index: u32) -> Result<()> {
@@ -462,13 +485,25 @@ fn wfp_error(operation: &str, status: u32) -> ShphError {
     ))
 }
 
+fn is_filter_absent_status(status: u32) -> bool {
+    status as i32 == FWP_E_FILTER_NOT_FOUND
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RPC_C_AUTHN_WINNT, WFP_AUTHN_SERVICE};
+    use super::{
+        is_filter_absent_status, FWP_E_FILTER_NOT_FOUND, RPC_C_AUTHN_WINNT, WFP_AUTHN_SERVICE,
+    };
 
     #[test]
     fn engine_open_uses_supported_rpc_authentication() {
         assert_eq!(WFP_AUTHN_SERVICE, RPC_C_AUTHN_WINNT);
         assert_ne!(WFP_AUTHN_SERVICE, 0);
+    }
+
+    #[test]
+    fn filter_cleanup_treats_missing_owned_filter_as_clean() {
+        assert!(is_filter_absent_status(FWP_E_FILTER_NOT_FOUND as u32));
+        assert!(!is_filter_absent_status(5));
     }
 }

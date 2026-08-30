@@ -1,25 +1,45 @@
 # SHPH Quality, Tests, and Benchmark Evidence
 
-This document summarizes the validation available for the `v0.6.5-dev.1`
-development line. The detailed collector capture was made before publication
-from the working tree based on `e44483897574d39a550b2c145d47fc480ffa4e5b`;
-the versioned follow-up was then checked from a clean candidate tree. Local
-and GitHub-hosted benchmark results are not Internet throughput, and code-path
-tests are not an independent security audit.
+This document summarizes the validation available for the `v0.6.6-dev`
+development line. The detailed collector capture below includes historical
+pre-publication evidence from the preceding development snapshot, while the
+current branch verification is recorded separately. Local and GitHub-hosted
+benchmark results are not Internet throughput, and code-path tests are not an
+independent security audit.
 
 ## Provenance
 
 | Field | Value |
 | --- | --- |
-| Development line | `v0.6.5-dev.1` |
-| Source base revision | `e44483897574d39a550b2c145d47fc480ffa4e5b` |
-| Publication ref | `v0.6.5-dev.1` |
-| Validation date | 2026-08-25 |
+| Development line | `v0.6.6-dev` |
+| Source revision | `v0.6.6-dev` (publication tag) |
+| Publication ref | `v0.6.6-dev` |
+| Validation date | 2026-08-30 |
 | Primary host | Windows 11 |
 | Rust toolchain | `rustc 1.96.0 (ac68faa20 2026-05-25)` |
 | Main target | `x86_64-pc-windows-msvc` |
 | Additional target | `i686-pc-windows-msvc` |
 | Final candidate tree | Clean before publication |
+
+## Current branch verification
+
+The Windows local verification pass for the publication snapshot completed
+with the following results:
+
+| Check | Result |
+| --- | --- |
+| Workspace tests | PASS: 379 passed, 0 failed |
+| Repeated fresh-process CLI reliability | PASS: 8 authenticated loopback sessions |
+| Standalone edge tests | PASS: 38 passed, 0 failed |
+| Standalone edge HTTP/3 tests | PASS: 38 passed, 0 failed |
+| Full benchmark smoke | PASS: `--suite all --iterations 3 --frames 512` |
+| Sanitized package verification | PASS: 11 allowlisted payload files plus manifest/checksums |
+| Native host toolchain | PASS: MSVC linker detected |
+| Native-TUN/two-host campaign | SKIP: requires a dedicated privileged host pair |
+
+These results are local engineering evidence. They do not close the native
+TUN, two-host, Internet, uptime, hostile-network, censorship-resistance, or
+independent-audit boundaries.
 
 ## Automated gate capture
 
@@ -45,14 +65,15 @@ dedicated operator evidence is captured separately.
 | Dedicated native TUN two-host gate | SKIP in collector; covered by operator evidence |
 | Collector release eligibility | Host-gated; direct two-host evidence is recorded separately |
 
-The workspace test run executed **316 tests with 0 failures** across the CLI,
-configuration, core cryptography and handshake, identity, obfuscation,
-transport, and TUN crates. The advisory scan covered 299 locked crate
-dependencies.
+The current workspace test run executed **379 tests with 0 failures** across
+the CLI, configuration, core cryptography and handshake, identity,
+obfuscation, transport, and TUN crates. The advisory scan covered 299 locked
+crate dependencies. The historical collector capture referenced by the
+original gate table recorded an earlier 316-test snapshot.
 
 ## Fuzz smoke
 
-The five checked-in fuzz targets completed 1,000 executions each, for 5,000
+The six checked-in fuzz targets completed 1,000 executions each, for 6,000
 requested executions total, using the installed MSVC sanitizer runtime:
 
 | Target | Runs | Result |
@@ -62,6 +83,7 @@ requested executions total, using the installed MSVC sanitizer runtime:
 | `audit_record` | 1,000 | PASS |
 | `replay_window` | 1,000 | PASS |
 | `shroud2_datagram` | 1,000 | PASS |
+| `phantom_one_envelope` | 1,000 | PASS |
 
 This is smoke evidence. It is not a 20-million or 100-million iteration
 campaign and does not replace an independent audit.

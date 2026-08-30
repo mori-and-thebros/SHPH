@@ -5,13 +5,16 @@
 //! QUIC transport backed by Quinn.
 
 pub mod ja4;
+pub mod phantom_one;
 pub mod shroud2;
 pub mod standards_quic;
 #[cfg(target_os = "linux")]
 pub mod standards_tun;
 
 use base64::Engine as _;
-use rand::RngCore;
+use phantom_one::{PhantomOneConfig, PhantomOneDecoder, PhantomOneEncoder, PhantomOneFrameType};
+use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
 use shph_core::roadmap::{
     data_mule_inbox_path, offline_session_id, safe_path_component, MAX_ADAPTER_POLL_INTERVAL_MS,
     MAX_DATA_MULE_AGE_MS, MAX_DATA_MULE_TOTAL_BYTES,
@@ -23,7 +26,7 @@ use shph_core::{
     ReceiveCipher, Result, SendCipher, ShphError, ShroudProfile, StatelessCookieAuthority,
     ML_KEM_768_CIPHERTEXT_BYTES,
 };
-use shph_obfuscation::{apply_profile, remove_profile, ProfilePadder, ProfileTier};
+use shph_obfuscation::{apply_profile_into, remove_profile_in_place, ProfilePadder, ProfileTier};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -33,6 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_HELLO_BYTES: usize = 16 * 1024;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -41,6 +45,7 @@ const MAX_QUIC_HELLO_BYTES: usize = 12 * 1024;
 const SHROUD_AEAD_OVERHEAD: usize = 12 + 16;
 const MAX_QUIC_PAYLOAD_BYTES: usize = MAX_QUIC_FRAME_BYTES - 4 - SHROUD_AEAD_OVERHEAD;
 const MAX_TCP_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - SHROUD_AEAD_OVERHEAD;
+const PHANTOM_ONE_TCP_PATH_MTU: usize = MAX_TCP_PAYLOAD_BYTES;
 const SHROUD_LENGTH_PREFIX: usize = 2;
 const QUIC_HANDSHAKE_ATTEMPTS: usize = 3;
 const MAX_QUIC_INVALID_DATAGRAMS_PER_RECV: usize = 8;
@@ -51,6 +56,24 @@ const TCP_PREAUTH_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_TCP_HANDSHAKES: usize = 16;
 const MAX_DNS_RESOLVER_WORKERS: usize = 4;
 const MAX_DNS_RESOLVER_QUEUE: usize = 32;
+const MAX_RESOLVED_ADDRESSES: usize = 32;
+
+struct ZeroizeOnDrop<'a> {
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'a> ZeroizeOnDrop<'a> {
+    fn new(buffer: &'a mut Vec<u8>) -> Self {
+        Self { buffer }
+    }
+}
+
+impl Drop for ZeroizeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.buffer.zeroize();
+        self.buffer.clear();
+    }
+}
 
 /// Per-source connection-rate limiting for the unauthenticated TCP entry path.
 /// A single peer address may open at most `MAX_CONNECTS_PER_PEER_PER_WINDOW`
@@ -64,6 +87,19 @@ const COOKIE_CHALLENGE_THRESHOLD: usize = MAX_CONNECTS_PER_PEER_PER_WINDOW / 2;
 const COOKIE_CHALLENGE_PREFIX: &[u8] = b"SHPH-COOKIE-CHALLENGE ";
 const COOKIE_RESPONSE_PREFIX: &[u8] = b"SHPH-COOKIE-RESPONSE ";
 const MAX_COOKIE_LINE_BYTES: usize = 128;
+
+/// Derive the authenticated-session Phantom One generation from the transcript hash.
+///
+/// The transcript hash is already authenticated by the SHPH handshake. Using
+/// its first four bytes keeps both directions on the same generation without
+/// adding another key-derivation mechanism to the morphology layer.
+pub fn phantom_one_generation_from_transcript(transcript_hash_hex: &str) -> Result<u32> {
+    let prefix = transcript_hash_hex.get(..8).ok_or_else(|| {
+        ShphError::Protocol("transcript hash is too short for Phantom One".into())
+    })?;
+    u32::from_str_radix(prefix, 16)
+        .map_err(|_| ShphError::Protocol("transcript hash is not valid hexadecimal".into()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
@@ -174,8 +210,8 @@ pub struct SecureSession {
 }
 
 enum SecureSessionInner {
-    Tcp(SecureTcpSession),
-    Quic(ExperimentalQuicSession),
+    Tcp(Box<SecureTcpSession>),
+    Quic(Box<ExperimentalQuicSession>),
     OfflineMesh(OfflineMeshSession),
     DataMule(DataMuleSession),
 }
@@ -185,19 +221,25 @@ pub struct SecureSender {
 }
 
 enum SecureSenderInner {
-    Tcp(SecureTcpSender),
-    Quic(ExperimentalQuicSender),
-    OfflineMesh(OfflineMeshSender),
-    DataMule(DataMuleSender),
+    Tcp(Box<SecureTcpSender>),
+    Quic(Box<ExperimentalQuicSender>),
+    OfflineMesh(Box<OfflineMeshSender>),
+    DataMule(Box<DataMuleSender>),
 }
 
 pub struct SecureReceiver {
     inner: SecureReceiverInner,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct QuicLabConfig {
+    /// Legacy Shroud 2 profile for the experimental datagram transport.
     pub shroud_profile: Option<ShroudProfile>,
+    /// Opt-in Phantom One profile for authenticated TCP sessions.
+    ///
+    /// Phantom One is a separate wire envelope and cannot be stacked with the
+    /// legacy Shroud 2 profile.
+    pub phantom_one_profile: Option<ProfileTier>,
 }
 
 enum SecureReceiverInner {
@@ -424,34 +466,11 @@ fn create_atomic_temp_file(parent: &Path, filename: &str) -> Result<(File, PathB
 }
 
 fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
-    ensure_no_reparse_components(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file adapter path must reference a regular file",
-            ));
-        }
-        Ok(file)
-    }
-    #[cfg(not(unix))]
-    {
-        ensure_no_reparse_components(path)?;
-        let file = File::open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file adapter path must reference a regular file",
-            ));
-        }
-        Ok(file)
-    }
+    shph_core::open_readonly_no_reparse(path).map_err(|error| match error {
+        ShphError::Io(error) => error,
+        ShphError::InvalidArgument(message) => io::Error::new(io::ErrorKind::InvalidInput, message),
+        error => io::Error::other(error.to_string()),
+    })
 }
 
 fn quarantine_file(path: &Path) {
@@ -777,7 +796,7 @@ fn dns_resolver_pool() -> &'static DnsResolverPool {
                 .name(format!("shph-dns-resolver-{worker_id}"))
                 .spawn(move || {
                     while let Ok(request) = receiver.recv() {
-                        let result = resolve_socket_addrs_unbounded(&request.addr);
+                        let result = resolve_socket_addrs_bounded(&request.addr);
                         let _ = request.response.send(result);
                     }
                 })
@@ -794,10 +813,19 @@ fn dns_resolver_pool() -> &'static DnsResolverPool {
     })
 }
 
-fn resolve_socket_addrs_unbounded(addr: &str) -> Result<Vec<SocketAddr>> {
+fn resolve_socket_addrs_bounded(addr: &str) -> Result<Vec<SocketAddr>> {
     addr.to_socket_addrs()
-        .map(|addrs| addrs.collect())
+        .map(collect_bounded_socket_addrs)
         .map_err(|_| ShphError::Config(format!("invalid peer address: {addr}")))
+}
+
+fn collect_bounded_socket_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    addrs
+        .into_iter()
+        .filter(|address| seen.insert(*address))
+        .take(MAX_RESOLVED_ADDRESSES)
+        .collect()
 }
 
 fn resolve_socket_addrs_with_deadline(addr: &str, deadline: Instant) -> Result<Vec<SocketAddr>> {
@@ -825,7 +853,10 @@ fn resolve_socket_addrs_with_deadline(addr: &str, deadline: Instant) -> Result<V
     let mut disconnected = 0;
     for offset in 0..pool.senders.len() {
         let index = (start + offset) % pool.senders.len();
-        match pool.senders[index].try_send(request.take().expect("DNS request available")) {
+        let Some(pending_request) = request.take() else {
+            break;
+        };
+        match pool.senders[index].try_send(pending_request) {
             Ok(()) => break,
             Err(mpsc::TrySendError::Full(returned)) => request = Some(returned),
             Err(mpsc::TrySendError::Disconnected(returned)) => {
@@ -874,7 +905,12 @@ fn connect_tcp_with_deadline(peer: &str, deadline: Instant) -> Result<TcpStream>
             break;
         }
         match TcpStream::connect_timeout(&addr, remaining) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                if let Err(err) = stream.set_nodelay(true) {
+                    tracing::debug!(peer = %addr, error = %err, "failed to enable TCP_NODELAY");
+                }
+                return Ok(stream);
+            }
             Err(err) => last_error = Some(err),
         }
     }
@@ -1534,11 +1570,11 @@ pub fn connect_secure_session_with_profile_and_underlay(
             )?;
             Ok((
                 SecureSession {
-                    inner: SecureSessionInner::Tcp(SecureTcpSession::new(
+                    inner: SecureSessionInner::Tcp(Box::new(SecureTcpSession::new(
                         stream,
                         state.session_keys.send_key,
                         state.session_keys.recv_key,
-                    )),
+                    ))),
                 },
                 state,
             ))
@@ -1553,12 +1589,12 @@ pub fn connect_secure_session_with_profile_and_underlay(
             )?;
             Ok((
                 SecureSession {
-                    inner: SecureSessionInner::Quic(ExperimentalQuicSession::new(
+                    inner: SecureSessionInner::Quic(Box::new(ExperimentalQuicSession::new(
                         socket,
                         peer_addr,
                         state.session_keys.send_key,
                         state.session_keys.recv_key,
-                    )),
+                    ))),
                 },
                 state,
             ))
@@ -1623,7 +1659,8 @@ pub fn connect_secure_session_lab_with_profile_and_underlay(
     profile: HandshakeProfile,
     underlay: &TcpUnderlay,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let (session, state) = connect_secure_session_with_profile_and_underlay(
+    validate_lab_profiles(mode, lab.shroud_profile, lab.phantom_one_profile)?;
+    let (mut session, state) = connect_secure_session_with_profile_and_underlay(
         peer,
         local_identity,
         policy,
@@ -1633,14 +1670,19 @@ pub fn connect_secure_session_lab_with_profile_and_underlay(
         underlay,
     )?;
     if let Some(shroud_profile) = lab.shroud_profile {
-        let session = match mode {
+        session = match mode {
             TransportMode::Tcp => {
                 session.with_tcp_profile(ProfileTier::from_shroud_profile(shroud_profile))?
             }
             TransportMode::Quic => session.with_quic_profile(shroud_profile)?,
             _ => session,
         };
-        return Ok((session, state));
+    }
+    if let Some(phantom_one_profile) = lab.phantom_one_profile {
+        session = session.with_phantom_one_generation_and_profile(
+            phantom_one_generation_from_transcript(&state.transcript_hash_hex)?,
+            phantom_one_profile,
+        )?;
     }
     Ok((session, state))
 }
@@ -1681,11 +1723,11 @@ pub fn accept_secure_session_with_profile(
             )?;
             Ok((
                 SecureSession {
-                    inner: SecureSessionInner::Tcp(SecureTcpSession::new(
+                    inner: SecureSessionInner::Tcp(Box::new(SecureTcpSession::new(
                         stream,
                         state.session_keys.send_key,
                         state.session_keys.recv_key,
-                    )),
+                    ))),
                 },
                 state,
             ))
@@ -1700,12 +1742,12 @@ pub fn accept_secure_session_with_profile(
             )?;
             Ok((
                 SecureSession {
-                    inner: SecureSessionInner::Quic(ExperimentalQuicSession::new(
+                    inner: SecureSessionInner::Quic(Box::new(ExperimentalQuicSession::new(
                         socket,
                         peer_addr,
                         state.session_keys.send_key,
                         state.session_keys.recv_key,
-                    )),
+                    ))),
                 },
                 state,
             ))
@@ -1747,7 +1789,8 @@ pub fn accept_secure_session_lab_with_profile(
     lab: QuicLabConfig,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
-    let (session, state) = accept_secure_session_with_profile(
+    validate_lab_profiles(mode, lab.shroud_profile, lab.phantom_one_profile)?;
+    let (mut session, state) = accept_secure_session_with_profile(
         bind_addr,
         local_identity,
         policy,
@@ -1756,16 +1799,39 @@ pub fn accept_secure_session_lab_with_profile(
         profile,
     )?;
     if let Some(shroud_profile) = lab.shroud_profile {
-        let session = match mode {
+        session = match mode {
             TransportMode::Tcp => {
                 session.with_tcp_profile(ProfileTier::from_shroud_profile(shroud_profile))?
             }
             TransportMode::Quic => session.with_quic_profile(shroud_profile)?,
             _ => session,
         };
-        return Ok((session, state));
+    }
+    if let Some(phantom_one_profile) = lab.phantom_one_profile {
+        session = session.with_phantom_one_generation_and_profile(
+            phantom_one_generation_from_transcript(&state.transcript_hash_hex)?,
+            phantom_one_profile,
+        )?;
     }
     Ok((session, state))
+}
+
+fn validate_lab_profiles(
+    mode: TransportMode,
+    shroud_profile: Option<ShroudProfile>,
+    phantom_one_profile: Option<ProfileTier>,
+) -> Result<()> {
+    if shroud_profile.is_some() && phantom_one_profile.is_some() {
+        return Err(ShphError::InvalidArgument(
+            "Shroud 2 and Phantom One cannot be enabled together".into(),
+        ));
+    }
+    if phantom_one_profile.is_some() && mode != TransportMode::Tcp {
+        return Err(ShphError::Unsupported(
+            "Phantom One is currently available on authenticated TCP only".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl SecureSession {
@@ -1776,6 +1842,7 @@ impl SecureSession {
                 // This avoids the legacy fixed-cell plus shared-wrapper
                 // combination and keeps the full QUIC payload budget usable.
                 session.shroud_profile = None;
+                session.shroud_rng = None;
                 session.padding_profile = Some(ProfileTier::from_shroud_profile(profile));
                 session.padding_padder = Some(ProfilePadder::new(
                     ProfileTier::from_shroud_profile(profile),
@@ -1785,6 +1852,7 @@ impl SecureSession {
                 // Keep the legacy double envelope for compatibility with
                 // peers from previous developer releases.
                 session.shroud_profile = Some(profile);
+                session.shroud_rng = (!profile.deterministic_padding).then(StdRng::from_entropy);
                 session.padding_profile = Some(ProfileTier::from_shroud_profile(profile));
                 session.padding_padder = Some(ProfilePadder::new(
                     ProfileTier::from_shroud_profile(profile),
@@ -1800,6 +1868,49 @@ impl SecureSession {
             session.padding_profile = Some(profile);
             session.padding_padder = Some(ProfilePadder::new(profile));
             session.padding_buffer.clear();
+        }
+        Ok(self)
+    }
+
+    /// Enable the opt-in Phantom One inner envelope for authenticated TCP.
+    ///
+    /// Phantom One is deliberately mutually exclusive with the legacy TCP profile:
+    /// stacking two independent padding envelopes makes the wire budget harder
+    /// to reason about and can cause avoidable overhead. The authenticated SHPH
+    /// AEAD remains the security boundary; Phantom One supplies only bounded framing
+    /// and morphology.
+    pub fn with_phantom_one_generation(self, generation: u32) -> Result<Self> {
+        self.with_phantom_one_generation_and_profile(generation, ProfileTier::Medium)
+    }
+
+    /// Enable Phantom One with an explicit profile for authenticated TCP.
+    pub fn with_phantom_one_generation_and_profile(
+        mut self,
+        generation: u32,
+        profile: ProfileTier,
+    ) -> Result<Self> {
+        match &mut self.inner {
+            SecureSessionInner::Tcp(session) => {
+                session.padding_profile = None;
+                session.padding_padder = None;
+                session.padding_buffer.clear();
+                session.phantom_one_encoder =
+                    Some(PhantomOneEncoder::with_profile(generation, profile));
+                session.phantom_one_decoder = Some(PhantomOneDecoder::with_config(
+                    generation,
+                    PhantomOneConfig::for_profile(profile),
+                )?);
+            }
+            SecureSessionInner::Quic(_) => {
+                return Err(ShphError::Unsupported(
+                    "Phantom One is currently available on authenticated TCP only".into(),
+                ));
+            }
+            SecureSessionInner::OfflineMesh(_) | SecureSessionInner::DataMule(_) => {
+                return Err(ShphError::Unsupported(
+                    "Phantom One is not available on offline or data-mule sessions".into(),
+                ));
+            }
         }
         Ok(self)
     }
@@ -1824,10 +1935,10 @@ impl SecureSession {
     pub fn into_split(self) -> Result<(SecureSender, SecureReceiver)> {
         match self.inner {
             SecureSessionInner::Tcp(session) => {
-                let (sender, receiver) = session.into_split()?;
+                let (sender, receiver) = (*session).into_split()?;
                 Ok((
                     SecureSender {
-                        inner: SecureSenderInner::Tcp(sender),
+                        inner: SecureSenderInner::Tcp(Box::new(sender)),
                     },
                     SecureReceiver {
                         inner: SecureReceiverInner::Tcp(receiver),
@@ -1835,10 +1946,10 @@ impl SecureSession {
                 ))
             }
             SecureSessionInner::Quic(session) => {
-                let (sender, receiver) = session.into_split()?;
+                let (sender, receiver) = (*session).into_split()?;
                 Ok((
                     SecureSender {
-                        inner: SecureSenderInner::Quic(sender),
+                        inner: SecureSenderInner::Quic(Box::new(sender)),
                     },
                     SecureReceiver {
                         inner: SecureReceiverInner::Quic(receiver),
@@ -1849,7 +1960,7 @@ impl SecureSession {
                 let (sender, receiver) = session.into_split()?;
                 Ok((
                     SecureSender {
-                        inner: SecureSenderInner::OfflineMesh(sender),
+                        inner: SecureSenderInner::OfflineMesh(Box::new(sender)),
                     },
                     SecureReceiver {
                         inner: SecureReceiverInner::OfflineMesh(receiver),
@@ -1860,7 +1971,7 @@ impl SecureSession {
                 let (sender, receiver) = session.into_split()?;
                 Ok((
                     SecureSender {
-                        inner: SecureSenderInner::DataMule(sender),
+                        inner: SecureSenderInner::DataMule(Box::new(sender)),
                     },
                     SecureReceiver {
                         inner: SecureReceiverInner::DataMule(receiver),
@@ -2214,6 +2325,9 @@ pub fn tcp_accept_and_handshake_with_profile(
         match listener.accept() {
             Ok((stream, peer_addr)) => {
                 stream.set_nonblocking(false).map_err(ShphError::Io)?;
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::debug!(peer = %peer_addr, error = %error, "failed to enable TCP_NODELAY");
+                }
 
                 // Rate-limit before any handshake work so one source cannot
                 // fill the worker budget with repeated malformed sessions.
@@ -2694,6 +2808,8 @@ pub struct SecureTcpSession {
     padding_profile: Option<ProfileTier>,
     padding_padder: Option<ProfilePadder>,
     padding_buffer: Vec<u8>,
+    phantom_one_encoder: Option<PhantomOneEncoder>,
+    phantom_one_decoder: Option<PhantomOneDecoder>,
     frame_reader: TcpFrameReader,
 }
 
@@ -2706,6 +2822,8 @@ impl SecureTcpSession {
             padding_profile: None,
             padding_padder: None,
             padding_buffer: Vec::new(),
+            phantom_one_encoder: None,
+            phantom_one_decoder: None,
             frame_reader: TcpFrameReader::default(),
         }
     }
@@ -2718,6 +2836,7 @@ impl SecureTcpSession {
             self.padding_profile,
             self.padding_padder.as_mut(),
             &mut self.padding_buffer,
+            self.phantom_one_encoder.as_mut(),
         )
     }
 
@@ -2727,6 +2846,7 @@ impl SecureTcpSession {
             &mut self.recv_cipher,
             &mut self.frame_reader,
             self.padding_profile,
+            self.phantom_one_decoder.as_mut(),
         )
     }
 
@@ -2749,11 +2869,13 @@ impl SecureTcpSession {
             padding_profile: self.padding_profile,
             padding_padder: self.padding_padder,
             padding_buffer: self.padding_buffer,
+            phantom_one_encoder: self.phantom_one_encoder,
         };
         let receiver = SecureTcpReceiver {
             stream: recv_stream,
             recv_cipher: self.recv_cipher,
             padding_profile: self.padding_profile,
+            phantom_one_decoder: self.phantom_one_decoder,
             frame_reader: self.frame_reader,
         };
         Ok((sender, receiver))
@@ -2766,6 +2888,7 @@ pub struct SecureTcpSender {
     padding_profile: Option<ProfileTier>,
     padding_padder: Option<ProfilePadder>,
     padding_buffer: Vec<u8>,
+    phantom_one_encoder: Option<PhantomOneEncoder>,
 }
 
 impl SecureTcpSender {
@@ -2777,6 +2900,7 @@ impl SecureTcpSender {
             self.padding_profile,
             self.padding_padder.as_mut(),
             &mut self.padding_buffer,
+            self.phantom_one_encoder.as_mut(),
         )
     }
 }
@@ -2785,6 +2909,7 @@ pub struct SecureTcpReceiver {
     stream: TcpStream,
     recv_cipher: ReceiveCipher,
     padding_profile: Option<ProfileTier>,
+    phantom_one_decoder: Option<PhantomOneDecoder>,
     frame_reader: TcpFrameReader,
 }
 
@@ -2795,6 +2920,7 @@ impl SecureTcpReceiver {
             &mut self.recv_cipher,
             &mut self.frame_reader,
             self.padding_profile,
+            self.phantom_one_decoder.as_mut(),
         )
     }
 }
@@ -2817,6 +2943,7 @@ pub fn tcp_secure_send(
         None,
         None,
         &mut padding_buffer,
+        None,
     )
 }
 
@@ -2829,13 +2956,35 @@ pub fn tcp_secure_send_with_profile(
 ) -> Result<()> {
     let mut padder = ProfilePadder::new(profile);
     let mut padding_buffer = Vec::new();
+    tcp_secure_send_with_profile_stateful(
+        stream,
+        send_cipher,
+        payload,
+        &mut padder,
+        &mut padding_buffer,
+    )
+}
+
+/// Send one encrypted TCP frame using caller-owned session padding state.
+///
+/// Reuse `padder` and `padding_buffer` for every frame in a session. This
+/// keeps profile randomness session-stable and avoids recreating the padding
+/// generator or its working buffer for each call.
+pub fn tcp_secure_send_with_profile_stateful(
+    stream: &mut TcpStream,
+    send_cipher: &mut SendCipher,
+    payload: &[u8],
+    padder: &mut ProfilePadder,
+    padding_buffer: &mut Vec<u8>,
+) -> Result<()> {
     write_encrypted_tcp_frame(
         stream,
         send_cipher,
         payload,
-        Some(profile),
-        Some(&mut padder),
-        &mut padding_buffer,
+        Some(padder.profile()),
+        Some(padder),
+        padding_buffer,
+        None,
     )
 }
 
@@ -2848,7 +2997,7 @@ pub fn tcp_secure_receive(
     recv_cipher: &mut ReceiveCipher,
 ) -> Result<Vec<u8>> {
     let mut frame_reader = TcpFrameReader::default();
-    read_encrypted_tcp_frame(stream, recv_cipher, &mut frame_reader, None)
+    read_encrypted_tcp_frame(stream, recv_cipher, &mut frame_reader, None, None)
 }
 
 /// Receive one encrypted TCP frame and remove its shared discrete padding
@@ -2859,7 +3008,7 @@ pub fn tcp_secure_receive_with_profile(
     profile: ProfileTier,
 ) -> Result<Vec<u8>> {
     let mut frame_reader = TcpFrameReader::default();
-    read_encrypted_tcp_frame(stream, recv_cipher, &mut frame_reader, Some(profile))
+    read_encrypted_tcp_frame(stream, recv_cipher, &mut frame_reader, Some(profile), None)
 }
 
 // Experimental QUIC-like shim.
@@ -3202,6 +3351,7 @@ pub struct ExperimentalQuicSession {
     send_cipher: SendCipher,
     recv_cipher: ReceiveCipher,
     shroud_profile: Option<ShroudProfile>,
+    shroud_rng: Option<StdRng>,
     padding_profile: Option<ProfileTier>,
     padding_padder: Option<ProfilePadder>,
     padding_buffer: Vec<u8>,
@@ -3212,6 +3362,7 @@ pub struct ExperimentalQuicSender {
     peer: SocketAddr,
     send_cipher: SendCipher,
     shroud_profile: Option<ShroudProfile>,
+    shroud_rng: Option<StdRng>,
     padding_profile: Option<ProfileTier>,
     padding_padder: Option<ProfilePadder>,
     padding_buffer: Vec<u8>,
@@ -3233,6 +3384,7 @@ impl ExperimentalQuicSession {
             send_cipher: SendCipher::new(send_key),
             recv_cipher: ReceiveCipher::new_with_replay_window(recv_key, 128),
             shroud_profile: None,
+            shroud_rng: None,
             padding_profile: None,
             padding_padder: None,
             padding_buffer: Vec::new(),
@@ -3249,6 +3401,7 @@ impl ExperimentalQuicSession {
             self.padding_profile,
             self.padding_padder.as_mut(),
             &mut self.padding_buffer,
+            self.shroud_rng.as_mut(),
         )
     }
 
@@ -3272,6 +3425,7 @@ impl ExperimentalQuicSession {
                 peer,
                 send_cipher: self.send_cipher,
                 shroud_profile: self.shroud_profile,
+                shroud_rng: self.shroud_rng,
                 padding_profile: self.padding_profile,
                 padding_padder: self.padding_padder,
                 padding_buffer: self.padding_buffer,
@@ -3298,6 +3452,7 @@ impl ExperimentalQuicSender {
             self.padding_profile,
             self.padding_padder.as_mut(),
             &mut self.padding_buffer,
+            self.shroud_rng.as_mut(),
         )
     }
 }
@@ -3321,19 +3476,36 @@ fn write_encrypted_tcp_frame(
     padding_profile: Option<ProfileTier>,
     padding_padder: Option<&mut ProfilePadder>,
     padding_buffer: &mut Vec<u8>,
+    phantom_one_encoder: Option<&mut PhantomOneEncoder>,
 ) -> Result<()> {
+    let padding_cleanup = ZeroizeOnDrop::new(padding_buffer);
     validate_tcp_payload(payload)?;
-    let fallback;
+    if phantom_one_encoder.is_some() && (padding_profile.is_some() || padding_padder.is_some()) {
+        return Err(ShphError::Protocol(
+            "Phantom One cannot be combined with the legacy TCP padding profile".into(),
+        ));
+    }
     let framed = match (padding_profile, padding_padder) {
         (Some(_), Some(padder)) => {
-            padder.apply_into(payload, padding_buffer)?;
-            padding_buffer.as_slice()
+            padder.apply_into(payload, padding_cleanup.buffer)?;
+            padding_cleanup.buffer.as_slice()
         }
         (Some(profile), None) => {
-            fallback = apply_profile(profile, payload)?;
-            fallback.as_slice()
+            apply_profile_into(profile, payload, padding_cleanup.buffer)?;
+            padding_cleanup.buffer.as_slice()
         }
-        (None, _) => payload,
+        (None, _) => match phantom_one_encoder {
+            Some(encoder) => {
+                encoder.encode_into(
+                    PhantomOneFrameType::Data,
+                    payload,
+                    PHANTOM_ONE_TCP_PATH_MTU,
+                    padding_cleanup.buffer,
+                )?;
+                padding_cleanup.buffer.as_slice()
+            }
+            None => payload,
+        },
     };
     let encrypted = cipher.encrypt(framed)?;
     let len = u32::try_from(encrypted.len())
@@ -3376,12 +3548,13 @@ impl TcpFrameReader {
     ) -> Result<Vec<u8>> {
         loop {
             if self.expected_wire_len.is_none() && self.wire.len() >= 4 {
-                let len = u32::from_be_bytes(
-                    self.wire[..4]
-                        .try_into()
-                        .expect("four-byte frame prefix is present"),
-                ) as usize;
+                let len =
+                    u32::from_be_bytes([self.wire[0], self.wire[1], self.wire[2], self.wire[3]])
+                        as usize;
                 if len == 0 || len > MAX_FRAME_BYTES {
+                    self.wire.zeroize();
+                    self.wire.clear();
+                    self.expected_wire_len = None;
                     return Err(ShphError::Protocol("encrypted frame length invalid".into()));
                 }
                 self.expected_wire_len = Some(4 + len);
@@ -3389,14 +3562,18 @@ impl TcpFrameReader {
 
             if let Some(expected_wire_len) = self.expected_wire_len {
                 if self.wire.len() >= expected_wire_len {
-                    let ciphertext = self.wire[4..expected_wire_len].to_vec();
-                    self.wire.drain(..expected_wire_len);
+                    let decrypted = cipher.decrypt(&self.wire[4..expected_wire_len]);
+                    self.wire.zeroize();
+                    self.wire.clear();
                     self.expected_wire_len = None;
-                    let framed = cipher.decrypt(&ciphertext)?;
-                    return match padding_profile {
-                        Some(profile) => remove_profile(profile, &framed),
-                        None => Ok(framed),
-                    };
+                    let mut framed = decrypted?;
+                    if let Some(profile) = padding_profile {
+                        if let Err(error) = remove_profile_in_place(profile, &mut framed) {
+                            framed.zeroize();
+                            return Err(error);
+                        }
+                    }
+                    return Ok(framed);
                 }
             }
 
@@ -3424,8 +3601,24 @@ fn read_encrypted_tcp_frame(
     cipher: &mut ReceiveCipher,
     frame_reader: &mut TcpFrameReader,
     padding_profile: Option<ProfileTier>,
+    phantom_one_decoder: Option<&mut PhantomOneDecoder>,
 ) -> Result<Vec<u8>> {
-    frame_reader.recv_frame(stream, cipher, padding_profile)
+    if phantom_one_decoder.is_some() && padding_profile.is_some() {
+        return Err(ShphError::Protocol(
+            "Phantom One cannot be combined with the legacy TCP padding profile".into(),
+        ));
+    }
+    let mut framed = frame_reader.recv_frame(stream, cipher, padding_profile)?;
+    match phantom_one_decoder {
+        Some(decoder) => {
+            if let Err(error) = decoder.decode_in_place(&mut framed, PHANTOM_ONE_TCP_PATH_MTU) {
+                framed.zeroize();
+                return Err(error);
+            }
+            Ok(framed)
+        }
+        None => Ok(framed),
+    }
 }
 
 #[cfg(test)]
@@ -3446,6 +3639,7 @@ fn write_encrypted_quic_frame(
         None,
         None,
         &mut padding_buffer,
+        None,
     )
 }
 
@@ -3459,16 +3653,17 @@ fn write_encrypted_quic_frame_with_profile(
     padding_profile: Option<ProfileTier>,
     padding_padder: Option<&mut ProfilePadder>,
     padding_buffer: &mut Vec<u8>,
+    shroud_rng: Option<&mut StdRng>,
 ) -> Result<()> {
-    let fallback;
+    let padding_cleanup = ZeroizeOnDrop::new(padding_buffer);
     let framed_payload = match (padding_profile, padding_padder) {
         (Some(_), Some(padder)) => {
-            padder.apply_into(payload, padding_buffer)?;
-            padding_buffer.as_slice()
+            padder.apply_into(payload, padding_cleanup.buffer)?;
+            padding_cleanup.buffer.as_slice()
         }
         (Some(profile), None) => {
-            fallback = apply_profile(profile, payload)?;
-            fallback.as_slice()
+            apply_profile_into(profile, payload, padding_cleanup.buffer)?;
+            padding_cleanup.buffer.as_slice()
         }
         (None, _) => payload,
     };
@@ -3489,16 +3684,22 @@ fn write_encrypted_quic_frame_with_profile(
                 "payload exceeds Shroud profile capacity".into(),
             ));
         }
-        let mut padded = vec![0u8; plaintext_capacity];
+        let mut padded = Zeroizing::new(vec![0u8; plaintext_capacity]);
         padded[..SHROUD_LENGTH_PREFIX]
             .copy_from_slice(&(framed_payload.len() as u16).to_be_bytes());
         padded[SHROUD_LENGTH_PREFIX..SHROUD_LENGTH_PREFIX + framed_payload.len()]
             .copy_from_slice(framed_payload);
         if !profile.deterministic_padding {
-            rand::rngs::OsRng
-                .fill_bytes(&mut padded[SHROUD_LENGTH_PREFIX + framed_payload.len()..]);
+            if let Some(rng) = shroud_rng {
+                rng.try_fill_bytes(&mut padded[SHROUD_LENGTH_PREFIX + framed_payload.len()..])
+                    .map_err(|_| ShphError::Crypto("Shroud padding randomness failed".into()))?;
+            } else {
+                rand::rngs::OsRng
+                    .try_fill_bytes(&mut padded[SHROUD_LENGTH_PREFIX + framed_payload.len()..])
+                    .map_err(|_| ShphError::Crypto("Shroud padding randomness failed".into()))?;
+            }
         }
-        cipher.encrypt(&padded)?
+        cipher.encrypt(padded.as_slice())?
     } else {
         if framed_payload.len() > MAX_QUIC_PAYLOAD_BYTES {
             return Err(ShphError::Protocol(format!(
@@ -3521,7 +3722,7 @@ fn write_encrypted_quic_frame_with_profile(
         ));
     }
 
-    let mut packet = Vec::with_capacity(4 + encrypted.len());
+    let mut packet = Zeroizing::new(Vec::with_capacity(4 + encrypted.len()));
     packet.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
     packet.extend_from_slice(&encrypted);
     if packet.len() > MAX_QUIC_FRAME_BYTES {
@@ -3530,7 +3731,7 @@ fn write_encrypted_quic_frame_with_profile(
         ));
     }
     socket
-        .send_to(&packet, peer)
+        .send_to(packet.as_slice(), peer)
         .map_err(map_io_error)
         .map(|_| ())
 }
@@ -3547,10 +3748,10 @@ fn read_encrypted_quic_frame(
     // check an off-path attacker could inject forged ciphertext datagrams,
     // forcing expensive AEAD-decrypt work and disrupting the authenticated
     // stream. Rejecting foreign sources closes the injection/amplification path.
-    let mut packet = vec![0u8; MAX_QUIC_FRAME_BYTES + 1];
+    let mut packet = Zeroizing::new(vec![0u8; MAX_QUIC_FRAME_BYTES + 1]);
     let mut invalid = 0;
     loop {
-        let (len, addr) = match socket.recv_from(&mut packet) {
+        let (len, addr) = match socket.recv_from(packet.as_mut_slice()) {
             Ok(packet) => packet,
             Err(err)
                 if matches!(
@@ -3622,8 +3823,9 @@ fn decode_encrypted_quic_frame_with_profile(
         }
         let encrypted = shph_core::decode_cell_payload(profile, payload)?
             .ok_or_else(|| ShphError::Protocol("unexpected shroud chaff frame".into()))?;
-        let padded = cipher.decrypt(encrypted)?;
+        let mut padded = cipher.decrypt(encrypted)?;
         if padded.len() < SHROUD_LENGTH_PREFIX {
+            padded.zeroize();
             return Err(ShphError::Protocol(
                 "Shroud payload missing length prefix".into(),
             ));
@@ -3632,21 +3834,31 @@ fn decode_encrypted_quic_frame_with_profile(
         if payload_len > padded.len() - SHROUD_LENGTH_PREFIX
             || payload_len > profile.max_payload_chunk
         {
+            padded.zeroize();
             return Err(ShphError::Protocol(
                 "Shroud payload length exceeds profile capacity".into(),
             ));
         }
-        let framed = padded[SHROUD_LENGTH_PREFIX..SHROUD_LENGTH_PREFIX + payload_len].to_vec();
-        match padding_profile {
-            Some(profile) => remove_profile(profile, &framed),
-            None => Ok(framed),
+        let payload_end = SHROUD_LENGTH_PREFIX + payload_len;
+        padded.copy_within(SHROUD_LENGTH_PREFIX..payload_end, 0);
+        padded[payload_len..].zeroize();
+        padded.truncate(payload_len);
+        if let Some(profile) = padding_profile {
+            if let Err(error) = remove_profile_in_place(profile, &mut padded) {
+                padded.zeroize();
+                return Err(error);
+            }
         }
+        Ok(padded)
     } else {
-        let framed = cipher.decrypt(payload)?;
-        match padding_profile {
-            Some(profile) => remove_profile(profile, &framed),
-            None => Ok(framed),
+        let mut framed = cipher.decrypt(payload)?;
+        if let Some(profile) = padding_profile {
+            if let Err(error) = remove_profile_in_place(profile, &mut framed) {
+                framed.zeroize();
+                return Err(error);
+            }
         }
+        Ok(framed)
     }
 }
 fn write_tcp_all_or_closed(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
@@ -4700,7 +4912,7 @@ mod tests {
     };
     use super::{
         collect_shph_files, offline_session_id, DataMuleScanContext, MAX_DATA_MULE_AGE_MS,
-        TEMP_FILE_COUNTER,
+        MAX_RESOLVED_ADDRESSES, TEMP_FILE_COUNTER,
     };
     use super::{
         decode_encrypted_quic_frame, PeerRateLimiter, TcpUnderlay, TransportMode,
@@ -4712,6 +4924,7 @@ mod tests {
         SendCipher, ShphError,
     };
     use shph_obfuscation::ProfileTier;
+    use std::collections::HashSet;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -4800,6 +5013,29 @@ mod tests {
     }
 
     #[test]
+    fn tcp_reusable_padding_buffer_is_wiped_on_preflight_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP listener");
+        let address = listener.local_addr().expect("listener address");
+        let mut stream = TcpStream::connect(address).expect("connect TCP listener");
+        let mut cipher = SendCipher::new([0x44; 32]);
+        let mut padding_buffer = vec![0xa5; 256];
+        let payload = vec![0x5a; super::MAX_TCP_PAYLOAD_BYTES + 1];
+
+        let result = super::write_encrypted_tcp_frame(
+            &mut stream,
+            &mut cipher,
+            &payload,
+            None,
+            None,
+            &mut padding_buffer,
+            None,
+        );
+
+        assert!(matches!(result, Err(ShphError::Protocol(_))));
+        assert!(padding_buffer.is_empty());
+    }
+
+    #[test]
     fn tcp_frame_reader_preserves_partial_frames_across_poll_timeouts() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP listener");
         let address = listener.local_addr().expect("listener address");
@@ -4823,13 +5059,13 @@ mod tests {
         let mut reader = super::TcpFrameReader::default();
         let mut receiver = ReceiveCipher::new([0x43; 32]);
         assert!(matches!(
-            super::read_encrypted_tcp_frame(&mut stream, &mut receiver, &mut reader, None),
+            super::read_encrypted_tcp_frame(&mut stream, &mut receiver, &mut reader, None, None,),
             Err(ShphError::Timeout)
         ));
 
         thread::sleep(Duration::from_millis(125));
         assert_eq!(
-            super::read_encrypted_tcp_frame(&mut stream, &mut receiver, &mut reader, None)
+            super::read_encrypted_tcp_frame(&mut stream, &mut receiver, &mut reader, None, None,)
                 .expect("receive frame after timeout"),
             b"partial-frame"
         );
@@ -5299,6 +5535,21 @@ mod tests {
     }
 
     #[test]
+    fn hostname_resolution_deduplicates_and_bounds_addresses() {
+        let addresses = (1..=MAX_RESOLVED_ADDRESSES + 8)
+            .map(|offset| SocketAddr::from(([192, 0, 2, (offset % 254) as u8], 443)))
+            .collect::<Vec<_>>();
+        let bounded = super::collect_bounded_socket_addrs(
+            addresses
+                .iter()
+                .copied()
+                .chain(addresses.iter().copied().take(4)),
+        );
+        assert_eq!(bounded.len(), MAX_RESOLVED_ADDRESSES);
+        assert_eq!(bounded.iter().collect::<HashSet<_>>().len(), bounded.len());
+    }
+
+    #[test]
     fn transport_mode_parses_supported_values() {
         assert!(TransportMode::parse("tcp").is_ok());
         assert!(TransportMode::parse("quic").is_ok());
@@ -5607,6 +5858,73 @@ mod tests {
     }
 
     #[test]
+    fn tcp_phantom_one_session_round_trips_inside_authenticated_aead() {
+        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve TCP port");
+        let address = probe.local_addr().expect("probe address");
+        drop(probe);
+
+        let server_identity = IdentityKeyPair::generate().expect("server identity");
+        let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
+        let client_address = address.to_string();
+        let client_policy_for_thread = client_policy.clone();
+        let client_handle = thread::spawn(move || {
+            connect_secure_session_lab(
+                &client_address,
+                &client_identity,
+                &client_policy_for_thread,
+                5,
+                TransportMode::Tcp,
+                QuicLabConfig {
+                    shroud_profile: None,
+                    phantom_one_profile: Some(ProfileTier::Medium),
+                },
+            )
+        });
+
+        let (mut server_session, server_state) = accept_secure_session_lab(
+            &address.to_string(),
+            &server_identity,
+            &server_policy,
+            5,
+            TransportMode::Tcp,
+            QuicLabConfig {
+                shroud_profile: None,
+                phantom_one_profile: Some(ProfileTier::Medium),
+            },
+        )
+        .expect("server handshake");
+        let (mut client_session, client_state) = client_handle
+            .join()
+            .expect("client thread")
+            .expect("client handshake");
+        assert_eq!(
+            server_state.transcript_hash_hex,
+            client_state.transcript_hash_hex
+        );
+
+        client_session
+            .send_frame(b"phantom_one-client-frame")
+            .expect("send Phantom One client frame");
+        assert_eq!(
+            server_session
+                .recv_frame()
+                .expect("receive Phantom One client frame"),
+            b"phantom_one-client-frame"
+        );
+        server_session
+            .send_frame(b"phantom_one-server-frame")
+            .expect("send Phantom One server frame");
+        assert_eq!(
+            client_session
+                .recv_frame()
+                .expect("receive Phantom One server frame"),
+            b"phantom_one-server-frame"
+        );
+    }
+
+    #[test]
     fn peer_rate_limiter_evicts_oldest_source() {
         let mut rl = PeerRateLimiter::new();
         for octet in 0..MAX_QUIC_TRACKED_PEERS {
@@ -5883,6 +6201,7 @@ mod tests {
                 TransportMode::Quic,
                 QuicLabConfig {
                     shroud_profile: Some(shph_core::BALANCED),
+                    phantom_one_profile: None,
                 },
             )
             .unwrap();
@@ -5896,6 +6215,7 @@ mod tests {
             TransportMode::Quic,
             QuicLabConfig {
                 shroud_profile: Some(shph_core::BALANCED),
+                phantom_one_profile: None,
             },
         )
         .unwrap();
@@ -5936,6 +6256,7 @@ mod tests {
                 TransportMode::Quic,
                 QuicLabConfig {
                     shroud_profile: Some(shph_core::TUNED_MEDIUM),
+                    phantom_one_profile: None,
                 },
             )
             .unwrap();
@@ -5949,6 +6270,7 @@ mod tests {
             TransportMode::Quic,
             QuicLabConfig {
                 shroud_profile: Some(shph_core::TUNED_MEDIUM),
+                phantom_one_profile: None,
             },
         )
         .unwrap();
@@ -5989,6 +6311,7 @@ mod tests {
                 TransportMode::Quic,
                 QuicLabConfig {
                     shroud_profile: shph_core::shroud_profile_by_name("randomized-lab"),
+                    phantom_one_profile: None,
                 },
             )
             .unwrap();
@@ -6002,6 +6325,7 @@ mod tests {
             TransportMode::Quic,
             QuicLabConfig {
                 shroud_profile: shph_core::shroud_profile_by_name("randomized-lab"),
+                phantom_one_profile: None,
             },
         )
         .unwrap();

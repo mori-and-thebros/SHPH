@@ -183,7 +183,7 @@ removes ML-KEM and therefore provides a different security contract.
 
 ## Expanded benchmark coverage
 
-The standalone runner now supports `--suite all|core|defensive|dataplane|resource|shroud|quic|scalability|identity|wire|evidence|extended`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2.0 morphology profiles, QUIC-shim loopback handshake timing, long-session replay/nonce behavior, identity/plugin-provider validation costs, explicit wire overhead/packet-rate metrics, a fixed-size evidence campaign for Shroud2 overhead, pre-authentication CPU paths, and replay-window throughput, plus bounded defensive rejection-path measurements.
+The standalone runner now supports `--suite all|core|defensive|dataplane|resource|shroud|quic|scalability|identity|wire|evidence|extended`, reports p50/p95/p99/p99.9 latency, bidirectional in-memory goodput/wire rate for 1 KiB, 4 KiB, 1400-byte, 1500-byte, and 64 KiB payloads, CPU, RSS/peak RSS, allocation pressure, fixed-cell Shroud profiles, Shroud 2 morphology profiles, QUIC-shim loopback handshake timing, long-session replay/nonce behavior, identity/plugin-provider validation costs, explicit wire overhead/packet-rate metrics, a fixed-size evidence campaign for Shroud2 overhead, pre-authentication CPU paths, and replay-window throughput, plus bounded defensive rejection-path measurements.
 
 These are local measurements, not proof of live VPN throughput, TUN performance, network RTT, reconnect recovery, or control-plane cost. Use `scripts/benchmark_operator.sh` for real-process lifecycle, reconnect, control-plane, and native-TUN prerequisite/timing checks. It emits explicit `SKIP` records when a host, privilege, peer, or tool is unavailable.
 
@@ -286,7 +286,7 @@ the standalone async probe, not end-to-end packet forwarding. Benchmark results
 must identify whether they measure the probe, the Linux CLI bridge, or a
 privileged two-host tunnel.
 
-The `shroud` suite additionally measures the Shroud 2.0 lab envelope for
+The `shroud` suite additionally measures the Shroud 2 lab envelope for
 `low-latency`, `web-browsing-lab`, `video-streaming-lab`,
 `video-streaming-large-payload-lab`, `video-streaming-balanced-payload-lab`,
 and `bulk-lab` using a 1,450-byte
@@ -312,6 +312,20 @@ The same suite now includes:
 The impairment test is a local queue-pressure model only. It must not be
 reported as QUIC congestion control or Internet loss-recovery evidence.
 
+The same `shroud` suite includes `phantom_one` rows for the opt-in authenticated
+TCP inner envelope. It measures seeded local encode/decode latency for data,
+control, and keepalive frames, observed envelope overhead, and a sustained
+in-memory encode/decode rate. The TCP budget used by these rows is a logical
+encrypted-frame budget, not a physical path MTU. These measurements are local
+implementation signals only; they do not measure network throughput,
+fingerprint parity, DPI evasion, censorship resistance, or native-TUN behavior.
+
+It also emits `shroud2_adaptive`, which drives the bounded session-local
+integer-EWMA profile selector over a fixed synthetic workload. The row reports
+profile switches and final EWMA state alongside local wire accounting. It is a
+regression signal for the adaptive API, not evidence of traffic classification
+quality or censorship resistance.
+
 ### Extended local coverage
 
 The separate `extended` suite adds bounded coverage that is useful before a
@@ -336,6 +350,10 @@ real two-host run:
   sequential session models while keeping the requested frame count fixed.
   This is a resource/churn signal, not reconnect or handshake recovery
   evidence.
+- `edge_opaque_relay` runs bounded in-memory opaque forwarding through the
+  standalone `shph-edge` relay fast path. It is included in `all` and
+  `extended` and covers relay copy behavior only; TLS, HTTP/2, sockets,
+  congestion, TUN, and Internet conditions are excluded.
 
 Use `scripts/benchmark_repeat.ps1` for repeated captures. It writes ignored
 raw captures and a SHA-256 summary under `benchmark-runs/`. Shroud2 padding is
@@ -362,6 +380,15 @@ IPv4 UDP payload after SHPH's 28-byte AEAD nonce/tag overhead:
   socket stack; and
 - `shroud2_envelope_*`: Shroud2 envelope sizing, randomized padding, and
   encode/decode rate at a 1,472-byte IPv4 UDP payload budget.
+
+The Criterion harness also includes `transport/phantom_one` groups for Phantom One
+authenticated-inner-envelope encode/decode and malformed-input rejection. The
+standalone `shroud` suite includes one row for each of the six Phantom One
+profile IDs, confirming profile-bound encode/decode behavior and reporting the
+observed local wire size for that run.
+The `transport/shroud2/adaptive` group compares adaptive profile selection and
+reusable-buffer encode/decode. These are local microbenchmarks, not network
+measurements.
 
 The CSV rows include average serialized bytes per packet, overhead bytes,
 overhead percentage, and packets per second. Wire bytes are application

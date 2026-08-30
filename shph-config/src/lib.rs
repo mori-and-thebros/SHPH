@@ -1,9 +1,12 @@
 //! Configuration management for SHPH.
 
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +21,13 @@ use shph_core::{ensure_no_reparse_components, open_readonly_no_reparse};
 
 static CONFIG_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
+const MAX_PEERS: usize = 1024;
+const MAX_LIST_ENTRIES: usize = 1024;
+const MAX_DNS_SERVERS: usize = 32;
+const MAX_ALIAS_BYTES: usize = 128;
+const MAX_ENDPOINT_BYTES: usize = 512;
+const MAX_PROFILE_BYTES: usize = 64;
+const MAX_STARTUP_PAYLOAD_BYTES: usize = 64 * 1024;
 
 pub mod error;
 
@@ -125,8 +135,18 @@ pub struct SessionConfig {
     /// Owner-only standards-QUIC server private-key path.
     #[serde(default)]
     pub quic_key: Option<String>,
+    /// Select the separate Phantom One morphology envelope.
+    #[serde(default)]
+    pub phantom_one: bool,
+    /// Phantom One profile name. The CLI validates the six supported tiers.
+    #[serde(default = "default_phantom_one_profile")]
+    pub phantom_one_profile: String,
     pub reconnect: Option<ReconnectConfig>,
     pub startup_payload: Option<String>,
+}
+
+fn default_phantom_one_profile() -> String {
+    "medium".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,10 +216,167 @@ impl Config {
     }
 
     pub fn parse(contents: &str) -> Result<Self> {
-        toml::from_str(contents).map_err(ConfigError::Parse)
+        let mut document: toml::Value = toml::from_str(contents).map_err(ConfigError::Parse)?;
+        let mut migrated = false;
+        let legacy_profile = document
+            .get("stealth")
+            .and_then(toml::Value::as_table)
+            .and_then(|stealth| stealth.get("shroud_profile"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("medium")
+            .to_ascii_lowercase();
+
+        if let Some(session) = document
+            .get_mut("session")
+            .and_then(toml::Value::as_table_mut)
+        {
+            if let Some(old_value) = session.remove("shroud_version") {
+                let old_version = old_value.as_str().ok_or_else(|| {
+                    ConfigError::Parse(toml::de::Error::custom(
+                        "session.shroud_version must be the string 2.0 or 2.1",
+                    ))
+                })?;
+                let migrated_phantom_one = match old_version {
+                    "2.0" => false,
+                    "2.1" => true,
+                    _ => {
+                        return Err(ConfigError::Parse(toml::de::Error::custom(
+                            "session.shroud_version must be 2.0 or 2.1",
+                        )))
+                    }
+                };
+
+                if let Some(configured) = session.get("phantom_one").and_then(toml::Value::as_bool)
+                {
+                    if configured != migrated_phantom_one {
+                        return Err(ConfigError::Parse(toml::de::Error::custom(
+                            "session.shroud_version conflicts with session.phantom_one",
+                        )));
+                    }
+                } else {
+                    session.insert(
+                        "phantom_one".into(),
+                        toml::Value::Boolean(migrated_phantom_one),
+                    );
+                }
+
+                if migrated_phantom_one && !session.contains_key("phantom_one_profile") {
+                    let profile = match legacy_profile.as_str() {
+                        "low-latency" => "low",
+                        "balanced" => "medium",
+                        "bulk" => "high",
+                        "tuned" | "optimized" | "optimized-medium" => "tuned-medium",
+                        "optimized-low" => "tuned-low",
+                        "optimized-high" => "tuned-high",
+                        "low" | "medium" | "high" | "tuned-low" | "tuned-medium" | "tuned-high" => {
+                            legacy_profile.as_str()
+                        }
+                        _ => "medium",
+                    };
+                    session.insert("phantom_one_profile".into(), profile.into());
+                }
+                migrated = true;
+            }
+        }
+
+        if migrated {
+            eprintln!(
+                "Warning: migrated session.shroud_version in memory; the configuration file was not rewritten"
+            );
+        }
+
+        let config: Self = document.try_into().map_err(ConfigError::Parse)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate the complete configuration before any session or host
+    /// mutation is attempted.
+    ///
+    /// Parsing TOML only proves that the document has the right types. This
+    /// second boundary checks sizes, endpoint shapes, cross-field
+    /// requirements, and privileged control-plane inputs in one place so
+    /// callers cannot accidentally skip the same safety checks.
+    pub fn validate(&self) -> Result<()> {
+        validate_interface_name(&self.interface_name)?;
+        validate_endpoint("local_endpoint", &self.local_endpoint)?;
+
+        if self.peers.len() > MAX_PEERS {
+            return Err(ConfigError::Invalid(format!(
+                "peers exceeds the maximum of {MAX_PEERS} entries"
+            )));
+        }
+        let mut aliases = HashSet::with_capacity(self.peers.len());
+        for peer in &self.peers {
+            validate_text("peer alias", &peer.alias, MAX_ALIAS_BYTES, false)?;
+            if !aliases.insert(peer.alias.to_ascii_lowercase()) {
+                return Err(ConfigError::Invalid(format!(
+                    "peer aliases must be unique: {}",
+                    peer.alias
+                )));
+            }
+            validate_endpoint("peer endpoint", &peer.endpoint)?;
+            validate_key_text("peer public key", &peer.pubkey)?;
+            if let Some(sign_pubkey) = &peer.sign_pubkey {
+                validate_key_text("peer signing public key", sign_pubkey)?;
+            }
+        }
+
+        if let Some(obfuscation) = &self.obfuscation {
+            if let Some(shadowsocks) = &obfuscation.shadowsocks {
+                validate_endpoint("obfuscation.shadowsocks.server", &shadowsocks.server)?;
+                validate_text(
+                    "obfuscation.shadowsocks.method",
+                    &shadowsocks.method,
+                    MAX_PROFILE_BYTES,
+                    false,
+                )?;
+                validate_text(
+                    "obfuscation.shadowsocks.password",
+                    &shadowsocks.password,
+                    MAX_STARTUP_PAYLOAD_BYTES,
+                    false,
+                )?;
+            }
+            if let Some(tls) = &obfuscation.tls {
+                validate_dns_name("obfuscation.tls.server_name", &tls.server_name)?;
+                if let Some(ca_cert) = &tls.ca_cert {
+                    validate_path_text("obfuscation.tls.ca_cert", ca_cert)?;
+                }
+                if let Some(pin) = &tls.pin_sha256 {
+                    validate_text("obfuscation.tls.pin_sha256", pin, 128, false)?;
+                }
+            }
+        }
+
+        if let Some(stealth) = &self.stealth {
+            validate_text(
+                "stealth.profile",
+                &stealth.profile,
+                MAX_PROFILE_BYTES,
+                false,
+            )?;
+            validate_text(
+                "stealth.shroud_profile",
+                &stealth.shroud_profile,
+                MAX_PROFILE_BYTES,
+                false,
+            )?;
+        }
+
+        if let Some(control) = &self.control_plane {
+            validate_control_plane(control)?;
+        }
+
+        if let Some(session) = &self.session {
+            validate_session(session)?;
+        }
+
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate()?;
         let contents = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
         if let Some(parent) = path
             .parent()
@@ -276,6 +453,296 @@ impl Config {
         let home = home::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         home.join(".shph").join("config.toml")
     }
+}
+
+fn validate_interface_name(value: &str) -> Result<()> {
+    validate_text("interface_name", value, 15, false)?;
+    if !value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+    }) {
+        return Err(ConfigError::Invalid(
+            "interface_name contains unsupported characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_text(label: &str, value: &str, max_bytes: usize, allow_empty: bool) -> Result<()> {
+    if (!allow_empty && value.is_empty())
+        || value.len() > max_bytes
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{label} must be non-empty ASCII text of at most {max_bytes} bytes without whitespace or control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_path_text(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > MAX_ENDPOINT_BYTES || value.contains('\0') {
+        return Err(ConfigError::Invalid(format!(
+            "{label} is empty or too long"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_key_text(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 512
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{label} must be bounded ASCII text without whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_endpoint(label: &str, value: &str) -> Result<()> {
+    if value.len() > MAX_ENDPOINT_BYTES
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || value.contains('@')
+        || value.contains('/')
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{label} is not a valid host:port"
+        )));
+    }
+    let endpoint = shph_core::Endpoint::parse(value)
+        .map_err(|error| ConfigError::Invalid(format!("{label}: {error}")))?;
+    if endpoint.host.is_empty() || endpoint.host.len() > MAX_ENDPOINT_BYTES {
+        return Err(ConfigError::Invalid(format!(
+            "{label} host is empty or too long"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dns_name(label: &str, value: &str) -> Result<()> {
+    validate_text(label, value, 253, false)?;
+    if value.starts_with('.') || value.ends_with('.') || value.contains("..") {
+        return Err(ConfigError::Invalid(format!(
+            "{label} is not a valid DNS name"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cidr(label: &str, value: &str) -> Result<()> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| ConfigError::Invalid(format!("{label} must be an IP/prefix")))?;
+    let ip = address
+        .parse::<IpAddr>()
+        .map_err(|_| ConfigError::Invalid(format!("{label} has an invalid IP address")))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| ConfigError::Invalid(format!("{label} has an invalid prefix")))?;
+    let maximum = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix > maximum {
+        return Err(ConfigError::Invalid(format!(
+            "{label} has an invalid CIDR prefix; maximum is /{maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_single_host_cidr(label: &str, value: &str) -> Result<()> {
+    validate_cidr(label, value)?;
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| ConfigError::Invalid(format!("{label} must be an IP/prefix")))?;
+    let ip = address
+        .parse::<IpAddr>()
+        .map_err(|_| ConfigError::Invalid(format!("{label} has an invalid IP address")))?;
+    let expected = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix != expected.to_string() {
+        return Err(ConfigError::Invalid(format!(
+            "{label} must be a single-host route"
+        )));
+    }
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return Err(ConfigError::Invalid(format!(
+            "{label} must be a unicast, non-loopback address"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_list<T>(label: &str, values: Option<&Vec<T>>, maximum: usize) -> Result<()> {
+    if values.is_some_and(|values| values.len() > maximum) {
+        return Err(ConfigError::Invalid(format!(
+            "{label} exceeds the maximum of {maximum} entries"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_control_plane(control: &ControlPlaneConfig) -> Result<()> {
+    if control.apply_interface_address.unwrap_or(false) {
+        let cidr = control.interface_cidr.as_deref().ok_or_else(|| {
+            ConfigError::Invalid(
+                "apply_interface_address=true requires control_plane.interface_cidr".into(),
+            )
+        })?;
+        validate_cidr("control_plane.interface_cidr", cidr)?;
+    } else if let Some(cidr) = &control.interface_cidr {
+        validate_cidr("control_plane.interface_cidr", cidr)?;
+    }
+
+    validate_list(
+        "control_plane.route_cidrs",
+        control.route_cidrs.as_ref(),
+        MAX_LIST_ENTRIES,
+    )?;
+    if let Some(routes) = &control.route_cidrs {
+        for route in routes {
+            validate_cidr("control_plane.route_cidrs entry", route)?;
+        }
+    }
+    validate_list(
+        "control_plane.underlay_bypass_cidrs",
+        control.underlay_bypass_cidrs.as_ref(),
+        MAX_LIST_ENTRIES,
+    )?;
+    if let Some(routes) = &control.underlay_bypass_cidrs {
+        for route in routes {
+            validate_single_host_cidr("control_plane.underlay_bypass_cidrs entry", route)?;
+        }
+    }
+
+    validate_list(
+        "control_plane.dns_servers",
+        control.dns_servers.as_ref(),
+        MAX_DNS_SERVERS,
+    )?;
+    if control.apply_dns.unwrap_or(false) && control.dns_servers.as_ref().is_none_or(Vec::is_empty)
+    {
+        return Err(ConfigError::Invalid(
+            "apply_dns=true requires at least one DNS server".into(),
+        ));
+    }
+    if let Some(servers) = &control.dns_servers {
+        for server in servers {
+            let ip = server.parse::<IpAddr>().map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "control_plane.dns_servers entry is not an IP address: {server}"
+                ))
+            })?;
+            if ip.is_unspecified() || ip.is_multicast() {
+                return Err(ConfigError::Invalid(
+                    "control_plane.dns_servers entries must be unicast addresses".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_session(session: &SessionConfig) -> Result<()> {
+    match session.role {
+        SessionRole::Listen => {
+            if let Some(bind) = &session.bind {
+                validate_endpoint("session.bind", bind)?;
+            }
+        }
+        SessionRole::Connect => {
+            let peer = session.peer.as_deref().ok_or_else(|| {
+                ConfigError::Invalid("connect sessions require session.peer".into())
+            })?;
+            validate_endpoint("session.peer", peer)?;
+        }
+    }
+    if let Some(transport_peer) = &session.transport_peer {
+        validate_endpoint("session.transport_peer", transport_peer)?;
+    }
+    if let Some(timeout) = session.timeout_secs {
+        if !(1..=3600).contains(&timeout) {
+            return Err(ConfigError::Invalid(
+                "session.timeout_secs must be between 1 and 3600".into(),
+            ));
+        }
+    }
+    if let Some(underlay) = &session.underlay {
+        let value = underlay.trim();
+        if value != "direct" {
+            let proxy = value
+                .strip_prefix("socks5://")
+                .or_else(|| value.strip_prefix("socks5h://"))
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "session.underlay must be direct or socks5://host:port".into(),
+                    )
+                })?;
+            validate_endpoint("session.underlay proxy", proxy)?;
+        }
+    }
+    if let Some(cert) = &session.quic_cert {
+        validate_path_text("session.quic_cert", cert)?;
+    }
+    if let Some(key) = &session.quic_key {
+        validate_path_text("session.quic_key", key)?;
+    }
+    validate_text(
+        "session.phantom_one_profile",
+        &session.phantom_one_profile,
+        MAX_PROFILE_BYTES,
+        false,
+    )?;
+    if let Some(reconnect) = &session.reconnect {
+        if reconnect.enabled.unwrap_or(false) && reconnect.max_attempts.unwrap_or(0) == 0 {
+            return Err(ConfigError::Invalid(
+                "enabled reconnect requires max_attempts greater than zero".into(),
+            ));
+        }
+        if let Some(attempts) = reconnect.max_attempts {
+            if attempts > 100 {
+                return Err(ConfigError::Invalid(
+                    "session.reconnect.max_attempts cannot exceed 100".into(),
+                ));
+            }
+        }
+        if let Some(delay) = reconnect.initial_delay_ms {
+            if !(1..=60_000).contains(&delay) {
+                return Err(ConfigError::Invalid(
+                    "session.reconnect.initial_delay_ms must be between 1 and 60000".into(),
+                ));
+            }
+        }
+        if let Some(delay) = reconnect.max_delay_ms {
+            if !(1..=300_000).contains(&delay) {
+                return Err(ConfigError::Invalid(
+                    "session.reconnect.max_delay_ms must be between 1 and 300000".into(),
+                ));
+            }
+        }
+        if let (Some(initial), Some(maximum)) = (reconnect.initial_delay_ms, reconnect.max_delay_ms)
+        {
+            if maximum < initial {
+                return Err(ConfigError::Invalid(
+                    "session.reconnect.max_delay_ms must be >= initial_delay_ms".into(),
+                ));
+            }
+        }
+    }
+    if let Some(payload) = &session.startup_payload {
+        if payload.len() > MAX_STARTUP_PAYLOAD_BYTES {
+            return Err(ConfigError::Invalid(format!(
+                "session.startup_payload exceeds {MAX_STARTUP_PAYLOAD_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn open_config_readonly(path: &Path) -> std::io::Result<std::fs::File> {
@@ -540,6 +1007,70 @@ handshake_profile = "classical-lab"
     }
 
     #[test]
+    fn parse_migrates_legacy_shroud_version_in_memory() {
+        let input = r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[stealth]
+profile = "steady"
+shroud_profile = "tuned-high"
+
+[session]
+role = "connect"
+peer = "127.0.0.1:7000"
+shroud_version = "2.1"
+"#;
+
+        let cfg = Config::parse(input).expect("parse migrated config");
+        let session = cfg.session.as_ref().expect("session");
+        assert!(session.phantom_one);
+        assert_eq!(session.phantom_one_profile, "tuned-high");
+        assert!(!input.contains("phantom_one ="));
+    }
+
+    #[test]
+    fn parse_migrates_legacy_shroud_two_without_phantom_one() {
+        let input = r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[session]
+role = "listen"
+bind = "0.0.0.0:7000"
+shroud_version = "2.0"
+"#;
+
+        let cfg = Config::parse(input).expect("parse migrated config");
+        let session = cfg.session.as_ref().expect("session");
+        assert!(!session.phantom_one);
+        assert_eq!(session.phantom_one_profile, "medium");
+        let canonical = toml::to_string_pretty(&cfg).expect("serialize canonical config");
+        assert!(canonical.contains("phantom_one = false"));
+        assert!(canonical.contains("phantom_one_profile = \"medium\""));
+        assert!(!canonical.contains("shroud_version"));
+    }
+
+    #[test]
+    fn parse_rejects_conflicting_legacy_and_new_morphology() {
+        let input = r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[session]
+role = "connect"
+peer = "127.0.0.1:7000"
+shroud_version = "2.0"
+phantom_one = true
+"#;
+
+        assert!(Config::parse(input).is_err());
+    }
+
+    #[test]
     fn parse_rejects_unknown_top_level_and_privileged_control_plane_fields() {
         let top_level = r#"
 interface_name = "shph0"
@@ -559,6 +1090,64 @@ apply_routes = true
 route_cidrss = ["10.0.0.0/24"]
 "#;
         assert!(Config::parse(control_plane).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_peers_and_missing_connect_peer() {
+        let duplicate = r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = [
+  { alias = "ALPHA", endpoint = "127.0.0.1:7000", pubkey = "AA" },
+  { alias = "alpha", endpoint = "127.0.0.1:7001", pubkey = "BB" }
+]
+"#;
+        assert!(Config::parse(duplicate)
+            .expect_err("duplicate peer aliases must fail")
+            .to_string()
+            .contains("peer aliases must be unique"));
+
+        let missing_peer = r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[session]
+role = "connect"
+"#;
+        assert!(Config::parse(missing_peer)
+            .expect_err("connect peer is required")
+            .to_string()
+            .contains("session.peer"));
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_control_plane_combinations() {
+        let missing_dns = r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[control_plane]
+apply_dns = true
+"#;
+        assert!(Config::parse(missing_dns)
+            .expect_err("DNS apply without servers must fail")
+            .to_string()
+            .contains("apply_dns"));
+
+        let broad_bypass = r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[control_plane]
+underlay_bypass_cidrs = ["198.51.100.0/24"]
+"#;
+        assert!(Config::parse(broad_bypass)
+            .expect_err("bypass route must be single-host")
+            .to_string()
+            .contains("single-host"));
     }
 
     #[cfg(unix)]

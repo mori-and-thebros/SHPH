@@ -11,6 +11,9 @@
 fuzz/corpus/
 fuzz/artifacts/
 /benchmark-runs/
+/dist/
+/__pycache__/
+**/__pycache__/
 .wintun-staging/
 /wintun.dll
 /wintun.h

@@ -791,6 +791,7 @@ fn prune_jsonl(path: &Path, max_entries: usize) -> Result<()> {
             .open(&tmp_path)
             .map_err(ShphError::Io)?;
         temp_created = true;
+        ensure_audit_file_handle(&f).map_err(ShphError::Io)?;
         restrict_audit_file_perms(&tmp_path).map_err(ShphError::Io)?;
         for record in records {
             let line = serde_json::to_string(&record).map_err(ShphError::Serialization)?;
@@ -850,8 +851,10 @@ fn persist_audit_over(tmp: &Path, path: &Path) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = fs::remove_file(path);
-        fs::rename(tmp, path)
+        crate::keystore::persist_over(path, tmp).map_err(|error| match error {
+            ShphError::Io(error) => error,
+            other => io::Error::other(other.to_string()),
+        })
     }
 }
 
@@ -887,62 +890,76 @@ fn restrict_audit_file_perms(path: &Path) -> io::Result<()> {
 fn open_audit_read(path: &Path) -> io::Result<File> {
     ensure_audit_path_components(path)?;
     #[cfg(unix)]
-    {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
+        OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "audit path must reference a regular file",
-            ));
-        }
-        Ok(file)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = File::open(path)?;
+
+    ensure_audit_file_handle(&file)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "audit path must reference a regular file",
+        ));
     }
-    #[cfg(not(unix))]
-    {
-        let file = File::open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "audit path must reference a regular file",
-            ));
-        }
-        Ok(file)
-    }
+    Ok(file)
 }
 
 fn open_audit_append(path: &Path) -> io::Result<File> {
     ensure_audit_path_components(path)?;
     #[cfg(unix)]
-    {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
+        OpenOptions::new()
             .create(true)
             .append(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "audit path must reference a regular file",
-            ));
-        }
-        Ok(file)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    ensure_audit_file_handle(&file)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "audit path must reference a regular file",
+        ));
     }
-    #[cfg(not(unix))]
-    {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "audit path must reference a regular file",
-            ));
-        }
-        Ok(file)
-    }
+    Ok(file)
+}
+
+fn ensure_audit_file_handle(file: &File) -> io::Result<()> {
+    crate::ensure_open_handle_not_reparse(file).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("audit file handle rejected: {error}"),
+        )
+    })
 }
 
 fn ensure_audit_path_components(path: &Path) -> io::Result<()> {

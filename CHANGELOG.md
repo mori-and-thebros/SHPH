@@ -1,5 +1,118 @@
 # Changelog
 
+## [0.6.6-dev] - 2026-08-30
+
+This engineering snapshot adds the opt-in Phantom One prototype and a separate
+owned-domain edge relay prototype. It remains outside the release profile and
+does not claim production VPN behavior, anonymity, browser/TLS fingerprint
+parity, DPI evasion, censorship resistance, or independent audit status.
+
+- Added a bounded repeated-process CLI reliability test covering eight fresh
+  authenticated loopback sessions with cleanup-safe child watchdogs.
+- Added a sanitized release packager with an explicit public-document
+  allowlist, source/lockfile provenance, payload checksums, regular-file
+  checks, and common secret-marker scanning. CI now verifies the package
+  manifest and checksums on Linux and Windows.
+- Removed a discarded legacy TTY formatting pass so the live status bar has one
+  deterministic ASCII-safe rendering path.
+- Added a versioned `shph_transport::phantom_one` inner envelope with bounded
+  session-scoped padding, explicit generation, frame types, replay-window
+  checks, sequence-exhaustion handling, and runtime configuration validation.
+- Integrated Phantom One into authenticated TCP sessions only; the existing
+  AEAD, peer pinning, transcript signatures, and nonce/replay controls remain
+  the security boundary. Phantom One rejects incompatible transports before
+  handshake.
+- Added the Phantom One CLI/config/ticket path as a separate opt-in prototype;
+  Shroud 2 remains the compatibility default for existing configurations.
+- Added the standalone `shph-edge` owned-domain HTTP/2 relay prototype with
+  signed short-lived capabilities, bounded streams, fixed fallback responses,
+  strict URI validation, redacted metadata, paired TLS requirements, and a
+  loopback-only SOCKS5 client adapter.
+- Added the feature-gated HTTP/3 edge carrier using Quinn, rustls, `h3`, and
+  `h3-quinn`, with QUIC address-validation retry, bounded H3 request/response
+  handling, one-use capability-token consumption, and coordinated shutdown.
+  It remains an experimental standalone add-on with no live two-host H3
+  evidence.
+- Added Criterion and standalone Phantom One benchmark rows, a real Phantom One
+  fuzz target, CI smoke registration, and public design/operator/testing evidence
+  documents.
+- Hardened Phantom One replay-window advancement so authenticated forward jumps
+  beyond the bitmap window reset the receive bitmap instead of stalling after packet
+  loss; skipped and older sequences remain stale.
+- Made reconnect backoff shutdown-aware and retained failed control-plane
+  rollback operations for explicit persistence and retry instead of discarding
+  cleanup state.
+- Hardened the owned-domain edge prototype with bounded TLS/backend operations,
+  configured HTTP/2 stream limits, empty-domain rejection, and cancellation of
+  the dedicated HTTP/2 task after each SOCKS5 logical session.
+- Hardened Phantom One construction and state ownership: mutable encoder/decoder
+  state is no longer cloneable, unchecked configuration construction was removed,
+  decoder initialization no longer panics, and sequence/replay boundaries have
+  explicit regression coverage.
+- Hardened audit-journal persistence on Windows with handle-level
+  reparse-point checks and the existing atomic replacement path, while
+  preserving bounded reads and owner-only permissions.
+- Hardened the edge relay lifecycle with coordinated cancellation, bounded
+  public-key/token reads, stricter TLS server-name validation, and checked
+  capability-lifetime arithmetic.
+- Hardened native-TUN startup rollback and Windows WFP cleanup so failed
+  mutations remain retryable and cleanup errors stay visible.
+- Consolidated local regular-file input handling across the CLI, identity
+  provider, and filesystem adapters around the core no-reparse opener; Unix
+  read handles are now close-on-exec.
+- Hardened the standalone edge relay's bounded token, public-key, certificate,
+  and private-key reads against symlink/reparse traversal, and added a
+  Windows-hosted edge test gate.
+- Added a bounded, operator-configurable owned relay path and a standards-based
+  HTTP/2 connection/stream pool. The client accepts a bounded newline-delimited
+  bundle of independently issued one-use capabilities so pooling does not
+  weaken nonce replay protection.
+- Added seeded Shroud distribution-stability benchmark rows reporting wire-size
+  quantiles, entropy, and first-half/second-half drift metrics. These remain
+  local morphology measurements and do not establish DPI or censorship
+  resistance.
+- Hardened reusable Shroud buffers by wiping retired profile and Phantom One
+  envelope bytes before reuse or truncation; this is memory-lifetime hygiene,
+  not a wire
+  security change.
+- Bounded empirical morphology histograms by sample and bin count, switched
+  production sampling to a precomputed CDF, and ensured cloned engines do not
+  duplicate a live random stream.
+- Hardened the edge relay lifecycle with cancellation-aware HTTP/2 response
+  writes, prompt cleanup of stale producer/connection tasks, and an armed pool
+  notification wait that avoids a release/waiter lost-wakeup race.
+- Hardened reusable Phantom One and Shroud 2 buffers so rejected encodes clear
+  stale contents, added an in-place Shroud 2 decode path for standards-QUIC receive
+  loops, and made unweighted morphology classes path-MTU-aware instead of
+  collapsing ineligible classes into the MTU ceiling.
+- Added bounded zeroization for decoded Phantom One payloads and messages still held
+  by an unflushed morphology batcher.
+- Hardened reusable legacy profile buffers so early validation, randomness, and
+  TCP write failures clear stale contents, and routed stateless TCP/QUIC
+  profile encoding through the reusable buffer path.
+- Added scoped zeroization for QUIC padded plaintext, received datagram
+  storage, and sent packet buffers; hardened weighted morphology selection
+  against future profile-shape and weight-overflow changes.
+- Refreshed the root, benchmark, fuzz, and standalone edge lockfiles to the
+  non-yanked `chacha20 0.10.2` release, clearing the blocking yanked-package
+  audit warning without changing SHPH's cryptographic primitives.
+- Kept the standalone edge relay's HTTP/3 feature disabled by default and
+  retained an explicit CI compile/test gate for the opt-in carrier. The CLI
+  still refuses HTTP/3 when the feature is not compiled.
+- Added a central configuration validation boundary for normal parse/load/save
+  paths, including bounded peer/control-plane/session lists, cross-field
+  requirements, endpoint and path checks, reconnect limits, and startup
+  payload bounds.
+- Added pre-mutation control-plane duplicate detection for semantically
+  equivalent CIDRs, underlay bypass routes, and DNS servers.
+- Made transport DNS resolution deduplicate and cap returned socket addresses
+  before connection attempts, and added regression coverage for the bound.
+- Made metrics counters saturating and added stable snapshot serialization plus
+  bounded interval deltas for status reporting.
+- Added standalone edge configuration tests for unusable backends,
+  TLS-enabled server-name requirements, audience validation, and graceful
+  SIGTERM/Ctrl+C cancellation behavior.
+
 ## [0.6.5-dev.1] - 2026-08-25
 
 This documentation and evidence follow-up records the current controlled

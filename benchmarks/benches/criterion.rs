@@ -8,10 +8,11 @@ use shph_core::{
 use shph_identity::{IdentityEndpoint, IdentityRecord, VerificationPolicy};
 use shph_obfuscation::{apply_profile, remove_profile, ProfilePadder, ProfileTier};
 use shph_transport::ja4::{Ja4ClientHello, Ja4TlsVersion, Ja4Transport};
+use shph_transport::phantom_one::{PhantomOneDecoder, PhantomOneEncoder, PhantomOneFrameType};
 use shph_transport::shroud2::{
-    decode_batched_datagram, decode_datagram, encode_batched_datagram, encode_datagram,
-    wasserstein_distance, EmpiricalHistogram, MorphologyBatcher, MorphologyEngine,
-    MorphologyProfile,
+    decode_batched_datagram, decode_datagram, decode_datagram_in_place, encode_batched_datagram,
+    encode_datagram, wasserstein_distance, AdaptiveMorphologyConfig, AdaptiveMorphologyEngine,
+    EmpiricalHistogram, MorphologyBatcher, MorphologyEngine, MorphologyProfile,
 };
 use shph_transport::{PeerRateLimiterProbe, TcpUnderlay};
 use std::hint::black_box;
@@ -334,6 +335,92 @@ fn bench_morphology(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_phantom_one(c: &mut Criterion) {
+    let payload = vec![0x5c; 256];
+    let mut group = c.benchmark_group("transport/phantom_one");
+    group.bench_function("encode_decode_authenticated_inner_envelope", |b| {
+        let mut encoder = PhantomOneEncoder::from_seed(0x5348_3231, 0x21);
+        let mut decoder = PhantomOneDecoder::new(0x5348_3231);
+        b.iter(|| {
+            let envelope = encoder
+                .encode(PhantomOneFrameType::Data, black_box(&payload), PATH_MTU)
+                .expect("Phantom One encode");
+            black_box(
+                decoder
+                    .decode(&envelope, PATH_MTU)
+                    .expect("Phantom One decode"),
+            )
+        })
+    });
+    group.bench_function("encode_decode_reusable_buffer", |b| {
+        let mut encoder = PhantomOneEncoder::from_seed(0x5348_3231, 0x23);
+        let mut decoder = PhantomOneDecoder::new(0x5348_3231);
+        let mut envelope = Vec::with_capacity(PATH_MTU);
+        b.iter(|| {
+            encoder
+                .encode_into(
+                    PhantomOneFrameType::Data,
+                    black_box(&payload),
+                    PATH_MTU,
+                    &mut envelope,
+                )
+                .expect("Phantom One reusable encode");
+            decoder
+                .decode_in_place(&mut envelope, PATH_MTU)
+                .expect("Phantom One reusable decode");
+            black_box(envelope.len())
+        })
+    });
+    group.bench_function("decode_malformed_magic", |b| {
+        let mut encoder = PhantomOneEncoder::from_seed(0x5348_3231, 0x22);
+        let mut envelope = encoder
+            .encode(PhantomOneFrameType::Data, &payload, PATH_MTU)
+            .expect("Phantom One encode");
+        envelope[0] ^= 1;
+        b.iter(|| {
+            black_box(
+                PhantomOneDecoder::new(0x5348_3231)
+                    .decode(&envelope, PATH_MTU)
+                    .is_err(),
+            )
+        })
+    });
+    group.finish();
+}
+
+fn bench_adaptive_morphology(c: &mut Criterion) {
+    let payload = vec![0x2a; 1_440];
+    let mut group = c.benchmark_group("transport/shroud2/adaptive");
+    group.bench_function("encode_decode_buffer_reuse", |b| {
+        let mut adaptive =
+            AdaptiveMorphologyEngine::from_seed(AdaptiveMorphologyConfig::default(), 0x4144_5054)
+                .expect("adaptive config");
+        let mut datagram = Vec::with_capacity(PATH_MTU);
+        b.iter(|| {
+            adaptive
+                .encode_datagram_into(black_box(&payload[..1_024]), PATH_MTU, &mut datagram)
+                .expect("adaptive encode");
+            black_box(
+                decode_datagram_in_place(&mut datagram, PATH_MTU)
+                    .map(|()| datagram.len())
+                    .expect("adaptive decode"),
+            )
+        })
+    });
+    group.bench_function("profile_selection", |b| {
+        let mut adaptive =
+            AdaptiveMorphologyEngine::from_seed(AdaptiveMorphologyConfig::default(), 0x4144_5054)
+                .expect("adaptive config");
+        b.iter(|| {
+            adaptive
+                .encode_datagram(black_box(&payload[..512]), PATH_MTU)
+                .expect("adaptive encode")
+                .len()
+        })
+    });
+    group.finish();
+}
+
 fn bench_adapter_validation_and_observability(c: &mut Criterion) {
     let mut group = c.benchmark_group("transport/adapter-validation");
     let offline = TransportAdapterConfig::OfflineMesh {
@@ -416,6 +503,8 @@ criterion_group!(
     bench_handshake,
     bench_framing_and_profiles,
     bench_morphology,
+    bench_phantom_one,
+    bench_adaptive_morphology,
     bench_adapter_validation_and_observability,
     bench_identity
 );

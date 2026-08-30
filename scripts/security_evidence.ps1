@@ -102,6 +102,48 @@ function Invoke-CargoGate {
     }
 }
 
+function Add-WindowsFuzzRuntimeToPath {
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        return
+    }
+
+    $installer = if (${env:ProgramFiles(x86)}) {
+        Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    } else {
+        $null
+    }
+    $installations = @()
+    if ($installer -and (Test-Path -LiteralPath $installer)) {
+        $installations += @(& $installer -products * -property installationPath 2>$null)
+    }
+    $installations += @(
+        "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools",
+        "C:\Program Files\Microsoft Visual Studio\18\BuildTools"
+    )
+
+    foreach ($installation in ($installations | Where-Object { $_ } | Select-Object -Unique)) {
+        $msvcRoot = Join-Path ([string]$installation) "VC\Tools\MSVC"
+        if (-not (Test-Path -LiteralPath $msvcRoot)) {
+            continue
+        }
+        foreach ($toolset in (Get-ChildItem -LiteralPath $msvcRoot -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($archDir in @(
+                (Join-Path $toolset.FullName "bin\Hostx64\x64"),
+                (Join-Path $toolset.FullName "bin\Hostx86\x64")
+            )) {
+                $runtime = Join-Path $archDir "clang_rt.asan_dynamic-x86_64.dll"
+                if (Test-Path -LiteralPath $runtime) {
+                    $env:PATH = "$archDir;$env:PATH"
+                    Write-RunLog "fuzz runtime path=$archDir"
+                    return
+                }
+            }
+        }
+    }
+
+    Write-RunLog "fuzz runtime path not found; Windows fuzz smoke may be capability-blocked"
+}
+
 Write-RunLog "# SHPH security-evidence collector"
 Write-RunLog "generated_utc=$((Get-Date).ToUniversalTime().ToString("o"))"
 Write-RunLog "allow_dirty=$AllowDirty"
@@ -204,7 +246,11 @@ if ($null -eq $cargo) {
         Add-Result -Id "cargo-audit" -Status "SKIP" -Command "cargo audit --deny warnings" `
             -Detail "cargo-audit is not installed"
     } else {
-        Invoke-CargoGate -Id "cargo-audit" -Arguments @("audit", "--deny", "warnings")
+        $auditArguments = @("audit", "--deny", "warnings")
+        if (-not $AllowNetwork) {
+            $auditArguments += "--no-fetch"
+        }
+        Invoke-CargoGate -Id "cargo-audit" -Arguments $auditArguments
     }
 }
 
@@ -214,12 +260,20 @@ if ($SkipFuzz) {
     Add-Result -Id "fuzz-smoke" -Status "SKIP" -Command "cargo fuzz smoke" `
         -Detail "cargo-fuzz is not installed"
 } else {
+    Add-WindowsFuzzRuntimeToPath
     $nightly = @(& rustup toolchain list 2>&1 | ForEach-Object { $_.ToString() })
     if (-not ($nightly -match "nightly-2026-07-16")) {
         Add-Result -Id "fuzz-smoke" -Status "SKIP" -Command "rustup toolchain list" `
             -Detail "nightly-2026-07-16 is not installed"
     } else {
-        $targets = @("frame_decode", "config_parse", "audit_record", "replay_window", "shroud2_datagram")
+        $targets = @(
+            "frame_decode",
+            "config_parse",
+            "audit_record",
+            "replay_window",
+            "shroud2_datagram",
+            "phantom_one_envelope"
+        )
         foreach ($target in $targets) {
             $targetName = "fuzz-$target"
             Invoke-Gate -Id $targetName `

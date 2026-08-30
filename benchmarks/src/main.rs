@@ -9,8 +9,14 @@ use shph_identity::{
     IdentityRecord, LocalDirectoryProvider, PublishReceipt, VerificationPolicy, MAX_CAPABILITIES,
     MAX_ENDPOINTS, MAX_RECORD_BYTES,
 };
+use shph_obfuscation::ProfileTier;
+use shph_transport::phantom_one::{
+    PhantomOneConfig, PhantomOneDecoder, PhantomOneEncoder, PhantomOneFrameType,
+    PHANTOM_ONE_HEADER_BYTES,
+};
 use shph_transport::shroud2::{
     decode_batched_datagram, decode_datagram, encode_batched_datagram, encode_datagram,
+    wasserstein_distance, AdaptiveMorphologyConfig, AdaptiveMorphologyEngine, EmpiricalHistogram,
     MorphologyBatchPolicy, MorphologyBatchPushResult, MorphologyBatcher, MorphologyEngine,
     MorphologyProfile,
 };
@@ -26,6 +32,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -156,6 +163,25 @@ struct WireMetrics {
     packets_per_sec: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DistributionStats {
+    min_bytes: usize,
+    p50_bytes: usize,
+    p95_bytes: usize,
+    max_bytes: usize,
+    mean_bytes: f64,
+    distinct_sizes: usize,
+    entropy_bits: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DistributionStability {
+    full: DistributionStats,
+    first_half: DistributionStats,
+    second_half: DistributionStats,
+    half_wasserstein_bytes: f64,
+}
+
 const WIRE_UDP_IPV4_PAYLOAD_MTU: usize = 1_472;
 const WIRE_AEAD_OVERHEAD: usize = 12 + 16;
 const WIRE_MAX_AEAD_PAYLOAD: usize = WIRE_UDP_IPV4_PAYLOAD_MTU - WIRE_AEAD_OVERHEAD;
@@ -174,6 +200,8 @@ const EVIDENCE_OVERHEAD_PACKETS: usize = 5_000;
 const EVIDENCE_COOKIE_PACKETS: usize = 50_000;
 const EVIDENCE_REPLAY_PACKETS: usize = 500_000;
 const EVIDENCE_MORPHOLOGY_PATH_MTU: usize = 1_472;
+const MORPHOLOGY_STABILITY_MIN_SAMPLES: usize = 256;
+const MORPHOLOGY_STABILITY_MAX_SAMPLES: usize = 50_000;
 const EXTENDED_PATH_MTUS: &[usize] = &[1_200, 1_280, 1_360, 1_400, 1_472];
 const EXTENDED_LOSS_PCTS: &[usize] = &[0, 1, 5, 10];
 const EXTENDED_BATCH_SIZES: &[usize] = &[1, 2, 4, 8];
@@ -205,9 +233,13 @@ fn main() {
     if matches!(options.suite, Suite::All | Suite::Shroud) {
         bench_shroud_profiles(options);
         bench_shroud2_morphology(options);
+        bench_shroud2_distribution_stability(options);
         bench_shroud2_delay(options);
         bench_shroud2_long_session(options);
         bench_shroud2_impairment(options);
+        bench_adaptive_morphology(options);
+        bench_phantom_one(options);
+        bench_phantom_one_profiles(options);
     }
     if matches!(options.suite, Suite::All | Suite::Quic) {
         bench_quic_loopback(options);
@@ -227,6 +259,9 @@ fn main() {
     }
     if matches!(options.suite, Suite::Extended) {
         bench_extended(options);
+    }
+    if matches!(options.suite, Suite::All | Suite::Extended) {
+        bench_edge_relay(options);
     }
 }
 
@@ -635,6 +670,71 @@ fn emit_rate_with_wire(
         overhead_pct,
         packets_per_sec,
         notes
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_distribution(
+    options: Options,
+    scenario: &str,
+    average_payload_bytes: usize,
+    sample_count: usize,
+    raw_bytes: usize,
+    wire_bytes: usize,
+    runtime: RuntimeStats,
+    wire_metrics: WireMetrics,
+    stability: DistributionStability,
+    path_mtu: usize,
+    workload: &str,
+    seed: u64,
+) {
+    let cpu_pct = runtime
+        .cpu_pct
+        .map_or_else(|| "-".to_string(), |value| format!("{value:.2}"));
+    let rss_kib = runtime
+        .rss_kib
+        .map_or_else(|| "-".to_string(), |value| value.to_string());
+    let peak_rss_kib = runtime
+        .peak_rss_kib
+        .map_or_else(|| "-".to_string(), |value| value.to_string());
+    let wire_bytes_per_packet = format_wire_metric(wire_metrics.wire_bytes_per_packet);
+    let overhead_bytes = format_wire_metric(wire_metrics.overhead_bytes);
+    let overhead_pct = format_wire_metric(wire_metrics.overhead_pct);
+    let packets_per_sec = format_wire_metric(wire_metrics.packets_per_sec);
+    let notes = format!(
+        "workload={workload};seed={seed};samples={sample_count};path_mtu={path_mtu};raw_total_bytes={raw_bytes};wire_total_bytes={wire_bytes};wire_min_bytes={};wire_p50_bytes={};wire_p95_bytes={};wire_max_bytes={};wire_mean_bytes={:.3};distinct_wire_sizes={};wire_entropy_bits={:.6};first_half_entropy_bits={:.6};second_half_entropy_bits={:.6};first_half_mean_bytes={:.3};second_half_mean_bytes={:.3};mean_delta_bytes={:.3};half_wasserstein_bytes={:.3};half_wasserstein_path_mtu_ratio={:.6};stability_method=first_half_vs_second_half;seeded_local_encode_decode_only;not_network_or_dpi_evidence",
+        stability.full.min_bytes,
+        stability.full.p50_bytes,
+        stability.full.p95_bytes,
+        stability.full.max_bytes,
+        stability.full.mean_bytes,
+        stability.full.distinct_sizes,
+        stability.full.entropy_bits,
+        stability.first_half.entropy_bits,
+        stability.second_half.entropy_bits,
+        stability.first_half.mean_bytes,
+        stability.second_half.mean_bytes,
+        (stability.first_half.mean_bytes - stability.second_half.mean_bytes).abs(),
+        stability.half_wasserstein_bytes,
+        stability.half_wasserstein_bytes / path_mtu as f64,
+    );
+    println!(
+        "distribution,{profile},{scenario},{average_payload_bytes},{sample_count},-,-,-,-,-,-,-,{elapsed_ms},-,{cpu_pct},{alloc_calls},{alloc_bytes},{rss_kib},{peak_rss_kib},{wire_bytes_per_packet},{overhead_bytes},{overhead_pct},{packets_per_sec},{notes}",
+        profile = options.profile.as_str(),
+        scenario = scenario,
+        average_payload_bytes = average_payload_bytes,
+        sample_count = sample_count,
+        elapsed_ms = runtime.elapsed_ns / 1_000_000,
+        cpu_pct = cpu_pct,
+        alloc_calls = runtime.alloc.calls,
+        alloc_bytes = runtime.alloc.bytes,
+        rss_kib = rss_kib,
+        peak_rss_kib = peak_rss_kib,
+        wire_bytes_per_packet = wire_bytes_per_packet,
+        overhead_bytes = overhead_bytes,
+        overhead_pct = overhead_pct,
+        packets_per_sec = packets_per_sec,
+        notes = notes
     );
 }
 
@@ -1559,6 +1659,60 @@ fn shannon_entropy(histogram: &BTreeMap<usize, usize>, samples: usize) -> f64 {
         .sum()
 }
 
+fn distribution_stats(samples: &[usize]) -> DistributionStats {
+    assert!(
+        !samples.is_empty(),
+        "distribution samples must not be empty"
+    );
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let histogram = samples.iter().fold(BTreeMap::new(), |mut histogram, size| {
+        *histogram.entry(*size).or_default() += 1;
+        histogram
+    });
+    let percentile =
+        |percent: usize| sorted[((sorted.len() - 1) * percent / 100).min(sorted.len() - 1)];
+    let mean_bytes = samples.iter().map(|size| *size as f64).sum::<f64>() / samples.len() as f64;
+    DistributionStats {
+        min_bytes: sorted[0],
+        p50_bytes: percentile(50),
+        p95_bytes: percentile(95),
+        max_bytes: sorted[sorted.len() - 1],
+        mean_bytes,
+        distinct_sizes: histogram.len(),
+        entropy_bits: shannon_entropy(&histogram, samples.len()),
+    }
+}
+
+fn compare_distribution(samples: &[usize]) -> DistributionStability {
+    assert!(
+        samples.len() >= 2 && samples.len().is_multiple_of(2),
+        "distribution comparison requires an even sample count of at least two"
+    );
+    let midpoint = samples.len() / 2;
+    let (first_half, second_half) = samples.split_at(midpoint);
+    let first_histogram = EmpiricalHistogram::from_samples(
+        &first_half
+            .iter()
+            .map(|size| u64::try_from(*size).expect("wire size fits u64"))
+            .collect::<Vec<_>>(),
+    )
+    .expect("first-half morphology histogram");
+    let second_histogram = EmpiricalHistogram::from_samples(
+        &second_half
+            .iter()
+            .map(|size| u64::try_from(*size).expect("wire size fits u64"))
+            .collect::<Vec<_>>(),
+    )
+    .expect("second-half morphology histogram");
+    DistributionStability {
+        full: distribution_stats(samples),
+        first_half: distribution_stats(first_half),
+        second_half: distribution_stats(second_half),
+        half_wasserstein_bytes: wasserstein_distance(&first_histogram, &second_histogram),
+    }
+}
+
 fn evidence_payload_len(profile: &str, packet: usize) -> usize {
     let mixed = evidence_mix64(
         packet as u64
@@ -2046,6 +2200,122 @@ fn bench_shroud2_morphology(options: Options) {
     }
 }
 
+fn bench_shroud2_distribution_stability(options: Options) {
+    let path_mtu = EVIDENCE_MORPHOLOGY_PATH_MTU;
+    let mut sample_count = options.frames.clamp(
+        MORPHOLOGY_STABILITY_MIN_SAMPLES,
+        MORPHOLOGY_STABILITY_MAX_SAMPLES,
+    );
+    sample_count -= sample_count % 2;
+
+    for (name, profile, workload, seed) in morphology_distribution_cases() {
+        let mut morphology = MorphologyEngine::from_seed(profile, seed);
+        let mut wire_sizes = Vec::with_capacity(sample_count);
+        let mut raw_bytes = 0usize;
+        let mut wire_bytes = 0usize;
+        let start = begin_measurement();
+
+        for packet in 0..sample_count {
+            let payload_len = evidence_payload_len(workload, packet);
+            let payload = vec![0x5a; payload_len];
+            let datagram = morphology
+                .encode_datagram(&payload, path_mtu)
+                .expect("distribution morphology encode");
+            let decoded =
+                decode_datagram(&datagram, path_mtu).expect("distribution morphology decode");
+            assert_eq!(decoded, payload);
+            raw_bytes = raw_bytes.saturating_add(payload.len());
+            wire_bytes = wire_bytes.saturating_add(datagram.len());
+            wire_sizes.push(datagram.len());
+            black_box(decoded);
+        }
+
+        let runtime = finish_measurement(start);
+        let stability = compare_distribution(&wire_sizes);
+        let wire_metrics =
+            aggregate_wire_metrics(raw_bytes, wire_bytes, sample_count, runtime.elapsed_ns);
+        emit_distribution(
+            options,
+            &format!("shroud2_{name}_distribution"),
+            raw_bytes / sample_count,
+            sample_count,
+            raw_bytes,
+            wire_bytes,
+            runtime,
+            wire_metrics,
+            stability,
+            path_mtu,
+            workload,
+            seed,
+        );
+    }
+}
+
+fn morphology_distribution_cases() -> [(&'static str, MorphologyProfile, &'static str, u64); 10] {
+    [
+        (
+            "low-latency",
+            MorphologyProfile::LowLatency,
+            "ssh",
+            0x0044_4953_544c_4f57,
+        ),
+        (
+            "web-browsing-lab",
+            MorphologyProfile::WebBrowsingLab,
+            "web",
+            0x0044_4953_5457_4542,
+        ),
+        (
+            "video-streaming-lab",
+            MorphologyProfile::VideoStreamingLab,
+            "video",
+            0x0044_4953_5456_4944,
+        ),
+        (
+            "video-streaming-large-payload-lab",
+            MorphologyProfile::VideoStreamingLargePayloadLab,
+            "video-large",
+            0x4449_5354_564c_4152,
+        ),
+        (
+            "video-streaming-balanced-payload-lab",
+            MorphologyProfile::VideoStreamingBalancedPayloadLab,
+            "video-balanced",
+            0x4449_5354_5642_414c,
+        ),
+        (
+            "bulk-lab",
+            MorphologyProfile::BulkLab,
+            "bulk",
+            0x4449_5354_4255_4c4b,
+        ),
+        (
+            "tuned-low-latency",
+            MorphologyProfile::TunedLowLatency,
+            "tuned-low",
+            0x4449_5354_544c_4f57,
+        ),
+        (
+            "tuned-web-browsing-lab",
+            MorphologyProfile::TunedWebBrowsingLab,
+            "tuned-web",
+            0x4449_5354_5457_4542,
+        ),
+        (
+            "tuned-video-streaming-lab",
+            MorphologyProfile::TunedVideoStreamingLab,
+            "tuned-video",
+            0x4449_5354_5456_4944,
+        ),
+        (
+            "tuned-bulk-lab",
+            MorphologyProfile::TunedBulkLab,
+            "tuned-bulk",
+            0x4449_5354_5442_554c,
+        ),
+    ]
+}
+
 fn bench_shroud2_delay(options: Options) {
     for (name, profile) in [
         ("low-latency", MorphologyProfile::LowLatency),
@@ -2211,6 +2481,54 @@ fn bench_shroud2_impairment(options: Options) {
     );
 }
 
+fn bench_adaptive_morphology(options: Options) {
+    let path_mtu = 1_450;
+    let payload = vec![0x2a; 1_440];
+    let mut adaptive =
+        AdaptiveMorphologyEngine::from_seed(AdaptiveMorphologyConfig::default(), 0x4144_5054)
+            .expect("adaptive morphology config");
+    let mut datagram = Vec::with_capacity(path_mtu);
+    let mut delivered_bytes = 0usize;
+    let mut wire_bytes = 0usize;
+    let start = begin_measurement();
+
+    for sequence in 0..options.frames {
+        let payload_len = match sequence % 32 {
+            0..=7 => 64,
+            8..=19 => 512,
+            20..=27 => 1_200,
+            _ => 1_400,
+        };
+        adaptive
+            .encode_datagram_into(&payload[..payload_len], path_mtu, &mut datagram)
+            .expect("adaptive morphology encode");
+        wire_bytes = wire_bytes.saturating_add(datagram.len());
+        let decoded = decode_datagram(&datagram, path_mtu).expect("adaptive morphology decode");
+        delivered_bytes = delivered_bytes.saturating_add(decoded.len());
+    }
+
+    let runtime = finish_measurement(start);
+    let frames = options.frames.max(1);
+    let average_payload = delivered_bytes / frames;
+    let wire_metrics = wire_rate_metrics(average_payload, wire_bytes, frames, runtime.elapsed_ns);
+    let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
+    emit_rate_with_wire(
+        options,
+        "shroud2_adaptive",
+        average_payload,
+        runtime,
+        delivered_bytes as f64 / seconds / 1_000_000.0,
+        wire_bytes as f64 / seconds / 1_000_000.0,
+        wire_metrics,
+        &format!(
+            "bounded_integer_ewma=true;profile_switches={};final_profile={:?};final_ewma_payload_bytes={};path_mtu={path_mtu};local_synthetic_workload",
+            adaptive.profile_switches(),
+            adaptive.profile(),
+            adaptive.ewma_payload_bytes(),
+        ),
+    );
+}
+
 fn bench_extended(options: Options) {
     bench_batching_api(options);
     bench_adaptive_batching_api(options);
@@ -2218,6 +2536,79 @@ fn bench_extended(options: Options) {
     bench_concurrent_sessions(options);
     bench_session_churn(options);
     bench_extended_repeatability_marker();
+}
+
+fn bench_edge_relay(options: Options) {
+    const PAYLOAD_BYTES: usize = 64 * 1024;
+    let sessions = options.iterations.clamp(1, 256);
+    let payload = vec![0x7a; PAYLOAD_BYTES];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("edge benchmark runtime");
+    let start = begin_measurement();
+    let mut transferred_bytes = 0usize;
+
+    for _ in 0..sessions {
+        let received = runtime.block_on(async {
+            let (mut application_left, relay_left) = tokio::io::duplex(PAYLOAD_BYTES * 2);
+            let (mut application_right, relay_right) = tokio::io::duplex(PAYLOAD_BYTES * 2);
+            let relay = tokio::spawn(shph_edge::pipe_opaque(
+                relay_left,
+                relay_right,
+                PAYLOAD_BYTES as u64,
+            ));
+
+            application_left
+                .write_all(&payload)
+                .await
+                .expect("edge benchmark request");
+            application_left
+                .shutdown()
+                .await
+                .expect("edge benchmark request EOF");
+            application_right
+                .shutdown()
+                .await
+                .expect("edge benchmark response EOF");
+
+            let mut received = Vec::with_capacity(PAYLOAD_BYTES);
+            application_right
+                .read_to_end(&mut received)
+                .await
+                .expect("edge benchmark response");
+            let counts = relay
+                .await
+                .expect("edge benchmark relay task")
+                .expect("edge benchmark relay result");
+            assert_eq!(counts, (PAYLOAD_BYTES as u64, 0));
+            assert_eq!(received, payload);
+            received.len()
+        });
+        transferred_bytes = transferred_bytes.saturating_add(received);
+    }
+
+    let runtime_stats = finish_measurement(start);
+    let seconds = runtime_stats.elapsed_ns as f64 / 1_000_000_000.0;
+    let wire_bytes = transferred_bytes;
+    emit_rate_with_wire(
+        options,
+        "edge_opaque_relay",
+        PAYLOAD_BYTES,
+        runtime_stats,
+        transferred_bytes as f64 / seconds / 1_000_000.0,
+        wire_bytes as f64 / seconds / 1_000_000.0,
+        wire_rate_metrics(
+            PAYLOAD_BYTES,
+            wire_bytes,
+            sessions,
+            runtime_stats.elapsed_ns,
+        ),
+        &format!(
+            "owned_edge_fast_path_only;duplex_sessions={sessions};payload_bytes={PAYLOAD_BYTES};bounded_pipe_opaque=true;no_tls_or_http2;local_in_memory_evidence"
+        ),
+    );
 }
 
 fn bench_batching_api(options: Options) {
@@ -2658,6 +3049,222 @@ fn measure_shroud_framing(
         samples.push(sample_start.elapsed().as_nanos());
     }
     samples
+}
+
+fn bench_phantom_one(options: Options) {
+    const PATH_MTU: usize = 1_360;
+    const GENERATION: u32 = 0x5348_5231;
+    const FRAME_CASES: &[(&str, usize, PhantomOneFrameType)] = &[
+        ("data", 256, PhantomOneFrameType::Data),
+        ("control", 64, PhantomOneFrameType::Control),
+        ("keepalive", 16, PhantomOneFrameType::Keepalive),
+    ];
+
+    for (frame_name, payload_bytes, frame_type) in FRAME_CASES {
+        let payload = vec![0x5a; *payload_bytes];
+        let mut encoder = PhantomOneEncoder::from_seed(GENERATION, 0x5348_5232);
+        let mut decoder = PhantomOneDecoder::new(GENERATION);
+        let mut samples = Vec::with_capacity(options.iterations);
+        let mut wire_bytes = 0usize;
+        let start = begin_measurement();
+
+        for _ in 0..options.iterations {
+            let sample_start = Instant::now();
+            let encoded = encoder
+                .encode(*frame_type, &payload, PATH_MTU)
+                .expect("Phantom One benchmark encode");
+            wire_bytes = wire_bytes.saturating_add(encoded.len());
+            let decoded = decoder
+                .decode(&encoded, PATH_MTU)
+                .expect("Phantom One benchmark decode");
+            assert_eq!(decoded.payload, payload);
+            black_box(decoded);
+            samples.push(sample_start.elapsed().as_nanos());
+        }
+
+        let runtime = finish_measurement(start);
+        let average_wire_bytes = wire_bytes as f64 / samples.len() as f64;
+        let overhead_bytes = average_wire_bytes - *payload_bytes as f64;
+        let overhead_pct = overhead_bytes / *payload_bytes as f64 * 100.0;
+        let packets_per_sec =
+            1_000_000_000.0 / (samples.iter().sum::<u128>() as f64 / samples.len() as f64);
+        emit_latency_with_wire(
+            "phantom_one",
+            options,
+            &format!("phantom_one_{frame_name}_encode_decode"),
+            *payload_bytes,
+            &samples,
+            runtime,
+            WireMetrics {
+                wire_bytes_per_packet: Some(average_wire_bytes),
+                overhead_bytes: Some(overhead_bytes),
+                overhead_pct: Some(overhead_pct),
+                packets_per_sec: Some(packets_per_sec),
+            },
+            "local_stateful_encode_decode;authenticated_transport_inner_envelope;seeded_rng;not_network_or_dpi_evidence",
+        );
+    }
+
+    let payload = vec![0x5b; 256];
+    let mut encoder = PhantomOneEncoder::from_seed(GENERATION, 0x5348_5234);
+    let mut decoder = PhantomOneDecoder::new(GENERATION);
+    let mut envelope = Vec::with_capacity(PATH_MTU);
+    let mut samples = Vec::with_capacity(options.iterations);
+    let mut wire_bytes = 0usize;
+    let start = begin_measurement();
+
+    for _ in 0..options.iterations {
+        let sample_start = Instant::now();
+        encoder
+            .encode_into(PhantomOneFrameType::Data, &payload, PATH_MTU, &mut envelope)
+            .expect("Phantom One reusable benchmark encode");
+        wire_bytes = wire_bytes.saturating_add(envelope.len());
+        decoder
+            .decode_in_place(&mut envelope, PATH_MTU)
+            .expect("Phantom One reusable benchmark decode");
+        assert_eq!(envelope, payload);
+        black_box(&envelope);
+        samples.push(sample_start.elapsed().as_nanos());
+    }
+
+    let runtime = finish_measurement(start);
+    let average_wire_bytes = wire_bytes as f64 / samples.len() as f64;
+    let overhead_bytes = average_wire_bytes - payload.len() as f64;
+    let packets_per_sec =
+        1_000_000_000.0 / (samples.iter().sum::<u128>() as f64 / samples.len() as f64);
+    emit_latency_with_wire(
+        "phantom_one",
+        options,
+        "phantom_one_data_reusable_buffer_encode_decode",
+        payload.len(),
+        &samples,
+        runtime,
+        WireMetrics {
+            wire_bytes_per_packet: Some(average_wire_bytes),
+            overhead_bytes: Some(overhead_bytes),
+            overhead_pct: Some(overhead_bytes / payload.len() as f64 * 100.0),
+            packets_per_sec: Some(packets_per_sec),
+        },
+        "local_reusable_buffer_encode_decode;authenticated_transport_inner_envelope;seeded_rng;not_network_or_dpi_evidence",
+    );
+
+    let payload = vec![0x17; 1_024];
+    let mut encoder = PhantomOneEncoder::from_seed(GENERATION, 0x5348_5233);
+    let mut decoder = PhantomOneDecoder::new(GENERATION);
+    let mut delivered_bytes = 0usize;
+    let mut wire_bytes = 0usize;
+    let start = begin_measurement();
+
+    for _ in 0..options.frames {
+        let encoded = encoder
+            .encode(PhantomOneFrameType::Data, &payload, PATH_MTU)
+            .expect("Phantom One sustained encode");
+        wire_bytes = wire_bytes.saturating_add(encoded.len());
+        let decoded = decoder
+            .decode(&encoded, PATH_MTU)
+            .expect("Phantom One sustained decode");
+        delivered_bytes = delivered_bytes.saturating_add(decoded.payload.len());
+        black_box(decoded);
+    }
+
+    let runtime = finish_measurement(start);
+    let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
+    let average_wire_bytes = wire_bytes as f64 / options.frames as f64;
+    let overhead_bytes = average_wire_bytes - payload.len() as f64;
+    emit_rate_with_wire(
+        options,
+        "phantom_one_sustained_data_encode_decode",
+        payload.len(),
+        runtime,
+        delivered_bytes as f64 / seconds / 1_000_000.0,
+        wire_bytes as f64 / seconds / 1_000_000.0,
+        WireMetrics {
+            wire_bytes_per_packet: Some(average_wire_bytes),
+            overhead_bytes: Some(overhead_bytes),
+            overhead_pct: Some(overhead_bytes / payload.len() as f64 * 100.0),
+            packets_per_sec: Some(options.frames as f64 / seconds),
+        },
+        "local_stateful_encode_decode;authenticated_transport_inner_envelope;seeded_rng;not_network_or_dpi_evidence",
+    );
+}
+
+fn bench_phantom_one_profiles(options: Options) {
+    const PATH_MTU: usize = 1_360;
+    const GENERATION: u32 = 0x5348_5246;
+    const REQUESTED_PAYLOAD_BYTES: usize = 256;
+    const PROFILES: &[(ProfileTier, &str)] = &[
+        (ProfileTier::Low, "low"),
+        (ProfileTier::Medium, "medium"),
+        (ProfileTier::High, "high"),
+        (ProfileTier::TunedLow, "tuned-low"),
+        (ProfileTier::TunedMedium, "tuned-medium"),
+        (ProfileTier::TunedHigh, "tuned-high"),
+    ];
+
+    for (profile, profile_name) in PROFILES {
+        // Low's largest canonical class is 256 bytes, while Phantom One's
+        // header is 24 bytes. Keep the requested 256-byte case where it fits
+        // and use the largest valid payload for smaller canonical profiles.
+        let payload_bytes = REQUESTED_PAYLOAD_BYTES.min(
+            profile
+                .base_tiers()
+                .last()
+                .copied()
+                .expect("Phantom One profile has a canonical tier")
+                .saturating_sub(PHANTOM_ONE_HEADER_BYTES),
+        );
+        let payload = vec![0x6d; payload_bytes];
+        let config = PhantomOneConfig::for_profile(*profile);
+        let mut encoder = PhantomOneEncoder::from_seed_with_profile(
+            GENERATION,
+            0x5348_5052 ^ u64::from(profile.id()),
+            *profile,
+        );
+        let mut decoder =
+            PhantomOneDecoder::with_config(GENERATION, config).expect("profile decoder config");
+        let mut samples = Vec::with_capacity(options.iterations);
+        let mut wire_bytes = 0usize;
+        let start = begin_measurement();
+
+        for _ in 0..options.iterations {
+            let sample_start = Instant::now();
+            let encoded = encoder
+                .encode(PhantomOneFrameType::Data, &payload, PATH_MTU)
+                .expect("Phantom One profile encode");
+            wire_bytes = wire_bytes.saturating_add(encoded.len());
+            let decoded = decoder
+                .decode(&encoded, PATH_MTU)
+                .expect("Phantom One profile decode");
+            assert_eq!(decoded.profile, *profile);
+            assert_eq!(decoded.payload, payload);
+            black_box(decoded);
+            samples.push(sample_start.elapsed().as_nanos());
+        }
+
+        let runtime = finish_measurement(start);
+        let average_wire_bytes = wire_bytes as f64 / samples.len() as f64;
+        let overhead_bytes = average_wire_bytes - payload.len() as f64;
+        let packets_per_sec =
+            1_000_000_000.0 / (samples.iter().sum::<u128>() as f64 / samples.len() as f64);
+        emit_latency_with_wire(
+            "phantom_one_profiles",
+            options,
+            &format!("profile_{profile_name}_id_{}_encode_decode", profile.id()),
+            payload.len(),
+            &samples,
+            runtime,
+            WireMetrics {
+                wire_bytes_per_packet: Some(average_wire_bytes),
+                overhead_bytes: Some(overhead_bytes),
+                overhead_pct: Some(overhead_bytes / payload.len() as f64 * 100.0),
+                packets_per_sec: Some(packets_per_sec),
+            },
+            &format!(
+                "profile={profile_name};profile_id={};requested_payload_bytes={REQUESTED_PAYLOAD_BYTES};actual_payload_bytes={payload_bytes};local_stateful_encode_decode;seeded_rng;not_network_or_dpi_evidence",
+                profile.id(),
+            ),
+        );
+    }
 }
 
 fn bench_shroud_decode_alloc(

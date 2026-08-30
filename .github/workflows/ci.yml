@@ -62,6 +62,71 @@ jobs:
           # Loopback integration tests self-skip on PermissionDenied.
           RUST_BACKTRACE: 1
 
+  local-reliability:
+    name: Repeated local reliability (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
+      - name: Run bounded repeated process sessions
+        run: cargo +1.96.0 test -p shph-cli --test cli_reliability --locked -- --test-threads=1
+        env:
+          RUST_BACKTRACE: 1
+
+  package-check:
+    name: Sanitized package check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary: target/release/shph
+          - os: windows-latest
+            binary: target/release/shph.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
+      - name: Build release binary
+        run: cargo +1.96.0 build -p shph-cli --release --locked
+      - name: Build sanitized package
+        shell: bash
+        run: python scripts/package_release.py --binary "${{ matrix.binary }}" --output dist/ci-package
+      - name: Verify package manifest and checksums
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          package = Path("dist/ci-package")
+          manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+          assert manifest["schema"] == "shph-release-package/v1"
+          assert manifest["source_dirty"] is False
+          assert manifest["files"]
+          assert all("keystore" not in item["path"].lower() for item in manifest["files"])
+
+          for item in manifest["files"]:
+              path = package / item["path"]
+              assert path.is_file()
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              assert digest == item["sha256"]
+
+          checksums = {}
+          for line in (package / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+              digest, name = line.split("  ", 1)
+              checksums[name] = digest
+          for name, digest in checksums.items():
+              assert hashlib.sha256((package / name).read_bytes()).hexdigest() == digest
+          PY
+
   demo:
     name: Reproducible demo
     runs-on: ubuntu-latest
@@ -87,7 +152,7 @@ jobs:
       - name: Run one fuzzing iteration per target
         working-directory: fuzz
         run: |
-          for target in frame_decode config_parse audit_record replay_window shroud2_datagram; do
+          for target in frame_decode config_parse audit_record replay_window shroud2_datagram phantom_one_envelope; do
             cargo +nightly-2026-07-16 fuzz run "$target" -- -runs=1
           done
 
@@ -101,6 +166,8 @@ jobs:
             manifest: benchmarks/Cargo.toml
           - name: fuzz manifest
             manifest: fuzz/Cargo.toml
+          - name: edge relay
+            manifest: shph-edge/Cargo.toml
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -110,6 +177,34 @@ jobs:
         run: cargo +1.96.0 fmt --manifest-path "${{ matrix.manifest }}" -- --check
       - name: cargo check --locked
         run: cargo +1.96.0 check --manifest-path "${{ matrix.manifest }}" --all-targets --locked
+
+  edge-windows:
+    name: Edge relay (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy --no-self-update
+      - name: cargo fmt --check
+        run: cargo +1.96.0 fmt --manifest-path shph-edge/Cargo.toml -- --check
+      - name: cargo clippy --locked
+        run: cargo +1.96.0 clippy --manifest-path shph-edge/Cargo.toml --all-targets --locked -- -D warnings
+      - name: cargo test --locked
+        run: cargo +1.96.0 test --manifest-path shph-edge/Cargo.toml --all-targets --locked
+
+  edge-http3-compile:
+    name: Edge relay HTTP/3 feature checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy --no-self-update
+      - name: Compile the explicitly gated HTTP/3 feature
+        run: cargo +1.96.0 check --manifest-path shph-edge/Cargo.toml --features http3 --all-targets --locked
+      - name: Clippy the explicitly gated HTTP/3 feature
+        run: cargo +1.96.0 clippy --manifest-path shph-edge/Cargo.toml --features http3 --all-targets --locked -- -D warnings
+      - name: Test the explicitly gated HTTP/3 feature
+        run: cargo +1.96.0 test --manifest-path shph-edge/Cargo.toml --features http3 --all-targets --locked
 
   windows-benchmark-smoke:
     name: Windows benchmark smoke
@@ -126,6 +221,22 @@ jobs:
         run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite wire --iterations 2 --frames 2
       - name: Run defensive rejection benchmark smoke
         run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite defensive --iterations 2 --frames 2
+      - name: Run Shroud morphology benchmark smoke
+        run: .\benchmarks\target\x86_64-pc-windows-msvc\release\shph-benchmarks.exe --suite shroud --iterations 2 --frames 8
+
+  linux-benchmark-smoke:
+    name: Linux benchmark smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
+      - name: Build standalone benchmark runner
+        run: cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml --locked
+      - name: Run defensive rejection benchmark smoke
+        run: ./benchmarks/target/release/shph-benchmarks --suite defensive --iterations 2 --frames 2
+      - name: Run Shroud morphology benchmark smoke
+        run: ./benchmarks/target/release/shph-benchmarks --suite shroud --iterations 2 --frames 8
 
   benchmark-linux:
     name: Full benchmark campaign (ubuntu-latest)

@@ -9,6 +9,10 @@ cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+
+# standalone edge relay prototype
+cargo test --manifest-path shph-edge/Cargo.toml --all-targets --locked
+cargo clippy --manifest-path shph-edge/Cargo.toml --all-targets --locked -- -D warnings
 ```
 
 For quick local diagnosis:
@@ -26,6 +30,14 @@ Core:
 ```powershell
 pwsh -File .\scripts\release_readiness.ps1 -AllowDirty
 pwsh -File .\scripts\security_evidence.ps1 -AllowDirty
+```
+
+If PowerShell 7 (`pwsh`) is not installed, Windows PowerShell 5.1 can run the
+same collectors with an explicit execution-policy override:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\release_readiness.ps1 -AllowDirty
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\security_evidence.ps1 -AllowDirty
 ```
 
 These commands write timestamped, machine-readable and Markdown snapshots
@@ -60,6 +72,28 @@ reconnect, controlled impairment, an MTU boundary check, session hold, and
 teardown, but not DNS, IPv6, UDP, standards-QUIC, or crash containment.
 The optional SOCKS5/Xray underlay is recorded separately and is not part of
 the direct-TCP release profile.
+
+Configuration loaded through SHPH's normal `Config::parse`, `Config::load`, or
+`Config::save` paths is validated at the boundary. The validation covers
+bounded list sizes, interface and endpoint syntax, peer alias uniqueness,
+control-plane cross-field requirements, session/reconnect limits, and
+startup-payload size. The CLI control-plane planner performs a second
+operation-specific preflight and rejects semantically duplicate routes,
+underlay bypass routes, and DNS servers before host mutation.
+
+`shph-edge` has its own lockfile and workspace boundary. Its 38-test
+standalone suite covers capability verification, replay handling, HTTP
+carrier parsing, SOCKS5 lifecycle, bounded relay behavior, TLS configuration,
+and graceful cancellation. The optional HTTP/3 path must be checked
+separately with:
+
+```bash
+cargo test --manifest-path shph-edge/Cargo.toml --features http3 --all-targets --locked
+cargo clippy --manifest-path shph-edge/Cargo.toml --features http3 --all-targets --locked -- -D warnings
+```
+
+These edge tests do not prove public reachability, browser-grade TLS/QUIC
+parity, anonymity, or resistance to DPI/censorship.
 
 ## Focused Test Runs
 
@@ -96,6 +130,12 @@ coverage also exercises the shared
 strict TUN interface-name validator.
 The special-file and X25519 checks are source-level fail-closed guards and
 should be exercised by the complete platform test matrix.
+
+Metrics counters use saturating updates rather than wrapping arithmetic.
+`MetricsSnapshot::delta_since` provides bounded interval deltas for human
+status reporting, while the snapshot type has stable JSON field names for
+machine-readable evidence. This is observability evidence only; it is not a
+throughput or reliability claim.
 
 ### Native TUN checks
 
@@ -134,6 +174,22 @@ log. It has no default route or host firewall mutation, and it reports
 This is handshake-and-payload evidence only; it is not native-TUN forwarding,
 throughput, DPI-resistance, or production VPN evidence.
 
+### Repeated local process reliability
+
+Run the bounded repeated-session check when changing the CLI, handshake
+lifecycle, or TCP data path:
+
+```bash
+cargo test -p shph-cli --test cli_reliability --locked -- --test-threads=1
+```
+
+The test creates two fresh identities, pins both peer identities, and performs
+eight separate authenticated `recv-once`/`send-once` process sessions on a
+fresh loopback endpoint. Each child has a bounded watchdog and the temporary
+state is removed even when an assertion fails. This is local process-lifecycle
+evidence; it does not prove two-host routing, native TUN forwarding, uptime, or
+Internet reliability.
+
 ### Firewall and MSS hardening checks
 
 The default test suite does not mutate host firewall state. The bounded plan
@@ -160,10 +216,10 @@ not established by these deterministic tests.
 ### Fuzzing
 
 The standalone `fuzz/` workspace contains `cargo-fuzz` targets for framing,
-configuration parsing, audit-record parsing, replay-window state, and the
-Shroud 2 datagram envelope. See `fuzz/README.md` for setup and bounded run
-commands. Fuzzing is an additional security gate, not a substitute for the
-deterministic test suite.
+configuration parsing, audit-record parsing, replay-window state, the Shroud 2
+datagram envelope, and the Phantom One envelope. See `fuzz/README.md` for setup
+and bounded run commands. Fuzzing is an additional security gate, not a
+substitute for the deterministic test suite.
 
 ### 30-minute fuzz campaign (Linux, 2026-07-21)
 
@@ -205,7 +261,8 @@ profiles. This is repeatable lab evidence, not a proof of absence of defects.
 The campaign corpora were replayed afterward with `-runs=0`:
 `frame_decode` (49 inputs), `config_parse` (4,824), `audit_record` (3,760),
 `replay_window` (62). All replays completed without crash artifacts. The
-`shroud2_datagram` target was added after this historical campaign.
+The `shroud2_datagram` and `phantom_one_envelope` targets were added after this
+historical campaign; their current campaign status must be recorded separately.
 
 The supported replay command is run from the fuzz workspace:
 
@@ -226,10 +283,12 @@ rustc 1.99.0-nightly (d0babd8b6 2026-07-15)
 cargo-fuzz 0.13.2
 ```
 
-With `--sanitizer none` and `-runs=1`, all five current targets passed:
-`frame_decode`, `config_parse`, `audit_record`, `replay_window`, and
-`shroud2_datagram`. A second bounded run using the default sanitizer path with
-`LSAN_OPTIONS=detect_leaks=0 ASAN_OPTIONS=detect_leaks=0` also passed for all
+With `--sanitizer none` and `-runs=1`, the five targets present at the time
+passed: `frame_decode`, `config_parse`, `audit_record`, `replay_window`, and
+`shroud2_datagram`. The newer `phantom_one_envelope` target is registered in CI
+and in the fuzz workspace, but no local six-target campaign is claimed by this
+historical record. A second bounded run using the default sanitizer path with
+`LSAN_OPTIONS=detect_leaks=0 ASAN_OPTIONS=detect_leaks=0` also passed for those
 five targets. Leak reporting is disabled only because the local WSL wrapper
 causes LeakSanitizer to fail under ptrace; these smoke runs do not replace the
 sanitizer-enabled CI job or a longer fuzz campaign. Full details are in
