@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.6-dev.2] - 2026-08-30
+
+This patch release fixes the remaining Unix warnings-as-errors path found by
+the GitHub-hosted Linux validation after `v0.6.6-dev.1`. It remains a
+development prototype for controlled lab environments.
+
+- Scoped Windows-only TUN route and MTU restore helpers, plus their focused
+  test, to Windows so Linux build, Clippy, native-TUN, reliability, and
+  package checks compile cleanly with warnings denied.
+- Refreshed current version metadata and standalone lockfiles for this patch.
+
 ## [0.6.6-dev.1] - 2026-08-30
 
 This patch release fixes Linux compilation and standalone validation failures

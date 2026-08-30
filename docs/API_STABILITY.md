@@ -5,7 +5,7 @@ stability guarantees, and the rules that hold during a **validation window**.
 
 ## 1. Current versioning
 
-- Workspace version: `0.6.6-dev.1` (see root `Cargo.toml`). `v0.4.0` added hybrid
+- Workspace version: `0.6.6-dev.2` (see root `Cargo.toml`). `v0.4.0` added hybrid
   post-quantum key exchange (ML-KEM-768) to the handshake (`shph/4`). The
   unreleased profile work adds the breaking, explicitly separated `shph/5`
   `secure-default` and `classical-lab` protocol identities. `v0.3.0` made the

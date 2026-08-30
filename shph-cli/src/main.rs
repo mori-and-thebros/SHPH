@@ -4891,6 +4891,7 @@ fn windows_tun_state_query(interface_name: &str) -> Result<Vec<String>> {
     ])
 }
 
+#[cfg(target_os = "windows")]
 fn build_windows_tun_mtu_restore_commands(
     interface_name: &str,
     ipv4_mtu: usize,
@@ -4926,6 +4927,7 @@ fn build_windows_tun_mtu_restore_commands(
     Ok(Vec::new())
 }
 
+#[cfg(target_os = "windows")]
 fn build_tun_route_priority_restore_command(
     interface_name: &str,
     ipv4_metric: u32,
@@ -7493,9 +7495,8 @@ mod tests {
         build_dns_apply_command, build_dns_apply_commands, build_dns_restore_command,
         build_interface_address_add_command, build_interface_address_delete_command,
         build_route_add_command, build_route_delete_command, build_tun_mtu_commands,
-        build_tun_route_priority_command, build_tun_route_priority_restore_command,
-        build_underlay_bypass_route_add_command, build_underlay_bypass_route_delete_command,
-        build_windows_tun_mtu_restore_commands, cli_exit_code, control_plane_state_path,
+        build_tun_route_priority_command, build_underlay_bypass_route_add_command,
+        build_underlay_bypass_route_delete_command, cli_exit_code, control_plane_state_path,
         enforce_peer_policy, handle_host, handle_up, load_control_plane_state,
         load_or_create_quic_server, morphology_from_ticket, native_tun_mtu_for_shroud_profile,
         parse_phantom_one_profile, parse_shroud_profile_name, phase_a1_now_ms,
@@ -7508,6 +7509,8 @@ mod tests {
         PersistedControlPlaneState, TcpUnderlay, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES,
         EXIT_CONFIG, EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
     };
+    #[cfg(target_os = "windows")]
+    use super::{build_tun_route_priority_restore_command, build_windows_tun_mtu_restore_commands};
     use shph_config::RoadmapConfig;
     use shph_config::{
         Config, ControlPlaneConfig, PeerConfig, ReconnectConfig, SessionConfig, SessionRole,
@@ -8332,6 +8335,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn native_tun_restore_builders_validate_saved_state() {
         let mtu_commands = build_windows_tun_mtu_restore_commands(
             "shph0",
@@ -8339,22 +8343,14 @@ mod tests {
             DEFAULT_TUN_MTU_BYTES,
         )
         .expect("MTU restore commands");
-        if cfg!(target_os = "windows") {
-            assert_eq!(mtu_commands.len(), 2);
-            assert!(mtu_commands
-                .iter()
-                .all(|command| command.contains(&"store=active".to_string())));
-        } else {
-            assert!(mtu_commands.is_empty());
-        }
+        assert_eq!(mtu_commands.len(), 2);
+        assert!(mtu_commands
+            .iter()
+            .all(|command| command.contains(&"store=active".to_string())));
 
         let metric_command =
             build_tun_route_priority_restore_command("shph0", 25, 25).expect("metric restore");
-        if cfg!(target_os = "windows") {
-            assert!(metric_command.iter().any(|part| part.contains("25")));
-        } else {
-            assert!(metric_command.is_empty());
-        }
+        assert!(metric_command.iter().any(|part| part.contains("25")));
 
         assert!(build_windows_tun_mtu_restore_commands("shph0", 575, 1500).is_err());
         assert!(build_windows_tun_mtu_restore_commands("", 1500, 1500).is_err());
