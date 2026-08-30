@@ -1,6 +1,6 @@
 # SHPH Quality, Tests, and Benchmark Evidence
 
-This document summarizes the validation available for the `v0.6.6-dev`
+This document summarizes the validation available for the `v0.6.6-dev.1`
 development line. The detailed collector capture below includes historical
 pre-publication evidence from the preceding development snapshot, while the
 current branch verification is recorded separately. Local and GitHub-hosted
@@ -11,9 +11,9 @@ independent security audit.
 
 | Field | Value |
 | --- | --- |
-| Development line | `v0.6.6-dev` |
-| Source revision | `v0.6.6-dev` (publication tag) |
-| Publication ref | `v0.6.6-dev` |
+| Development line | `v0.6.6-dev.1` |
+| Source revision | `v0.6.6-dev.1` (publication tag) |
+| Publication ref | `v0.6.6-dev.1` |
 | Validation date | 2026-08-30 |
 | Primary host | Windows 11 |
 | Rust toolchain | `rustc 1.96.0 (ac68faa20 2026-05-25)` |
@@ -23,7 +23,7 @@ independent security audit.
 
 ## Current branch verification
 
-The Windows local verification pass for the publication snapshot completed
+The Windows local verification pass for the patch publication snapshot completed
 with the following results:
 
 | Check | Result |

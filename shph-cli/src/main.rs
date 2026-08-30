@@ -2959,7 +2959,6 @@ fn open_control_plane_state_readonly(path: &Path) -> io::Result<fs::File> {
                 ),
             ));
         }
-        Ok(file)
     }
     #[cfg(not(unix))]
     {

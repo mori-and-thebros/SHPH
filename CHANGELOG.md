@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.6-dev.1] - 2026-08-30
+
+This patch release fixes Linux compilation and standalone validation failures
+found after the initial `v0.6.6-dev` prototype publication. It remains a
+development prototype for controlled lab environments.
+
+- Fixed the Unix control-plane state loader returning from a platform-specific
+  block before the common file result was produced.
+- Fixed the standalone edge relay's Linux/HTTP3 warning-as-error caused by an
+  intentionally unused metadata binding.
+- Refreshed standalone lockfiles and current version metadata for this patch.
+
 ## [0.6.6-dev] - 2026-08-30
 
 This engineering snapshot adds the opt-in Phantom One prototype and a separate

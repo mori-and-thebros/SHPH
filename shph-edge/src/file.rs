@@ -85,10 +85,10 @@ fn reject_reparse_components(path: &Path) -> io::Result<()> {
                     component.display()
                 )));
             }
-            Ok(metadata) =>
+            Ok(_metadata) =>
             {
                 #[cfg(windows)]
-                if metadata_is_reparse_point(&metadata) {
+                if metadata_is_reparse_point(&_metadata) {
                     return Err(invalid_input(format!(
                         "refusing to traverse Windows reparse-point component '{}'",
                         component.display()
