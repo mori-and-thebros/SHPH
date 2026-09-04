@@ -39,6 +39,9 @@ EXCLUDES=(
   --exclude='.agents/'
   --exclude='.codex/'
   --exclude='.gapcode/'
+  --exclude='__pycache__/'
+  --exclude='.git/*.lock'
+  --exclude='.git/**/*.lock'
   --exclude='/.two-host-validation/'
   --exclude='/tmp/'
   --exclude='/dist/'
@@ -124,6 +127,7 @@ verify() {
       -not -path './wintun.dll' -not -path './wintun.h' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
+      -not -path '*/__pycache__/*' \
       -not -path './.two-host-validation/*' -not -path './tmp/*' \
       -not -path './dist/*' -not -path './OTF_PRIVATE/*' \
       -not -path './docs/CRYPTO_FUNDING_BOOTSTRAP.md' \
@@ -138,6 +142,7 @@ verify() {
       -not -path './wintun.dll' -not -path './wintun.h' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
+      -not -path '*/__pycache__/*' \
       -not -path './.two-host-validation/*' -not -path './tmp/*' \
       -not -path './dist/*' -not -path './OTF_PRIVATE/*' \
       -not -path './docs/CRYPTO_FUNDING_BOOTSTRAP.md' \
