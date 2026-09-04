@@ -23,8 +23,8 @@ This file maps the repository layout and the main public validation artifacts.
 - `benchmarks/`: standalone benchmark crate; its lockfile is intentionally
   separate from the application workspace. `benches/criterion.rs` contains the
   statistical microbenchmark harness.
-- `scripts/`: reproducible demos, benchmark operators, evidence capture, and
-  optional multi-checkout synchronization.
+- `scripts/`: reproducible demos, benchmark operators, operator failure/edge
+  campaigns, evidence capture, and optional multi-checkout synchronization.
 - `docs/BENCHMARKING.md`: Linux-first benchmark methodology, profiles, and obstacles.
 - `docs/GITHUB_BENCHMARKING.md`: GitHub-hosted campaign triggers, artifacts,
   and evidence boundaries.
@@ -49,11 +49,17 @@ This file maps the repository layout and the main public validation artifacts.
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`: current elevated
   Windows Wintun lifecycle, route/DNS rollback, WFP smoke, and remaining
   packet-path gates.
+- `docs/evidence/WINDOWS_WFP_CRASH_VALIDATION_2026-09-01.md`: elevated
+  single-host forced-termination evidence showing WFP policy persistence and
+  explicit cleanup; automatic crash-time cleanup and packet-path claims remain
+  out of scope.
 - `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`:
   current Windows-to-Linux direct-TCP IPv4 forwarding evidence and its
   remaining coverage limits.
 - `docs/evidence/OPTIONAL_XRAY_UNDERLAY_VALIDATION_2026-08-25.md`:
   bounded optional SOCKS5/Xray and Quick Tunnel interoperability evidence.
+- `docs/evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md`: latest local
+  validation record for the current publication tag and remaining host gates.
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`: historical
   post-loader Windows validation record.
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`: versioned Shroud 2.0 morphology evidence.
@@ -74,6 +80,8 @@ This file maps the repository layout and the main public validation artifacts.
   non-claims boundary.
 - `docs/RELEASE_READINESS.md`: binding release gates and evidence package
   requirements.
+- `docs/OPERATOR_CAMPAIGNS.md`: bounded reconnect, crash, DNS, IPv6, PMTU, and
+  soak procedures with evidence boundaries.
 - `docs/WHY_CHOOSE_SHPH.md`: public positioning and fit comparison.
 - `docs/QUALITY_EVIDENCE.md`: current release validation and benchmark summary.
 - `docs/SECURITY_EVIDENCE.md`: threat-to-control mapping, evidence tiers, and
@@ -103,6 +111,10 @@ This file maps the repository layout and the main public validation artifacts.
   `docs/BENCHMARK_RESULTS_2026-08-05.md`.
 - Current native Windows lifecycle validation:
   `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`.
+- Current Windows WFP forced-termination validation:
+  `docs/evidence/WINDOWS_WFP_CRASH_VALIDATION_2026-09-01.md`.
+- Current tag validation:
+  `docs/evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md`.
 - Current cross-platform native-TUN forwarding validation:
   `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`.
 - Current Shroud report: `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`.
@@ -113,6 +125,9 @@ This file maps the repository layout and the main public validation artifacts.
 - Local release/security collectors write engineering snapshots under the
   ignored `benchmark-runs/` directory:
   `scripts/release_readiness.ps1` and `scripts/security_evidence.ps1`.
+- `scripts/operator_campaigns.py` writes bounded campaign results under
+  `benchmark-runs/campaigns/`; it never overwrites an existing result
+  directory.
 - Public evidence records are retained under `docs/evidence/` and named by
   validation type and date. Internal assessment and project-context records
   are kept outside the publishable checkout.

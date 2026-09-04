@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT="${1:-$ROOT/benchmark-runs/criterion-linux}"

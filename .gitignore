@@ -43,3 +43,5 @@ fuzz/artifacts/
 /.two-host-validation/
 
 /OTF_PRIVATE/
+
+/.pre-upgrade-local-changes.patch

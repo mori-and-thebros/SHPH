@@ -11,6 +11,9 @@
     current directory. This validator verifies its Authenticode signature
     before deployment.
 
+    The optional OutputDirectory parameter selects a new, non-overlapping
+    benchmark evidence directory under the repository root.
+
     The script intentionally enables only SHPH's native Wintun backend. It
     does not permit a stub-adapter fallback: missing, untrusted, or unusable
     Wintun causes the validation to fail.
@@ -23,7 +26,9 @@
 #>
 
 [CmdletBinding()]
-param()
+param(
+    [string]$OutputDirectory = ".\benchmark-runs\windows-native-final"
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -158,9 +163,18 @@ if ($deployedHash -cne $env:SHPH_WINTUN_SHA256) {
     throw "Application-local wintun.dll hash differs from SHPH_WINTUN_SHA256."
 }
 
-# Capture a fresh, non-overlapping final benchmark bundle. Existing output is
+# Capture a fresh, non-overlapping benchmark bundle. Existing output is
 # rejected to prevent evidence from multiple runs being mixed silently.
-$benchmarkOutputDirectory = Join-Path $repoRoot "benchmark-runs\windows-native-final"
+$benchmarkOutputPath = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
+    $OutputDirectory
+} else {
+    Join-Path $repoRoot $OutputDirectory
+}
+$benchmarkOutputDirectory = [System.IO.Path]::GetFullPath($benchmarkOutputPath)
+$repoRootDirectory = [System.IO.Path]::GetFullPath($repoRoot).TrimEnd("\") + "\"
+if (-not $benchmarkOutputDirectory.StartsWith($repoRootDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "OutputDirectory must remain inside the repository: $benchmarkOutputDirectory"
+}
 if (Test-Path -LiteralPath $benchmarkOutputDirectory) {
     throw "Benchmark output already exists: $benchmarkOutputDirectory. Archive or remove it before a fresh final capture."
 }
@@ -170,7 +184,7 @@ if (Test-Path -LiteralPath $benchmarkOutputDirectory) {
     -Suite all `
     -Iterations 5000 `
     -Frames 100000 `
-    -OutputDirectory .\benchmark-runs\windows-native-final
+    -OutputDirectory $benchmarkOutputDirectory
 
 if (-not $?) {
     throw "The Windows benchmark runner failed."

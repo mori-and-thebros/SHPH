@@ -32,13 +32,18 @@ export SHPH_SYNC_WINDOWS_DIR=/path/to/windows-checkout
 
 ## What is never mirrored
 
-These are local/build artifacts and are excluded on both sides:
+These are local/build artifacts or confidential/local-only material and are
+excluded on both sides:
 
 - `target/` — cargo build output
 - `benchmark-runs/` — generated benchmark captures
 - `fuzz/corpus/` and `fuzz/artifacts/` — generated fuzz data
 - root `Cargo.lock` — regenerated per platform; do not mirror
-- local tool and placeholder directories — local-only
+- `dist/` — generated release packages
+- `THE WORKING ONE/`, `.agents/`, `.codex/`, `.gapcode/`, `.two-host-validation/`,
+  and `tmp/` — local working and tooling state
+- `OTF_PRIVATE/` and the confidential funding/identity design documents — local
+  evidence and internal material
 
 The script mirrors `.git/` so the two repositories share history and tags. The
 standalone `benchmarks/Cargo.lock` and `fuzz/Cargo.lock` files are mirrored;
@@ -75,5 +80,5 @@ cargo check --workspace --locked
 ```
 
 On Windows, run the same commands in a native Windows terminal. Do not replace
-the Windows root lockfile with a WSL-generated file merely to make mirror
+the Windows root lockfile with a WSL-generated file merely to make parity
 checks pass.

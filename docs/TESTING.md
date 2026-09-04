@@ -62,9 +62,14 @@ Local workstation availability is intentionally not treated as release
 evidence.
 
 Remaining product gates are still explicit: broader native TUN packet I/O,
-reconnect, Ctrl+C/forced-termination behavior, crash-time WFP cleanup, and
-additional two-host campaigns require the dedicated host procedures described
-in `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`. The
+reconnect, Ctrl+C and forced-termination behavior beyond the single-host WFP
+policy test, automatic crash-time WFP cleanup, and additional two-host
+campaigns require the dedicated host procedures described in
+`docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`. The elevated
+single-host forced-termination record is
+`docs/evidence/WINDOWS_WFP_CRASH_VALIDATION_2026-09-01.md`; it covers WFP
+policy persistence and explicit `shph down` cleanup, not automatic crash-time
+packet-leak prevention. The
 cross-platform Windows-to-Linux direct-TCP run is recorded in
 `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`; it covers
 one IPv4 forwarding lane, external egress, a bounded 64 MiB transfer,
@@ -190,6 +195,53 @@ state is removed even when an assertion fails. This is local process-lifecycle
 evidence; it does not prove two-host routing, native TUN forwarding, uptime, or
 Internet reliability.
 
+### Reproducible operator campaigns
+
+The standard-library-only runner covers the operator cases that are useful
+before a privileged native-TUN campaign:
+
+```bash
+python scripts/operator_campaigns.py reconnect
+python scripts/operator_campaigns.py soak --sessions 10
+python scripts/operator_campaigns.py ipv6 --sessions 3
+python scripts/operator_campaigns.py dns
+python scripts/operator_campaigns.py pmtu --host 198.51.100.10
+```
+
+Use `crash` only with a prepared configuration and an explicit
+`--confirm-kill`. DNS is dry-run by default; `--live` requires an explicit
+configuration and platform privilege. PMTU accepts only literal IP addresses
+and records raw per-size results rather than inferring a path MTU. Each
+campaign uses a fresh output directory, records the revision/tree state, and
+returns `3` for an honest host-capability skip. The full command reference and
+claim boundaries are in `docs/OPERATOR_CAMPAIGNS.md`.
+
+### WSL2 validation boundary
+
+WSL2 can run the pinned workspace tests, standalone edge tests, explicit
+HTTP/3 feature checks, and `cargo-fuzz` smoke runs when the required toolchains
+are installed:
+
+```bash
+cargo +1.96.0 test --workspace --all-targets --locked
+cargo +1.96.0 test --manifest-path shph-edge/Cargo.toml --features http3 --all-targets --locked
+for target in frame_decode config_parse audit_record replay_window shroud2_datagram phantom_one_envelope; do
+  cargo +nightly-2026-07-16 fuzz run "$target" -- -runs=1
+done
+```
+
+Run the isolated native-TUN helpers explicitly as well:
+
+```bash
+./scripts/native_tun_namespace_test.sh
+./scripts/benchmark_native_tun.sh --iterations 3 --hold-ms 0
+```
+
+Those helpers must report `PASS` only after opening a real device inside an
+isolated namespace. WSL2 commonly reports `SKIP` because `/dev/net/tun`,
+`CAP_NET_ADMIN`, or `unshare` network capability is unavailable. A WSL2
+result never closes the native Linux or Windows TUN release gate.
+
 ### Firewall and MSS hardening checks
 
 The default test suite does not mutate host firewall state. The bounded plan
@@ -210,8 +262,10 @@ shph up --config <path> --killswitch --killswitch-dry-run
 Dry-run mode does not require native TUN, administrator/root privileges, or
 `nft`/WFP mutation. Live `--killswitch` and Linux `--mss-clamp` require
 `SHPH_TUN_NATIVE=1`, native host privileges, and platform-specific validation.
-Windows WFP execution, Linux crash-leak behavior, and two-host forwarding are
-not established by these deterministic tests.
+The elevated Windows WFP record covers policy persistence after forced
+termination and explicit cleanup; automatic crash-time cleanup, Linux
+crash-leak behavior, packet-path assertions, and two-host forwarding are not
+established by these deterministic tests.
 
 ### Fuzzing
 

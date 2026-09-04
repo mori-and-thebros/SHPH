@@ -38,17 +38,19 @@ cargo fuzz run shroud2_datagram -- -max_total_time=60
 cargo fuzz run phantom_one_envelope -- -max_total_time=60
 ```
 
-For a pinned Windows campaign, use the repository wrapper after installing
-`cargo-fuzz` and the matching nightly toolchain:
+For a pinned Windows campaign, use the tracked concurrent wrapper after
+installing `cargo-fuzz` and the matching nightly toolchain:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_fuzz_campaign.ps1 `
-  -RunsPerTarget 20000000
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\run_fuzz_campaign_concurrent.ps1 `
+  -MaxTotalTimeSeconds 21600
 ```
 
-The default is six targets times 20,000,000 executions (120,000,000 total).
-The wrapper records one log and one summary row per target. On Windows with
-the MSVC AddressSanitizer runtime, it discovers
+The default is six targets running concurrently for six hours. The wrapper
+records one log and one summary row per target, captures the process exit code
+after an explicit `WaitForExit()`, and records whether the libFuzzer completion
+marker was present. On Windows with the MSVC AddressSanitizer runtime, it discovers
 `clang_rt.asan_dynamic-x86_64.dll` under the installed Visual Studio tree and
 adds its directory to the child-process path. The campaign is still
 engineering evidence, not proof that all inputs or deployment environments are

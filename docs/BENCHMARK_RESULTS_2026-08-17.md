@@ -37,9 +37,10 @@ The standalone runner now exposes `--suite evidence`, which measures:
 | Raw capture | ignored `benchmark-runs/evidence-2026-08-17-shroud-rebalanced.txt` |
 | Raw capture SHA-256 | `AB6561D4A40174191DD37DA8AFB3394F2953E4ED4CF7418A061BE7A6F866C6B3` |
 
-The dirty-tree label is intentional: the campaign was run while the queued
-transport-padding and evidence-runner changes were uncommitted. A release
-record must be regenerated from a clean, reviewed commit.
+The dirty-tree label is intentional: the campaign included local
+transport-padding and evidence-runner changes that were not part of a reviewed
+publication commit. A release record must be regenerated from a clean, reviewed
+commit.
 
 The capture includes the rebalanced opt-in `LowLatency`, `WebBrowsingLab`, and
 `VideoStreamingLab` profiles. Each retains its existing discrete classes and

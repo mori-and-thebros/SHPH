@@ -51,8 +51,28 @@ demo_happy() {
   printf '[session]\nrole = "connect"\npeer = "127.0.0.1:7251"\ntimeout_secs = 4\nstartup_payload = "demo-payload"\n' >> "$b/config.toml"
   "$BIN" --config "$a/config.toml" up > "$a.out" 2>&1 &
   local pid=$!
-  sleep 0.4
-  if ! "$BIN" --config "$b/config.toml" up > "$b.out" 2>&1; then
+  local connector_ok=0
+  local attempt
+  for attempt in $(seq 1 20); do
+    if "$BIN" --config "$b/config.toml" up > "$b.out" 2>&1; then
+      connector_ok=1
+      break
+    fi
+    if ! grep -Eqi "connection refused|os error 111" "$b.out"; then
+      cat "$b.out"
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 1
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      cat "$b.out"
+      cat "$a.out"
+      wait "$pid" 2>/dev/null || true
+      return 1
+    fi
+    sleep 0.1
+  done
+  if [ "$connector_ok" -ne 1 ]; then
     cat "$b.out"
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true

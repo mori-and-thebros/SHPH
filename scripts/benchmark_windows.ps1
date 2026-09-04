@@ -66,7 +66,12 @@ if ([string]::IsNullOrWhiteSpace($resolvedBinary)) {
     throw "No usable benchmark executable was found. Build it with: cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml --target x86_64-pc-windows-msvc --locked"
 }
 
-$resolvedOutput = Join-Path $repoRoot $OutputDirectory
+$resolvedOutput = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
+    $OutputDirectory
+} else {
+    Join-Path $repoRoot $OutputDirectory
+}
+$resolvedOutput = [System.IO.Path]::GetFullPath($resolvedOutput)
 New-Item -ItemType Directory -Force -Path $resolvedOutput | Out-Null
 
 function Invoke-BenchmarkProfile {

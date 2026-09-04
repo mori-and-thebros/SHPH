@@ -84,6 +84,14 @@ Before tagging a release:
 - [ ] `cargo fmt --all -- --check` clean
 - [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings` clean
 - [ ] `cargo test --workspace --locked` passes on Linux **and** Windows
+- [ ] Standalone benchmark, fuzz-manifest, and edge workspaces pass their
+      locked format/check/test/Clippy gates; HTTP/3 feature checks are recorded
+- [ ] Pinned fuzz smoke runs cover every target, or an explicit host/toolchain
+      `SKIP` is recorded
+- [ ] Reconnect, soak, DNS, IPv6, PMTU, and crash campaign results are retained
+      when the changed surface needs them
+- [ ] `scripts/package_release.py` creates and verifies a sanitized package
+      from a clean tree
 - [ ] `CHANGELOG`/release notes updated
 - [ ] `Cargo.lock` committed and reproducible (see `docs/REPRODUCIBILITY.md`)
 - [ ] Version bumped consistently in workspace `Cargo.toml`

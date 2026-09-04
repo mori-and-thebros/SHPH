@@ -14,17 +14,19 @@
 #   scripts/sync_mirror.sh --verify        # checksum-only: report differences, change nothing
 #   scripts/sync_mirror.sh --dry-run       # show what would change, write nothing
 #
-# Excluded from mirroring (local/build artifacts): see EXCLUDES below.
+# Excluded from mirroring (local/build artifacts and confidential material):
+# see EXCLUDES below.
 # Exit codes: 0 success, 1 usage/mount error, 2 rsync failure, 3 verify found diffs.
 
 set -euo pipefail
 
 LINUX_DIR="${SHPH_SYNC_LINUX_DIR:-}"
-WINDOWS_MIRROR="${SHPH_SYNC_WINDOWS_DIR:-}"
+WINDOWS_DIR="${SHPH_SYNC_WINDOWS_DIR:-}"
 
-# Paths never mirrored: build output, generated benchmark/fuzz data, the root
-# application lockfile, and local-only dirs. The standalone benchmark/fuzz
-# lockfiles are mirrored. .git/ is mirrored so both trees share tag/history/HEAD.
+# Paths never mirrored: build output, generated benchmark/fuzz data, local
+# tooling state, and confidential/local-only material. The standalone
+# benchmark/fuzz lockfiles are mirrored. .git/ is mirrored so both trees share
+# tag/history/HEAD.
 EXCLUDES=(
   --exclude='target/'
   --exclude='benchmark-runs/'
@@ -37,12 +39,20 @@ EXCLUDES=(
   --exclude='.agents/'
   --exclude='.codex/'
   --exclude='.gapcode/'
+  --exclude='/.two-host-validation/'
+  --exclude='/tmp/'
+  --exclude='/dist/'
+  --exclude='/OTF_PRIVATE/'
+  --exclude='/docs/CRYPTO_FUNDING_BOOTSTRAP.md'
+  --exclude='/docs/FUNDING_SPRINT_BOARD.md'
+  --exclude='/docs/IDENTITY_DISCOVERY_BENCHMARKS_2026-08-14.md'
+  --exclude='/docs/IDENTITY_DISCOVERY_DESIGN.md'
 )
 
 MODE="auto"
 DRY_RUN=0
 
-if [ -z "$LINUX_DIR" ] || [ -z "$WINDOWS_MIRROR" ]; then
+if [ -z "$LINUX_DIR" ] || [ -z "$WINDOWS_DIR" ]; then
   echo "ERROR: set SHPH_SYNC_LINUX_DIR and SHPH_SYNC_WINDOWS_DIR first." >&2
   echo "Example: SHPH_SYNC_LINUX_DIR=/path/to/linux SHPH_SYNC_WINDOWS_DIR=/path/to/windows" >&2
   exit 1
@@ -71,7 +81,7 @@ if [ "$self_dir" = "$LINUX_DIR" ]; then
 else
   # If running from the configured Windows checkout, confirm the side.
   case "$self_dir" in
-    "$WINDOWS_MIRROR") HERE="windows" ;;
+    "$WINDOWS_DIR") HERE="windows" ;;
     *) HERE="linux" ;;  # default assumption
   esac
 fi
@@ -79,8 +89,8 @@ fi
 if [ ! -d "$LINUX_DIR" ]; then
   echo "ERROR: configured Linux checkout not found: $LINUX_DIR" >&2; exit 1
 fi
-if [ ! -d "$WINDOWS_MIRROR" ]; then
-  echo "ERROR: configured Windows checkout not found: $WINDOWS_MIRROR" >&2
+if [ ! -d "$WINDOWS_DIR" ]; then
+  echo "ERROR: configured Windows checkout not found: $WINDOWS_DIR" >&2
   exit 1
 fi
 
@@ -114,6 +124,12 @@ verify() {
       -not -path './wintun.dll' -not -path './wintun.h' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
+      -not -path './.two-host-validation/*' -not -path './tmp/*' \
+      -not -path './dist/*' -not -path './OTF_PRIVATE/*' \
+      -not -path './docs/CRYPTO_FUNDING_BOOTSTRAP.md' \
+      -not -path './docs/FUNDING_SPRINT_BOARD.md' \
+      -not -path './docs/IDENTITY_DISCOVERY_BENCHMARKS_2026-08-14.md' \
+      -not -path './docs/IDENTITY_DISCOVERY_DESIGN.md' \
       -not -path './Cargo.lock' -exec md5sum {} \; ) | sort -k2 > "$tmpa"
   ( cd "$b" && find . -type f \
       -not -path '*/target/*' -not -path './.git/*' \
@@ -122,6 +138,12 @@ verify() {
       -not -path './wintun.dll' -not -path './wintun.h' \
       -not -path './THE WORKING ONE/*' -not -path './.agents/*' \
       -not -path './.codex/*' -not -path './.gapcode/*' \
+      -not -path './.two-host-validation/*' -not -path './tmp/*' \
+      -not -path './dist/*' -not -path './OTF_PRIVATE/*' \
+      -not -path './docs/CRYPTO_FUNDING_BOOTSTRAP.md' \
+      -not -path './docs/FUNDING_SPRINT_BOARD.md' \
+      -not -path './docs/IDENTITY_DISCOVERY_BENCHMARKS_2026-08-14.md' \
+      -not -path './docs/IDENTITY_DISCOVERY_DESIGN.md' \
       -not -path './Cargo.lock' -exec md5sum {} \; ) | sort -k2 > "$tmpb"
   if diff -u "$tmpa" "$tmpb"; then
     echo ">> PARITY OK: trees are identical"
@@ -136,18 +158,18 @@ verify() {
 
 case "$MODE" in
   verify)
-    verify "$LINUX_DIR" "$WINDOWS_MIRROR" && exit 0 || exit 3
+    verify "$LINUX_DIR" "$WINDOWS_DIR" && exit 0 || exit 3
     ;;
   to-windows)
-    run_rsync "$LINUX_DIR/" "$WINDOWS_MIRROR/"
+    run_rsync "$LINUX_DIR/" "$WINDOWS_DIR/"
     ;;
   to-linux)
-    run_rsync "$WINDOWS_MIRROR/" "$LINUX_DIR/"
+    run_rsync "$WINDOWS_DIR/" "$LINUX_DIR/"
     ;;
   auto)
     # Default direction: the configured Linux checkout is the source.
     echo ">> auto mode (running from: $HERE); defaulting to Linux -> Windows"
-    run_rsync "$LINUX_DIR/" "$WINDOWS_MIRROR/"
+    run_rsync "$LINUX_DIR/" "$WINDOWS_DIR/"
     ;;
 esac
 
@@ -155,7 +177,7 @@ esac
 if [ "$DRY_RUN" -eq 1 ]; then
   echo ">> dry run complete; no changes written"
 else
-  if verify "$LINUX_DIR" "$WINDOWS_MIRROR"; then
+  if verify "$LINUX_DIR" "$WINDOWS_DIR"; then
     echo ">> DONE: mirrored and verified."
   else
     exit 3

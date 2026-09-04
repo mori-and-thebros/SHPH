@@ -64,6 +64,15 @@ if [[ ! -e /dev/net/tun ]]; then
   exit 0
 fi
 
+monotonic_ns() {
+  awk '{
+    split($1, parts, ".");
+    fraction = substr(parts[2] "000000000", 1, 9);
+    printf "%.0f\n", parts[1] * 1000000000 + fraction;
+    exit
+  }' /proc/uptime
+}
+
 if [[ -f "$HOME/.cargo/env" ]]; then
   # shellcheck disable=SC1091
   source "$HOME/.cargo/env"
@@ -77,8 +86,9 @@ if [[ ! -x "$PROBE" ]]; then
 fi
 
 metadata() {
+  commit="$(git -c safe.directory="$ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
   emit "# benchmark=native_tun_lifecycle"
-  emit "# commit=$(git rev-parse HEAD)"
+  emit "# commit=$commit"
   emit "# platform=$(uname -srm)"
   emit "# rustc=$(rustc --version)"
   emit "# iterations=$ITERATIONS"
@@ -95,14 +105,18 @@ trap cleanup EXIT
 metadata
 samples=()
 for ((sample = 1; sample <= ITERATIONS; sample++)); do
-  start="$(date +%s%N)"
+  start="$(monotonic_ns)"
   set +e
   unshare --user --map-root-user --net -- "$PROBE" --hold-ms "$HOLD_MS" \
     >"$TMP_OUTPUT" 2>&1
   status=$?
   set -e
-  end="$(date +%s%N)"
+  end="$(monotonic_ns)"
   elapsed="$((end - start))"
+  if [[ "$elapsed" -lt 0 ]]; then
+    emit "FAIL,native_tun_lifecycle,sample $sample produced a negative duration" >&2
+    exit 1
+  fi
 
   if [[ "$status" -ne 0 ]]; then
     if grep -Eqi 'operation not permitted|permission denied|cap_net_admin|tunsetiff|unshare failed' "$TMP_OUTPUT"; then

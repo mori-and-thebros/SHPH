@@ -1,11 +1,12 @@
 # SHPH Quality, Tests, and Benchmark Evidence
 
 This document summarizes the validation available for the `v0.6.6-dev.2`
-development line. The detailed collector capture below includes historical
-pre-publication evidence from the preceding development snapshot, while the
-current branch verification is recorded separately. Local and GitHub-hosted
-benchmark results are not Internet throughput, and code-path tests are not an
-independent security audit.
+development line. The latest local tag validation is recorded in
+[`evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md`](evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md).
+The detailed tables below retain earlier publication and pre-publication
+evidence with their original scope. Local and GitHub-hosted benchmark results
+are not Internet throughput, and code-path tests are not an independent
+security audit.
 
 ## Provenance
 
@@ -21,9 +22,9 @@ independent security audit.
 | Additional target | `i686-pc-windows-msvc` |
 | Final candidate tree | Clean before publication |
 
-## Current branch verification
+## Previous publication verification
 
-The Windows local verification pass for the patch publication snapshot completed
+The earlier Windows local verification pass for the patch publication snapshot completed
 with the following results:
 
 | Check | Result |
@@ -65,7 +66,7 @@ dedicated operator evidence is captured separately.
 | Dedicated native TUN two-host gate | SKIP in collector; covered by operator evidence |
 | Collector release eligibility | Host-gated; direct two-host evidence is recorded separately |
 
-The current workspace test run executed **379 tests with 0 failures** across
+That publication-snapshot test run executed **379 tests with 0 failures** across
 the CLI, configuration, core cryptography and handshake, identity,
 obfuscation, transport, and TUN crates. The advisory scan covered 299 locked
 crate dependencies. The historical collector capture referenced by the
@@ -159,6 +160,16 @@ A separate Windows-to-Linux native-TUN campaign passed:
 The complete scope and limitations are in
 [`evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md`](evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md).
 
+An additional elevated, single-host forced-termination run passed. A native
+Wintun client with `up --killswitch` had seven SHPH-owned WFP filters while
+active; the count remained seven after `Stop-Process -Force` and reached zero
+after an explicit `shph down`. The run also verified removal of the generated
+adapter and matching route/DNS, process, control-plane, and temporary-directory
+residue. See
+[`evidence/WINDOWS_WFP_CRASH_VALIDATION_2026-09-01.md`](evidence/WINDOWS_WFP_CRASH_VALIDATION_2026-09-01.md).
+This is policy-persistence and explicit-cleanup evidence, not automatic
+crash-time cleanup or packet-leak-prevention evidence.
+
 The optional local SOCKS5/Xray-compatible underlay also completed an
 authorized no-TUN SHPH preflight and one-shot payload test. It is not part of
 the direct-TCP release profile; see
@@ -185,16 +196,17 @@ This document does not establish:
   traffic indistinguishability;
 - DDoS capacity from local cryptographic operation rates;
 - generalized Linux/Linux or Windows/Windows native-TUN operation;
-- IPv6, DNS, UDP, standards-QUIC, crash-time killswitch containment, or
-  full-route/long-duration Xray behavior; or
+- IPv6, DNS, UDP, standards-QUIC, automatic crash-time killswitch cleanup or
+  packet-leak prevention, or full-route/long-duration Xray behavior; or
 - independent cryptographic or security-audit certification.
 
 ## Remaining release gates
 
 Before a release claim, SHPH still needs a clean-tree capture with complete
 provenance, dedicated Linux/Linux and Windows/Windows campaigns, forced
-termination and WFP crash-leak evidence, explicit DNS/IPv6/UDP and
-standards-QUIC validation, and follow-up on the Criterion regressions.
+termination coverage beyond the single-host policy test, automatic WFP
+crash-leak evidence, explicit DNS/IPv6/UDP and standards-QUIC validation, and
+follow-up on the Criterion regressions.
 
 The binding gate definitions are in
 [`RELEASE_READINESS.md`](RELEASE_READINESS.md), with the support boundary in

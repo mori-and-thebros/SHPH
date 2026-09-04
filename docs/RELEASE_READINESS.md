@@ -61,15 +61,45 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo build --workspace --release --locked
 cargo check --manifest-path benchmarks/Cargo.toml --all-targets --locked
+cargo clippy --manifest-path benchmarks/Cargo.toml --all-targets --locked -- -D warnings
+cargo test --manifest-path benchmarks/Cargo.toml --all-targets --locked
+cargo build --manifest-path benchmarks/Cargo.toml --release --locked
 cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
+cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
 cargo audit --deny warnings
+(
+  cd benchmarks
+  cargo audit --deny warnings
+)
+(
+  cd fuzz
+  cargo audit --deny warnings
+)
+(
+  cd shph-edge
+  cargo audit --deny warnings
+)
 cargo test -p shph-cli --test cli_reliability --locked -- --test-threads=1
 
 # standalone owned-domain edge relay prototype
 cargo test --manifest-path shph-edge/Cargo.toml --all-targets --locked
 cargo clippy --manifest-path shph-edge/Cargo.toml --all-targets --locked -- -D warnings
 cargo build --manifest-path shph-edge/Cargo.toml --release --locked
+cargo check --manifest-path shph-edge/Cargo.toml --features http3 --all-targets --locked
+cargo clippy --manifest-path shph-edge/Cargo.toml --features http3 --all-targets --locked -- -D warnings
+cargo test --manifest-path shph-edge/Cargo.toml --features http3 --all-targets --locked
+
+# Windows only, from a Visual Studio developer shell
+cargo build --workspace --all-targets --target x86_64-pc-windows-msvc --locked
+cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
+cargo build --manifest-path benchmarks/Cargo.toml --release \
+  --target x86_64-pc-windows-msvc --locked
 ```
+
+The fuzz workspace contains libFuzzer harnesses and is intentionally checked
+with `cargo check` and Clippy rather than a normal `cargo build --release`.
+Fuzz execution requires the pinned nightly toolchain and `cargo-fuzz`; use the
+campaign commands in `scripts/run_fuzz_campaign.ps1` or `fuzz/README.md`.
 
 On a disconnected workstation, `--offline` may be added only when the local
 cache is known to contain every locked dependency. The result must state that
@@ -94,6 +124,38 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\release_readin
 `-AllowDirty` is for an engineering snapshot only; it deliberately leaves the
 result ineligible for release.
 
+The collector also runs the standalone benchmark smoke, pinned fuzz smoke,
+explicit edge HTTP/3 checks, and sanitized package gate by default. Use
+`-SkipBenchmarks`, `-SkipFuzzSmoke`, `-SkipHttp3`, or `-SkipPackaging` only
+when the omission is recorded as an engineering `SKIP`. `-SkipBuild` and
+`-SkipTests` are similarly explicit and never turn an incomplete snapshot into
+a release pass.
+
+The Windows native-TUN validator accepts a custom evidence directory so
+successive captures cannot overwrite one another:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\validate_windows_tun.ps1 `
+  -OutputDirectory .\benchmark-runs\windows-native-<date>
+```
+
+The elevated single-host forced-termination/WFP sequence is captured by:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\validate_windows_wfp_crash.ps1 `
+  -Binary .\target\release\shph.exe `
+  -Wintun .\wintun.dll
+```
+
+The current record is
+[`evidence/WINDOWS_WFP_CRASH_VALIDATION_2026-09-01.md`](evidence/WINDOWS_WFP_CRASH_VALIDATION_2026-09-01.md).
+It shows seven SHPH-owned WFP filters before and after hard termination and
+zero after an explicit `shph down`, plus clean local residue checks. This is
+single-host policy-persistence and operator-cleanup evidence; it does not prove
+automatic crash-time WFP cleanup, packet-leak prevention, or either
+Windows-to-Windows or Linux-to-Linux forwarding.
+
 For a release candidate, build the platform binary and create a sanitized
 package without `--allow-dirty`:
 
@@ -107,6 +169,15 @@ Use `target/release/shph.exe` for Windows. The package manifest and
 The packager's allowlist is intentionally narrower than the repository and
 does not include deployment files, scratch output, raw evidence, keystores, or
 internal maintainer guidance.
+
+The September 2, 2026 engineering package check passed the manifest
+file-size/hash checks, `SHA256SUMS` verification, exact public allowlist, and
+secret-boundary review for version `0.6.6-dev.2`. The capture was made from a
+dirty checkout and the local Windows executable was not Authenticode-signed,
+so it is not a publishable release artifact. Before publication, rerun the
+packager without `--allow-dirty` from the approved clean revision and complete
+the project's artifact-signing step. The package did not include
+`docs/evidence/`, `benchmark-runs/`, keystores, credentials, or runtime DLLs.
 
 ### 2. Functional controlled-lab gates
 
@@ -128,6 +199,28 @@ The no-privilege starting point is:
 ```
 
 The demo is necessary but not sufficient for native TUN or two-host claims.
+
+### 2.5 Reproducible failure and edge campaigns
+
+Run the bounded operator campaigns described in
+`docs/OPERATOR_CAMPAIGNS.md` when changing lifecycle, reconnect, endpoint,
+control-plane, or packet-boundary behavior:
+
+```bash
+python scripts/operator_campaigns.py reconnect
+python scripts/operator_campaigns.py soak --sessions 10
+python scripts/operator_campaigns.py ipv6 --sessions 3
+python scripts/operator_campaigns.py dns
+python scripts/operator_campaigns.py pmtu --host <literal-ip>
+python scripts/operator_campaigns.py crash --config <prepared-config> \
+  --confirm-kill --up-arg=--no-tun --cleanup
+```
+
+The default DNS campaign is dry-run and does not mutate host state. Crash mode
+requires an explicit kill acknowledgement. A local IPv6, PMTU, reconnect, or
+soak `PASS` is narrow process/socket evidence and does not close a native-TUN,
+two-host, Internet, or long-duration release gate. A campaign exit code `3`
+must be recorded as `SKIP`, not converted to `PASS`.
 
 ### 3. Control-plane and containment gates
 
@@ -203,9 +296,13 @@ SHA-256-pinned Wintun runtime, elevation, adapter/session lifecycle, packet
 send/receive, route/DNS rollback, reconnect, teardown, and a two-node run.
 The cross-platform report closes packet forwarding and one service-restart
 reconnect path for one direct-TCP IPv4 configuration; it does not close
-Windows-to-Windows operation, forced-termination, or WFP crash-leak evidence.
+Windows-to-Windows operation, automatic crash-time WFP cleanup, or packet-leak
+prevention.
 The dated August 25 record closes only the signed runtime, lifecycle,
 temporary route/DNS rollback, and loopback WFP smoke portions.
+The dated September 1 record adds single-host hard-termination persistence and
+explicit WFP cleanup evidence; it does not replace the required two-node or
+automatic crash-leak campaign.
 The benchmark wrapper explicitly keeps native TUN disabled unless a prepared
 operator campaign supplies the missing evidence. Do not merge the
 cross-platform direct-TCP result with standards-QUIC, Xray, IPv6, DNS, PMTU, or
@@ -264,6 +361,8 @@ Do not call the release profile ready when any of these is true:
 - a Windows binary was produced with an unverified or incomplete runtime;
 - native TUN evidence is replaced with WSL2, loopback, or unit-test results;
 - route/DNS or killswitch cleanup was not observed after failure;
+- automatic crash-time WFP cleanup or packet-leak prevention is claimed from
+  policy-state inspection alone;
 - the support matrix and README disagree;
 - a benchmark is presented as a two-host or production result;
 - a secret, private path, or operator credential appears in evidence.

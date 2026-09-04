@@ -14,6 +14,9 @@ use shph_transport::phantom_one::{
     PHANTOM_ONE_MAX_ENVELOPE_BYTES, PHANTOM_ONE_MAX_PADDING_BYTES, PHANTOM_ONE_VERSION,
 };
 
+const FRAME_TYPE_OFFSET: usize = 10;
+const TARGET_LENGTH_OFFSET: usize = 21;
+
 fuzz_target!(|input: &[u8]| {
     // ---- Hard upper bound ----
     if input.len() > PHANTOM_ONE_MAX_ENVELOPE_BYTES {
@@ -142,9 +145,9 @@ fuzz_target!(|input: &[u8]| {
         }
 
         // 2h. Frame type corruption
-        if valid.len() > 9 {
+        if valid.len() > FRAME_TYPE_OFFSET {
             let mut bad = valid.clone();
-            bad[9] = 0xFF;
+            bad[FRAME_TYPE_OFFSET] = 0xFF;
             assert!(
                 decode(&bad, generation, envelope_mtu).is_err(),
                 "bad frame type should fail"
@@ -165,7 +168,8 @@ fuzz_target!(|input: &[u8]| {
         if valid.len() >= PHANTOM_ONE_HEADER_BYTES && valid.len() > 1 {
             let mut bad = valid.clone();
             let fake_target = (valid.len() - 1) as u16;
-            bad[20..22].copy_from_slice(&fake_target.to_be_bytes());
+            bad[TARGET_LENGTH_OFFSET..TARGET_LENGTH_OFFSET + 2]
+                .copy_from_slice(&fake_target.to_be_bytes());
             assert!(
                 decode(&bad, generation, envelope_mtu).is_err(),
                 "target length mismatch should fail"

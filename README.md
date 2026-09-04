@@ -30,6 +30,9 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   earlier post-loader record remains historical. Workstation-specific tool
   availability is not a project-status claim. See `docs/TESTING.md` for the
   prerequisites and evidence boundary.
+  The latest local tag validation is recorded in
+  `docs/evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md`; it is an engineering
+  capture and does not replace clean release evidence.
 - Identity + keystore initialization (`init`) and peer/config workflows (`add-peer`, `list-peers`, `show-public-key`, `show-signing-public-key`, `show-config`).
 - Guided host/join flow:
   - `shph host --port 443` creates missing local identity/config state and
@@ -89,8 +92,12 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   lifecycle, route/DNS rollback, and a loopback WFP install/teardown smoke. A
   separate controlled Windows-to-Linux direct-TCP campaign also validated native
   IPv4 forwarding, Linux-host egress, bounded throughput, reconnect, session
-  hold, and teardown. This does not close Windows-to-Windows, Linux-to-Linux,
-  DNS/IPv6, UDP/QUIC, or crash-time WFP gates.
+  hold, and teardown. A separate elevated single-host forced-termination test
+  observed seven SHPH-owned WFP filters surviving a hard client kill and zero
+  after explicit `shph down`; this is policy-persistence/explicit-cleanup
+  evidence, not automatic crash-time cleanup or packet-leak prevention. These
+  records do not close Windows-to-Windows, Linux-to-Linux, DNS/IPv6, UDP/QUIC,
+  or real-Internet/long-soak gates.
 - The historical native Windows validation snapshot records formatting, locked
   checks, strict Clippy, **180 workspace tests**, release builds, Windows-only
    Wintun unit tests, Windows ACL coverage, and both benchmark profiles. The
@@ -126,8 +133,9 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
     standards-QUIC/native-TUN bridge, requires `SHPH_TUN_NATIVE=1`, and reuses
     stable server material across reconnects. Windows one-shot QUIC is
     supported; Windows native-TUN forwarding remains host-gated.
-- Standalone fuzzing harnesses for Shroud-cell framing, TOML configuration,
-  audit-record JSON, and replay-window state transitions live under `fuzz/`.
+- Six standalone fuzzing harnesses cover Shroud-cell framing, TOML
+  configuration, audit-record JSON, replay-window state transitions, Shroud2
+  datagrams, and Phantom One envelopes under `fuzz/`.
 - Explicit benchmark profiles are available:
   - `secure-default` keeps authenticated Ed25519 + X25519 + mandatory ML-KEM-768.
   - `classical-lab` is a visible benchmark-only X25519 mode and requires both
@@ -149,6 +157,11 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   lifecycle, control-plane, reconnect, and native-TUN prerequisites without
   fabricating unsupported results. `scripts/benchmark_native_tun.sh` measures
   only isolated open/hold/close lifecycle latency.
+- Reproducible operator campaigns are provided by
+  `scripts/operator_campaigns.py`. They cover bounded reconnect, fresh-process
+  soak, IPv6 loopback, DNS dry-run, literal-IP PMTU probes, and explicitly
+  confirmed crash termination. See `docs/OPERATOR_CAMPAIGNS.md`; campaign
+  output is written beneath the ignored `benchmark-runs/campaigns/` directory.
 
 ### Not done yet
 
@@ -160,9 +173,9 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   transport integrations. Hybrid PQC is shipped in v0.4.0.
 - Full production anti-observation claims are explicitly out of scope at this stage.
 - Broader native-TUN coverage remains open: Ctrl+C and forced-termination
-  behavior during a native session, crash-time WFP leak testing,
-  Windows-to-Windows and Linux-to-Linux campaigns, UDP/QUIC, PMTU/DNS/IPv6
-  coverage, and standards-QUIC host validation.
+  behavior beyond the single-host policy test, automatic crash-time WFP
+  leak/packet-path testing, Windows-to-Windows and Linux-to-Linux campaigns,
+  UDP/QUIC, PMTU/DNS/IPv6 coverage, and standards-QUIC host validation.
 
 The current development sequence is Shroud lab completion, hardening and
 optimization, release-readiness, then the remaining native Windows TUN gates.
@@ -184,7 +197,7 @@ shph/
 ├── shph-identity/     # experimental signed identity/discovery boundary
 ├── shph-cli/          # shph binary + integration tests
 ├── shph-tui/          # optional terminal UI
-├── scripts/            # evidence, demo, benchmark, and mirror helpers
+├── scripts/            # evidence, demo, benchmark, campaign, and mirror helpers
 └── docs/              # operator, roadmap, audit, and evidence docs
 ```
 
@@ -415,6 +428,7 @@ Additional docs:
 
 - `FIVE_MINUTE_QUICKSTART.md` (local authenticated encrypted exchange)
 - `docs/TESTING.md`
+- `docs/OPERATOR_CAMPAIGNS.md` (bounded operator/failure campaign procedures)
 - `docs/SUPPORT_MATRIX.md` (authoritative product boundary and support levels)
 - `docs/RELEASE_READINESS.md` (binding release gate and evidence rules)
 - `docs/WHY_CHOOSE_SHPH.md` (honest fit and comparison guide)
@@ -459,6 +473,8 @@ Additional docs:
 - `CONTRIBUTING.md` (build/test, release checklist, governance)
 - `.github/workflows/ci.yml` (Linux + Windows CI template)
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md` (current elevated Windows lifecycle evidence)
+- `docs/evidence/WINDOWS_WFP_CRASH_VALIDATION_2026-09-01.md` (elevated single-host forced-termination and explicit WFP cleanup evidence)
+- `docs/evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md` (latest tag validation record)
 - `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md` (Windows-to-Linux direct-TCP IPv4 forwarding evidence)
 - `docs/evidence/OPTIONAL_XRAY_UNDERLAY_VALIDATION_2026-08-25.md` (bounded optional SOCKS5/Xray underlay evidence)
 
