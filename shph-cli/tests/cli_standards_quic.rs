@@ -29,11 +29,11 @@ fn test_dir(name: &str) -> PathBuf {
 }
 
 fn test_port() -> u16 {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time")
-        .as_nanos();
-    20_000 + ((timestamp % 40_000) as u16)
+    UdpSocket::bind("127.0.0.1:0")
+        .expect("reserve loopback UDP port")
+        .local_addr()
+        .expect("read reserved loopback UDP port")
+        .port()
 }
 
 fn command(config: &PathBuf, args: &[&str]) -> std::process::Output {
