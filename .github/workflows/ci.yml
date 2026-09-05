@@ -100,32 +100,7 @@ jobs:
         run: python scripts/package_release.py --binary "${{ matrix.binary }}" --output dist/ci-package
       - name: Verify package manifest and checksums
         shell: bash
-        run: |
-          python - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-
-          package = Path("dist/ci-package")
-          manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
-          assert manifest["schema"] == "shph-release-package/v1"
-          assert manifest["source_dirty"] is False
-          assert manifest["files"]
-          assert all("keystore" not in item["path"].lower() for item in manifest["files"])
-
-          for item in manifest["files"]:
-              path = package / item["path"]
-              assert path.is_file()
-              digest = hashlib.sha256(path.read_bytes()).hexdigest()
-              assert digest == item["sha256"]
-
-          checksums = {}
-          for line in (package / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
-              digest, name = line.split("  ", 1)
-              checksums[name] = digest
-          for name, digest in checksums.items():
-              assert hashlib.sha256((package / name).read_bytes()).hexdigest() == digest
-          PY
+        run: python scripts/verify_release.py --package dist/ci-package
 
   demo:
     name: Reproducible demo

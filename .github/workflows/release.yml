@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            binary: target/release/shph
+            archive: shph-${{ github.ref_name }}-linux-x86_64.zip
+          - name: windows-x86_64
+            os: windows-latest
+            binary: target/release/shph.exe
+            archive: shph-${{ github.ref_name }}-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --no-self-update
+
+      - name: Verify tag matches workspace version
+        shell: bash
+        run: |
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$(python -c 'import re; print(re.search(r"(?m)^\s*version\s*=\s*\"([^\"]+)\"\\s*$", open("Cargo.toml", encoding="utf-8").read()).group(1))')"
+          test "$actual" = "$expected"
+
+      - name: Build release binary
+        run: cargo +1.96.0 build -p shph-cli --release --locked
+
+      - name: Build sanitized package
+        shell: bash
+        run: python scripts/package_release.py --binary "${{ matrix.binary }}" --output dist/package
+
+      - name: Verify sanitized package
+        shell: bash
+        run: python scripts/verify_release.py --package dist/package --version "${GITHUB_REF_NAME#v}"
+
+      - name: Create release archive
+        shell: bash
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive }}
+        run: |
+          mkdir -p dist/archive
+          python -c 'import os, shutil; name = os.environ["ARCHIVE_NAME"]; shutil.make_archive(f"dist/archive/{name[:-4]}", "zip", "dist/package")'
+
+      - name: Generate artifact attestation
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: dist/archive/${{ matrix.archive }}
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/archive/${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -d '' archives < <(find dist -type f -name '*.zip' -print0)
+          test "${#archives[@]}" -gt 0
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${archives[@]}" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${archives[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "SHPH ${GITHUB_REF_NAME}" \
+              --generate-notes \
+              --prerelease
+          fi

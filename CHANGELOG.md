@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.7-dev] - 2026-09-05
+
+This development snapshot refreshes the publication and validation workflow
+after `v0.6.6-dev.2`. It remains a controlled-lab prototype and does not
+claim production VPN readiness, censorship resistance, anonymity, or an
+independent security audit.
+
+- Bumped the workspace and benchmark package metadata to `0.6.7-dev` and
+  refreshed the standalone lockfile provenance.
+- Consolidated the current release-readiness, package-integrity, evidence, and
+  mirror-synchronization documentation around the candidate snapshot.
+- Kept native two-host validation and artifact signing explicitly scoped to
+  their required host and publishing environments; the September 4 engineering
+  record does not turn unavailable evidence into a pass.
+
 ## [0.6.6-dev.2] - 2026-08-30
 
 This patch release fixes the remaining Unix warnings-as-errors path found by

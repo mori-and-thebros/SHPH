@@ -7,9 +7,9 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-08-30)
+## Current Status (2026-09-05)
 
-Workspace version `0.6.6-dev.2` (prototype pre-release). SHPH is **functional for controlled lab
+Workspace version `0.6.7-dev` (prototype pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
 claims.
 
@@ -30,8 +30,8 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   earlier post-loader record remains historical. Workstation-specific tool
   availability is not a project-status claim. See `docs/TESTING.md` for the
   prerequisites and evidence boundary.
-  The latest local tag validation is recorded in
-  `docs/evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md`; it is an engineering
+  The latest pre-commit candidate validation is recorded in
+  `docs/evidence/VALIDATION_2026-09-04_V0.6.7-DEV.md`; it is an engineering
   capture and does not replace clean release evidence.
 - Identity + keystore initialization (`init`) and peer/config workflows (`add-peer`, `list-peers`, `show-public-key`, `show-signing-public-key`, `show-config`).
 - Guided host/join flow:
@@ -103,9 +103,10 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
    Wintun unit tests, Windows ACL coverage, and both benchmark profiles. The
    `v0.6.4-dev.4` release evidence records 304 workspace tests; these totals
    belong to different snapshots and must not be conflated. The current
-   working-tree verification pass reached 379 workspace tests with 0 failures,
-   plus 38 passing tests in the standalone edge workspace. These are separate
-   engineering snapshots, not a new release claim. The lifecycle record reports
+   The September 4 `v0.6.7-dev` pre-commit verification reached 379 workspace
+   tests with 0 failures, plus 38 passing tests in the standalone edge
+   workspace. These are separate engineering snapshots, not a new release
+   claim. The lifecycle record reports
    clean adapter, route, DNS, WFP, process, and temporary-directory teardown. See
   `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md`.
 - Lab-only controls:
@@ -472,9 +473,12 @@ Additional docs:
 - `SECURITY.md` (vulnerability reporting, threat model, non-claims matrix)
 - `CONTRIBUTING.md` (build/test, release checklist, governance)
 - `.github/workflows/ci.yml` (Linux + Windows CI template)
+- `.github/workflows/release.yml` (tagged package, attestation, and prerelease workflow)
+- `scripts/verify_release.py` (sanitized package manifest/checksum verifier)
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-25.md` (current elevated Windows lifecycle evidence)
 - `docs/evidence/WINDOWS_WFP_CRASH_VALIDATION_2026-09-01.md` (elevated single-host forced-termination and explicit WFP cleanup evidence)
-- `docs/evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md` (latest tag validation record)
+- `docs/evidence/VALIDATION_2026-09-04_V0.6.7-DEV.md` (September 4 pre-commit validation record)
+- `docs/evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md` (previous tag validation record)
 - `docs/evidence/CROSS_PLATFORM_NATIVE_TUN_VALIDATION_2026-08-25.md` (Windows-to-Linux direct-TCP IPv4 forwarding evidence)
 - `docs/evidence/OPTIONAL_XRAY_UNDERLAY_VALIDATION_2026-08-25.md` (bounded optional SOCKS5/Xray underlay evidence)
 

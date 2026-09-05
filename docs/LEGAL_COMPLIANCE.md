@@ -77,8 +77,10 @@ Action items:
       committed `Cargo.lock`).
 - [x] **Release gates documented:** `docs/RELEASE_READINESS.md`.
 - [x] **Evidence captured for validation:** `docs/evidence/GATE_EVIDENCE.md`.
-- [ ] **Signed artifacts:** no GPG/Sigstore signing configured yet (tracked
-      follow-up for the first versioned release).
+- [ ] **Signed artifacts:** the tag-triggered GitHub release workflow now
+      creates a signed artifact attestation for each archive; the first
+      `v0.6.7-dev` run must complete and be independently verified before this
+      checklist item is closed.
 
 ## 7. Outstanding follow-ups
 
@@ -86,7 +88,8 @@ Action items:
 2. DCO/CLA policy decision (section 2).
 3. Refresh the captured `cargo audit` evidence after dependency changes.
 4. Export-control counsel review before commercial distribution (section 4).
-5. Release artifact signing (section 6).
+5. Complete and verify the first GitHub release artifact attestation
+   (section 6).
 
 These are explicitly tracked so reviewers see what is intentionally deferred
 versus what is missing.

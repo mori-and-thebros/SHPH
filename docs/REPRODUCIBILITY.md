@@ -106,6 +106,9 @@ use the repository packager after building the target binary:
 python scripts/package_release.py \
   --binary target/release/shph \
   --output dist/shph-package
+python scripts/verify_release.py \
+  --package dist/shph-package \
+  --version 0.6.7-dev
 ```
 
 Use `target/release/shph.exe` for a Windows build. The packager records the
@@ -114,8 +117,11 @@ platform metadata in `manifest.json`, and writes a `SHA256SUMS` file. It uses
 an explicit public-document allowlist and refuses symlinks, oversized files,
 and common private-key or token markers. `--allow-dirty` is available for
 engineering snapshots, but a release package must be made from a clean tree.
-This is packaging and provenance evidence; it is not artifact signing,
-byte-for-byte reproducibility, or an independent security review.
+`verify_release.py` rechecks the clean-tree marker, allowlisted payload,
+manifest metadata, and every checksum before publication. The tag-triggered
+GitHub release workflow also creates a signed artifact attestation for each
+published archive. These controls are packaging/provenance evidence; they are
+not byte-for-byte reproducibility or an independent security review.
 
 ## Known reproducibility caveats
 

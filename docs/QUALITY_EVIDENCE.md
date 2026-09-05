@@ -1,7 +1,9 @@
 # SHPH Quality, Tests, and Benchmark Evidence
 
-This document summarizes the validation available for the `v0.6.6-dev.2`
-development line. The latest local tag validation is recorded in
+This document summarizes the validation available for the `v0.6.7-dev`
+development line. The September 4 pre-commit engineering capture is recorded in
+[`evidence/VALIDATION_2026-09-04_V0.6.7-DEV.md`](evidence/VALIDATION_2026-09-04_V0.6.7-DEV.md).
+The previous publication snapshot remains recorded in
 [`evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md`](evidence/VALIDATION_2026-08-30_V0.6.6-DEV.2.md).
 The detailed tables below retain earlier publication and pre-publication
 evidence with their original scope. Local and GitHub-hosted benchmark results
@@ -12,15 +14,37 @@ security audit.
 
 | Field | Value |
 | --- | --- |
-| Development line | `v0.6.6-dev.2` |
-| Source revision | `v0.6.6-dev.2` (publication tag) |
-| Publication ref | `v0.6.6-dev.2` |
-| Validation date | 2026-08-30 |
+| Development line | `v0.6.7-dev` |
+| Source revision | September 4 pre-commit capture at `313cfb8`; final release-preparation commit is recorded in Git history |
+| Publication ref | `v0.6.7-dev` (planned tag) |
+| Validation date | 2026-09-04 |
 | Primary host | Windows 11 |
 | Rust toolchain | `rustc 1.96.0 (ac68faa20 2026-05-25)` |
 | Main target | `x86_64-pc-windows-msvc` |
-| Additional target | `i686-pc-windows-msvc` |
-| Final candidate tree | Clean before publication |
+| Additional target | Not exercised in this capture |
+| Candidate tree | The linked capture was dirty; the release-preparation branch requires a clean tree before tagging |
+
+## Current candidate gate summary
+
+The September 4 pre-commit capture recorded `313cfb8` plus the then-uncommitted
+release-preparation changes. Locked workspace, benchmark, standalone edge,
+HTTP/3, release-build, and advisory gates passed on Windows with Rust
+`1.96.0`. The workspace test run reported 379 passing tests and the standalone
+edge workspace reported 38. Its strict package gate correctly stopped at the
+dirty-tree prerequisite; that historical result is not a claim about the
+clean release-preparation commit.
+
+A prior attempted Windows fuzz smoke for this candidate compiled the six
+checked-in targets but could not launch them because the sanitizer runtime was
+unavailable (`STATUS_DLL_NOT_FOUND`). The final collector intentionally skipped
+fuzz smoke; this remains an explicit required follow-up and no fuzz pass is
+claimed here.
+
+The native-TUN/two-host gate remains host-gated. The checked-in
+Windows-to-Linux report is retained as scoped engineering evidence, but it is
+not relabeled as a fresh `v0.6.7-dev` two-host campaign. The tag-triggered
+workflow is configured to verify `SHA256SUMS` and create artifact
+attestations, but that workflow has not yet run for `v0.6.7-dev`.
 
 ## Previous publication verification
 
@@ -44,11 +68,13 @@ independent-audit boundaries.
 
 ## Automated gate capture
 
-The strict release-readiness collector was run with dirty-tree evidence
-allowed during the pre-publication engineering capture. The final candidate
-was separately rerun through the locked code gates from a clean tree. The
-privileged native-host gate remains host-gated in the collector because its
-dedicated operator evidence is captured separately.
+The strict release-readiness collector was rerun after the standards-QUIC
+loopback-port fix. The linked capture recorded the dirty-tree and package
+prerequisites as not release-eligible, while the locked code, benchmark, edge,
+and advisory gates passed. The privileged native-host gate remains host-gated
+in the collector because its dedicated operator evidence is captured
+separately. The clean release-preparation branch must be packaged and checked
+again before a tag is created.
 
 | Gate | Result |
 | --- | --- |
@@ -61,10 +87,11 @@ dedicated operator evidence is captured separately.
 | Benchmark manifest check | PASS |
 | Fuzz manifest check | PASS |
 | `cargo audit --deny warnings` | PASS |
-| Clean-tree gate | PASS on the final candidate; the historical collector capture was WARN because it preceded publication |
+| Clean-tree gate | FAIL in this engineering checkout; a clean revision is required |
+| Sanitized package gate | BLOCKED by the dirty-tree prerequisite; no current-candidate package pass claimed |
 | Dedicated native host toolchain gate | SKIP in collector; covered by operator evidence |
 | Dedicated native TUN two-host gate | SKIP in collector; covered by operator evidence |
-| Collector release eligibility | Host-gated; direct two-host evidence is recorded separately |
+| Collector release eligibility | FALSE until clean provenance, package, fuzz, and native-host gates are closed |
 
 That publication-snapshot test run executed **379 tests with 0 failures** across
 the CLI, configuration, core cryptography and handshake, identity,
@@ -72,10 +99,12 @@ obfuscation, transport, and TUN crates. The advisory scan covered 299 locked
 crate dependencies. The historical collector capture referenced by the
 original gate table recorded an earlier 316-test snapshot.
 
-## Fuzz smoke
+## Historical fuzz smoke evidence
 
-The six checked-in fuzz targets completed 1,000 executions each, for 6,000
-requested executions total, using the installed MSVC sanitizer runtime:
+The following table is retained from the previous publication snapshot
+(`v0.6.6-dev.2`); it is not a current `v0.6.7-dev` pass. The current
+candidate intentionally skipped fuzz smoke, and its Windows launch/runtime
+issue remains outside this release-preparation change:
 
 | Target | Runs | Result |
 | --- | ---: | --- |

@@ -170,14 +170,15 @@ The packager's allowlist is intentionally narrower than the repository and
 does not include deployment files, scratch output, raw evidence, keystores, or
 internal maintainer guidance.
 
-The September 2, 2026 engineering package check passed the manifest
+The historical September 2, 2026 engineering package check passed the manifest
 file-size/hash checks, `SHA256SUMS` verification, exact public allowlist, and
-secret-boundary review for version `0.6.6-dev.2`. The capture was made from a
-dirty checkout and the local Windows executable was not Authenticode-signed,
-so it is not a publishable release artifact. Before publication, rerun the
-packager without `--allow-dirty` from the approved clean revision and complete
-the project's artifact-signing step. The package did not include
-`docs/evidence/`, `benchmark-runs/`, keystores, credentials, or runtime DLLs.
+secret-boundary review for the then-current version `0.6.6-dev.2`. The capture
+was made from a dirty checkout and the local Windows executable was not
+Authenticode-signed, so it was not a publishable release artifact. The current
+`v0.6.7-dev` candidate still requires a clean-tree package run from the
+approved revision and completion of the project's artifact-signing step. The
+package did not include `docs/evidence/`, `benchmark-runs/`, keystores,
+credentials, or runtime DLLs.
 
 ### 2. Functional controlled-lab gates
 
