@@ -38,7 +38,7 @@ jobs:
         shell: bash
         run: |
           expected="${GITHUB_REF_NAME#v}"
-          actual="$(python -c 'import re; print(re.search(r"(?m)^\s*version\s*=\s*\"([^\"]+)\"\\s*$", open("Cargo.toml", encoding="utf-8").read()).group(1))')"
+          actual="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           test "$actual" = "$expected"
 
       - name: Build release binary
