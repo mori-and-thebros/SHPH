@@ -15,6 +15,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,8 @@ PUBLIC_DOCUMENTS = (
     "LICENSE-APACHE",
     "SECURITY.md",
     "docs/SUPPORT_MATRIX.md",
+    "docs/SNAP_PROFILES.md",
+    "docs/SNAP_ACCEPTANCE_EVIDENCE.md",
     "docs/RELEASE_READINESS.md",
     "docs/REPRODUCIBILITY.md",
     "docs/SECURITY_EVIDENCE.md",
@@ -42,6 +45,9 @@ SECRET_MARKERS = (
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+)
+SECRET_MARKERS_BYTES = tuple(
+    re.compile(marker.pattern.encode("ascii")) for marker in SECRET_MARKERS
 )
 
 
@@ -62,23 +68,59 @@ def run_git(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def relative_to_root(path: Path, root: Path) -> Path:
-    try:
-        return path.resolve().relative_to(root.resolve())
-    except ValueError:
-        fail(f"artifact must be inside the repository: {path}")
-
-
 def validate_regular_file(path: Path, *, max_bytes: int) -> None:
-    if path.is_symlink():
-        fail(f"refusing symlink: {path}")
-    if not path.is_file():
+    try:
+        metadata = path.lstat()
+    except OSError:
         fail(f"required regular file is missing: {path}")
-    size = path.stat().st_size
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if stat.S_ISLNK(metadata.st_mode) or (
+        reparse_flag and getattr(metadata, "st_file_attributes", 0) & reparse_flag
+    ):
+        fail(f"refusing link or reparse point: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(f"required regular file is missing: {path}")
+    size = metadata.st_size
     if size == 0:
         fail(f"refusing empty file: {path}")
     if size > max_bytes:
         fail(f"file is larger than the configured limit: {path}")
+
+
+def validate_repository_file(path: Path, root: Path, *, max_bytes: int) -> Path:
+    root_absolute = Path(os.path.abspath(root))
+    path_absolute = Path(os.path.abspath(path))
+    try:
+        relative = path_absolute.relative_to(root_absolute)
+        resolved_root = root_absolute.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        fail(f"artifact must be a regular file inside the repository: {path}")
+    if not relative.parts:
+        fail(f"artifact must be a regular file inside the repository: {path}")
+
+    current = resolved_root
+    metadata = None
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    for part in relative.parts:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError:
+            fail(f"required regular file is missing: {path}")
+        if stat.S_ISLNK(metadata.st_mode) or (
+            reparse_flag and getattr(metadata, "st_file_attributes", 0) & reparse_flag
+        ):
+            fail(f"refusing link or reparse point: {path}")
+        try:
+            resolved_path = current.resolve(strict=True)
+            resolved_path.relative_to(resolved_root)
+        except (OSError, RuntimeError, ValueError):
+            fail(f"artifact must be a regular file inside the repository: {path}")
+
+    if metadata is None or not stat.S_ISREG(metadata.st_mode):
+        fail(f"required regular file is missing: {path}")
+    validate_regular_file(resolved_path, max_bytes=max_bytes)
+    return resolved_path
 
 
 def sha256(path: Path) -> str:
@@ -100,6 +142,18 @@ def scan_public_text(path: Path) -> None:
             fail(f"secret-like marker found in public document: {path}")
 
 
+def contains_secret_marker(path: Path) -> bool:
+    overlap = max(len(marker.pattern) for marker in SECRET_MARKERS_BYTES) - 1
+    remainder = b""
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            sample = remainder + chunk
+            if any(marker.search(sample) for marker in SECRET_MARKERS_BYTES):
+                return True
+            remainder = sample[-overlap:]
+    return False
+
+
 def workspace_version(root: Path) -> str:
     cargo = (root / "Cargo.toml").read_text(encoding="utf-8")
     match = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"\s*$', cargo)
@@ -118,8 +172,9 @@ def package_files(
     if edge_binary is not None:
         payloads.append((edge_binary, Path(edge_binary.name)))
     for relative in PUBLIC_DOCUMENTS:
-        source = root / relative
-        validate_regular_file(source, max_bytes=MAX_DOCUMENT_BYTES)
+        source = validate_repository_file(
+            root / relative, root, max_bytes=MAX_DOCUMENT_BYTES
+        )
         scan_public_text(source)
         payloads.append((source, Path(relative)))
 
@@ -128,6 +183,8 @@ def package_files(
         destination = staging / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
+        if contains_secret_marker(destination):
+            fail(f"secret-like marker found in release payload: {relative}")
         records.append(
             {
                 "path": relative.as_posix(),
@@ -214,12 +271,15 @@ def main() -> int:
         fail(f"repository root is not a directory: {root}")
     if output.exists():
         fail(f"output already exists; choose a new path: {output}")
-    relative_to_root(binary, root)
+    binary = validate_repository_file(binary, root, max_bytes=MAX_FILE_BYTES)
+    if binary.name not in {"shph", "shph.exe"}:
+        fail("--binary must be named shph or shph.exe")
     if edge_binary is not None:
-        relative_to_root(edge_binary, root)
-    validate_regular_file(binary, max_bytes=MAX_FILE_BYTES)
-    if edge_binary is not None:
-        validate_regular_file(edge_binary, max_bytes=MAX_FILE_BYTES)
+        edge_binary = validate_repository_file(
+            edge_binary, root, max_bytes=MAX_FILE_BYTES
+        )
+        if edge_binary.name not in {"shph-edge", "shph-edge.exe"}:
+            fail("--edge-binary must be named shph-edge or shph-edge.exe")
 
     status = run_git(root, "status", "--porcelain=v1", "--untracked-files=all")
     dirty = status not in ("", "unknown")
@@ -244,7 +304,7 @@ def main() -> int:
         scan_public_text(staging / "manifest.json")
         write_checksums(staging)
         staging.rename(output)
-    except Exception:
+    except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
 

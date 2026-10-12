@@ -29,7 +29,8 @@ use shph_core::{
 };
 use shph_obfuscation::ProfileTier;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::time::timeout;
 use zeroize::{Zeroize, Zeroizing};
@@ -37,7 +38,7 @@ use zeroize::{Zeroize, Zeroizing};
 const MAX_HANDSHAKE_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_TUN_DATAGRAM_BYTES: usize = 65_535;
-const SHPH_AEAD_OVERHEAD_BYTES: usize = 12 + 16;
+pub(crate) const SHPH_AEAD_OVERHEAD_BYTES: usize = 12 + 16;
 const MAX_PHANTOM_ONE_STREAM_ENVELOPE_BYTES: usize = 16 * 1024;
 const MAX_PHANTOM_ONE_STREAM_RECORD_BYTES: usize =
     MAX_PHANTOM_ONE_STREAM_ENVELOPE_BYTES + SHPH_AEAD_OVERHEAD_BYTES;
@@ -179,6 +180,57 @@ pub struct StandardsQuicConnection {
     control_recv: RecvStream,
     phantom_one: Option<PhantomOneState>,
     phantom_one_negotiated: bool,
+}
+
+const BLOCKING_QUIC_COMMAND_CAPACITY: usize = 16;
+const BLOCKING_QUIC_RECEIVE_CAPACITY: usize = 64;
+const BLOCKING_QUIC_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const BLOCKING_QUIC_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+enum BlockingQuicCommand {
+    Send {
+        payload: Vec<u8>,
+        reply: mpsc::SyncSender<Result<()>>,
+    },
+}
+
+struct BlockingQuicShared {
+    command_tx: mpsc::SyncSender<BlockingQuicCommand>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for BlockingQuicShared {
+    fn drop(&mut self) {
+        self.shutdown_tx.send_replace(true);
+        if let Ok(worker) = self.worker.get_mut() {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+/// A synchronous session adapter for code that already uses `SecureSession`.
+///
+/// Quinn runs on a private Tokio runtime thread. The session remains gated
+/// until `activate` is called, allowing the caller to enforce its local SHPH
+/// peer policy before the data plane starts. QUIC DATAGRAM retains its normal
+/// unreliable delivery semantics.
+pub struct BlockingStandardsQuicSession {
+    activation: Option<mpsc::SyncSender<()>>,
+    sender: BlockingStandardsQuicSender,
+    receiver: Option<BlockingStandardsQuicReceiver>,
+}
+
+pub struct BlockingStandardsQuicSender {
+    shared: Arc<BlockingQuicShared>,
+}
+
+pub struct BlockingStandardsQuicReceiver {
+    shared: Arc<BlockingQuicShared>,
+    incoming: mpsc::Receiver<Result<Vec<u8>>>,
+    poll_timeout: Duration,
 }
 
 struct PhantomOneState {
@@ -387,13 +439,20 @@ async fn connect_inner(
 ) -> Result<StandardsQuicConnection> {
     let connection = endpoint
         .connect(peer_addr, server_name)
-        .map_err(|err| ShphError::Transport(err.to_string()))?
+        .map_err(|err| match err {
+            quinn::ConnectError::InvalidServerName(_)
+            | quinn::ConnectError::InvalidRemoteAddress(_)
+            | quinn::ConnectError::NoDefaultClientConfig => {
+                ShphError::Config("invalid standards QUIC connection parameters".into())
+            }
+            error => ShphError::Transport(error.to_string()),
+        })?
         .await
-        .map_err(|err| ShphError::Transport(err.to_string()))?;
+        .map_err(map_quic_connection_error)?;
     let (mut control_send, mut control_recv) = connection
         .open_bi()
         .await
-        .map_err(|err| ShphError::Transport(err.to_string()))?;
+        .map_err(map_quic_connection_error)?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_message(
         &mut control_send,
@@ -421,6 +480,366 @@ async fn connect_inner(
         phantom_one: None,
         phantom_one_negotiated: false,
     })
+}
+
+fn map_quic_connection_error(error: quinn::ConnectionError) -> ShphError {
+    if let quinn::ConnectionError::TransportError(transport_error) = &error {
+        let code = u64::from(transport_error.code);
+        if transport_error.reason.starts_with("TLS error:") || (0x100..0x200).contains(&code) {
+            return ShphError::Auth(
+                "standards QUIC TLS peer authentication or protocol negotiation failed".into(),
+            );
+        }
+        if transport_error.code == quinn::TransportErrorCode::CONNECTION_REFUSED
+            || transport_error.code == quinn::TransportErrorCode::NO_VIABLE_PATH
+        {
+            return ShphError::Transport(error.to_string());
+        }
+        return ShphError::Protocol("standards QUIC transport protocol failure".into());
+    }
+    match error {
+        quinn::ConnectionError::VersionMismatch => {
+            ShphError::Protocol("standards QUIC version negotiation failed".into())
+        }
+        error => ShphError::Transport(error.to_string()),
+    }
+}
+
+impl BlockingStandardsQuicSession {
+    /// Establish a standards-QUIC connection on a private runtime thread and
+    /// return it inactive. `activate` must be called after the caller has
+    /// enforced its local peer policy.
+    pub fn connect(
+        peer_addr: SocketAddr,
+        server_name: String,
+        server_certificate_der: Vec<u8>,
+        local_identity: IdentityKeyPair,
+        policy: PeerPolicy,
+        profile: HandshakeProfile,
+        handshake_timeout: Duration,
+    ) -> Result<(Self, HandshakeState)> {
+        if handshake_timeout.is_zero() {
+            return Err(ShphError::Config(
+                "standards QUIC handshake timeout must be greater than zero".into(),
+            ));
+        }
+
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let (activation_tx, activation_rx) = mpsc::sync_channel(1);
+        let (command_tx, command_rx) = mpsc::sync_channel(BLOCKING_QUIC_COMMAND_CAPACITY);
+        let (incoming_tx, incoming_rx) = mpsc::sync_channel(BLOCKING_QUIC_RECEIVE_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker_shutdown_tx = shutdown_tx.clone();
+
+        let worker = thread::Builder::new()
+            .name("shph-standards-quic".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(ShphError::Internal(format!(
+                            "start standards QUIC runtime: {error}"
+                        ))));
+                        return;
+                    }
+                };
+
+                let setup = runtime.block_on(async {
+                    let endpoint = client_endpoint(
+                        "0.0.0.0:0".parse().expect("valid ephemeral endpoint"),
+                        &server_certificate_der,
+                        StandardsQuicConfig::default(),
+                    )?;
+                    let connection = connect(
+                        &endpoint,
+                        peer_addr,
+                        &server_name,
+                        &local_identity,
+                        &policy,
+                        profile,
+                        handshake_timeout,
+                    )
+                    .await?;
+                    Ok::<_, ShphError>((endpoint, connection))
+                });
+
+                let (endpoint, connection) = match setup {
+                    Ok(setup) => setup,
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let state = connection.handshake.clone();
+                if startup_tx.send(Ok(state)).is_err() {
+                    endpoint.close(0u32.into(), b"session setup cancelled");
+                    return;
+                }
+                if activation_rx.recv().is_err() {
+                    endpoint.close(0u32.into(), b"peer policy rejected");
+                    return;
+                }
+
+                let receive_error_tx = incoming_tx.clone();
+                let result = runtime.block_on(run_blocking_quic_data_plane(
+                    connection,
+                    command_rx,
+                    incoming_tx,
+                    shutdown_rx,
+                ));
+                if let Err(error) = result {
+                    let _ = receive_error_tx.send(Err(error));
+                }
+                endpoint.close(0u32.into(), b"session closed");
+                let _ = runtime.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await
+                });
+            })
+            .map_err(ShphError::Io)?;
+
+        let startup_wait = handshake_timeout.saturating_add(Duration::from_secs(2));
+        let state = match startup_rx.recv_timeout(startup_wait) {
+            Ok(Ok(state)) => state,
+            Ok(Err(error)) => {
+                drop(activation_tx);
+                let _ = worker.join();
+                return Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                shutdown_tx.send_replace(true);
+                drop(activation_tx);
+                let _ = worker.join();
+                return Err(ShphError::Timeout);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(activation_tx);
+                let _ = worker.join();
+                return Err(ShphError::Internal(
+                    "standards QUIC worker exited during setup".into(),
+                ));
+            }
+        };
+
+        let shared = Arc::new(BlockingQuicShared {
+            command_tx,
+            shutdown_tx: worker_shutdown_tx,
+            worker: Mutex::new(Some(worker)),
+        });
+        let session = Self {
+            activation: Some(activation_tx),
+            sender: BlockingStandardsQuicSender {
+                shared: Arc::clone(&shared),
+            },
+            receiver: Some(BlockingStandardsQuicReceiver {
+                shared,
+                incoming: incoming_rx,
+                poll_timeout: Duration::from_millis(100),
+            }),
+        };
+        Ok((session, state))
+    }
+
+    /// Release the authenticated data plane after local peer-policy checks.
+    pub fn activate(&mut self) -> Result<()> {
+        let activation = self.activation.take().ok_or(ShphError::AlreadyConnected)?;
+        activation.send(()).map_err(|_| ShphError::ConnectionClosed)
+    }
+
+    pub fn send_frame(&mut self, payload: &[u8]) -> Result<()> {
+        if self.activation.is_some() {
+            return Err(ShphError::Auth(
+                "standards QUIC data plane is not active before peer policy enforcement".into(),
+            ));
+        }
+        self.sender.send_frame(payload)
+    }
+
+    pub fn set_poll_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.receiver
+            .as_mut()
+            .ok_or(ShphError::ConnectionClosed)?
+            .set_poll_timeout(timeout)
+    }
+
+    pub fn recv_frame(&mut self) -> Result<Vec<u8>> {
+        if self.activation.is_some() {
+            return Err(ShphError::Auth(
+                "standards QUIC data plane is not active before peer policy enforcement".into(),
+            ));
+        }
+        self.receiver
+            .as_mut()
+            .ok_or(ShphError::ConnectionClosed)?
+            .recv_frame()
+    }
+
+    pub fn into_split(
+        mut self,
+    ) -> Result<(BlockingStandardsQuicSender, BlockingStandardsQuicReceiver)> {
+        if self.activation.is_some() {
+            return Err(ShphError::Auth(
+                "standards QUIC session must pass peer policy before split".into(),
+            ));
+        }
+        let receiver = self.receiver.take().ok_or(ShphError::ConnectionClosed)?;
+        Ok((self.sender, receiver))
+    }
+}
+
+impl BlockingStandardsQuicSender {
+    pub fn send_frame(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() > MAX_TUN_DATAGRAM_BYTES {
+            return Err(ShphError::Protocol(
+                "QUIC datagram exceeds 65535 bytes".into(),
+            ));
+        }
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.shared
+            .command_tx
+            .send(BlockingQuicCommand::Send {
+                payload: payload.to_vec(),
+                reply: reply_tx,
+            })
+            .map_err(|_| ShphError::ConnectionClosed)?;
+        match reply_rx.recv_timeout(BLOCKING_QUIC_SEND_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ShphError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ShphError::ConnectionClosed),
+        }
+    }
+}
+
+impl BlockingStandardsQuicReceiver {
+    pub fn set_poll_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.poll_timeout = timeout
+            .max(Duration::from_millis(1))
+            .min(Duration::from_secs(60));
+        Ok(())
+    }
+
+    pub fn recv_frame(&mut self) -> Result<Vec<u8>> {
+        let _keep_worker_alive = &self.shared;
+        match self.incoming.recv_timeout(self.poll_timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ShphError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ShphError::ConnectionClosed),
+        }
+    }
+}
+
+async fn run_blocking_quic_data_plane(
+    connection: StandardsQuicConnection,
+    command_rx: mpsc::Receiver<BlockingQuicCommand>,
+    incoming_tx: mpsc::SyncSender<Result<Vec<u8>>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let receive_connection = connection.connection.clone();
+    let send = run_blocking_quic_sender(connection, command_rx, shutdown_rx.clone());
+    let receive = run_blocking_quic_receiver(receive_connection, incoming_tx, shutdown_rx);
+    tokio::pin!(send, receive);
+    tokio::select! {
+        result = &mut send => result,
+        result = &mut receive => result,
+    }
+}
+
+async fn run_blocking_quic_sender(
+    connection: StandardsQuicConnection,
+    command_rx: mpsc::Receiver<BlockingQuicCommand>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+        match command_rx.try_recv() {
+            Ok(BlockingQuicCommand::Send { payload, reply }) => {
+                let payload = Zeroizing::new(payload);
+                let result = tokio::select! {
+                    result = connection.send_datagram_wait(&payload) => result,
+                    changed = shutdown_rx.changed() => {
+                        let _ = reply.send(Err(ShphError::ConnectionClosed));
+                        let _ = changed;
+                        return Ok(());
+                    }
+                };
+                let stop_session = result
+                    .as_ref()
+                    .is_err_and(|error| !matches!(error, ShphError::Protocol(_)));
+                let _ = reply.send(result);
+                if stop_session {
+                    return Err(ShphError::ConnectionClosed);
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = tokio::time::sleep(BLOCKING_QUIC_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+async fn run_blocking_quic_receiver(
+    connection: Connection,
+    incoming_tx: mpsc::SyncSender<Result<Vec<u8>>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let mut pending: Option<Result<Vec<u8>>> = None;
+    loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+        if let Some(datagram) = pending.take() {
+            let terminal = datagram.is_err();
+            match incoming_tx.try_send(datagram) {
+                Ok(()) if terminal => return Ok(()),
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(datagram)) => pending = Some(datagram),
+                Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
+            }
+        }
+
+        if pending.is_some() {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep(BLOCKING_QUIC_POLL_INTERVAL) => {}
+            }
+            continue;
+        }
+
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+            }
+            result = connection.read_datagram() => {
+                pending = Some(result.map_err(map_quic_connection_error).and_then(|datagram| {
+                    if datagram.len() > MAX_TUN_DATAGRAM_BYTES {
+                        Err(ShphError::Protocol(
+                            "received QUIC datagram exceeds 65535 bytes".into(),
+                        ))
+                    } else {
+                        Ok(datagram.to_vec())
+                    }
+                }));
+            }
+        }
+    }
 }
 
 /// Accept one standards QUIC connection and run the SHPH application
@@ -931,6 +1350,118 @@ impl StandardsQuicConnection {
             .map_err(|err| ShphError::Transport(err.to_string()))
     }
 
+    /// Explicit bounded alternative to the legacy morphology send helper.
+    pub async fn send_morphology_datagram_paced(
+        &self,
+        morphology: &mut MorphologyEngine,
+        payload: &[u8],
+        pacer: &crate::pacing::DatagramPacer,
+        enqueued_at: std::time::Instant,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let limit = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let datagram = Zeroizing::new(morphology.encode_datagram(payload, limit)?);
+        pacer
+            .send(
+                &self.connection,
+                &datagram,
+                enqueued_at,
+                morphology.next_delay(),
+                cancel,
+            )
+            .await
+    }
+
+    pub async fn send_morphology_datagram_paced_until(
+        &self,
+        morphology: &mut MorphologyEngine,
+        payload: &[u8],
+        pacer: &crate::pacing::DatagramPacer,
+        enqueued_at: std::time::Instant,
+        deadline: std::time::Instant,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let limit = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let datagram = Zeroizing::new(morphology.encode_datagram(payload, limit)?);
+        pacer
+            .send_until(
+                &self.connection,
+                &datagram,
+                enqueued_at,
+                deadline,
+                morphology.next_delay(),
+                cancel,
+            )
+            .await
+    }
+
+    /// Encode caller-observed workload signals and send through the bounded
+    /// paced datagram path. The observation clock and queue age belong to the
+    /// caller; this API does not inspect application traffic or spawn timers.
+    pub async fn send_workload_morphology_datagram_paced(
+        &self,
+        morphology: &mut crate::shroud2::workload::WorkloadMorphology,
+        payload: &[u8],
+        observation: crate::shroud2::workload::WorkloadObservation,
+        pacer: &crate::pacing::DatagramPacer,
+        enqueued_at: std::time::Instant,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let limit = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let datagram = Zeroizing::new(morphology.encode(
+            payload,
+            limit,
+            observation.observed_at,
+            observation.queue_age,
+        )?);
+        let shaping_delay = morphology.next_delay();
+        pacer
+            .send(
+                &self.connection,
+                &datagram,
+                enqueued_at,
+                shaping_delay,
+                cancel,
+            )
+            .await
+    }
+
+    /// Send one opt-in adaptive Shroud 3 envelope through bounded QUIC pacing.
+    /// The caller supplies monotonic workload and queue-age observations.
+    pub async fn send_shroud3_adaptive_datagram_paced(
+        &self,
+        morphology: &mut crate::shroud3::AdaptiveShroud3,
+        payload: &[u8],
+        observation: crate::shroud2::workload::WorkloadObservation,
+        pacer: &crate::pacing::DatagramPacer,
+        enqueued_at: std::time::Instant,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let limit = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let datagram = Zeroizing::new(morphology.encode(payload, limit, observation)?);
+        pacer
+            .send(
+                &self.connection,
+                &datagram,
+                enqueued_at,
+                morphology.next_delay(),
+                cancel,
+            )
+            .await
+    }
+
     /// Send several small application messages in one authenticated Shroud2
     /// morphology datagram.
     ///
@@ -1021,6 +1552,22 @@ impl StandardsQuicConnection {
             .map_err(|err| ShphError::Transport(err.to_string()))?
             .to_vec();
         decode_datagram_in_place(&mut datagram, path_mtu)?;
+        Ok(datagram)
+    }
+
+    /// Receive and decode one opt-in adaptive Shroud 3 datagram.
+    pub async fn recv_shroud3_datagram(&self) -> Result<Vec<u8>> {
+        let path_mtu = self
+            .connection
+            .max_datagram_size()
+            .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+        let mut datagram = self
+            .connection
+            .read_datagram()
+            .await
+            .map_err(|err| ShphError::Transport(err.to_string()))?
+            .to_vec();
+        crate::shroud3::decode_in_place(&mut datagram, path_mtu)?;
         Ok(datagram)
     }
 
@@ -1610,6 +2157,211 @@ mod tests {
         client.wait_idle().await;
     }
 
+    #[tokio::test]
+    async fn paced_morphology_datagram_uses_carrier_and_honors_cancellation() {
+        let (client, client_connection, server_connection) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        let mut morphology = crate::shroud2::MorphologyEngine::from_seed(
+            crate::shroud2::MorphologyProfile::WebBrowsingLab,
+            17,
+        );
+        let pacer = crate::pacing::DatagramPacer::new(2, Duration::from_secs(2)).expect("pacer");
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        client_connection
+            .send_morphology_datagram_paced(
+                &mut morphology,
+                b"paced-morphology",
+                &pacer,
+                std::time::Instant::now(),
+                cancel_rx,
+            )
+            .await
+            .expect("paced morphology send");
+        let payload = tokio::time::timeout(
+            Duration::from_secs(2),
+            server_connection.recv_morphology_datagram(),
+        )
+        .await
+        .expect("paced receive timeout")
+        .expect("paced receive");
+        assert_eq!(payload, b"paced-morphology");
+        assert_eq!(
+            pacer
+                .metrics()
+                .sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        cancel_tx.send(true).expect("signal cancellation");
+        let result = client_connection
+            .send_morphology_datagram_paced(
+                &mut morphology,
+                b"cancelled-morphology",
+                &pacer,
+                std::time::Instant::now(),
+                cancel_rx,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(shph_core::ShphError::ConnectionClosed)
+        ));
+        assert_eq!(
+            pacer
+                .metrics()
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        client_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        server_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn workload_adaptation_drives_paced_quic_datagrams() {
+        let (client, client_connection, server_connection) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        let workload_config = crate::shroud2::workload::WorkloadConfig {
+            minimum_dwell: Duration::ZERO,
+            use_arrivals: false,
+            use_queue_age: false,
+            ..Default::default()
+        };
+        let mut morphology =
+            crate::shroud2::workload::WorkloadMorphology::from_seed(workload_config, 23)
+                .expect("workload morphology");
+        let pacer = crate::pacing::DatagramPacer::new(2, Duration::from_secs(2)).expect("pacer");
+        let application_payload = [0x6a; 256];
+        for index in 0..5 {
+            let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            client_connection
+                .send_workload_morphology_datagram_paced(
+                    &mut morphology,
+                    &application_payload,
+                    crate::shroud2::workload::WorkloadObservation {
+                        observed_at: Duration::from_millis(index),
+                        queue_age: Duration::ZERO,
+                    },
+                    &pacer,
+                    std::time::Instant::now(),
+                    cancel_rx,
+                )
+                .await
+                .expect("workload morphology send");
+        }
+        assert_eq!(
+            morphology.profile(),
+            crate::shroud2::MorphologyProfile::TunedWebBrowsingLab
+        );
+        assert_eq!(morphology.metrics().switches, 1);
+
+        for _ in 0..5 {
+            let payload = tokio::time::timeout(
+                Duration::from_secs(2),
+                server_connection.recv_morphology_datagram(),
+            )
+            .await
+            .expect("workload receive timeout")
+            .expect("workload receive");
+            assert_eq!(payload, application_payload);
+        }
+        assert_eq!(
+            pacer
+                .metrics()
+                .sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
+
+        client_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        server_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn shroud3_adaptation_round_trips_over_authenticated_quic_and_rejects_s2() {
+        let (client, client_connection, server_connection) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        let mut morphology =
+            crate::shroud3::AdaptiveShroud3::new(crate::shroud2::workload::WorkloadConfig {
+                minimum_dwell: Duration::ZERO,
+                use_arrivals: false,
+                use_queue_age: false,
+                ..Default::default()
+            })
+            .expect("Shroud 3 engine");
+        let pacer = crate::pacing::DatagramPacer::new(4, Duration::from_secs(2)).expect("pacer");
+        let application_payload = b"adaptive Shroud 3 over authenticated QUIC";
+        for index in 0..3 {
+            let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            client_connection
+                .send_shroud3_adaptive_datagram_paced(
+                    &mut morphology,
+                    application_payload,
+                    crate::shroud2::workload::WorkloadObservation {
+                        observed_at: Duration::from_millis(index),
+                        queue_age: Duration::ZERO,
+                    },
+                    &pacer,
+                    std::time::Instant::now(),
+                    cancel_rx,
+                )
+                .await
+                .expect("send Shroud 3 datagram");
+            let payload = tokio::time::timeout(
+                Duration::from_secs(2),
+                server_connection.recv_shroud3_datagram(),
+            )
+            .await
+            .expect("Shroud 3 receive timeout")
+            .expect("decode Shroud 3 datagram");
+            assert_eq!(payload, application_payload);
+        }
+        assert_eq!(morphology.metrics().observations, 3);
+        assert_eq!(
+            pacer
+                .metrics()
+                .sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+
+        let shroud2 =
+            crate::shroud2::encode_datagram(b"wrong version", 64, 1472).expect("Shroud 2 frame");
+        client_connection
+            .send_datagram_wait(&shroud2)
+            .await
+            .expect("send wrong version for rejection test");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            server_connection.recv_shroud3_datagram(),
+        )
+        .await
+        .expect("version rejection timeout")
+        .unwrap_err();
+        assert!(matches!(error, shph_core::ShphError::Protocol(_)));
+
+        client_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        server_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
     async fn established_pair(
         handshake_profile: HandshakeProfile,
     ) -> (
@@ -1659,6 +2411,277 @@ mod tests {
             .expect("server task")
             .expect("server QUIC/SHPH handshake");
         (client, client_connection, server_connection)
+    }
+
+    async fn negotiated_cover_pair(
+        cover: crate::cover::CoverPolicy,
+    ) -> (
+        quinn::Endpoint,
+        crate::envelope_policy::NegotiatedQuic,
+        crate::envelope_policy::NegotiatedQuic,
+    ) {
+        use crate::envelope_policy::{EnvelopeOffer, NegotiatedQuic};
+        use crate::phantom_one::PhantomOneConfig;
+
+        let (client, client_transport, server_transport) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        let transcript = client_transport.handshake.transcript_hash_hex.clone();
+        let offer = EnvelopeOffer::new(
+            &transcript,
+            PhantomOneConfig::new(0, 0).expect("zero-padding test config"),
+            1360,
+        )
+        .expect("policy offer")
+        .with_cover(Some(cover))
+        .expect("cover policy");
+        let (client_result, server_result) = tokio::join!(
+            NegotiatedQuic::establish_with_offer(
+                client_transport,
+                offer.clone(),
+                Duration::from_secs(2),
+            ),
+            NegotiatedQuic::establish_with_offer(server_transport, offer, Duration::from_secs(2),),
+        );
+        (
+            client,
+            client_result.expect("client policy agreement"),
+            server_result.expect("server policy agreement"),
+        )
+    }
+
+    #[tokio::test]
+    async fn envelope_policy_quic_enforces_directional_budgets() {
+        use crate::envelope_policy::{EnvelopeOffer, FrameBudget, NegotiatedQuic};
+        use crate::phantom_one::PhantomOneConfig;
+
+        let (client, client_transport, server_transport) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        let transcript = client_transport.handshake.transcript_hash_hex.clone();
+        assert_eq!(transcript, server_transport.handshake.transcript_hash_hex);
+        let client_offer = EnvelopeOffer::new(
+            &transcript,
+            PhantomOneConfig::for_profile(ProfileTier::Medium),
+            1360,
+        )
+        .unwrap()
+        .with_directional_budgets(
+            FrameBudget {
+                max_frames: 1,
+                max_payload_bytes: 5,
+            },
+            FrameBudget {
+                max_frames: 10,
+                max_payload_bytes: 100,
+            },
+        )
+        .unwrap();
+        let server_offer = EnvelopeOffer::new(
+            &transcript,
+            PhantomOneConfig::for_profile(ProfileTier::Medium),
+            1360,
+        )
+        .unwrap()
+        .with_directional_budgets(
+            FrameBudget {
+                max_frames: 10,
+                max_payload_bytes: 100,
+            },
+            FrameBudget {
+                max_frames: 1,
+                max_payload_bytes: 5,
+            },
+        )
+        .unwrap();
+        let (client_result, server_result) = tokio::join!(
+            NegotiatedQuic::establish_with_offer(
+                client_transport,
+                client_offer,
+                Duration::from_secs(2),
+            ),
+            NegotiatedQuic::establish_with_offer(
+                server_transport,
+                server_offer,
+                Duration::from_secs(2),
+            ),
+        );
+        let mut client_session = client_result.expect("client policy agreement");
+        let mut server_session = server_result.expect("server policy agreement");
+
+        client_session.send(b"hello").await.expect("first frame");
+        assert!(matches!(
+            client_session.send(b"again").await,
+            Err(shph_core::ShphError::ResourceExhausted(_))
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), server_session.recv())
+                .await
+                .expect("receive timeout")
+                .expect("receive data"),
+            b"hello"
+        );
+        server_session.send(b"world").await.expect("reverse frame");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), client_session.recv())
+                .await
+                .expect("reverse receive timeout")
+                .expect("reverse receive"),
+            b"world"
+        );
+        drop(client_session);
+        drop(server_session);
+        client.close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn envelope_policy_quic_negotiates_and_discards_cover_frames() {
+        use crate::cover::CoverPolicy;
+        use crate::envelope_policy::{EnvelopeOffer, NegotiatedQuic};
+        use crate::phantom_one::PhantomOneConfig;
+
+        let (client, client_transport, server_transport) =
+            established_pair(HandshakeProfile::SecureDefault).await;
+        let transcript = client_transport.handshake.transcript_hash_hex.clone();
+        assert_eq!(transcript, server_transport.handshake.transcript_hash_hex);
+        let cover = CoverPolicy {
+            interval_ms: 100,
+            idle_timeout_ms: 2_000,
+            maximum_bytes: 4_096,
+            overhead_percent: 100,
+        };
+        let offer = EnvelopeOffer::new(
+            &transcript,
+            PhantomOneConfig::for_profile(ProfileTier::Medium),
+            1360,
+        )
+        .unwrap()
+        .with_cover(Some(cover))
+        .unwrap();
+        let (client_result, server_result) = tokio::join!(
+            NegotiatedQuic::establish_with_offer(
+                client_transport,
+                offer.clone(),
+                Duration::from_secs(2),
+            ),
+            NegotiatedQuic::establish_with_offer(server_transport, offer, Duration::from_secs(2),),
+        );
+        let mut client_session = client_result.expect("client policy agreement");
+        let mut server_session = server_result.expect("server policy agreement");
+
+        let first_payload = vec![0x5a; 512];
+        client_session
+            .send(&first_payload)
+            .await
+            .expect("initial application frame");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), server_session.recv())
+                .await
+                .expect("initial receive timeout")
+                .expect("initial receive"),
+            first_payload
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(client_session
+            .send_cover_if_due(false, false, false)
+            .await
+            .expect("cover scheduling"));
+        client_session
+            .send(b"after-cover")
+            .await
+            .expect("application frame after cover");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), server_session.recv())
+                .await
+                .expect("post-cover receive timeout")
+                .expect("post-cover receive"),
+            b"after-cover"
+        );
+
+        drop(client_session);
+        drop(server_session);
+        client.close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn envelope_policy_quic_accepts_cover_before_budgeted_application_data() {
+        let policy = crate::cover::CoverPolicy {
+            interval_ms: 100,
+            idle_timeout_ms: 1_000,
+            maximum_bytes: 4_096,
+            overhead_percent: 10,
+        };
+        let (client, mut sender, mut receiver) = negotiated_cover_pair(policy).await;
+
+        crate::envelope_policy::send_quic_cover_without_scheduler(&mut sender)
+            .await
+            .expect("send raw authenticated cover");
+        let payload = vec![0x5a; 1024];
+        sender.send(&payload).await.expect("send application data");
+        let result = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("receive timeout")
+            .expect("receive data after cover");
+        assert_eq!(result, payload);
+
+        drop(sender);
+        drop(receiver);
+        client.close(0u32.into(), b"test complete");
+        client.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn envelope_policy_quic_enforces_cumulative_cover_overhead() {
+        let policy = crate::cover::CoverPolicy {
+            interval_ms: 100,
+            idle_timeout_ms: 1_000,
+            maximum_bytes: 4_096,
+            overhead_percent: 10,
+        };
+        let (client, mut sender, mut receiver) = negotiated_cover_pair(policy).await;
+
+        let payload = vec![0x5a; 1024];
+        sender.send(&payload).await.expect("send application data");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("application receive timeout")
+                .expect("application receive"),
+            payload
+        );
+
+        crate::envelope_policy::send_quic_cover_without_scheduler(&mut sender)
+            .await
+            .expect("send first raw authenticated cover");
+        sender
+            .send(b"after-first-cover")
+            .await
+            .expect("send second application frame");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("post-cover receive timeout")
+                .expect("post-cover receive"),
+            b"after-first-cover"
+        );
+
+        crate::envelope_policy::send_quic_cover_without_scheduler(&mut sender)
+            .await
+            .expect("send second raw authenticated cover");
+        sender
+            .send(b"after-second-cover")
+            .await
+            .expect("send payload to evaluate cumulative cover budget");
+        let result = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("cumulative cover receive timeout");
+        assert!(matches!(result, Err(shph_core::ShphError::Protocol(_))));
+
+        drop(sender);
+        drop(receiver);
+        client.close(0u32.into(), b"test complete");
+        client.wait_idle().await;
     }
 
     #[tokio::test]

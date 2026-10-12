@@ -1,5 +1,38 @@
 # Changelog
 
+## [Unreleased]
+
+This source snapshot adds opt-in SHPH-native SNAP planning, Shroud 3, and a
+native multi-hop onion prototype. These experimental surfaces remain outside
+the release profile and still require additional operator, host, measurement,
+or independent-review evidence.
+
+- Added strict versioned SNAP profile validation and deterministic planning
+  for JSON and TOML, with `shph snap validate` / `shph snap plan`, persistent
+  session profile selection, bounded fallback policy, and SHPH peer pinning.
+  Local paired adapter tests do not establish external bridge/relay acceptance
+  or Python SierraNode session interoperability.
+
+- Added an adaptive `S3` v1 QUIC datagram envelope with caller-supplied
+  workload observations, bounded pacing, strict Shroud 2 separation, and a
+  deterministic test constructor reserved for tests/labs. Native Linux TUN
+  links are activated before route setup and their prior down state is restored
+  on cleanup.
+- Added nested TLS 1.3 onion paths over two or three explicitly pinned relays,
+  a standalone `shph-onion-relay` process with numeric target allowlists and
+  bounded per-circuit resources, and local authenticated SHPH loopback tests.
+- Added an isolated Linux namespace probe for a real adaptive Shroud 3 TUN
+  packet round trip and graceful control-plane cleanup; it is not two-host
+  release evidence.
+- Added support-boundary, release-readiness, fuzz-target, and operator design
+  documentation. No release version was assigned or changed.
+- Updated the locked `quinn-proto` dependency to `0.11.19` in all four Cargo
+  lockfiles after the October 12 RustSec re-scan found advisories affecting the
+  previously locked versions. The updated lockfiles pass warning and yanked
+  audits. Local builds against the exact upstream tag source pass; the
+  registry-backed locked build and package verification remain unverified
+  because the crate archive could not be fetched in this environment.
+
 ## [0.6.7-dev] - 2026-09-05
 
 This development snapshot refreshes the publication and validation workflow
@@ -737,9 +770,8 @@ or substantial design work and are tracked in `docs/RISK_MATRIX.md`.
 
 ### Changed
 - Workspace version `0.2.0` -> `0.3.0`.
-- `SECURITY.md` corrected: the "Ed25519-style handshake signatures" claim is now
-  genuinely true (previously aspirational), and the MITM threat row reflects the
-  real public-key signature.
+- `SECURITY.md` now documents the implemented Ed25519 handshake signatures;
+  the MITM threat row reflects the public-key signature check.
 
 ### Tests
 - +4 handshake authentication regression tests: real sig verifies; forged

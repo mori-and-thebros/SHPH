@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$OutputDirectory = "benchmark-runs/release-readiness",
+    [string]$SnapEvidenceDirectory,
     [switch]$AllowDirty,
     [switch]$AllowNetwork,
     [switch]$SkipBuild,
@@ -89,6 +90,16 @@ function Add-Result {
     }
 }
 
+function Get-ResultStatus {
+    param([Parameter(Mandatory = $true)][string]$Id)
+
+    $matchingResults = @($results | Where-Object { $_.id -eq $Id })
+    if ($matchingResults.Count -ne 1) {
+        return $null
+    }
+    return $matchingResults[0].status
+}
+
 function Invoke-Gate {
     param(
         [Parameter(Mandatory = $true)][string]$Id,
@@ -173,7 +184,14 @@ function Invoke-CargoGate {
 function Find-MsvcLinker {
     $linker = Get-Command link.exe -ErrorAction SilentlyContinue
     if ($linker) {
-        return $linker
+        $linkerPath = $linker.Source
+        if ([string]::IsNullOrWhiteSpace($linkerPath)) {
+            $linkerPath = $linker.Path
+        }
+        if (-not [string]::IsNullOrWhiteSpace($linkerPath) -and
+            (Test-Path -LiteralPath $linkerPath -PathType Leaf)) {
+            return Get-Item -LiteralPath $linkerPath
+        }
     }
 
     $installer = if (${env:ProgramFiles(x86)}) {
@@ -209,12 +227,62 @@ function Find-MsvcLinker {
     return $null
 }
 
+function Add-WindowsFuzzRuntimeToPath {
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        return $true
+    }
+
+    $runtimeName = "clang_rt.asan_dynamic-x86_64.dll"
+    foreach ($pathEntry in ($env:PATH -split ';')) {
+        if (-not [string]::IsNullOrWhiteSpace($pathEntry) -and
+            (Test-Path -LiteralPath (Join-Path $pathEntry $runtimeName))) {
+            return $true
+        }
+    }
+
+    $installer = if (${env:ProgramFiles(x86)}) {
+        Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    } else {
+        $null
+    }
+    $installations = @()
+    if ($installer -and (Test-Path -LiteralPath $installer)) {
+        $installations += @(& $installer -products * -property installationPath 2>$null)
+    }
+    $installations += @(
+        "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools",
+        "C:\Program Files\Microsoft Visual Studio\18\BuildTools"
+    )
+
+    foreach ($installation in ($installations | Where-Object { $_ } | Select-Object -Unique)) {
+        $msvcRoot = Join-Path ([string]$installation) "VC\Tools\MSVC"
+        if (-not (Test-Path -LiteralPath $msvcRoot)) {
+            continue
+        }
+        foreach ($toolset in (Get-ChildItem -LiteralPath $msvcRoot -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($archDir in @(
+                (Join-Path $toolset.FullName "bin\Hostx64\x64"),
+                (Join-Path $toolset.FullName "bin\Hostx86\x64")
+            )) {
+                if (Test-Path -LiteralPath (Join-Path $archDir $runtimeName)) {
+                    $env:PATH = "$archDir;$env:PATH"
+                    Write-RunLog "Windows AddressSanitizer runtime found and added to process PATH"
+                    return $true
+                }
+            }
+        }
+    }
+
+    return $false
+}
+
 Write-RunLog "# SHPH release-readiness collector"
 Write-RunLog "generated_utc=$((Get-Date).ToUniversalTime().ToString("o"))"
 Write-RunLog "repository=$repoRoot"
 Write-RunLog "allow_dirty=$AllowDirty"
 Write-RunLog "allow_network=$AllowNetwork"
 
+$snapWorkspaceClean = $false
 $gitCommand = Get-Command git -ErrorAction SilentlyContinue
 if ($null -eq $gitCommand) {
     Add-SyntheticResult -Id "git-available" -Status "FAIL" -Class "provenance" `
@@ -222,6 +290,7 @@ if ($null -eq $gitCommand) {
 } else {
     $dirtyLines = @(& git status --porcelain 2>&1)
     if ($dirtyLines.Count -eq 0) {
+        $snapWorkspaceClean = $true
         Add-SyntheticResult -Id "clean-tree" -Status "PASS" -Class "provenance" `
             -Command "git status --porcelain" -Detail "clean"
     } elseif ($AllowDirty) {
@@ -284,6 +353,22 @@ if ($null -eq $cargo) {
         Invoke-CargoGate -Id "workspace-tests" -Arguments (@("test", "--workspace", "--all-targets") + $cargoFlags)
     }
 
+    if ($SkipTests) {
+        Add-SyntheticResult -Id "snap-profile-tests" -Status "SKIP" -Class "required" `
+            -Command "cargo test -p shph-snap --locked" -Detail "explicitly skipped"
+        Add-SyntheticResult -Id "snap-adapter-tests" -Status "SKIP" -Class "required" `
+            -Command "cargo test -p shph-transport snap_adapter --locked" -Detail "explicitly skipped"
+        Add-SyntheticResult -Id "snap-paired-integration-tests" -Status "SKIP" -Class "required" `
+            -Command "cargo test -p shph-cli --test cli_snap --locked" -Detail "explicitly skipped"
+    } else {
+        Invoke-CargoGate -Id "snap-profile-tests" `
+            -Arguments (@("test", "-p", "shph-snap") + $cargoFlags)
+        Invoke-CargoGate -Id "snap-adapter-tests" `
+            -Arguments (@("test", "-p", "shph-transport", "snap_adapter") + $cargoFlags)
+        Invoke-CargoGate -Id "snap-paired-integration-tests" `
+            -Arguments (@("test", "-p", "shph-cli", "--test", "cli_snap") + $cargoFlags)
+    }
+
     if ($SkipBuild) {
         Add-SyntheticResult -Id "workspace-release-build" -Status "SKIP" -Class "required" `
             -Command "cargo build --workspace --release" -Detail "explicitly skipped"
@@ -318,17 +403,32 @@ if ($null -eq $cargo) {
         }
     }
 
+    $packageBuildGateId = if ($isWindowsHost) {
+        "windows-msvc-release-build"
+    } else {
+        "workspace-release-build"
+    }
+    $packageBuildStatus = Get-ResultStatus -Id $packageBuildGateId
+
     if ($SkipPackaging) {
         Add-SyntheticResult -Id "package-release" -Status "SKIP" -Class "required" `
             -Command "python scripts/package_release.py --binary target/release/shph(.exe)" `
             -Detail "explicitly skipped"
+    } elseif ($packageBuildStatus -ne "PASS") {
+        Add-SyntheticResult -Id "package-release" -Status "BLOCKED" -Class "required" `
+            -Command "python scripts/package_release.py --binary target/release/shph(.exe)" `
+            -Detail "blocked because $packageBuildGateId status is $packageBuildStatus; refusing to package a binary left from an earlier run"
     } elseif ($null -eq (Get-Command python -ErrorAction SilentlyContinue)) {
         Add-SyntheticResult -Id "package-release" -Status "SKIP" -Class "required" `
             -Command "python scripts/package_release.py --binary target/release/shph(.exe)" `
             -Detail "python is not installed"
     } else {
         $releaseBinaryName = if ($isWindowsHost) { "shph.exe" } else { "shph" }
-        $releaseBinary = Join-Path $repoRoot (Join-Path "target" (Join-Path "release" $releaseBinaryName))
+        if ($isWindowsHost) {
+            $releaseBinary = Join-Path $repoRoot (Join-Path "target" (Join-Path $msvcTarget (Join-Path "release" $releaseBinaryName)))
+        } else {
+            $releaseBinary = Join-Path $repoRoot (Join-Path "target" (Join-Path "release" $releaseBinaryName))
+        }
         if (-not (Test-Path -LiteralPath $releaseBinary -PathType Leaf)) {
             Add-SyntheticResult -Id "package-release" -Status "BLOCKED" -Class "required" `
                 -Command "python scripts/package_release.py --binary $releaseBinary" `
@@ -405,37 +505,44 @@ if ($null -eq $cargo) {
             -Detail "explicitly skipped"
     } else {
         $benchmarkBinaryName = if ($isWindowsHost) { "shph-benchmarks.exe" } else { "shph-benchmarks" }
-        $benchmarkCandidates = if ($isWindowsHost) {
-            @(
-                (Join-Path $repoRoot (Join-Path "benchmarks" (Join-Path "target" (Join-Path "x86_64-pc-windows-msvc" (Join-Path "release" $benchmarkBinaryName))))),
-                (Join-Path $repoRoot (Join-Path "benchmarks" (Join-Path "target" (Join-Path "release" $benchmarkBinaryName))))
-            )
+        $benchmarkBuildGateId = if ($isWindowsHost) {
+            "windows-msvc-benchmark-release-build"
         } else {
-            @(
-                (Join-Path $repoRoot (Join-Path "benchmarks" (Join-Path "target" (Join-Path "release" $benchmarkBinaryName))))
-            )
+            "benchmark-release-build"
         }
-        $benchmarkBinary = $benchmarkCandidates | Where-Object {
-            Test-Path -LiteralPath $_ -PathType Leaf
-        } | Select-Object -First 1
-        if ($null -eq $benchmarkBinary -or -not (Test-Path -LiteralPath $benchmarkBinary -PathType Leaf)) {
-            Add-SyntheticResult -Id "benchmark-smoke-secure-default" -Status "FAIL" -Class "required" `
+        $benchmarkBuildStatus = Get-ResultStatus -Id $benchmarkBuildGateId
+        if ($benchmarkBuildStatus -ne "PASS") {
+            Add-SyntheticResult -Id "benchmark-smoke-secure-default" -Status "BLOCKED" -Class "required" `
                 -Command "shph-benchmarks --profile secure-default --suite all" `
-                -Detail "benchmark executable is missing; checked: $($benchmarkCandidates -join ', ')"
+                -Detail "blocked because $benchmarkBuildGateId status is $benchmarkBuildStatus; stale binaries are not eligible"
             Add-SyntheticResult -Id "benchmark-smoke-classical-lab" -Status "BLOCKED" -Class "required" `
                 -Command "shph-benchmarks --profile classical-lab --suite all" `
-                -Detail "blocked because benchmark executable is missing"
+                -Detail "blocked because $benchmarkBuildGateId status is $benchmarkBuildStatus; stale binaries are not eligible"
         } else {
-            foreach ($benchmarkProfile in @("secure-default", "classical-lab")) {
-                $benchmarkId = "benchmark-smoke-$($benchmarkProfile -replace '-', '-')"
-                Invoke-Gate -Id $benchmarkId `
-                    -Command "$benchmarkBinary --profile $benchmarkProfile --suite all --iterations $BenchmarkIterations --frames $BenchmarkFrames" `
-                    -Action {
-                    & $benchmarkBinary `
-                        --profile $benchmarkProfile `
-                        --suite all `
-                        --iterations $BenchmarkIterations `
-                        --frames $BenchmarkFrames
+            $benchmarkBinary = if ($isWindowsHost) {
+                Join-Path $repoRoot (Join-Path "benchmarks" (Join-Path "target" (Join-Path $benchmarkMsvcTarget (Join-Path "release" $benchmarkBinaryName))))
+            } else {
+                Join-Path $repoRoot (Join-Path "benchmarks" (Join-Path "target" (Join-Path "release" $benchmarkBinaryName)))
+            }
+            if (-not (Test-Path -LiteralPath $benchmarkBinary -PathType Leaf)) {
+                Add-SyntheticResult -Id "benchmark-smoke-secure-default" -Status "FAIL" -Class "required" `
+                    -Command "shph-benchmarks --profile secure-default --suite all" `
+                    -Detail "benchmark executable is missing after $benchmarkBuildGateId passed: $benchmarkBinary"
+                Add-SyntheticResult -Id "benchmark-smoke-classical-lab" -Status "BLOCKED" -Class "required" `
+                    -Command "shph-benchmarks --profile classical-lab --suite all" `
+                    -Detail "blocked because the benchmark executable is missing after $benchmarkBuildGateId passed"
+            } else {
+                foreach ($benchmarkProfile in @("secure-default", "classical-lab")) {
+                    $benchmarkId = "benchmark-smoke-$($benchmarkProfile -replace '-', '-')"
+                    Invoke-Gate -Id $benchmarkId `
+                        -Command "$benchmarkBinary --profile $benchmarkProfile --suite all --iterations $BenchmarkIterations --frames $BenchmarkFrames" `
+                        -Action {
+                        & $benchmarkBinary `
+                            --profile $benchmarkProfile `
+                            --suite all `
+                            --iterations $BenchmarkIterations `
+                            --frames $BenchmarkFrames
+                    }
                 }
             }
         }
@@ -465,6 +572,10 @@ if ($null -eq $cargo) {
             Add-SyntheticResult -Id "fuzz-smoke" -Status "SKIP" -Class "required" `
                 -Command "rustup toolchain list" `
                 -Detail "$FuzzToolchain is not installed"
+        } elseif (-not (Add-WindowsFuzzRuntimeToPath)) {
+            Add-SyntheticResult -Id "fuzz-smoke" -Status "SKIP" -Class "required" `
+                -Command "locate clang_rt.asan_dynamic-x86_64.dll" `
+                -Detail "Windows AddressSanitizer runtime is unavailable"
         } else {
             $fuzzTargets = @(
                 "frame_decode",
@@ -472,7 +583,8 @@ if ($null -eq $cargo) {
                 "audit_record",
                 "replay_window",
                 "shroud2_datagram",
-                "phantom_one_envelope"
+                "phantom_one_envelope",
+                "snap_profile"
             )
             foreach ($fuzzTarget in $fuzzTargets) {
                 Invoke-Gate -Id "fuzz-smoke-$fuzzTarget" `
@@ -588,6 +700,102 @@ if ($SkipNative) {
 Add-SyntheticResult -Id "native-tun-two-host" -Status "SKIP" -Class "host" `
     -Command "native TUN packet and two-host campaign" `
     -Detail "requires a dedicated privileged Linux or Windows operator campaign; see docs/RELEASE_READINESS.md"
+if ([string]::IsNullOrWhiteSpace($SnapEvidenceDirectory)) {
+    foreach ($snapGate in @(
+        @{ Id = "snap-linux-adapter-acceptance"; Detail = "Linux acceptance manifest is missing" },
+        @{ Id = "snap-windows-adapter-acceptance"; Detail = "Windows acceptance manifest is missing" },
+        @{ Id = "snap-external-service-acceptance"; Detail = "operator-service acceptance manifest is missing" }
+    )) {
+        Add-SyntheticResult -Id $snapGate.Id -Status "SKIP" -Class "host" `
+            -Command "validate SNAP acceptance evidence bundle" -Detail $snapGate.Detail
+    }
+} else {
+    $snapEvidencePython = Get-Command python -ErrorAction SilentlyContinue
+    if ($null -eq $snapEvidencePython) {
+        foreach ($snapGateId in @(
+            "snap-linux-adapter-acceptance",
+            "snap-windows-adapter-acceptance",
+            "snap-external-service-acceptance"
+        )) {
+            Add-SyntheticResult -Id $snapGateId -Status "FAIL" -Class "host" `
+                -Command "validate SNAP acceptance evidence bundle" -Detail "Python is required to validate the supplied evidence bundle"
+        }
+    } else {
+        $snapHeadCommit = ""
+        if ($null -ne $gitCommand) {
+            try {
+                $snapHeadOutput = @(& git rev-parse HEAD 2>$null)
+                if ($LASTEXITCODE -eq 0 -and $snapHeadOutput.Count -gt 0) {
+                    $snapHeadCommit = ([string]$snapHeadOutput[0]).Trim()
+                }
+            } catch {
+                $snapHeadCommit = ""
+            }
+        }
+        $snapEvidenceArguments = @(
+            (Join-Path $scriptRoot "validate_snap_evidence.py"),
+            "--repository", $repoRoot,
+            "--commit", $snapHeadCommit,
+            "--evidence-directory", $SnapEvidenceDirectory
+        )
+        if ($snapWorkspaceClean) {
+            $snapEvidenceArguments += "--workspace-clean"
+        }
+        $snapEvidenceExitCode = 1
+        $snapEvidenceOutput = @()
+        try {
+            $snapEvidenceOutput = @(& $snapEvidencePython.Source @snapEvidenceArguments 2>&1)
+            $snapEvidenceExitCode = if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }
+        } catch {
+            $snapEvidenceExitCode = 1
+        }
+        $snapEvidenceReport = $null
+        if ($snapEvidenceExitCode -eq 0) {
+            try {
+                $snapEvidenceReport = ($snapEvidenceOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                $snapEvidenceReport = $null
+            }
+        }
+        if ($null -eq $snapEvidenceReport -or $null -eq $snapEvidenceReport.gates) {
+            foreach ($snapGateId in @(
+                "snap-linux-adapter-acceptance",
+                "snap-windows-adapter-acceptance",
+                "snap-external-service-acceptance"
+            )) {
+                Add-SyntheticResult -Id $snapGateId -Status "FAIL" -Class "host" `
+                    -Command "validate SNAP acceptance evidence bundle" -Detail "evidence validator failed or returned invalid output"
+            }
+        } else {
+            $snapExpectedGateIds = @(
+                "snap-linux-adapter-acceptance",
+                "snap-windows-adapter-acceptance",
+                "snap-external-service-acceptance"
+            )
+            $snapReturnedGateIds = @($snapEvidenceReport.gates | ForEach-Object { $_.id })
+            if ($snapReturnedGateIds.Count -ne $snapExpectedGateIds.Count -or
+                @($snapReturnedGateIds | Sort-Object -Unique).Count -ne $snapExpectedGateIds.Count -or
+                @($snapExpectedGateIds | Where-Object { $_ -notin $snapReturnedGateIds }).Count -gt 0) {
+                Add-SyntheticResult -Id "snap-evidence-validator" -Status "FAIL" -Class "host" `
+                    -Command "validate SNAP acceptance evidence bundle" -Detail "evidence validator returned incomplete or duplicate gates"
+            } else {
+                foreach ($snapGate in $snapEvidenceReport.gates) {
+                if ($snapGate.id -notin @(
+                    "snap-linux-adapter-acceptance",
+                    "snap-windows-adapter-acceptance",
+                    "snap-external-service-acceptance"
+                ) -or $snapGate.status -notin @("PASS", "FAIL", "SKIP")) {
+                    Add-SyntheticResult -Id "snap-evidence-validator" -Status "FAIL" -Class "host" `
+                        -Command "validate SNAP acceptance evidence bundle" -Detail "evidence validator returned an unknown gate"
+                    break
+                }
+                Add-SyntheticResult -Id $snapGate.id -Status $snapGate.status -Class "host" `
+                    -Command "validate SNAP acceptance evidence bundle" -Detail $snapGate.detail
+                }
+            }
+        }
+    }
+}
 
 $releaseEligible = -not $hasIncomplete
 $reportLines = @(

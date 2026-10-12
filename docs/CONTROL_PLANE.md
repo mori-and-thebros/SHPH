@@ -32,12 +32,17 @@ dry_run = true
     is rejected and nothing is changed.
 
 `underlay_bypass_cidrs` is an explicit safety control for full-tunnel sessions
-that use a local SOCKS5 underlay. Each listed endpoint route is installed on
+that use a remote SOCKS5 proxy. The configured proxy must use a literal IP
+address and the bypass list must contain exactly that endpoint as a `/32` or
+`/128` host route. Unrelated bypasses, DNS proxy names, broad prefixes, and a
+TUN route that shadows the host route are rejected. The route is installed on
 the current physical/default interface before SHPH installs the configured
 default route. On Windows, SHPH discovers the active default gateway and
 interface with the native networking cmdlets; on Linux, it derives them from
 `ip route get`. These routes are persisted with the other control-plane state
-and removed during `undo`, `down`, normal shutdown, or failed apply.
+and removed during `undo`, `down`, normal shutdown, or failed apply. A literal
+loopback proxy remains on the host's local route and does not need an explicit
+bypass entry.
 
 ## Commands
 
@@ -55,13 +60,13 @@ route. A typical two-node lab uses `10.250.0.1/30` on the listener and
 `10.250.0.2/30` on the connector, with a narrow `/32` route for the opposite
 endpoint before attempting broader routing.
 
-SHPH refuses a `0.0.0.0/0` or `::/0` route when the session uses a SOCKS5
-underlay unless `underlay_bypass_cidrs` is configured. Without an explicit
-route that keeps the proxy's upstream endpoint outside the TUN, the proxy
-connection can loop back into SHPH and disconnect the tunnel. Resolve the
-actual Quick Tunnel/Xray endpoint first, add its address as a `/32` (or `/128`)
-entry, and test the bypass before enabling full-tunnel routing. Keep the list
-current if the endpoint's address changes.
+SHPH refuses a `0.0.0.0/0` or `::/0` route for a remote SOCKS5 proxy unless an
+exact host bypass for its literal IP is configured. DNS proxy names are
+rejected for full-tunnel use because resolution can return multiple addresses
+or change between validation and connection setup. Pin the proxy to a stable
+literal address, add only its `/32` or `/128` bypass, and revalidate the route
+whenever the endpoint changes. A loopback SOCKS endpoint stays local through
+the host's local routing table; do not add unrelated bypass routes for it.
 
 ## Host leak containment
 
@@ -119,6 +124,10 @@ validation is published.
   plus family/interface context.
 - **Interface requirement:** a non-empty interface name is required to apply
   the control plane; an empty/blank name is rejected.
+- **Linux link lifecycle:** `shph up` records whether the opened native TUN link
+  was already up, activates it before applying addresses and routes, and restores
+  a previously-down link after control-plane rollback during normal shutdown or
+  startup failure.
 
 ## Graceful Shutdown
 

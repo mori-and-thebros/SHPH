@@ -102,6 +102,25 @@ parity, anonymity, or resistance to DPI/censorship.
 
 ## Focused Test Runs
 
+### SNAP profile and adapter tests
+
+Run the focused SNAP checks when changing profile parsing, planning, adapter
+framing, or session fallback behavior:
+
+```bash
+cargo test -p shph-snap --locked
+cargo test -p shph-transport snap_adapter --locked
+cargo test -p shph-cli --test cli_snap --locked
+python -B scripts/tests/test_snap_evidence.py
+```
+
+These checks cover profile policy and paired local SHPH sessions. They do not
+replace the adapter-specific Linux and Windows acceptance lane for TUN
+forwarding, routes, DNS, killswitch containment, or operator-owned external
+bridges and relays. Those results belong in the release evidence and remain
+`SKIP` when the required authorized host or service is unavailable; see
+`docs/RELEASE_READINESS.md`.
+
 ### CLI integration tests
 
 ```bash
@@ -240,7 +259,29 @@ Run the isolated native-TUN helpers explicitly as well:
 Those helpers must report `PASS` only after opening a real device inside an
 isolated namespace. WSL2 commonly reports `SKIP` because `/dev/net/tun`,
 `CAP_NET_ADMIN`, or `unshare` network capability is unavailable. A WSL2
-result never closes the native Linux or Windows TUN release gate.
+result never closes the native Linux or Windows TUN release gate. On
+2026-10-12, the current WSL2 environment passed the isolated AsyncFd TUN
+open/hold/close probe and three lifecycle samples. The probe exchanged no
+packets and changed no host routes, DNS, or firewall state; it does not prove
+two-host forwarding or killswitch containment.
+
+For packet-path evidence of the experimental adaptive Shroud 3 bridge, run:
+
+```bash
+./scripts/validate_shroud3_tun_namespace.sh
+```
+
+The helper creates client and server network namespaces inside a private user
+and mount namespace, connects them with a namespace-local veth underlay, and
+starts two local SHPH processes. It applies only namespace-local TUN addresses
+and `/32` routes, then verifies a UDP echo packet crosses both real TUN devices
+and the authenticated standards-QUIC Shroud 3 session. It sends SIGTERM and
+checks for normal process exit, removed interfaces, and removed control-plane
+state. A successful run writes a concise report under the ignored
+`benchmark-runs/` directory. This remains one-kernel evidence (including when
+the kernel is WSL2); it does not close native two-host, Windows, killswitch,
+DNS, or full-session performance gates. Missing namespace or TUN capabilities
+are reported as `SKIP`.
 
 ### Firewall and MSS hardening checks
 
@@ -567,10 +608,12 @@ workspace gates also passed:
 
 The outer WSL2 process exposes `/dev/net/tun` but lacks effective
 `CAP_NET_ADMIN`, so direct `TUNSETIFF` startup fails closed with an explicit
-permission error. The isolated namespace smoke and lifecycle scripts pass on
-this host; they validate only AsyncFd open/hold/close behavior and do not
-establish SHPH two-host packet forwarding or throughput evidence. The complete
-scope is in `docs/NATIVE_TUN_STATUS_2026-08-04.md`.
+permission error. The isolated namespace smoke and lifecycle scripts validate
+only AsyncFd open/hold/close behavior. The separate Shroud 3 namespace script
+now also exercises an authenticated packet round trip through two TUN devices;
+it remains one-kernel evidence and does not establish native two-host behavior
+or throughput. The complete scope is in
+`docs/NATIVE_TUN_STATUS_2026-08-04.md`.
 
 The earlier 20-sample lifecycle run reported `min=58,672,713 ns`,
 `p50=199,054,823 ns`, `p95=458,718,205 ns`, and `max=468,719,396 ns`; all

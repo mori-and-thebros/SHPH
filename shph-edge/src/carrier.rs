@@ -1,9 +1,10 @@
 use crate::{
     capability::ReplayCache,
     config::{validate_relay_path, EdgeConfig, DEFAULT_RELAY_PATH},
-    file::read_bounded_regular_file,
+    file::{read_bounded_private_file, read_bounded_regular_file},
     frontdoor::{
-        is_octet_stream, FrontDoor, FrontDoorDecision, FrontDoorResponse, CAPABILITY_HEADER,
+        is_octet_stream, FrontDoor, FrontDoorDecision, FrontDoorPreparation, FrontDoorResponse,
+        CAPABILITY_HEADER,
     },
     logging::{emit, MetadataEvent},
     relay::{
@@ -20,7 +21,7 @@ use hyper::{
     body::{Frame, Incoming},
     service::service_fn,
 };
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::{
     pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName},
     ClientConfig, RootCertStore, ServerConfig,
@@ -40,7 +41,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
-    time::{sleep, timeout},
+    time::{sleep, sleep_until, timeout, Instant},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_stream::wrappers::ReceiverStream;
@@ -52,9 +53,85 @@ const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_CAPABILITY_TOKEN_FILE_BYTES: usize = 64 * 1024;
 const MAX_CAPABILITY_TOKENS: usize = 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+#[cfg(feature = "http3")]
+const MAX_HTTP3_REMOTE_ADDRESSES: usize = 16;
 
 type ClientBody = StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>;
 type ClientSender = hyper::client::conn::http2::SendRequest<ClientBody>;
+
+#[derive(Clone)]
+struct Http2Activity(Arc<Mutex<Http2ActivityState>>);
+
+struct Http2ActivityState {
+    last_activity: Instant,
+    active_streams: usize,
+}
+
+struct Http2StreamGuard(Http2Activity);
+
+impl Http2Activity {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Http2ActivityState {
+            last_activity: Instant::now(),
+            active_streams: 0,
+        })))
+    }
+
+    fn touch(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_activity = Instant::now();
+    }
+
+    fn begin_stream(&self) -> Http2StreamGuard {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.last_activity = Instant::now();
+        state.active_streams += 1;
+        Http2StreamGuard(self.clone())
+    }
+
+    async fn wait_until_idle(&self, idle_timeout: Duration) {
+        loop {
+            let (last_activity, active_streams) = {
+                let state = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (state.last_activity, state.active_streams)
+            };
+            if active_streams > 0 {
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            sleep_until(last_activity + idle_timeout).await;
+            let state = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.active_streams == 0
+                && Instant::now().saturating_duration_since(state.last_activity) >= idle_timeout
+            {
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for Http2StreamGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+             .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_streams = state.active_streams.saturating_sub(1);
+        state.last_activity = Instant::now();
+    }
+}
 
 struct Http2Pool {
     config: Arc<EdgeConfig>,
@@ -301,6 +378,7 @@ impl Http2Pool {
         let max_streams = self.config.limits.max_streams_per_connection;
         let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
         builder
+            .timer(TokioTimer::new())
             .initial_max_send_streams(max_streams as usize)
             .max_concurrent_streams(max_streams);
         let (sender, connection) = timeout(
@@ -347,12 +425,18 @@ async fn send_frame_with_cancel(
     data: Bytes,
     idle_timeout: Duration,
     cancellation: &CancellationToken,
+    activity: Option<&Http2Activity>,
 ) -> Result<(), RelayError> {
     tokio::select! {
         _ = cancellation.cancelled() => Err(RelayError::Cancelled),
         result = timeout(idle_timeout, sender.send(Ok(Frame::data(data)))) => {
             match result {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(())) => {
+                    if let Some(activity) = activity {
+                        activity.touch();
+                    }
+                    Ok(())
+                },
                 Ok(Err(_)) => Err(RelayError::Cancelled),
                 Err(_) => Err(RelayError::IdleTimeout),
             }
@@ -470,6 +554,30 @@ fn response_for_fallback(fallback: FrontDoorResponse) -> Response<BoxBody> {
         .expect("static fallback response")
 }
 
+async fn decide_with_replay(
+    front_door: &FrontDoor,
+    method: &http::Method,
+    uri: &Uri,
+    headers: &http::HeaderMap,
+    replay: &tokio::sync::Mutex<ReplayCache>,
+    shutdown: &CancellationToken,
+) -> FrontDoorDecision {
+    if shutdown.is_cancelled() {
+        return FrontDoorDecision::Fallback(FrontDoorResponse::service_unavailable());
+    }
+    let verified = match front_door.prepare(method, uri, headers) {
+        FrontDoorPreparation::Verified(verified) => verified,
+        FrontDoorPreparation::Fallback(decision) => return decision,
+    };
+    let mut replay = tokio::select! {
+        _ = shutdown.cancelled() => {
+            return FrontDoorDecision::Fallback(FrontDoorResponse::service_unavailable());
+        }
+        replay = replay.lock() => replay,
+    };
+    front_door.commit_verified(verified, &mut replay)
+}
+
 fn validate_content_length(headers: &http::HeaderMap, max_bytes: u64) -> Result<(), StatusCode> {
     let mut declared = None;
     for value in headers.get_all(header::CONTENT_LENGTH).iter() {
@@ -486,6 +594,16 @@ fn validate_content_length(headers: &http::HeaderMap, max_bytes: u64) -> Result<
         }
         declared = Some(parsed);
     }
+    Ok(())
+}
+
+fn add_bounded_stream_bytes(total: &mut u64, bytes: usize, limit: u64) -> Result<(), RelayError> {
+    let bytes = u64::try_from(bytes).map_err(|_| RelayError::LimitExceeded)?;
+    let updated = total.checked_add(bytes).ok_or(RelayError::LimitExceeded)?;
+    if updated > limit {
+        return Err(RelayError::LimitExceeded);
+    }
+    *total = updated;
     Ok(())
 }
 
@@ -507,6 +625,11 @@ pub async fn serve_http2_until(
     config
         .validate()
         .map_err(|error| CarrierError::Http(format!("invalid edge configuration: {error}")))?;
+    if front_door.replay_capacity() != config.limits.replay_capacity {
+        return Err(CarrierError::Http(
+            "front-door replay capacity does not match edge configuration".into(),
+        ));
+    }
     let (cert, key) = config
         .tls
         .cert
@@ -519,10 +642,7 @@ pub async fn serve_http2_until(
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let listener = TcpListener::bind(config.listen).await?;
-    let replay = Arc::new(Mutex::new(
-        ReplayCache::new(config.limits.replay_capacity)
-            .map_err(|_| CarrierError::Http("invalid replay capacity".into()))?,
-    ));
+    let replay = front_door.replay_cache();
     let active = Arc::new(tokio::sync::Semaphore::new(config.limits.max_connections));
     let mut tasks = JoinSet::new();
     loop {
@@ -577,7 +697,7 @@ async fn serve_http2_connection(
     stream: TcpStream,
     config: Arc<EdgeConfig>,
     front_door: Arc<FrontDoor>,
-    replay: Arc<Mutex<ReplayCache>>,
+    replay: Arc<tokio::sync::Mutex<ReplayCache>>,
     tls_acceptor: TlsAcceptor,
     shutdown: CancellationToken,
 ) -> Result<(), CarrierError> {
@@ -603,7 +723,7 @@ async fn serve_http2_io<I>(
     io: TokioIo<I>,
     config: Arc<EdgeConfig>,
     front_door: Arc<FrontDoor>,
-    replay: Arc<Mutex<ReplayCache>>,
+    replay: Arc<tokio::sync::Mutex<ReplayCache>>,
     shutdown: CancellationToken,
 ) -> Result<(), CarrierError>
 where
@@ -612,19 +732,54 @@ where
     let max_streams = config.limits.max_streams_per_connection;
     let service_config = config.clone();
     let request_shutdown = shutdown.clone();
+    let activity = Http2Activity::new();
+    let service_activity = activity.clone();
     let service = service_fn(move |request: Request<Incoming>| {
         let config = service_config.clone();
         let front_door = front_door.clone();
         let replay = replay.clone();
         let shutdown = request_shutdown.clone();
-        async move { handle_http2_request(request, config, front_door, replay, shutdown).await }
+        let activity = service_activity.clone();
+        activity.touch();
+        let stream_guard = activity.begin_stream();
+        async move {
+            let response = handle_http2_request(
+                request,
+                config,
+                front_door,
+                replay,
+                shutdown,
+                activity.clone(),
+            )
+            .await?;
+            Ok::<_, Infallible>(response.map(move |body| {
+                let body_activity = activity;
+                body.map_frame(move |frame| {
+                    body_activity.touch();
+                    let _ = &stream_guard;
+                    frame
+                })
+                .boxed()
+            }))
+        }
     });
-    let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+    let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+    builder
+        .timer(TokioTimer::new())
         .max_concurrent_streams(max_streams)
-        .serve_connection(io, service);
+        .keep_alive_interval(Some(Duration::from_secs(15)))
+        .keep_alive_timeout(Duration::from_secs(10));
+    let connection = builder.serve_connection(io, service);
+    tokio::pin!(connection);
+    let idle_timeout = config.http2_idle_timeout();
     let result = tokio::select! {
+        biased;
         _ = shutdown.cancelled() => Ok(()),
-        result = connection => result.map_err(|error| CarrierError::Http(error.to_string())),
+        result = &mut connection => result.map_err(|error| CarrierError::Http(error.to_string())),
+        _ = activity.wait_until_idle(idle_timeout) => {
+            tracing::debug!(carrier = "h2", "idle connection closed");
+            Ok(())
+        },
     };
     shutdown.cancel();
     result
@@ -634,8 +789,9 @@ async fn handle_http2_request(
     request: Request<Incoming>,
     config: Arc<EdgeConfig>,
     front_door: Arc<FrontDoor>,
-    replay: Arc<Mutex<ReplayCache>>,
+    replay: Arc<tokio::sync::Mutex<ReplayCache>>,
     connection_shutdown: CancellationToken,
+    activity: Http2Activity,
 ) -> Result<Response<BoxBody>, Infallible> {
     if connection_shutdown.is_cancelled() {
         return Ok(response_for_fallback(FrontDoorResponse {
@@ -647,20 +803,15 @@ async fn handle_http2_request(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
-    let decision = {
-        let mut cache = match replay.lock() {
-            Ok(cache) => cache,
-            Err(_) => {
-                tracing::error!(carrier = "h2", "replay cache lock poisoned");
-                return Ok(response_for_fallback(FrontDoorResponse {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
-                    content_type: "text/plain; charset=utf-8",
-                    body: b"temporarily unavailable\n",
-                }));
-            }
-        };
-        front_door.decide(&method, &uri, &headers, &mut cache)
-    };
+    let decision = decide_with_replay(
+        &front_door,
+        &method,
+        &uri,
+        &headers,
+        replay.as_ref(),
+        &connection_shutdown,
+    )
+    .await;
     let FrontDoorDecision::Relay = decision else {
         return Ok(response_for_fallback(match decision {
             FrontDoorDecision::Fallback(response) => response,
@@ -711,6 +862,8 @@ async fn handle_http2_request(
     let request_cancellation = cancellation.clone();
     let backend_cancellation = cancellation.clone();
     let response_cancellation = cancellation.clone();
+    let request_activity = activity.clone();
+    let response_activity = activity.clone();
     tokio::spawn(async move {
         let (mut backend_read, mut backend_write) = tokio::io::split(backend);
         let (mut request_body, mut response_body) = tokio::io::duplex(16 * 1024);
@@ -725,6 +878,7 @@ async fn handle_http2_request(
                     frame.map_err(|_| RelayError::IdleTimeout)?
                 }
             } {
+                request_activity.touch();
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(_) => {
@@ -740,12 +894,7 @@ async fn handle_http2_request(
                         "request trailers are not supported",
                     ))
                 })?;
-                total = total
-                    .checked_add(data.len() as u64)
-                    .ok_or(RelayError::LimitExceeded)?;
-                if total > max_bytes {
-                    return Err(RelayError::LimitExceeded);
-                }
+                add_bounded_stream_bytes(&mut total, data.len(), max_bytes)?;
                 write_all_with_cancel(
                     &mut request_body,
                     &data,
@@ -793,6 +942,7 @@ async fn handle_http2_request(
                     Bytes::copy_from_slice(&buf[..read]),
                     idle_timeout,
                     &response_cancellation,
+                    Some(&response_activity),
                 )
                 .await?;
             }
@@ -934,6 +1084,7 @@ async fn handle_socks5(
                 Bytes::copy_from_slice(&buf[..read]),
                 idle_timeout,
                 &producer_cancellation,
+                None,
             )
             .await?;
         }
@@ -1011,12 +1162,7 @@ async fn handle_socks5(
                     "response trailers are not supported",
                 ))
             })?;
-            total = total
-                .checked_add(data.len() as u64)
-                .ok_or(RelayError::LimitExceeded)?;
-            if total > config.limits.max_stream_bytes {
-                return Err(RelayError::LimitExceeded);
-            }
+            add_bounded_stream_bytes(&mut total, data.len(), config.limits.max_stream_bytes)?;
             write_all_with_cancel(&mut local_write, &data, idle_timeout, &copy_cancellation)
                 .await?;
         }
@@ -1203,27 +1349,33 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, CarrierError>
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, CarrierError> {
-    let pem = read_bounded_pem_file(path)?;
+    let pem = read_bounded_private_pem_file(path)?;
     PrivateKeyDer::from_pem_slice(&pem).map_err(|error| CarrierError::Tls(error.to_string()))
 }
 
 fn read_bounded_pem_file(path: &Path) -> Result<Vec<u8>, CarrierError> {
-    read_bounded_regular_file(path, MAX_PEM_FILE_BYTES).map_err(|error| {
-        if error.kind() == io::ErrorKind::InvalidInput
-            && error.to_string() == "file exceeds the configured size limit"
-        {
-            CarrierError::Tls(format!(
-                "PEM file exceeds {} byte limit",
-                MAX_PEM_FILE_BYTES
-            ))
-        } else if error.kind() == io::ErrorKind::InvalidInput
-            && error.to_string() == "path must reference a regular file"
-        {
-            CarrierError::Tls("PEM path must be a regular file".into())
-        } else {
-            CarrierError::Io(error)
-        }
-    })
+    read_bounded_regular_file(path, MAX_PEM_FILE_BYTES).map_err(map_pem_file_error)
+}
+
+fn read_bounded_private_pem_file(path: &Path) -> Result<Vec<u8>, CarrierError> {
+    read_bounded_private_file(path, MAX_PEM_FILE_BYTES).map_err(map_pem_file_error)
+}
+
+fn map_pem_file_error(error: io::Error) -> CarrierError {
+    if error.kind() == io::ErrorKind::InvalidInput
+        && error.to_string() == "file exceeds the configured size limit"
+    {
+        CarrierError::Tls(format!(
+            "PEM file exceeds {} byte limit",
+            MAX_PEM_FILE_BYTES
+        ))
+    } else if error.kind() == io::ErrorKind::InvalidInput
+        && error.to_string() == "path must reference a regular file"
+    {
+        CarrierError::Tls("PEM path must be a regular file".into())
+    } else {
+        CarrierError::Io(error)
+    }
 }
 
 fn client_tls(ca_path: &Path, server_name: &str) -> Result<ClientConfig, CarrierError> {
@@ -1310,6 +1462,11 @@ pub async fn serve_http3_until(
     config
         .validate()
         .map_err(|error| CarrierError::Http(format!("invalid edge configuration: {error}")))?;
+    if front_door.replay_capacity() != config.limits.replay_capacity {
+        return Err(CarrierError::Http(
+            "front-door replay capacity does not match edge configuration".into(),
+        ));
+    }
     let (cert, key) = config
         .tls
         .cert
@@ -1320,10 +1477,7 @@ pub async fn serve_http3_until(
         })?;
     let server_config = quic_server_config(cert, key, config.limits.max_streams_per_connection)?;
     let endpoint = quinn::Endpoint::server(server_config, config.listen)?;
-    let replay = Arc::new(Mutex::new(
-        ReplayCache::new(config.limits.replay_capacity)
-            .map_err(|_| CarrierError::Http("invalid replay capacity".into()))?,
-    ));
+    let replay = front_door.replay_cache();
     let active = Arc::new(tokio::sync::Semaphore::new(config.limits.max_connections));
     let mut tasks = JoinSet::new();
 
@@ -1381,7 +1535,7 @@ async fn serve_http3_connection(
     incoming: quinn::Incoming,
     config: Arc<EdgeConfig>,
     front_door: Arc<FrontDoor>,
-    replay: Arc<Mutex<ReplayCache>>,
+    replay: Arc<tokio::sync::Mutex<ReplayCache>>,
     shutdown: CancellationToken,
 ) -> Result<(), CarrierError> {
     let connection = tokio::select! {
@@ -1447,7 +1601,7 @@ async fn handle_http3_request<S>(
     mut stream: h3::server::RequestStream<S, Bytes>,
     config: Arc<EdgeConfig>,
     front_door: Arc<FrontDoor>,
-    replay: Arc<Mutex<ReplayCache>>,
+    replay: Arc<tokio::sync::Mutex<ReplayCache>>,
     shutdown: CancellationToken,
 ) -> Result<(), CarrierError>
 where
@@ -1458,12 +1612,15 @@ where
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
-    let decision = {
-        let mut cache = replay
-            .lock()
-            .map_err(|_| CarrierError::Http("replay cache lock poisoned".into()))?;
-        front_door.decide(&method, &uri, &headers, &mut cache)
-    };
+    let decision = decide_with_replay(
+        &front_door,
+        &method,
+        &uri,
+        &headers,
+        replay.as_ref(),
+        &shutdown,
+    )
+    .await;
     let FrontDoorDecision::Relay = decision else {
         let fallback = match decision {
             FrontDoorDecision::Fallback(response) => response,
@@ -1541,12 +1698,7 @@ where
                 .map_err(|error| CarrierError::Http(error.to_string()))?;
             let Some(mut data) = data else { break };
             let size = data.remaining();
-            total = total
-                .checked_add(size as u64)
-                .ok_or(RelayError::LimitExceeded)?;
-            if total > max_bytes {
-                return Err(CarrierError::Relay(RelayError::LimitExceeded));
-            }
+            add_bounded_stream_bytes(&mut total, size, max_bytes)?;
             let bytes = data.copy_to_bytes(size);
             timeout(idle_timeout, backend_write.write_all(&bytes))
                 .await
@@ -1741,6 +1893,34 @@ pub async fn open_socks5_http3_until(
 }
 
 #[cfg(feature = "http3")]
+struct Http3ClientDriver<T> {
+    endpoint: quinn::Endpoint,
+    driver: Option<tokio::task::JoinHandle<T>>,
+}
+
+#[cfg(feature = "http3")]
+impl<T> Http3ClientDriver<T> {
+    async fn stop(mut self, reason: &[u8]) {
+        self.endpoint.close(quinn::VarInt::from_u32(0), reason);
+        if let Some(driver) = self.driver.take() {
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+}
+
+#[cfg(feature = "http3")]
+impl<T> Drop for Http3ClientDriver<T> {
+    fn drop(&mut self) {
+        self.endpoint
+            .close(quinn::VarInt::from_u32(0), b"client task dropped");
+        if let Some(driver) = &self.driver {
+            driver.abort();
+        }
+    }
+}
+
+#[cfg(feature = "http3")]
 async fn handle_socks5_http3(
     mut local: TcpStream,
     config: Arc<EdgeConfig>,
@@ -1764,30 +1944,25 @@ async fn handle_socks5_http3(
     let authority = edge_uri.authority().ok_or(CarrierError::InvalidUri)?;
     let host = authority.host().to_owned();
     let port = authority.port_u16().unwrap_or(443);
-    let remote = timeout(
+    let remote_addresses = timeout(
         config.backend_connect_timeout(),
         tokio::net::lookup_host((host.as_str(), port)),
     )
     .await
     .map_err(|_| CarrierError::Timeout("HTTP/3 DNS lookup"))??
-    .next()
-    .ok_or_else(|| CarrierError::Http("edge host did not resolve".into()))?;
-    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-    endpoint.set_default_client_config(quic_client_config(ca, &config.tls.server_name)?);
-    let connecting = endpoint
-        .connect(remote, &config.tls.server_name)
-        .map_err(|error| CarrierError::Http(error.to_string()))?;
-    let quic = timeout(config.tls_handshake_timeout(), connecting)
-        .await
-        .map_err(|_| CarrierError::Timeout("HTTP/3 QUIC handshake"))?
-        .map_err(|error| CarrierError::Http(error.to_string()))?;
+    .collect::<Vec<_>>();
+    let (endpoint, quic) = connect_http3_quic(
+        remote_addresses,
+        ca,
+        &config.tls.server_name,
+        config.tls_handshake_timeout(),
+    )
+    .await?;
     let (mut h3_connection, mut send_request) = h3::client::builder()
         .max_field_section_size(16 * 1024)
         .build(h3_quinn::Connection::new(quic))
         .await
         .map_err(|error| CarrierError::Http(error.to_string()))?;
-    let driver =
-        tokio::spawn(async move { std::future::poll_fn(|cx| h3_connection.poll_close(cx)).await });
     let request = Request::builder()
         .method("POST")
         .uri(edge_uri)
@@ -1795,13 +1970,28 @@ async fn handle_socks5_http3(
         .header(CAPABILITY_HEADER, token)
         .body(())
         .map_err(|error| CarrierError::Http(error.to_string()))?;
-    let stream = timeout(
+    let driver =
+        tokio::spawn(async move { std::future::poll_fn(|cx| h3_connection.poll_close(cx)).await });
+    let client_driver = Http3ClientDriver {
+        endpoint,
+        driver: Some(driver),
+    };
+    let stream = match timeout(
         config.backend_connect_timeout(),
         send_request.send_request(request),
     )
     .await
-    .map_err(|_| CarrierError::Timeout("HTTP/3 request setup"))?
-    .map_err(|error| CarrierError::Http(error.to_string()))?;
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            client_driver.stop(b"request setup failed").await;
+            return Err(CarrierError::Http(error.to_string()));
+        }
+        Err(_) => {
+            client_driver.stop(b"request setup timed out").await;
+            return Err(CarrierError::Timeout("HTTP/3 request setup"));
+        }
+    };
     let (mut send, mut recv) = stream.split();
     let idle_timeout = config.backend_idle_timeout();
     let max_bytes = config.limits.max_stream_bytes;
@@ -1850,12 +2040,14 @@ async fn handle_socks5_http3(
         timeout(idle_timeout, write_socks5_reply(&mut local_write, 0x00))
             .await
             .map_err(|_| CarrierError::Timeout("SOCKS5 success reply"))??;
+        let mut total = 0u64;
         while let Some(mut data) = timeout(idle_timeout, recv.recv_data())
             .await
             .map_err(|_| CarrierError::Timeout("HTTP/3 response body"))?
             .map_err(|error| CarrierError::Http(error.to_string()))?
         {
             let size = data.remaining();
+            add_bounded_stream_bytes(&mut total, size, max_bytes)?;
             let bytes = data.copy_to_bytes(size);
             timeout(idle_timeout, local_write.write_all(&bytes))
                 .await
@@ -1870,16 +2062,352 @@ async fn handle_socks5_http3(
         _ = shutdown.cancelled() => Err(CarrierError::Relay(RelayError::Cancelled)),
         result = async { tokio::try_join!(local_to_edge, edge_to_local) } => result.map(|_| ()),
     };
-    endpoint.close(quinn::VarInt::from_u32(0), b"done");
-    driver.abort();
-    let _ = driver.await;
+    client_driver.stop(b"done").await;
     result
+}
+
+#[cfg(feature = "http3")]
+fn prioritize_http3_remote_addresses(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut prioritized = Vec::new();
+    for prefer_ipv4 in [true, false] {
+        for address in &addresses {
+            if address.is_ipv4() == prefer_ipv4 && !prioritized.contains(address) {
+                prioritized.push(*address);
+                if prioritized.len() == MAX_HTTP3_REMOTE_ADDRESSES {
+                    return prioritized;
+                }
+            }
+        }
+    }
+    prioritized
+}
+
+#[cfg(feature = "http3")]
+fn http3_client_bind_address(remote: SocketAddr) -> SocketAddr {
+    match remote {
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
+    }
+}
+
+#[cfg(feature = "http3")]
+async fn connect_http3_quic(
+    addresses: Vec<SocketAddr>,
+    ca: &Path,
+    server_name: &str,
+    handshake_timeout: Duration,
+) -> Result<(quinn::Endpoint, quinn::Connection), CarrierError> {
+    let candidates = prioritize_http3_remote_addresses(addresses);
+    if candidates.is_empty() {
+        return Err(CarrierError::Http("edge host did not resolve".into()));
+    }
+    let client_config = quic_client_config(ca, server_name)?;
+    let deadline = tokio::time::Instant::now() + handshake_timeout;
+    let mut last_error = CarrierError::Http("all HTTP/3 addresses failed".into());
+
+    for remote in candidates {
+        let mut endpoint = match quinn::Endpoint::client(http3_client_bind_address(remote)) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                last_error = CarrierError::Io(error);
+                continue;
+            }
+        };
+        endpoint.set_default_client_config(client_config.clone());
+        let connecting = match endpoint.connect(remote, server_name) {
+            Ok(connecting) => connecting,
+            Err(error) => {
+                endpoint.close(quinn::VarInt::from_u32(0), b"connect setup failed");
+                last_error = CarrierError::Http(error.to_string());
+                continue;
+            }
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            endpoint.close(quinn::VarInt::from_u32(0), b"connect timed out");
+            return Err(CarrierError::Timeout("HTTP/3 QUIC handshake"));
+        }
+        match timeout(remaining, connecting).await {
+            Ok(Ok(connection)) => return Ok((endpoint, connection)),
+            Ok(Err(error)) => {
+                endpoint.close(quinn::VarInt::from_u32(0), b"connect attempt failed");
+                last_error = CarrierError::Http(error.to_string());
+            }
+            Err(_) => {
+                endpoint.close(quinn::VarInt::from_u32(0), b"connect timed out");
+                return Err(CarrierError::Timeout("HTTP/3 QUIC handshake"));
+            }
+        }
+    }
+
+    Err(last_error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::{CapabilityClaims, CapabilityIssuer};
     use std::time::Duration;
+
+    fn signed_capability_headers(issuer: &CapabilityIssuer, nonce: [u8; 16]) -> http::HeaderMap {
+        let now = crate::capability::unix_now().expect("clock");
+        let token = issuer
+            .issue(&CapabilityClaims::new("edge-a", now, now + 60, nonce))
+            .expect("token");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(CAPABILITY_HEADER, token.parse().expect("header value"));
+        headers
+    }
+
+    fn spawn_frontdoor_decision(
+        front_door: Arc<FrontDoor>,
+        replay: Arc<tokio::sync::Mutex<ReplayCache>>,
+        headers: http::HeaderMap,
+    ) -> tokio::task::JoinHandle<FrontDoorDecision> {
+        tokio::spawn(async move {
+            let method = http::Method::POST;
+            let uri = H2_PATH.parse().expect("URI");
+            let shutdown = CancellationToken::new();
+            decide_with_replay(
+                &front_door,
+                &method,
+                &uri,
+                &headers,
+                replay.as_ref(),
+                &shutdown,
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn shared_frontdoor_replay_state_rejects_cross_carrier_replay() {
+        let (issuer, _) = CapabilityIssuer::generate(Duration::from_secs(300)).expect("issuer");
+        let verifier = crate::capability::CapabilityVerifier::new(
+            issuer.public_key(),
+            "edge-a",
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .expect("verifier");
+        let front_door = Arc::new(FrontDoor::new(verifier, 4096));
+        let h2_replay = front_door.replay_cache();
+        let h3_replay = front_door.replay_cache();
+        assert!(Arc::ptr_eq(&h2_replay, &h3_replay));
+
+        let headers = signed_capability_headers(&issuer, [7; 16]);
+        let method = http::Method::POST;
+        let uri = H2_PATH.parse().expect("URI");
+        let shutdown = CancellationToken::new();
+        assert_eq!(
+            decide_with_replay(
+                &front_door,
+                &method,
+                &uri,
+                &headers,
+                h2_replay.as_ref(),
+                &shutdown,
+            )
+            .await,
+            FrontDoorDecision::Relay
+        );
+        assert_eq!(
+            decide_with_replay(
+                &front_door,
+                &method,
+                &uri,
+                &headers,
+                h3_replay.as_ref(),
+                &shutdown,
+            )
+            .await,
+            FrontDoorDecision::Fallback(FrontDoorResponse::unauthorized())
+        );
+    }
+
+    #[test]
+    fn bounded_stream_accounting_enforces_limit_and_overflow() {
+        let mut total = 0;
+        add_bounded_stream_bytes(&mut total, 10, 10).expect("exact limit");
+        assert_eq!(total, 10);
+        assert!(matches!(
+            add_bounded_stream_bytes(&mut total, 1, 10),
+            Err(RelayError::LimitExceeded)
+        ));
+        assert_eq!(total, 10);
+        total = u64::MAX;
+        assert!(matches!(
+            add_bounded_stream_bytes(&mut total, 1, u64::MAX),
+            Err(RelayError::LimitExceeded)
+        ));
+        assert_eq!(total, u64::MAX);
+    }
+
+    #[cfg(feature = "http3")]
+    #[test]
+    fn http3_address_selection_prefers_ipv4_but_supports_ipv6_only() {
+        let ipv6: SocketAddr = "[2001:db8::1]:443".parse().expect("IPv6 address");
+        let ipv4: SocketAddr = "192.0.2.1:443".parse().expect("IPv4 address");
+
+        assert_eq!(
+            prioritize_http3_remote_addresses(vec![ipv6, ipv4]),
+            vec![ipv4, ipv6]
+        );
+        assert_eq!(
+            http3_client_bind_address(ipv4),
+            "0.0.0.0:0".parse().unwrap()
+        );
+        assert_eq!(http3_client_bind_address(ipv6), "[::]:0".parse().unwrap());
+        assert!(prioritize_http3_remote_addresses(Vec::new()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_lock_waits_after_verification_and_serializes_duplicates() {
+        let (issuer, _) = CapabilityIssuer::generate(Duration::from_secs(300)).expect("issuer");
+        let (other_issuer, _) =
+            CapabilityIssuer::generate(Duration::from_secs(300)).expect("other issuer");
+        let verifier = crate::capability::CapabilityVerifier::new(
+            issuer.public_key(),
+            "edge-a",
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .expect("verifier");
+        let front_door = Arc::new(FrontDoor::new(verifier, 4096));
+        let replay = Arc::new(tokio::sync::Mutex::new(
+            ReplayCache::new(4).expect("replay cache"),
+        ));
+        let held = replay.lock().await;
+
+        let invalid = spawn_frontdoor_decision(
+            front_door.clone(),
+            replay.clone(),
+            signed_capability_headers(&other_issuer, [1; 16]),
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), invalid)
+                .await
+                .expect("invalid signature should not wait for replay lock")
+                .expect("request task"),
+            FrontDoorDecision::Fallback(FrontDoorResponse::unauthorized())
+        );
+
+        let first = spawn_frontdoor_decision(
+            front_door.clone(),
+            replay.clone(),
+            signed_capability_headers(&issuer, [2; 16]),
+        );
+        let second = spawn_frontdoor_decision(
+            front_door.clone(),
+            replay.clone(),
+            signed_capability_headers(&issuer, [3; 16]),
+        );
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        drop(held);
+
+        for request in [first, second] {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), request)
+                    .await
+                    .expect("valid request should leave replay-lock wait")
+                    .expect("request task"),
+                FrontDoorDecision::Relay
+            );
+        }
+
+        let duplicate_headers = signed_capability_headers(&issuer, [4; 16]);
+        let held = replay.lock().await;
+        let duplicate_first = spawn_frontdoor_decision(
+            front_door.clone(),
+            replay.clone(),
+            duplicate_headers.clone(),
+        );
+        let duplicate_second =
+            spawn_frontdoor_decision(front_door.clone(), replay.clone(), duplicate_headers);
+        tokio::task::yield_now().await;
+        drop(held);
+
+        let outcomes = [
+            tokio::time::timeout(Duration::from_secs(1), duplicate_first)
+                .await
+                .expect("first duplicate request should finish")
+                .expect("request task"),
+            tokio::time::timeout(Duration::from_secs(1), duplicate_second)
+                .await
+                .expect("second duplicate request should finish")
+                .expect("request task"),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, FrontDoorDecision::Relay))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    **outcome == FrontDoorDecision::Fallback(FrontDoorResponse::unauthorized())
+                })
+                .count(),
+            1
+        );
+        assert_eq!(replay.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_requests_skip_verification_and_replay_commit() {
+        let (issuer, _) = CapabilityIssuer::generate(Duration::from_secs(300)).expect("issuer");
+        let verifier = crate::capability::CapabilityVerifier::new(
+            issuer.public_key(),
+            "edge-a",
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .expect("verifier");
+        let front_door = Arc::new(
+            FrontDoor::new(verifier, 4096)
+                .with_max_verifications_per_second(1)
+                .expect("verification limit"),
+        );
+        let replay = Arc::new(tokio::sync::Mutex::new(
+            ReplayCache::new(2).expect("replay cache"),
+        ));
+        let headers = signed_capability_headers(&issuer, [5; 16]);
+        let method = http::Method::POST;
+        let uri = H2_PATH.parse().expect("URI");
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        assert_eq!(
+            decide_with_replay(
+                &front_door,
+                &method,
+                &uri,
+                &headers,
+                replay.as_ref(),
+                &shutdown,
+            )
+            .await,
+            FrontDoorDecision::Fallback(FrontDoorResponse::service_unavailable())
+        );
+        assert_eq!(
+            decide_with_replay(
+                &front_door,
+                &method,
+                &uri,
+                &headers,
+                replay.as_ref(),
+                &CancellationToken::new(),
+            )
+            .await,
+            FrontDoorDecision::Relay
+        );
+        assert_eq!(replay.lock().await.len(), 1);
+    }
 
     #[test]
     fn h2_uri_requires_exact_owned_relay_endpoint() {
@@ -1975,6 +2503,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http2_server_handles_a_local_fallback_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let client_stream = TcpStream::connect(address).await.expect("client stream");
+        let (server_stream, _) = listener.accept().await.expect("server stream");
+        let (issuer, _) = CapabilityIssuer::generate(Duration::from_secs(300)).expect("issuer");
+        let verifier = crate::capability::CapabilityVerifier::new(
+            issuer.public_key(),
+            "edge-a",
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .expect("verifier");
+        let front_door = Arc::new(FrontDoor::new(verifier, 4096));
+        let replay = front_door.replay_cache();
+        let config = Arc::new(EdgeConfig {
+            listen: address,
+            backend: "127.0.0.1:1".into(),
+            audience: "edge-a".into(),
+            public_key: String::new(),
+            relay_path: DEFAULT_RELAY_PATH.into(),
+            tls: Default::default(),
+            limits: Default::default(),
+            socks: Default::default(),
+        });
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            serve_http2_io(
+                TokioIo::new(server_stream),
+                config,
+                front_door,
+                replay,
+                server_shutdown,
+            )
+            .await
+        });
+
+        let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+        builder.timer(TokioTimer::new());
+        let (mut sender, connection) = timeout(
+            Duration::from_secs(2),
+            builder.handshake::<_, Full<Bytes>>(TokioIo::new(client_stream)),
+        )
+        .await
+        .expect("client handshake timeout")
+        .expect("client handshake");
+        let client_task = tokio::spawn(connection);
+        let request = Request::builder()
+            .method("GET")
+            .uri("https://edge.example/")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = timeout(Duration::from_secs(2), sender.send_request(request))
+            .await
+            .expect("request timeout")
+            .expect("fallback response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        response.into_body().collect().await.expect("fallback body");
+
+        shutdown.cancel();
+        drop(sender);
+        client_task.abort();
+        timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server shutdown timeout")
+            .expect("server task")
+            .expect("server connection");
+    }
+
+    #[tokio::test]
     async fn armed_pool_notification_observes_a_released_stream_slot() {
         let slots = Arc::new(Semaphore::new(1));
         let permit = slots.clone().acquire_owned().await.expect("slot");
@@ -1990,6 +2589,49 @@ mod tests {
             .await
             .expect("released slot should wake an armed waiter");
         assert!(slots.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn http2_idle_deadline_restarts_after_connection_activity() {
+        let activity = Http2Activity::new();
+        let wait_activity = activity.clone();
+        let mut idle_wait = tokio::spawn(async move {
+            wait_activity
+                .wait_until_idle(Duration::from_millis(60))
+                .await;
+        });
+
+        sleep(Duration::from_millis(20)).await;
+        activity.touch();
+
+        assert!(timeout(Duration::from_millis(45), &mut idle_wait)
+            .await
+            .is_err());
+        timeout(Duration::from_millis(100), idle_wait)
+            .await
+            .expect("idle deadline should close after activity stops")
+            .expect("idle monitor task");
+    }
+
+    #[tokio::test]
+    async fn http2_idle_deadline_waits_for_active_streams_to_finish() {
+        let activity = Http2Activity::new();
+        let stream_guard = activity.begin_stream();
+        let wait_activity = activity.clone();
+        let idle_wait = tokio::spawn(async move {
+            wait_activity
+                .wait_until_idle(Duration::from_millis(60))
+                .await;
+        });
+
+        sleep(Duration::from_millis(80)).await;
+        assert!(!idle_wait.is_finished());
+        drop(stream_guard);
+
+        timeout(Duration::from_millis(200), idle_wait)
+            .await
+            .expect("idle deadline should close after active stream ends")
+            .expect("idle monitor task");
     }
 
     #[tokio::test]

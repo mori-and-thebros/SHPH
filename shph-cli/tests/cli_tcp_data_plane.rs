@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,13 +24,16 @@ fn skip_when_unpermitted_loopback() -> bool {
     }
 }
 
+static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn test_dir(name: &str) -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time")
         .as_nanos();
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("shph-{name}-{pid}-{ts}"))
+    let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("shph-{name}-{pid}-{ts}-{counter}"))
 }
 
 fn public_key(config: &PathBuf) -> String {
@@ -82,6 +86,18 @@ fn send_once_and_recv_once_transfer_encrypted_payload() {
     if skip_when_unpermitted_loopback() {
         return;
     }
+    run_one_shot_transfer(false);
+}
+
+#[test]
+fn send_once_and_recv_once_negotiate_envelope_policy_before_payload() {
+    if skip_when_unpermitted_loopback() {
+        return;
+    }
+    run_one_shot_transfer(true);
+}
+
+fn run_one_shot_transfer(negotiate_envelope_policy: bool) {
     let server_dir = test_dir("server-dp");
     let client_dir = test_dir("client-dp");
     fs::create_dir_all(&server_dir).expect("create server dir");
@@ -107,50 +123,62 @@ fn send_once_and_recv_once_transfer_encrypted_payload() {
         .output()
         .expect("init client");
     assert!(init_client.status.success());
-    let bind = "127.0.0.1:7220";
+    let port_reservation = TcpListener::bind("127.0.0.1:0").expect("reserve loopback TCP port");
+    let bind = port_reservation
+        .local_addr()
+        .expect("read loopback TCP address")
+        .to_string();
     add_peer(
         &server_cfg,
         "client",
-        bind,
+        &bind,
         &public_key(&client_cfg),
         &signing_public_key(&client_cfg),
     );
     add_peer(
         &client_cfg,
         "server",
-        bind,
+        &bind,
         &public_key(&server_cfg),
         &signing_public_key(&server_cfg),
     );
 
     let server_cfg_for_thread = server_cfg.clone();
+    let server_bind = bind.clone();
     let recv_handle = thread::spawn(move || {
-        Command::new(env!("CARGO_BIN_EXE_shph"))
+        drop(port_reservation);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shph"));
+        command
             .arg("--config")
             .arg(server_cfg_for_thread)
             .arg("recv-once")
             .arg("--bind")
-            .arg(bind)
+            .arg(server_bind)
             .arg("--timeout-secs")
-            .arg("3")
-            .output()
-            .expect("recv-once output")
+            .arg("3");
+        if negotiate_envelope_policy {
+            command.arg("--negotiate-envelope-policy");
+        }
+        command.output().expect("recv-once output")
     });
 
     thread::sleep(Duration::from_millis(150));
 
-    let send_out = Command::new(env!("CARGO_BIN_EXE_shph"))
+    let mut send_command = Command::new(env!("CARGO_BIN_EXE_shph"));
+    send_command
         .arg("--config")
         .arg(&client_cfg)
         .arg("send-once")
         .arg("--peer")
-        .arg(bind)
+        .arg(&bind)
         .arg("--text")
         .arg("hello-over-data-plane")
         .arg("--timeout-secs")
-        .arg("3")
-        .output()
-        .expect("send-once output");
+        .arg("3");
+    if negotiate_envelope_policy {
+        send_command.arg("--negotiate-envelope-policy");
+    }
+    let send_out = send_command.output().expect("send-once output");
     assert!(
         send_out.status.success(),
         "send stderr: {}",

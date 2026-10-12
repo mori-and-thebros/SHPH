@@ -45,7 +45,9 @@ cargo +1.96.0 build --release --manifest-path benchmarks/Cargo.toml --locked
   --profile secure-default --suite extended --iterations 100 --frames 10000
 ./benchmarks/target/release/shph-benchmarks \
   --profile secure-default --suite defensive --iterations 2000 --frames 1
-bash ./scripts/benchmark_criterion.sh
+bash ./scripts/benchmark_criterion.sh \
+  "./benchmark-runs/criterion-linux-$(date -u +%Y%m%dT%H%M%SZ)" \
+  "transport/phantom_one"
 ```
 
 On Windows:
@@ -58,8 +60,14 @@ cargo +1.96.0 build --release `
   -Suite all -Iterations 100 -Frames 10000 `
   -OutputDirectory .\benchmark-runs\windows-all
 .\scripts\benchmark_criterion.ps1 `
-  -OutputDirectory .\benchmark-runs\windows-criterion
+  -OutputDirectory ".\benchmark-runs\criterion-windows-$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))" `
+  -Filter "transport/phantom_one"
 ```
+
+Use a new output directory for every local Criterion run. The scripts reject
+existing destinations, record dirty-tree state and working-tree fingerprints,
+and use an isolated target directory so older reports cannot be mixed into a
+new capture.
 
 ## Evidence boundary
 

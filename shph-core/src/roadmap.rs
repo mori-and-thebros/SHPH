@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -246,7 +247,7 @@ impl TransportAdapterConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IdentityProviderConfig {
     #[default]
@@ -273,6 +274,17 @@ pub enum IdentityProviderConfig {
         #[serde(default)]
         pcr_profile: Option<String>,
     },
+}
+
+impl fmt::Debug for IdentityProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Software => "IdentityProviderConfig::Software",
+            Self::HsmPkcs11 { .. } => "IdentityProviderConfig::HsmPkcs11 { [REDACTED] }",
+            Self::YubikeyPiv { .. } => "IdentityProviderConfig::YubikeyPiv { [REDACTED] }",
+            Self::TpmBinding { .. } => "IdentityProviderConfig::TpmBinding { [REDACTED] }",
+        })
+    }
 }
 
 impl IdentityProviderConfig {
@@ -1266,6 +1278,42 @@ mod tests {
             pcr_profile: None,
         };
         assert!(matches!(tpm.validate(), Err(ShphError::Unsupported(_))));
+    }
+
+    #[test]
+    fn identity_provider_debug_redacts_all_provider_settings() {
+        let settings = [
+            IdentityProviderConfig::HsmPkcs11 {
+                module_path: "secret-module-path".into(),
+                token_label: "secret-token-label".into(),
+                slot: 741,
+                key_label: "secret-key-label".into(),
+            },
+            IdentityProviderConfig::YubikeyPiv {
+                slot: "secret-yubikey-slot".into(),
+                pin: Some("secret-yubikey-pin".into()),
+            },
+            IdentityProviderConfig::TpmBinding {
+                aik_key_handle: "secret-aik-handle".into(),
+                pcr_profile: Some("secret-pcr-profile".into()),
+            },
+        ];
+
+        for setting in settings {
+            let debug = format!("{setting:?}");
+            assert!(debug.contains("[REDACTED]"));
+            for secret in [
+                "secret-module-path",
+                "secret-token-label",
+                "secret-key-label",
+                "secret-yubikey-slot",
+                "secret-yubikey-pin",
+                "secret-aik-handle",
+                "secret-pcr-profile",
+            ] {
+                assert!(!debug.contains(secret), "debug output leaked {secret}");
+            }
+        }
     }
 
     #[test]

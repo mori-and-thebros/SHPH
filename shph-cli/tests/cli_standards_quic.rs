@@ -3,8 +3,11 @@ use std::io::ErrorKind;
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn skip_when_unpermitted_loopback() -> bool {
     match UdpSocket::bind("127.0.0.1:0") {
@@ -21,11 +24,15 @@ fn skip_when_unpermitted_loopback() -> bool {
 }
 
 fn test_dir(name: &str) -> PathBuf {
+    let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time")
         .as_nanos();
-    std::env::temp_dir().join(format!("shph-{name}-{}-{timestamp}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "shph-{name}-{}-{timestamp}-{counter}",
+        std::process::id()
+    ))
 }
 
 fn test_port() -> u16 {
@@ -89,7 +96,18 @@ fn standards_quic_one_shot_cli_transfers_payload_and_receipt_ack() {
     if skip_when_unpermitted_loopback() {
         return;
     }
+    run_standards_quic_one_shot(false);
+}
 
+#[test]
+fn standards_quic_one_shot_negotiates_envelope_policy_before_payload() {
+    if skip_when_unpermitted_loopback() {
+        return;
+    }
+    run_standards_quic_one_shot(true);
+}
+
+fn run_standards_quic_one_shot(negotiate_envelope_policy: bool) {
     let server_dir = test_dir("standards-quic-server");
     let client_dir = test_dir("standards-quic-client");
     fs::create_dir_all(&server_dir).expect("create server dir");
@@ -110,22 +128,23 @@ fn standards_quic_one_shot_cli_transfers_payload_and_receipt_ack() {
     let private_key_for_thread = private_key.clone();
     let server_bind = bind.clone();
     let receiver = thread::spawn(move || {
-        command(
-            &server_config_for_thread,
-            &[
-                "recv-once",
-                "--bind",
-                &server_bind,
-                "--timeout-secs",
-                "5",
-                "--transport",
-                "quic-standard",
-                "--quic-cert",
-                certificate_for_thread.to_str().expect("certificate path"),
-                "--quic-key",
-                private_key_for_thread.to_str().expect("private key path"),
-            ],
-        )
+        let mut args = vec![
+            "recv-once",
+            "--bind",
+            server_bind.as_str(),
+            "--timeout-secs",
+            "5",
+            "--transport",
+            "quic-standard",
+            "--quic-cert",
+            certificate_for_thread.to_str().expect("certificate path"),
+            "--quic-key",
+            private_key_for_thread.to_str().expect("private key path"),
+        ];
+        if negotiate_envelope_policy {
+            args.push("--negotiate-envelope-policy");
+        }
+        command(&server_config_for_thread, &args)
     });
 
     for _ in 0..50 {
@@ -143,22 +162,23 @@ fn standards_quic_one_shot_cli_transfers_payload_and_receipt_ack() {
         "server did not persist QUIC private key"
     );
 
-    let sender = command(
-        &client_config,
-        &[
-            "send-once",
-            "--peer",
-            &bind,
-            "--text",
-            "hello-over-standards-quic",
-            "--timeout-secs",
-            "5",
-            "--transport",
-            "quic-standard",
-            "--quic-cert",
-            certificate.to_str().expect("certificate path"),
-        ],
-    );
+    let mut sender_args = vec![
+        "send-once",
+        "--peer",
+        bind.as_str(),
+        "--text",
+        "hello-over-standards-quic",
+        "--timeout-secs",
+        "5",
+        "--transport",
+        "quic-standard",
+        "--quic-cert",
+        certificate.to_str().expect("certificate path"),
+    ];
+    if negotiate_envelope_policy {
+        sender_args.push("--negotiate-envelope-policy");
+    }
+    let sender = command(&client_config, &sender_args);
     let receiver = receiver.join().expect("receiver thread join");
     assert!(
         receiver.status.success(),
@@ -168,9 +188,10 @@ fn standards_quic_one_shot_cli_transfers_payload_and_receipt_ack() {
     );
     assert!(
         sender.status.success(),
-        "sender failed: stdout={} stderr={}",
+        "sender failed: stdout={} stderr={} receiver_stdout={}",
         String::from_utf8_lossy(&sender.stdout),
-        String::from_utf8_lossy(&sender.stderr)
+        String::from_utf8_lossy(&sender.stderr),
+        String::from_utf8_lossy(&receiver.stdout)
     );
     assert!(String::from_utf8_lossy(&sender.stdout).contains("Sent bytes:"));
 

@@ -13,6 +13,7 @@ serde_json = "1.0"
 shph-config = { path = "../shph-config" }
 shph-core = { path = "../shph-core" }
 shph-obfuscation = { path = "../shph-obfuscation" }
+shph-snap = { path = "../shph-snap" }
 shph-transport = { path = "../shph-transport" }
 
 [[bin]]
@@ -53,6 +54,13 @@ bench = false
 [[bin]]
 name = "phantom_one_envelope"
 path = "fuzz_targets/phantom_one_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snap_profile"
+path = "fuzz_targets/snap_profile.rs"
 test = false
 doc = false
 bench = false

@@ -24,12 +24,17 @@ pub struct StandardsTunBridgeConfig {
     /// Maximum number of malformed authenticated datagrams tolerated before
     /// the connection is closed.
     pub max_invalid_datagrams: usize,
+    /// Decode and encode opt-in adaptive Shroud 3 envelopes on this QUIC
+    /// session. Both peers must select the same mode; no negotiation or
+    /// format downgrade is performed.
+    pub shroud3_adaptive: bool,
 }
 
 impl Default for StandardsTunBridgeConfig {
     fn default() -> Self {
         Self {
             max_invalid_datagrams: DEFAULT_MAX_INVALID_DATAGRAMS,
+            shroud3_adaptive: false,
         }
     }
 }
@@ -56,6 +61,7 @@ pub struct StandardsTunBridgeStats {
     pub quic_to_tun_bytes: u64,
     pub dropped_oversized_packets: u64,
     pub dropped_invalid_datagrams: u64,
+    pub dropped_pacing_packets: u64,
 }
 
 impl StandardsTunBridgeStats {
@@ -79,6 +85,9 @@ impl StandardsTunBridgeStats {
             dropped_invalid_datagrams: self
                 .dropped_invalid_datagrams
                 .saturating_add(other.dropped_invalid_datagrams),
+            dropped_pacing_packets: self
+                .dropped_pacing_packets
+                .saturating_add(other.dropped_pacing_packets),
         }
     }
 }
@@ -97,6 +106,21 @@ pub async fn run(
     config: StandardsTunBridgeConfig,
 ) -> Result<StandardsTunBridgeStats> {
     let config = config.validate()?;
+    if config.shroud3_adaptive {
+        if connection.phantom_one_profile().is_some() {
+            return Err(ShphError::Config(
+                "adaptive Shroud 3 cannot be combined with Phantom One".into(),
+            ));
+        }
+        let quic = connection.connection;
+        let sender_connection = quic.clone();
+        let receiver_connection = quic.clone();
+        let (sender, receiver) = tokio::try_join!(
+            shroud3_tun_to_quic_loop(sender_connection, tun_to_quic, config),
+            shroud3_quic_to_tun_loop(receiver_connection, quic_to_tun, config),
+        )?;
+        return Ok(sender.combine(receiver));
+    }
     if connection.phantom_one_profile().is_some() {
         let bridge = connection.into_phantom_one_datagram_bridge()?;
         let (sender, receiver) = bridge.split();
@@ -117,6 +141,195 @@ pub async fn run(
     )?;
 
     Ok(sender.combine(receiver))
+}
+
+async fn shroud3_tun_to_quic_loop(
+    connection: Connection,
+    mut tun: AsyncTunDevice,
+    _config: StandardsTunBridgeConfig,
+) -> Result<StandardsTunBridgeStats> {
+    let mut stats = StandardsTunBridgeStats::default();
+    let mut packet = Zeroizing::new(vec![0u8; TUN_READ_BUFFER_BYTES]);
+    let session_started = std::time::Instant::now();
+    let pacer = crate::pacing::DatagramPacer::new(64, std::time::Duration::from_secs(1))?;
+    let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+    let mut morphology =
+        crate::shroud3::AdaptiveShroud3::new(crate::shroud2::workload::WorkloadConfig::default())?;
+
+    loop {
+        tokio::select! {
+            _ = connection.closed() => return Err(ShphError::ConnectionClosed),
+            result = tun.recv_packet(&mut packet) => {
+                match result {
+                    Ok(length) => {
+                        if length == 0 {
+                            close_connection(&connection);
+                            return Ok(stats);
+                        }
+                        let enqueued_at = std::time::Instant::now();
+                        let observation = crate::shroud2::workload::WorkloadObservation {
+                            observed_at: session_started.elapsed(),
+                            // TUN reads are handed directly to the bounded pacer;
+                            // there is no application queue before this timestamp.
+                            queue_age: std::time::Duration::ZERO,
+                        };
+                        let path_mtu = connection.max_datagram_size().ok_or_else(|| {
+                            ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into())
+                        })?;
+                        let datagram = match encode_shroud3_tun_datagram(
+                            &mut morphology,
+                            &packet[..length],
+                            path_mtu,
+                            observation,
+                        ) {
+                            Ok(Some(datagram)) => datagram,
+                            Ok(None) => {
+                                stats.dropped_oversized_packets =
+                                    stats.dropped_oversized_packets.saturating_add(1);
+                                packet[..length].zeroize();
+                                continue;
+                            }
+                            Err(error) => {
+                                close_connection(&connection);
+                                return Err(error);
+                            }
+                        };
+                        let result = tokio::select! {
+                            _ = connection.closed() => return Err(ShphError::ConnectionClosed),
+                            result = pacer.send(
+                                &connection,
+                                &datagram,
+                                enqueued_at,
+                                morphology.next_delay(),
+                                cancel_receiver.clone(),
+                            ) => result,
+                        };
+                        match result {
+                            Ok(()) => {
+                                stats.tun_to_quic_packets =
+                                    stats.tun_to_quic_packets.saturating_add(1);
+                                stats.tun_to_quic_bytes =
+                                    stats.tun_to_quic_bytes.saturating_add(length as u64);
+                            }
+                            Err(ShphError::Timeout | ShphError::ResourceExhausted(_)) => {
+                                stats.dropped_pacing_packets =
+                                    stats.dropped_pacing_packets.saturating_add(1);
+                            }
+                            Err(ShphError::Protocol(_)) => {
+                                stats.dropped_oversized_packets =
+                                    stats.dropped_oversized_packets.saturating_add(1);
+                            }
+                            Err(error) => {
+                                close_connection(&connection);
+                                return Err(error);
+                            }
+                        }
+                        packet[..length].zeroize();
+                    }
+                    Err(ShphError::ConnectionClosed) => {
+                        close_connection(&connection);
+                        return Err(ShphError::ConnectionClosed);
+                    }
+                    Err(error) => {
+                        close_connection(&connection);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn encode_shroud3_tun_datagram(
+    morphology: &mut crate::shroud3::AdaptiveShroud3,
+    packet: &[u8],
+    path_mtu: usize,
+    observation: crate::shroud2::workload::WorkloadObservation,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    if packet.len() > shph_tun::MAX_TUN_PACKET_BYTES
+        || packet
+            .len()
+            .saturating_add(crate::shroud3::SHROUD3_HEADER_BYTES)
+            > path_mtu
+    {
+        return Ok(None);
+    }
+    morphology
+        .encode(packet, path_mtu, observation)
+        .map(Zeroizing::new)
+        .map(Some)
+}
+
+fn decode_shroud3_tun_datagram(datagram: &[u8], path_mtu: usize) -> Result<Zeroizing<Vec<u8>>> {
+    let mut payload = Zeroizing::new(datagram.to_vec());
+    crate::shroud3::decode_in_place(&mut payload, path_mtu)?;
+    if is_oversized_tun_datagram(&payload) || is_invalid_tun_datagram(&payload) {
+        payload.zeroize();
+        return Err(ShphError::Protocol(
+            "Shroud 3 payload is not a valid bounded IP packet".into(),
+        ));
+    }
+    Ok(payload)
+}
+
+async fn shroud3_quic_to_tun_loop(
+    connection: Connection,
+    mut tun: AsyncTunDevice,
+    config: StandardsTunBridgeConfig,
+) -> Result<StandardsTunBridgeStats> {
+    let mut stats = StandardsTunBridgeStats::default();
+    let mut invalid_datagrams = 0usize;
+    let path_mtu = connection
+        .max_datagram_size()
+        .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+
+    loop {
+        tokio::select! {
+            _ = connection.closed() => return Err(ShphError::ConnectionClosed),
+            result = connection.read_datagram() => {
+                let datagram = match result {
+                    Ok(datagram) => Zeroizing::new(datagram.to_vec()),
+                    Err(error) => {
+                        close_connection(&connection);
+                        return Err(ShphError::Transport(error.to_string()));
+                    }
+                };
+
+                if datagram.len() > path_mtu || datagram.len() > shph_tun::MAX_TUN_PACKET_BYTES {
+                    invalid_datagrams = invalid_datagrams.saturating_add(1);
+                    stats.dropped_oversized_packets =
+                        stats.dropped_oversized_packets.saturating_add(1);
+                } else {
+                    match decode_shroud3_tun_datagram(&datagram, path_mtu) {
+                        Ok(payload) => {
+                            let length = payload.len();
+                            if let Err(error) = tun.send_packet(&payload).await {
+                                close_connection(&connection);
+                                return Err(error);
+                            }
+                            stats.quic_to_tun_packets =
+                                stats.quic_to_tun_packets.saturating_add(1);
+                            stats.quic_to_tun_bytes =
+                                stats.quic_to_tun_bytes.saturating_add(length as u64);
+                        }
+                        Err(_) => {
+                            invalid_datagrams = invalid_datagrams.saturating_add(1);
+                            stats.dropped_invalid_datagrams =
+                                stats.dropped_invalid_datagrams.saturating_add(1);
+                        }
+                    }
+                }
+
+                if invalid_datagrams >= config.max_invalid_datagrams {
+                    close_connection(&connection);
+                    return Err(ShphError::Protocol(format!(
+                        "received {} malformed Shroud 3 QUIC datagrams",
+                        invalid_datagrams
+                    )));
+                }
+            }
+        }
+    }
 }
 
 async fn phantom_one_tun_to_quic_loop(
@@ -351,19 +564,24 @@ fn is_oversized_tun_datagram(datagram: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_invalid_tun_datagram, is_oversized_tun_datagram, StandardsTunBridgeConfig,
-        StandardsTunBridgeStats,
+        decode_shroud3_tun_datagram, encode_shroud3_tun_datagram, is_invalid_tun_datagram,
+        is_oversized_tun_datagram, StandardsTunBridgeConfig, StandardsTunBridgeStats,
     };
+    use crate::shroud2::workload::{WorkloadConfig, WorkloadObservation};
+    use crate::shroud3::AdaptiveShroud3;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn bridge_config_rejects_unbounded_invalid_datagram_policy() {
         assert!(StandardsTunBridgeConfig {
             max_invalid_datagrams: 0,
+            shroud3_adaptive: false,
         }
         .validate()
         .is_err());
         assert!(StandardsTunBridgeConfig {
             max_invalid_datagrams: 4097,
+            shroud3_adaptive: false,
         }
         .validate()
         .is_err());
@@ -412,5 +630,176 @@ mod tests {
             shph_tun::MAX_TUN_PACKET_BYTES
                 + 1
         ]));
+    }
+
+    fn valid_ipv4_packet() -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(20u16).to_be_bytes());
+        packet
+    }
+
+    fn shroud3_engine() -> AdaptiveShroud3 {
+        AdaptiveShroud3::from_seed(
+            WorkloadConfig {
+                minimum_dwell: Duration::ZERO,
+                use_arrivals: false,
+                use_queue_age: false,
+                ..WorkloadConfig::default()
+            },
+            0x5348_5244,
+        )
+        .expect("Shroud 3 engine")
+    }
+
+    #[test]
+    fn shroud3_bridge_helpers_round_trip_valid_ip_and_reject_malformed_payloads() {
+        let packet = valid_ipv4_packet();
+        let mut morphology = shroud3_engine();
+        let encoded = encode_shroud3_tun_datagram(
+            &mut morphology,
+            &packet,
+            1472,
+            WorkloadObservation {
+                observed_at: Duration::from_millis(1),
+                queue_age: Duration::ZERO,
+            },
+        )
+        .expect("encode")
+        .expect("packet fits");
+        assert_eq!(&encoded[..2], &crate::shroud3::SHROUD3_MAGIC);
+        assert_eq!(
+            decode_shroud3_tun_datagram(&encoded, 1472)
+                .unwrap()
+                .as_slice(),
+            packet
+        );
+
+        let malformed_ip = morphology
+            .encode(
+                b"not an IP packet",
+                1472,
+                WorkloadObservation {
+                    observed_at: Duration::from_millis(2),
+                    queue_age: Duration::ZERO,
+                },
+            )
+            .expect("frame malformed payload");
+        assert!(decode_shroud3_tun_datagram(&malformed_ip, 1472).is_err());
+
+        let shroud2 = crate::shroud2::encode_datagram(&packet, 64, 1472).expect("Shroud 2 frame");
+        assert!(decode_shroud3_tun_datagram(&shroud2, 1472).is_err());
+        assert!(encode_shroud3_tun_datagram(
+            &mut morphology,
+            &vec![0u8; shph_tun::MAX_TUN_PACKET_BYTES + 1],
+            1472,
+            WorkloadObservation {
+                observed_at: Duration::from_millis(3),
+                queue_age: Duration::ZERO,
+            },
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn shroud3_bridge_helpers_round_trip_over_authenticated_quic() {
+        use crate::standards_quic::{
+            accept, client_endpoint, connect, server_endpoint, StandardsQuicConfig,
+        };
+        use shph_core::{HandshakeProfile, IdentityKeyPair, PeerPin, PeerPolicy};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let server_identity = IdentityKeyPair::generate().expect("server identity");
+        let client_identity = IdentityKeyPair::generate().expect("client identity");
+        let server_policy = PeerPolicy::single(PeerPin::for_identity(&client_identity));
+        let client_policy = PeerPolicy::single(PeerPin::for_identity(&server_identity));
+        let server = server_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            StandardsQuicConfig::default(),
+        )
+        .expect("server endpoint");
+        let server_addr = server.endpoint.local_addr().expect("server address");
+        let client = client_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &server.certificate_der,
+            StandardsQuicConfig::default(),
+        )
+        .expect("client endpoint");
+        let server_task = tokio::spawn(async move {
+            accept(
+                &server,
+                &server_identity,
+                &server_policy,
+                HandshakeProfile::SecureDefault,
+                Duration::from_secs(10),
+            )
+            .await
+        });
+        let client_connection = connect(
+            &client,
+            server_addr,
+            "localhost",
+            &client_identity,
+            &client_policy,
+            HandshakeProfile::SecureDefault,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("client SHPH/QUIC handshake");
+        let server_connection = server_task
+            .await
+            .expect("server accept task")
+            .expect("server SHPH/QUIC handshake");
+
+        let path_mtu = client_connection
+            .connection
+            .max_datagram_size()
+            .expect("negotiated QUIC DATAGRAM");
+        let packet = valid_ipv4_packet();
+        let mut morphology = shroud3_engine();
+        let datagram = encode_shroud3_tun_datagram(
+            &mut morphology,
+            &packet,
+            path_mtu,
+            WorkloadObservation {
+                observed_at: Duration::from_millis(1),
+                queue_age: Duration::ZERO,
+            },
+        )
+        .expect("encode bridge datagram")
+        .expect("packet fits QUIC path");
+        let pacer = crate::pacing::DatagramPacer::new(2, Duration::from_secs(2))
+            .expect("bounded datagram pacer");
+        let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        pacer
+            .send(
+                &client_connection.connection,
+                &datagram,
+                Instant::now(),
+                Duration::ZERO,
+                cancel_receiver,
+            )
+            .await
+            .expect("paced Shroud 3 send");
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            server_connection.connection.read_datagram(),
+        )
+        .await
+        .expect("QUIC receive timeout")
+        .expect("authenticated QUIC datagram");
+        let decoded =
+            decode_shroud3_tun_datagram(&received, path_mtu).expect("Shroud 3 bridge decode");
+        assert_eq!(decoded.as_slice(), packet);
+
+        client_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        server_connection
+            .connection
+            .close(0u32.into(), b"test complete");
+        client.close(0u32.into(), b"test complete");
+        client.wait_idle().await;
     }
 }

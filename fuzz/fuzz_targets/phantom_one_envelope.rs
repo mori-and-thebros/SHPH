@@ -4,10 +4,11 @@
 //! Exercises the real `shph_transport::phantom_one` decode/validation, encoder,
 //! and stateful-decoder paths with arbitrary bytes and bounded path MTU.
 //! Covers malformed, truncated, noncanonical, oversized, replay, and
-//! sequence-exhaustion inputs. Never panics, never allocates unboundedly.
+//! policy-offer inputs. Never panics, never allocates unboundedly.
 
 use libfuzzer_sys::fuzz_target;
 use shph_obfuscation::ProfileTier;
+use shph_transport::envelope_policy::EnvelopeOffer;
 use shph_transport::phantom_one::{
     decode, validate_path_mtu, PhantomOneConfig, PhantomOneDecoder, PhantomOneEncoder,
     PhantomOneFrameType, PHANTOM_ONE_HEADER_BYTES, PHANTOM_ONE_MAGIC,
@@ -18,9 +19,21 @@ const FRAME_TYPE_OFFSET: usize = 10;
 const TARGET_LENGTH_OFFSET: usize = 21;
 
 fuzz_target!(|input: &[u8]| {
-    // ---- Hard upper bound ----
     if input.len() > PHANTOM_ONE_MAX_ENVELOPE_BYTES {
         return;
+    }
+
+    let _ = EnvelopeOffer::decode(input);
+    if let Ok(offer) = EnvelopeOffer::new(
+        &"00".repeat(32),
+        PhantomOneConfig::for_profile(ProfileTier::Medium),
+        1_360,
+    ) {
+        let mut mutated_offer = offer.encode();
+        for (target, value) in mutated_offer[9..].iter_mut().zip(input) {
+            *target = *value;
+        }
+        let _ = EnvelopeOffer::decode(&mutated_offer);
     }
 
     // ---- Derive fuzz-controlled parameters from input bytes ----
@@ -271,26 +284,7 @@ fuzz_target!(|input: &[u8]| {
         }
     }
 
-    // 4e. Sequence exhaustion boundary
-    let _ex_enc = PhantomOneEncoder::from_seed_with_config(
-        generation,
-        seed,
-        PhantomOneConfig::new(0, 0).expect("valid zero-padding config"),
-    )
-    .expect("valid seeded encoder");
-    // Fast-forward to near exhaustion
-    let mut fast_enc = PhantomOneEncoder::from_seed_with_config(
-        generation,
-        seed,
-        PhantomOneConfig::new(0, 0).expect("valid zero-padding config"),
-    )
-    .expect("valid seeded encoder");
-    // Drain some sequences
-    for _ in 0..4 {
-        let _ = fast_enc.encode(PhantomOneFrameType::Data, b"x", envelope_mtu);
-    }
-
-    // 4f. All frame types
+    // 4e. All frame types
     for ft in [
         PhantomOneFrameType::Data,
         PhantomOneFrameType::Control,

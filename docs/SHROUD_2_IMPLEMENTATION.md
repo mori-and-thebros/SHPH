@@ -70,6 +70,27 @@ The envelope is expected to be carried inside the authenticated QUIC
 connection. It is not an authentication mechanism and must not be treated as
 one.
 
+## Current roadmap APIs (2026-09-28)
+
+- `shph_transport::shroud2::workload::WorkloadMorphology` is a separate,
+  explicit adaptive API. Callers supply monotonic session-relative timestamps
+  and queue age; it does not inspect payload contents or application identity.
+  It supplements, but does not replace or silently enable, the existing
+  payload-EWMA `AdaptiveMorphologyEngine`.
+- `shph_transport::pacing::DatagramPacer` bounds queued QUIC datagrams and
+  exposes policy-relative and caller-deadline sends. The
+  `send_morphology_datagram_paced_until` helper accepts the enqueue time,
+  deadline, and cancellation receiver. Queue overflow and expiry return errors;
+  a local send is not evidence of remote delivery or hard real-time behavior.
+- Optional cover frames are disabled by default. The negotiated envelope-policy
+  API requires identical explicit cover settings at both peers; callers drive
+  each attempt, and pending payload, congestion, cancellation, byte caps, and
+  idle timeout suppress cover sends. This is not a background cover generator.
+
+Deterministic unit tests cover policy bounds and transitions. Complete-session
+performance, scheduler overshoot, and detectability comparisons remain pending;
+these APIs do not establish DPI resistance or censorship resistance.
+
 ## Technical Hardening Deep Dive
 
 ### Invariants enforced at the morphology boundary

@@ -19,17 +19,24 @@ use shph_core::{
     Endpoint, HandshakeProfile, HandshakeState, KeyStore, KeyStoreConfig, MetricsCollector,
     PeerPin, PeerPolicy, Result, ShamirShare, ShphError,
 };
+use shph_transport::envelope_policy::{NegotiatedQuic, NegotiatedTcp};
+use shph_transport::phantom_one::PhantomOneConfig;
+use shph_transport::snap_adapter::{connect_snap_bridge_stream, SnapBridgeConfig};
 #[cfg(target_os = "linux")]
 use shph_transport::standards_tun;
 use shph_transport::{
     accept_secure_session_lab_with_profile, connect_secure_session_lab_with_profile,
     connect_secure_session_lab_with_profile_and_underlay,
-    data_mule_accept_and_handshake_with_profile, data_mule_accept_secure_session_with_profile,
-    data_mule_connect_and_handshake_with_profile, data_mule_connect_secure_session_with_profile,
+    connect_secure_session_lab_with_profile_and_underlay_timeout,
+    connect_secure_session_on_snap_stream, data_mule_accept_and_handshake_with_profile,
+    data_mule_accept_secure_session_with_profile, data_mule_connect_and_handshake_with_profile,
+    data_mule_connect_secure_session_with_profile,
+    data_mule_connect_secure_session_with_profile_timeout,
     offline_mesh_accept_and_handshake_with_profile,
     offline_mesh_accept_secure_session_with_profile,
     offline_mesh_connect_and_handshake_with_profile,
-    offline_mesh_connect_secure_session_with_profile, quic_handshake_client_with_profile,
+    offline_mesh_connect_secure_session_with_profile,
+    offline_mesh_connect_secure_session_with_profile_timeout, quic_handshake_client_with_profile,
     quic_handshake_server_with_profile, standards_quic, tcp_handshake_server_with_profile,
     QuicLabConfig, SecureReceiver, SecureSender, SecureSession, TcpUnderlay, TransportMode,
 };
@@ -65,6 +72,10 @@ use std::{future::Future, net::SocketAddr};
 use zeroize::{Zeroize, Zeroizing};
 
 use shph_obfuscation::ProfileTier;
+use shph_snap::{
+    AttemptOutcome, CandidateKind, ProfileFormat, SnapAuditContext, SnapAuditEvent, SnapPlan,
+    SnapProfile,
+};
 use ticket::{render_qr, JoinTicket};
 
 const MAX_STDIN_LINE_BYTES: usize = 64 * 1024;
@@ -257,6 +268,9 @@ enum Commands {
         /// Phantom One profile
         #[arg(long)]
         phantom_one_profile: Option<String>,
+        /// Opt into the experimental adaptive Shroud 3 QUIC/TUN data plane
+        #[arg(long)]
+        shroud3_adaptive: bool,
         /// Run without opening a native TUN interface
         #[arg(long)]
         no_tun: bool,
@@ -284,6 +298,9 @@ enum Commands {
         /// Read the ticket from an owner-only file
         #[arg(long, value_name = "PATH", conflicts_with = "ticket")]
         ticket_file: Option<PathBuf>,
+        /// Opt into the experimental adaptive Shroud 3 QUIC/TUN data plane
+        #[arg(long)]
+        shroud3_adaptive: bool,
         /// Run without opening a native TUN interface
         #[arg(long)]
         no_tun: bool,
@@ -326,12 +343,18 @@ enum Commands {
         /// Phantom One profile
         #[arg(long)]
         phantom_one_profile: Option<String>,
+        /// Opt into the experimental adaptive Shroud 3 QUIC/TUN data plane
+        #[arg(long)]
+        shroud3_adaptive: bool,
         /// Run without opening a native TUN interface
         #[arg(long)]
         no_tun: bool,
         /// Optional outbound underlay (direct or socks5://host:port)
         #[arg(long)]
         underlay: Option<String>,
+        /// Opt into a versioned SNAP profile (JSON or TOML)
+        #[arg(long, value_name = "PATH")]
+        snap_profile: Option<PathBuf>,
         /// DER certificate path for standards QUIC; servers write it and clients trust it out of band
         #[arg(long)]
         quic_cert: Option<PathBuf>,
@@ -399,6 +422,11 @@ enum Commands {
     },
     /// Validate optional roadmap adapters and trust configuration
     ValidateRoadmap,
+    /// Inspect an opt-in SNAP path profile
+    Snap {
+        #[command(subcommand)]
+        command: SnapCommands,
+    },
     /// Split a secret into configured Shamir shares
     ShamirSplit {
         /// Read the secret from a protected file. Use "-" for stdin.
@@ -489,6 +517,9 @@ enum Commands {
         /// Optional outbound underlay (direct or socks5://host:port)
         #[arg(long)]
         underlay: Option<String>,
+        /// Require authenticated envelope-policy agreement before sending.
+        #[arg(long)]
+        negotiate_envelope_policy: bool,
     },
     /// Receive one encrypted payload after TCP handshake
     RecvOnce {
@@ -508,7 +539,18 @@ enum Commands {
         /// Handshake profile (secure-default or classical-lab)
         #[arg(long)]
         handshake_profile: Option<String>,
+        /// Require authenticated envelope-policy agreement before receiving.
+        #[arg(long)]
+        negotiate_envelope_policy: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapCommands {
+    /// Strictly parse and validate a JSON or TOML SNAP profile
+    Validate { profile: PathBuf },
+    /// Resolve a profile's peer alias to a locally pinned peer and print its plan
+    Plan { profile: PathBuf },
 }
 
 #[derive(Debug, Serialize)]
@@ -574,6 +616,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             shroud_profile,
             phantom_one,
             phantom_one_profile,
+            shroud3_adaptive,
             no_tun,
             no_nat,
             ticket_file,
@@ -588,6 +631,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             shroud_profile.as_deref(),
             phantom_one,
             phantom_one_profile.as_deref(),
+            shroud3_adaptive,
             no_tun,
             no_nat,
             ticket_file.as_deref(),
@@ -597,6 +641,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Join {
             ticket,
             ticket_file,
+            shroud3_adaptive,
             no_tun,
             underlay,
             quic_cert,
@@ -608,6 +653,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 &config_path,
                 &keystore_path,
                 &ticket,
+                shroud3_adaptive,
                 no_tun,
                 underlay.as_deref(),
                 quic_cert.as_deref(),
@@ -624,8 +670,10 @@ fn run_cli(cli: Cli) -> Result<()> {
             shroud_profile,
             phantom_one,
             phantom_one_profile,
+            shroud3_adaptive,
             no_tun,
             underlay,
+            snap_profile,
             quic_cert,
             quic_key,
             handshake_profile,
@@ -650,15 +698,35 @@ fn run_cli(cli: Cli) -> Result<()> {
                     bind: None,
                     peer: Some(peer),
                     transport_peer: None,
+                    snap_profile: None,
                     timeout_secs: Some(5),
                     handshake_profile: None,
                     underlay: underlay.clone(),
                     quic_cert: None,
                     quic_key: None,
                     phantom_one: morphology.phantom_one,
+                    shroud3_adaptive,
+                    negotiate_envelope_policy: false,
                     phantom_one_profile: morphology.phantom_one_profile,
                     reconnect: None,
                     startup_payload: None,
+                });
+            }
+            if let Some(path) = snap_profile {
+                let session = config.session.as_mut().ok_or_else(|| {
+                    ShphError::Config(
+                        "--snap-profile requires a connect session or --to peer".into(),
+                    )
+                })?;
+                if session.role != SessionRole::Connect {
+                    return Err(ShphError::Config(
+                        "--snap-profile can only be used by an outbound connect session".into(),
+                    ));
+                }
+                session.snap_profile = Some(if path.is_absolute() {
+                    path.display().to_string()
+                } else {
+                    std::env::current_dir()?.join(path).display().to_string()
                 });
             }
             let mode = resolve_transport_mode(transport.as_deref(), config.roadmap.as_ref())?;
@@ -704,6 +772,11 @@ fn run_cli(cli: Cli) -> Result<()> {
                     profile,
                     shroud_profile: morphology.shroud_profile,
                     phantom_one: morphology.phantom_one,
+                    shroud3_adaptive: shroud3_adaptive
+                        || config
+                            .session
+                            .as_ref()
+                            .is_some_and(|session| session.shroud3_adaptive),
                     phantom_one_profile: morphology.phantom_one_profile,
                     quic_cert_path: quic_cert.as_deref().or(configured_quic_cert),
                     quic_key_path: quic_key.as_deref().or(configured_quic_key),
@@ -745,6 +818,104 @@ fn run_cli(cli: Cli) -> Result<()> {
         )?,
         Commands::ShowConfig { show_secrets } => handle_show_config(&config_path, show_secrets)?,
         Commands::ValidateRoadmap => handle_validate_roadmap(&config_path)?,
+        Commands::Snap { command } => match command {
+            SnapCommands::Validate { profile } => {
+                let profile = read_snap_profile(&profile)?;
+                profile
+                    .validate_operator_service_contracts()
+                    .map_err(|error| ShphError::Config(error.to_string()))?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "valid": true,
+                            "version": profile.version,
+                            "profile_name": profile.profile_name,
+                            "peer_alias": profile.peer_alias,
+                            "profile_hash": profile.profile_hash(),
+                            "direct_endpoints": profile.direct_endpoints.len(),
+                            "bridges": profile.bridges.len(),
+                        }))?
+                    );
+                } else {
+                    println!("SNAP profile valid");
+                    println!("  Name: {}", profile.profile_name);
+                    println!("  Version: {}", profile.version);
+                    println!("  Peer alias: {}", profile.peer_alias);
+                    println!("  Profile hash: {}", profile.profile_hash());
+                    println!(
+                        "  Candidates declared: {}",
+                        profile.direct_endpoints.len() + profile.bridges.len()
+                    );
+                }
+            }
+            SnapCommands::Plan { profile: path } => {
+                let profile = read_snap_profile(&path)?;
+                profile
+                    .validate_operator_service_contracts()
+                    .map_err(|error| ShphError::Config(error.to_string()))?;
+                let keystore = KeyStore::load(&keystore_path, None)?;
+                let contact = keystore.contacts.get(&profile.peer_alias).ok_or_else(|| {
+                    ShphError::Config(format!(
+                        "SNAP peer alias '{}' is not locally pinned",
+                        profile.peer_alias
+                    ))
+                })?;
+                let plan = profile
+                    .plan(&contact.endpoint.host, contact.endpoint.port)
+                    .map_err(|error| ShphError::Config(error.to_string()))?;
+                if json {
+                    let candidates: Vec<_> = plan
+                        .candidates
+                        .iter()
+                        .map(|candidate| {
+                            serde_json::json!({
+                                "id": candidate.id(),
+                                "adapter": candidate.adapter,
+                                "target_host": candidate.target_host,
+                                "target_port": candidate.target_port,
+                                "priority": candidate.priority,
+                                "weight": candidate.weight,
+                                "timeout_sec": plan.effective_candidate_timeout_sec(candidate),
+                                "timeout_source": plan.effective_candidate_timeout_source(candidate),
+                            })
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "profile_name": plan.profile_name,
+                            "profile_hash": plan.profile_hash,
+                            "peer_alias": plan.peer_alias,
+                            "attempt_limit": plan.attempt_limit,
+                            "candidates": candidates,
+                        }))?
+                    );
+                } else {
+                    println!("SNAP plan");
+                    println!("  Profile: {} ({})", plan.profile_name, plan.profile_hash);
+                    println!("  Pinned peer: {}", plan.peer_alias);
+                    println!("  Attempt limit: {}", plan.attempt_limit);
+                    for (index, candidate) in plan.candidates.iter().enumerate() {
+                        println!(
+                            "  {}. {} {} -> {}:{} (priority {}, weight {})",
+                            index + 1,
+                            candidate.id(),
+                            candidate.adapter,
+                            candidate.target_host,
+                            candidate.target_port,
+                            candidate.priority,
+                            candidate.weight,
+                        );
+                        println!(
+                            "     Timeout: {:.2}s ({})",
+                            plan.effective_candidate_timeout_sec(candidate),
+                            plan.effective_candidate_timeout_source(candidate),
+                        );
+                    }
+                }
+            }
+        },
         Commands::ShamirSplit {
             secret_file,
             secret_stdin,
@@ -772,6 +943,11 @@ fn run_cli(cli: Cli) -> Result<()> {
             handshake_profile,
         } => {
             let config = load_config(&config_path)?;
+            if session_requires_envelope_policy(&config) {
+                return Err(ShphError::Unsupported(
+                    "envelope-policy negotiation is only wired for send-once and recv-once; persistent sessions fail closed".into(),
+                ));
+            }
             set_morphology_from_config(&config)?;
             handle_listen(
                 &keystore_path,
@@ -799,6 +975,11 @@ fn run_cli(cli: Cli) -> Result<()> {
             underlay,
         } => {
             let config = load_config(&config_path)?;
+            if session_requires_envelope_policy(&config) {
+                return Err(ShphError::Unsupported(
+                    "envelope-policy negotiation is only wired for send-once and recv-once; use those commands to exchange application data".into(),
+                ));
+            }
             set_morphology_from_config(&config)?;
             let underlay = underlay.as_deref().or_else(|| {
                 config
@@ -831,6 +1012,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             quic_cert,
             handshake_profile,
             underlay,
+            negotiate_envelope_policy,
         } => {
             let config = load_config(&config_path)?;
             set_morphology_from_config(&config)?;
@@ -840,12 +1022,13 @@ fn run_cli(cli: Cli) -> Result<()> {
                     .as_ref()
                     .and_then(|session| session.underlay.as_deref())
             });
-            handle_send_once(
+            handle_send_once_with_snap(
                 &keystore_path,
                 &peer,
                 &peer,
                 &text,
                 timeout_secs,
+                None,
                 transport,
                 quic_cert.as_deref(),
                 resolve_handshake_profile(
@@ -856,7 +1039,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                         .and_then(|session| session.handshake_profile),
                 )?,
                 underlay,
+                negotiate_envelope_policy || session_requires_envelope_policy(&config),
                 config.roadmap.as_ref(),
+                None,
             )?
         }
         Commands::RecvOnce {
@@ -866,6 +1051,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             quic_cert,
             quic_key,
             handshake_profile,
+            negotiate_envelope_policy,
         } => {
             let config = load_config(&config_path)?;
             set_morphology_from_config(&config)?;
@@ -883,6 +1069,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                         .as_ref()
                         .and_then(|session| session.handshake_profile),
                 )?,
+                negotiate_envelope_policy || session_requires_envelope_policy(&config),
                 config.roadmap.as_ref(),
             )?
         }
@@ -981,6 +1168,210 @@ fn ensure_workspace(config_path: &Path, keystore_path: &Path) -> Result<(Config,
     };
 
     Ok((config, keystore))
+}
+
+fn read_snap_profile(path: &Path) -> Result<SnapProfile> {
+    let path = absolute_lexical_path(path)?;
+    let format = ProfileFormat::from_path(&path)
+        .map_err(|error| ShphError::Config(format!("invalid SNAP profile format: {error}")))?;
+    let file = open_readonly_no_reparse(&path).map_err(|error| {
+        ShphError::Config(format!("unable to safely open SNAP profile: {error}"))
+    })?;
+    let max_bytes = shph_snap::MAX_PROFILE_BYTES as u64;
+    if file.metadata()?.len() > max_bytes {
+        return Err(ShphError::Config(format!(
+            "SNAP profile exceeds the {max_bytes}-byte limit"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(ShphError::Config(format!(
+            "SNAP profile exceeds the {max_bytes}-byte limit"
+        )));
+    }
+    let mut profile = SnapProfile::parse(&bytes, format)
+        .map_err(|error| ShphError::Config(format!("invalid SNAP profile: {error}")))?;
+    validate_snap_profile_files(&mut profile, &path)?;
+    Ok(profile)
+}
+
+fn absolute_lexical_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let source = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in source.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+fn resolve_snap_reference_path(profile_path: &Path, value: &str) -> Result<PathBuf> {
+    let path = Path::new(value);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        profile_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    };
+    let path = absolute_lexical_path(&path)?;
+    ensure_no_reparse_components(&path).map_err(|error| {
+        ShphError::Config(format!(
+            "SNAP reference path is not safe to traverse: {error}"
+        ))
+    })?;
+    Ok(path)
+}
+
+fn validate_snap_reference_file(path: &Path, field: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let file = open_readonly_no_reparse(path).map_err(|error| {
+        ShphError::Config(format!("SNAP {field} is not a safe regular file: {error}"))
+    })?;
+    if file.metadata()?.len() > max_bytes {
+        return Err(ShphError::Config(format!(
+            "SNAP {field} exceeds its size limit"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(ShphError::Config(format!(
+            "SNAP {field} exceeds its size limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_snap_profile_files(profile: &mut SnapProfile, profile_path: &Path) -> Result<()> {
+    const MAX_SNAP_KEY_FILE_BYTES: u64 = 16 * 1024;
+    const MAX_SNAP_ROUTE_FILE_BYTES: u64 = 1024 * 1024;
+    const MAX_SNAP_CA_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+    for bridge in &mut profile.bridges {
+        if let Some(path_text) = bridge.key_file.as_mut() {
+            let path = resolve_snap_reference_path(profile_path, path_text)?;
+            let bytes = validate_snap_reference_file(&path, "key_file", MAX_SNAP_KEY_FILE_BYTES)?;
+            if !matches!(bridge.adapter.as_str(), "mesh-dtn-local" | "mule-usb") {
+                let text = std::str::from_utf8(&bytes).map_err(|_| {
+                    ShphError::Config("SNAP key_file must contain base64 text".into())
+                })?;
+                let decoded = Zeroizing::new(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(text.trim().as_bytes())
+                        .map_err(|_| {
+                            ShphError::Config("SNAP key_file contains invalid base64".into())
+                        })?,
+                );
+                if decoded.len() != 32 {
+                    return Err(ShphError::Config(
+                        "SNAP key_file must decode to exactly 32 bytes".into(),
+                    ));
+                }
+            }
+            *path_text = path.to_string_lossy().into_owned();
+        }
+
+        if let Some(path_text) = bridge.route_file.as_mut() {
+            let path = resolve_snap_reference_path(profile_path, path_text)?;
+            let bytes =
+                validate_snap_reference_file(&path, "route_file", MAX_SNAP_ROUTE_FILE_BYTES)?;
+            let route: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                ShphError::Config("SNAP route_file must contain a JSON object".into())
+            })?;
+            let relays = route
+                .as_object()
+                .and_then(|object| object.get("relays"))
+                .and_then(serde_json::Value::as_array)
+                .filter(|relays| !relays.is_empty() && relays.len() <= shph_snap::MAX_ROUTE_HOPS)
+                .ok_or_else(|| {
+                    ShphError::Config(format!(
+                        "SNAP route_file must contain between 1 and {} relays",
+                        shph_snap::MAX_ROUTE_HOPS
+                    ))
+                })?;
+            let _ = relays;
+            *path_text = path.to_string_lossy().into_owned();
+        }
+
+        if let Some(path_text) = bridge.tls_ca_file.as_mut() {
+            let path = resolve_snap_reference_path(profile_path, path_text)?;
+            let _ = validate_snap_reference_file(&path, "tls_ca_file", MAX_SNAP_CA_FILE_BYTES)?;
+            *path_text = path.to_string_lossy().into_owned();
+        }
+    }
+    Ok(())
+}
+
+fn session_snap_plan(
+    config_path: &Path,
+    keystore_path: &Path,
+    config: &Config,
+) -> Result<Option<SnapPlan>> {
+    let Some(session) = config.session.as_ref() else {
+        return Ok(None);
+    };
+    let Some(profile_text) = session.snap_profile.as_deref() else {
+        return Ok(None);
+    };
+    if session.role != SessionRole::Connect {
+        return Err(ShphError::Config(
+            "session.snap_profile requires an outbound connect session".into(),
+        ));
+    }
+    let profile_path = Path::new(profile_text);
+    let profile_path = if profile_path.is_absolute() {
+        profile_path.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(profile_path)
+    };
+    let profile = read_snap_profile(&profile_path)?;
+    let keystore = KeyStore::load(keystore_path, None)?;
+    let contact = keystore.contacts.get(&profile.peer_alias).ok_or_else(|| {
+        ShphError::Auth(format!(
+            "SNAP peer alias '{}' is not locally pinned",
+            profile.peer_alias
+        ))
+    })?;
+    let selector = session.peer.as_deref().ok_or_else(|| {
+        ShphError::Config("session.peer is required when session.snap_profile is set".into())
+    })?;
+    if !outbound_contacts(&keystore, selector)
+        .iter()
+        .any(|selected| selected.alias == contact.alias)
+    {
+        return Err(ShphError::Auth(
+            "SNAP peer alias does not match the session's locally pinned peer".into(),
+        ));
+    }
+    let plan = profile
+        .plan(&contact.endpoint.host, contact.endpoint.port)
+        .map_err(|error| ShphError::Config(error.to_string()))?;
+    if plan.candidates.is_empty() {
+        return Err(ShphError::Config(
+            "SNAP profile produced no connection candidates".into(),
+        ));
+    }
+    Ok(Some(plan))
 }
 
 fn read_ticket_source(inline: Option<&str>, ticket_file: Option<&Path>) -> Result<String> {
@@ -1155,6 +1546,7 @@ fn handle_host(
     shroud_profile: Option<&str>,
     phantom_one: bool,
     phantom_one_profile: Option<&str>,
+    shroud3_adaptive: bool,
     no_tun: bool,
     no_nat: bool,
     ticket_file: Option<&Path>,
@@ -1200,6 +1592,14 @@ fn handle_host(
         &empty_config,
     )?;
     validate_morphology_transport(mode, morphology.phantom_one)?;
+    validate_shroud3_selection(
+        mode,
+        shroud3_adaptive,
+        !no_tun,
+        morphology.phantom_one,
+        false,
+    )?;
+    validate_shroud3_platform(shroud3_adaptive)?;
     let advertised_endpoint = advertised_endpoint(advertise, port)?;
     let bind = format_endpoint("0.0.0.0", port);
     let (mut config, keystore) = ensure_workspace(config_path, keystore_path)?;
@@ -1219,6 +1619,7 @@ fn handle_host(
         bind: Some(bind),
         peer: None,
         transport_peer: None,
+        snap_profile: None,
         timeout_secs: Some(300),
         handshake_profile: Some(HandshakeProfile::SecureDefault),
         underlay: None,
@@ -1229,6 +1630,8 @@ fn handle_host(
             .as_ref()
             .map(|path| path.display().to_string()),
         phantom_one: morphology.phantom_one,
+        shroud3_adaptive,
+        negotiate_envelope_policy: false,
         phantom_one_profile: morphology.phantom_one_profile.clone(),
         reconnect: Some(ReconnectConfig {
             enabled: Some(true),
@@ -1287,6 +1690,7 @@ fn handle_host(
             profile: HandshakeProfile::SecureDefault,
             shroud_profile: morphology.shroud_profile,
             phantom_one: morphology.phantom_one,
+            shroud3_adaptive,
             phantom_one_profile: morphology.phantom_one_profile,
             quic_cert_path: quic_cert_path.as_deref(),
             quic_key_path: quic_key_path.as_deref(),
@@ -1305,6 +1709,7 @@ fn handle_join(
     config_path: &Path,
     keystore_path: &Path,
     ticket_value: &str,
+    shroud3_adaptive: bool,
     no_tun: bool,
     underlay_value: Option<&str>,
     quic_cert_path: Option<&Path>,
@@ -1315,6 +1720,19 @@ fn handle_join(
     let mode = TransportMode::parse(&ticket.transport)?;
     let morphology = morphology_from_ticket(&ticket)?;
     validate_morphology_transport(mode, morphology.phantom_one)?;
+    validate_shroud3_selection(
+        mode,
+        shroud3_adaptive,
+        !no_tun,
+        morphology.phantom_one,
+        false,
+    )?;
+    validate_shroud3_platform(shroud3_adaptive)?;
+    if shroud3_adaptive && check {
+        return Err(ShphError::Unsupported(
+            "Shroud 3 is a persistent QUIC/TUN data-plane option and cannot be exercised by `join --check`".into(),
+        ));
+    }
     let underlay = parse_tcp_underlay_for_mode(underlay_value, mode)?;
     let endpoint = Endpoint::parse(&ticket.endpoint)
         .map_err(|error| ShphError::InvalidArgument(format!("invalid ticket endpoint: {error}")))?;
@@ -1352,12 +1770,15 @@ fn handle_join(
         bind: None,
         peer: Some(ticket.endpoint.clone()),
         transport_peer,
+        snap_profile: None,
         timeout_secs: Some(10),
         handshake_profile: Some(HandshakeProfile::SecureDefault),
         underlay: underlay.config_value(),
         quic_cert: quic_cert_path.map(|path| path.display().to_string()),
         quic_key: None,
         phantom_one: morphology.phantom_one,
+        shroud3_adaptive,
+        negotiate_envelope_policy: false,
         phantom_one_profile: morphology.phantom_one_profile.clone(),
         reconnect: Some(ReconnectConfig {
             enabled: Some(true),
@@ -1400,6 +1821,7 @@ fn handle_join(
             profile: HandshakeProfile::SecureDefault,
             shroud_profile: morphology.shroud_profile,
             phantom_one: morphology.phantom_one,
+            shroud3_adaptive,
             phantom_one_profile: morphology.phantom_one_profile,
             quic_cert_path,
             quic_key_path: None,
@@ -1586,6 +2008,7 @@ struct UpOptions<'a> {
     profile: HandshakeProfile,
     shroud_profile: String,
     phantom_one: bool,
+    shroud3_adaptive: bool,
     phantom_one_profile: String,
     quic_cert_path: Option<&'a Path>,
     quic_key_path: Option<&'a Path>,
@@ -1608,6 +2031,7 @@ fn handle_up(
         profile,
         shroud_profile,
         phantom_one,
+        shroud3_adaptive,
         phantom_one_profile,
         quic_cert_path,
         quic_key_path,
@@ -1618,6 +2042,17 @@ fn handle_up(
         nat,
         underlay,
     } = options;
+    let shroud3_adaptive = shroud3_adaptive
+        || config
+            .session
+            .as_ref()
+            .is_some_and(|session| session.shroud3_adaptive);
+    validate_shroud3_platform(shroud3_adaptive)?;
+    if session_requires_envelope_policy(config) {
+        return Err(ShphError::Unsupported(
+            "envelope-policy negotiation is only wired for send-once and recv-once; persistent TUN sessions fail closed".into(),
+        ));
+    }
     let phantom_one_wire_profile = phantom_one
         .then(|| parse_phantom_one_profile(&phantom_one_profile))
         .transpose()?;
@@ -1625,6 +2060,61 @@ fn handle_up(
     std::env::set_var("SHPH_PHANTOM_ONE", if phantom_one { "1" } else { "0" });
     std::env::set_var("SHPH_PHANTOM_ONE_PROFILE", &phantom_one_profile);
     validate_config_roadmap(config)?;
+    let snap_plan = session_snap_plan(config_path, keystore_path, config)?;
+    if let Some(plan) = &snap_plan {
+        validate_snap_runtime(plan)?;
+        let primary_mode = snap_primary_mode(plan)?;
+        if plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.adapter == "quic-standard")
+        {
+            let certificate_path = quic_cert_path.ok_or_else(|| {
+                ShphError::Config(
+                    "--quic-cert or session.quic_cert is required for SNAP quic-standard candidates"
+                        .into(),
+                )
+            })?;
+            let _ = read_quic_certificate(certificate_path)?;
+        }
+        if killswitch
+            && plan.candidates.iter().any(|candidate| {
+                snap_mode_for_adapter(&candidate.adapter).ok() != Some(primary_mode)
+            })
+        {
+            return Err(ShphError::Unsupported(
+                "SNAP killswitch sessions require every candidate to use the same transport mode"
+                    .into(),
+            ));
+        }
+        println!(
+            "  SNAP profile: {} ({} candidates, {} attempts max)",
+            plan.profile_name,
+            plan.candidates.len(),
+            plan.attempt_limit
+        );
+    }
+    let transport = match snap_plan.as_ref() {
+        Some(plan) => snap_primary_mode(plan)?,
+        None => transport,
+    };
+    validate_shroud3_selection(
+        transport,
+        shroud3_adaptive,
+        tun,
+        phantom_one,
+        snap_plan.is_some(),
+    )?;
+    if shroud3_adaptive
+        && config
+            .session
+            .as_ref()
+            .is_none_or(|session| session.startup_payload.is_some())
+    {
+        return Err(ShphError::Unsupported(
+            "adaptive Shroud 3 requires a persistent session without a startup payload".into(),
+        ));
+    }
     validate_tun_name(&config.interface_name)?;
     if control_plane_state_path(config_path).exists() {
         return Err(ShphError::Config(
@@ -1634,7 +2124,7 @@ fn handle_up(
     }
     announce_handshake_profile(profile);
     let mut killswitch_guard = if killswitch {
-        apply_killswitch(config, transport, killswitch_dry_run)?
+        apply_killswitch(config, transport, &underlay, killswitch_dry_run)?
     } else {
         FirewallGuard::default()
     };
@@ -1652,6 +2142,15 @@ fn handle_up(
             ));
         }
     };
+    if shroud3_adaptive && !tun.is_native() {
+        return Err(error_with_cleanup(
+            "Shroud 3 TUN startup",
+            ShphError::Unsupported(
+                "adaptive Shroud 3 requires a native TUN; set SHPH_TUN_NATIVE=1".into(),
+            ),
+            vec![("killswitch", killswitch_guard.cleanup())],
+        ));
+    }
     let mut tun_mutation_guard = if tun.is_native() {
         match NativeTunMutationGuard::capture(tun.name()) {
             Ok(guard) => guard,
@@ -1667,7 +2166,11 @@ fn handle_up(
     } else {
         NativeTunMutationGuard::default()
     };
-    if transport == TransportMode::QuicStandard && !tun.is_native() {
+    let standard_quic_one_shot = config
+        .session
+        .as_ref()
+        .is_some_and(|session| session.startup_payload.is_some());
+    if transport == TransportMode::QuicStandard && !tun.is_native() && !standard_quic_one_shot {
         return Err(error_with_cleanup(
             "quic-standard startup",
             ShphError::Unsupported(
@@ -1731,6 +2234,17 @@ fn handle_up(
                 cleanup_errors,
             ));
         }
+        if let Err(error) = configure_native_tun_link_up(tun.name()) {
+            let cleanup_errors = vec![
+                ("native TUN mutations", tun_mutation_guard.cleanup()),
+                ("killswitch", killswitch_guard.cleanup()),
+            ];
+            return Err(error_with_cleanup(
+                "native TUN link activation",
+                error,
+                cleanup_errors,
+            ));
+        }
         if let Err(error) = configure_native_tun_route_priority(tun.name()) {
             let cleanup_errors = vec![
                 ("native TUN mutations", tun_mutation_guard.cleanup()),
@@ -1781,7 +2295,12 @@ fn handle_up(
     println!("  Peer count: {}", config.peers.len());
     println!("  Underlay: {}", underlay.label());
     print_control_plane_status(config);
-    let mut control_guard = match apply_control_plane(config, tun.name(), Some(config_path)) {
+    let mut control_guard = match apply_control_plane_with_underlay(
+        config,
+        tun.name(),
+        Some(config_path),
+        Some(&underlay),
+    ) {
         Ok(guard) => guard,
         Err(error) => {
             let cleanup_errors = vec![
@@ -1862,6 +2381,7 @@ fn handle_up(
                             quic_cert_path,
                             quic_key_path,
                             profile,
+                            false,
                             roadmap,
                         )?;
                     } else {
@@ -1874,11 +2394,13 @@ fn handle_up(
                                 run_listen_loop(
                                     keystore_path,
                                     &tun,
+                                    native_tun_mtu,
                                     bind,
                                     timeout_secs,
                                     transport,
                                     profile,
                                     phantom_one_wire_profile,
+                                    shroud3_adaptive,
                                     config.roadmap.as_ref(),
                                     quic_cert_path,
                                     quic_key_path,
@@ -1898,17 +2420,20 @@ fn handle_up(
                         println!("  Transport peer: {transport_peer}");
                     }
                     if let Some(payload) = session.startup_payload.as_deref() {
-                        handle_send_once(
+                        handle_send_once_with_snap(
                             keystore_path,
                             peer,
                             transport_peer,
                             payload,
                             timeout_secs,
+                            session.timeout_secs,
                             Some(transport_mode_to_str(transport).to_string()),
                             quic_cert_path,
                             profile,
                             underlay.config_value().as_deref(),
+                            false,
                             roadmap,
+                            snap_plan.as_ref(),
                         )?;
                     } else {
                         run_with_reconnect(
@@ -1920,16 +2445,20 @@ fn handle_up(
                                 run_connect_loop(
                                     keystore_path,
                                     &tun,
+                                    native_tun_mtu,
                                     peer,
                                     transport_peer,
                                     timeout_secs,
+                                    session.timeout_secs,
                                     transport,
                                     profile,
                                     phantom_one_wire_profile,
+                                    shroud3_adaptive,
                                     config.roadmap.as_ref(),
                                     quic_cert_path,
                                     quic_key_path,
                                     &underlay,
+                                    snap_plan.as_ref(),
                                 )
                             },
                         )?;
@@ -1971,6 +2500,19 @@ fn handle_up(
 
 fn bounded_cli_timeout(timeout_secs: u64) -> Duration {
     Duration::from_secs(timeout_secs.clamp(1, 300))
+}
+
+fn retry_poll_timeouts_until<T>(
+    timeout: Duration,
+    mut poll: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match poll() {
+            Err(ShphError::Timeout) if Instant::now() < deadline => thread::yield_now(),
+            result => return result,
+        }
+    }
 }
 
 fn parse_socket_addr(value: &str) -> Result<SocketAddr> {
@@ -2733,7 +3275,7 @@ fn append_deep_doctor_checks(
 
     let probe_target = match &underlay {
         TcpUnderlay::Direct => transport_peer.as_str(),
-        TcpUnderlay::Socks5 { proxy } => proxy.as_str(),
+        TcpUnderlay::Socks5 { proxy } | TcpUnderlay::Tor { proxy } => proxy.as_str(),
     };
     match probe_tcp_endpoint(probe_target, session.timeout_secs.unwrap_or(5)) {
         Ok(elapsed) => doctor_check(
@@ -3834,14 +4376,35 @@ fn handle_connect(
         return Ok(());
     }
     let state = match mode {
-        TransportMode::Tcp => shph_transport::tcp_handshake_client_with_profile_and_underlay(
-            peer,
-            &keystore.identity,
-            &policy,
-            timeout_secs,
-            profile,
-            &underlay,
-        )?,
+        TransportMode::Tcp => {
+            let result = if underlay.is_direct() {
+                shph_transport::tcp_handshake_client_with_profile_and_underlay(
+                    peer,
+                    &keystore.identity,
+                    &policy,
+                    timeout_secs,
+                    profile,
+                    &underlay,
+                )
+            } else {
+                shph_transport::tcp_handshake_client_with_profile_and_underlay_with_cancel(
+                    peer,
+                    &keystore.identity,
+                    &policy,
+                    timeout_secs,
+                    profile,
+                    &underlay,
+                    &shutdown::shutdown_requested,
+                )
+            };
+            match result {
+                Err(_) if shutdown::shutdown_requested() => {
+                    println!("  Shutdown requested; cancelled SOCKS setup");
+                    return Ok(());
+                }
+                result => result?,
+            }
+        }
         TransportMode::Quic => {
             let (_socket, _peer_addr, state) = quic_handshake_client_with_profile(
                 peer,
@@ -3886,17 +4449,20 @@ fn handle_connect(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_send_once(
+fn handle_send_once_with_snap(
     keystore_path: &Path,
     peer: &str,
     transport_peer: &str,
     text: &str,
     timeout_secs: u64,
+    snap_timeout_cap_secs: Option<u64>,
     transport: Option<String>,
     quic_cert_path: Option<&Path>,
     profile: HandshakeProfile,
     underlay_value: Option<&str>,
+    negotiate_envelope_policy: bool,
     roadmap: Option<&RoadmapConfig>,
+    snap_plan: Option<&SnapPlan>,
 ) -> Result<()> {
     if let Some(roadmap) = roadmap {
         validate_roadmap(roadmap)?;
@@ -3908,13 +4474,64 @@ fn handle_send_once(
     println!("  Session id: {session_id}");
     println!("  Session start: {start_ms}ms");
     println!("  Initial metrics: {:?}", metrics.snapshot());
-    let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
+    let mode = match snap_plan {
+        Some(plan) => snap_primary_mode(plan)?,
+        None => resolve_transport_mode(transport.as_deref(), roadmap)?,
+    };
+    if let Some(plan) = snap_plan {
+        validate_snap_runtime(plan)?;
+    }
+    validate_envelope_policy_transport(negotiate_envelope_policy, mode)?;
     let underlay = parse_tcp_underlay_for_mode(underlay_value, mode)?;
     let lab = quic_lab_config()?;
+    let envelope_config =
+        PhantomOneConfig::for_profile(lab.phantom_one_profile.unwrap_or(ProfileTier::Medium));
+    let lab_for_session = if negotiate_envelope_policy {
+        QuicLabConfig::default()
+    } else {
+        lab.clone()
+    };
     announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
     let policy = peer_policy_for_endpoint(&keystore, peer, true)?;
     println!("  Underlay: {}", underlay.label());
+    if let Some(plan) = snap_plan.filter(|plan| {
+        plan.candidates
+            .iter()
+            .any(|candidate| candidate.adapter == "quic-standard")
+    }) {
+        let cert_path = quic_cert_path.ok_or_else(|| {
+            ShphError::Config(
+                "--quic-cert is required for a SNAP profile containing quic-standard".into(),
+            )
+        })?;
+        let certificate = read_quic_certificate(cert_path)?;
+        let state = send_snap_payload_with_plan(
+            plan,
+            &keystore,
+            &policy,
+            keystore_path,
+            peer,
+            &certificate,
+            text.as_bytes(),
+            snap_timeout_cap_secs,
+            profile,
+            lab.phantom_one_profile,
+            negotiate_envelope_policy,
+            envelope_config,
+            lab_for_session.clone(),
+            &underlay,
+            roadmap,
+        )?;
+        append_handshake_audit(roadmap, &keystore.identity, peer, &state, "send", mode)?;
+        metrics.inc_bytes_sent(text.len());
+        print_handshake_state("send-once", peer, &state);
+        println!("  Sent bytes: {}", text.len());
+        println!("  Session id: {session_id}");
+        println!("  Session end: {}ms", phase_a1_now_ms()?);
+        println!("  Final metrics: {:?}", metrics.snapshot());
+        return Ok(());
+    }
     if mode == TransportMode::QuicStandard {
         let cert_path = quic_cert_path.ok_or_else(|| {
             ShphError::Config(
@@ -3940,32 +4557,42 @@ fn handle_send_once(
                 bounded_cli_timeout(timeout_secs),
             )
             .await?;
-            if let Some(phantom_one_profile) = phantom_one_profile {
-                connection
-                    .negotiate_phantom_one(
-                        Some(phantom_one_profile),
-                        bounded_cli_timeout(timeout_secs),
-                    )
-                    .await?;
-            }
-            enforce_peer_policy(keystore_path, peer, &connection.handshake, true)?;
-            if phantom_one_profile.is_some() {
-                connection
-                    .send_phantom_one_datagram(text.as_bytes())
-                    .await?;
-            } else {
-                connection.send_datagram_wait(text.as_bytes()).await?;
-            }
-            let ack =
-                tokio::time::timeout(bounded_cli_timeout(timeout_secs), connection.recv_control())
+            let state = connection.handshake.clone();
+            enforce_peer_policy(keystore_path, peer, &state, true)?;
+            let timeout_duration = bounded_cli_timeout(timeout_secs);
+            if negotiate_envelope_policy {
+                let mut session =
+                    NegotiatedQuic::establish(connection, envelope_config, 1472, timeout_duration)
+                        .await?;
+                session.send(text.as_bytes()).await?;
+                let ack = tokio::time::timeout(timeout_duration, session.recv_control())
                     .await
                     .map_err(|_| ShphError::Timeout)??;
-            if ack != QUIC_PAYLOAD_ACK {
-                return Err(ShphError::Protocol(
-                    "unexpected QUIC one-shot payload acknowledgement".into(),
-                ));
+                if ack != QUIC_PAYLOAD_ACK {
+                    return Err(ShphError::Protocol(
+                        "unexpected QUIC one-shot payload acknowledgement".into(),
+                    ));
+                }
+            } else {
+                if let Some(phantom_one_profile) = phantom_one_profile {
+                    connection
+                        .negotiate_phantom_one(Some(phantom_one_profile), timeout_duration)
+                        .await?;
+                    connection
+                        .send_phantom_one_datagram(text.as_bytes())
+                        .await?;
+                } else {
+                    connection.send_datagram_wait(text.as_bytes()).await?;
+                }
+                let ack = tokio::time::timeout(timeout_duration, connection.recv_control())
+                    .await
+                    .map_err(|_| ShphError::Timeout)??;
+                if ack != QUIC_PAYLOAD_ACK {
+                    return Err(ShphError::Protocol(
+                        "unexpected QUIC one-shot payload acknowledgement".into(),
+                    ));
+                }
             }
-            let state = connection.handshake;
             endpoint.close(0u32.into(), b"payload sent");
             endpoint.wait_idle().await;
             Ok(state)
@@ -3979,57 +4606,114 @@ fn handle_send_once(
         println!("  Final metrics: {:?}", metrics.snapshot());
         return Ok(());
     }
-    let (mut session, state) = match mode {
-        TransportMode::Tcp => connect_secure_session_lab_with_profile_and_underlay(
-            transport_peer,
-            &keystore.identity,
+    let (mut session, state, session_mode) = if let Some(plan) = snap_plan {
+        connect_snap_session(
+            plan,
+            &keystore,
             &policy,
-            timeout_secs,
-            mode,
-            lab,
+            snap_timeout_cap_secs,
+            lab_for_session,
             profile,
             &underlay,
-        )?,
-        TransportMode::Quic => connect_secure_session_lab_with_profile(
-            transport_peer,
-            &keystore.identity,
-            &policy,
-            timeout_secs,
-            mode,
-            lab,
-            profile,
-        )?,
-        TransportMode::OfflineMesh => {
-            let cfg = roadmap_offline_mesh_config(roadmap)?;
-            offline_mesh_connect_secure_session_with_profile(
-                &cfg,
+            quic_cert_path,
+            roadmap,
+        )?
+    } else {
+        let (session, state) = match mode {
+            TransportMode::Tcp => {
+                let result = if underlay.is_direct() {
+                    connect_secure_session_lab_with_profile_and_underlay(
+                        transport_peer,
+                        &keystore.identity,
+                        &policy,
+                        timeout_secs,
+                        mode,
+                        lab_for_session,
+                        profile,
+                        &underlay,
+                    )
+                } else {
+                    shph_transport::connect_secure_session_lab_with_profile_and_underlay_with_cancel(
+                        transport_peer,
+                        &keystore.identity,
+                        &policy,
+                        timeout_secs,
+                        mode,
+                        lab_for_session,
+                        profile,
+                        &underlay,
+                        &shutdown::shutdown_requested,
+                    )
+                };
+                match result {
+                    Err(_) if shutdown::shutdown_requested() => {
+                        println!("  Shutdown requested; cancelled SOCKS setup");
+                        return Ok(());
+                    }
+                    result => result?,
+                }
+            }
+            TransportMode::Quic => connect_secure_session_lab_with_profile(
+                transport_peer,
                 &keystore.identity,
                 &policy,
                 timeout_secs,
+                mode,
+                lab_for_session,
                 profile,
-            )?
-        }
-        TransportMode::DataMule => {
-            let cfg = roadmap_data_mule_config(roadmap)?;
-            data_mule_connect_secure_session_with_profile(
-                &cfg,
-                &keystore.identity,
-                peer,
-                &policy,
-                timeout_secs,
-                profile,
-            )?
-        }
-        TransportMode::QuicStandard => {
-            return Err(ShphError::Unsupported(
-                "quic-standard uses the async standards_quic API".into(),
-            ))
-        }
+            )?,
+            TransportMode::OfflineMesh => {
+                let cfg = roadmap_offline_mesh_config(roadmap)?;
+                offline_mesh_connect_secure_session_with_profile(
+                    &cfg,
+                    &keystore.identity,
+                    &policy,
+                    timeout_secs,
+                    profile,
+                )?
+            }
+            TransportMode::DataMule => {
+                let cfg = roadmap_data_mule_config(roadmap)?;
+                data_mule_connect_secure_session_with_profile(
+                    &cfg,
+                    &keystore.identity,
+                    peer,
+                    &policy,
+                    timeout_secs,
+                    profile,
+                )?
+            }
+            TransportMode::QuicStandard => {
+                return Err(ShphError::Unsupported(
+                    "quic-standard uses the async standards_quic API".into(),
+                ))
+            }
+        };
+        (session, state, mode)
     };
     enforce_peer_policy(keystore_path, peer, &state, true)?;
+    session.activate()?;
     let keystore = KeyStore::load(keystore_path, None)?;
-    append_handshake_audit(roadmap, &keystore.identity, peer, &state, "send", mode)?;
-    session.send_frame(text.as_bytes())?;
+    append_handshake_audit(
+        roadmap,
+        &keystore.identity,
+        peer,
+        &state,
+        "send",
+        session_mode,
+    )?;
+    if negotiate_envelope_policy {
+        let mut negotiated = NegotiatedTcp::establish(
+            session,
+            &state.transcript_hash_hex,
+            envelope_config,
+            shph_transport::MAX_TCP_PAYLOAD_BYTES,
+            bounded_cli_timeout(timeout_secs),
+        )?;
+        negotiated.send(text.as_bytes())?;
+    } else {
+        session.send_frame(text.as_bytes())?;
+    }
     metrics.inc_bytes_sent(text.len());
     print_handshake_state("send-once", peer, &state);
     println!("  Sent bytes: {}", text.len());
@@ -4037,6 +4721,290 @@ fn handle_send_once(
     println!("  Session end: {}ms", phase_a1_now_ms()?);
     println!("  Final metrics: {:?}", metrics.snapshot());
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_snap_payload_with_plan(
+    plan: &SnapPlan,
+    keystore: &KeyStore,
+    policy: &shph_core::PeerPolicy,
+    keystore_path: &Path,
+    peer_selector: &str,
+    certificate: &[u8],
+    payload: &[u8],
+    explicit_timeout_cap_secs: Option<u64>,
+    profile: HandshakeProfile,
+    phantom_one_profile: Option<ProfileTier>,
+    negotiate_envelope_policy: bool,
+    envelope_config: PhantomOneConfig,
+    lab: QuicLabConfig,
+    underlay: &TcpUnderlay,
+    roadmap: Option<&RoadmapConfig>,
+) -> Result<HandshakeState> {
+    validate_snap_runtime(plan)?;
+    let audit_context = snap_audit_context(plan, keystore)?;
+    if !plan
+        .candidates
+        .iter()
+        .any(|candidate| candidate.adapter == "quic-standard")
+    {
+        return Err(ShphError::Unsupported(
+            "SNAP planned one-shot runtime requires a quic-standard candidate".into(),
+        ));
+    }
+
+    let started = Instant::now();
+    let max_elapsed = (plan.retry_policy.max_elapsed_sec > 0.0)
+        .then(|| Duration::from_secs_f64(plan.retry_policy.max_elapsed_sec));
+    let mut attempt = 0u32;
+    let mut last_error = None;
+
+    for round in 1..=plan.retry_policy.rounds {
+        let mut previous_failed: Option<shph_snap::SnapCandidate> = None;
+        if round > 1 {
+            let jitter = rand::thread_rng().gen_range(0.0..=1.0);
+            let delay =
+                Duration::from_secs_f64(plan.retry_policy.backoff_after_round(round - 1, jitter));
+            if max_elapsed.is_some_and(|budget| started.elapsed().saturating_add(delay) >= budget) {
+                if let Some(candidate) = previous_failed.as_ref() {
+                    log_snap_audit(SnapAuditEvent::new(
+                        &audit_context,
+                        candidate,
+                        round,
+                        attempt,
+                        AttemptOutcome::BudgetExceeded,
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    ));
+                }
+                break;
+            }
+            thread::sleep(delay);
+        }
+
+        for candidate in plan.candidates_for_round(round) {
+            if attempt as usize >= plan.attempt_limit {
+                break;
+            }
+            if previous_failed
+                .as_ref()
+                .is_some_and(|previous| !plan.candidate_allows_fallback(previous, &candidate))
+            {
+                log_snap_audit(SnapAuditEvent::new(
+                    &audit_context,
+                    &candidate,
+                    round,
+                    attempt,
+                    AttemptOutcome::FallbackDenied,
+                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                ));
+                continue;
+            }
+
+            let remaining = max_elapsed.map(|budget| budget.saturating_sub(started.elapsed()));
+            if remaining.is_some_and(|duration| duration < SNAP_MIN_CANDIDATE_BUDGET) {
+                if let Some(previous) = previous_failed.as_ref() {
+                    log_snap_audit(SnapAuditEvent::new(
+                        &audit_context,
+                        previous,
+                        round,
+                        attempt,
+                        AttemptOutcome::BudgetExceeded,
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    ));
+                }
+                break;
+            }
+            let Some(timeout_duration) = snap_candidate_attempt_timeout(
+                plan,
+                &candidate,
+                explicit_timeout_cap_secs,
+                remaining,
+            ) else {
+                break;
+            };
+            if timeout_duration < SNAP_MIN_CANDIDATE_BUDGET {
+                break;
+            }
+            let mode = snap_mode_for_adapter(&candidate.adapter)?;
+            attempt += 1;
+            let attempt_started = Instant::now();
+            let (result, payload_may_have_been_delivered) = if mode == TransportMode::QuicStandard {
+                let endpoint_text = format_endpoint(&candidate.target_host, candidate.target_port);
+                let peer_addr = parse_socket_addr(&endpoint_text)?;
+                match run_async(async {
+                    let endpoint = standards_quic::client_endpoint(
+                        "0.0.0.0:0".parse().expect("valid ephemeral endpoint"),
+                        certificate,
+                        standards_quic::StandardsQuicConfig::default(),
+                    )?;
+                    let mut payload_may_have_been_delivered = false;
+                    let attempt_result = async {
+                        let mut connection = standards_quic::connect(
+                            &endpoint,
+                            peer_addr,
+                            candidate.sni.as_deref().unwrap_or("localhost"),
+                            &keystore.identity,
+                            policy,
+                            profile,
+                            timeout_duration,
+                        )
+                        .await?;
+                        let state = connection.handshake.clone();
+                        enforce_peer_policy(keystore_path, peer_selector, &state, true)?;
+                        if negotiate_envelope_policy {
+                            let mut session = NegotiatedQuic::establish(
+                                connection,
+                                envelope_config,
+                                1472,
+                                timeout_duration,
+                            )
+                            .await?;
+                            payload_may_have_been_delivered = true;
+                            session.send(payload).await?;
+                            let ack =
+                                tokio::time::timeout(timeout_duration, session.recv_control())
+                                    .await
+                                    .map_err(|_| ShphError::Timeout)??;
+                            if ack != QUIC_PAYLOAD_ACK {
+                                return Err(ShphError::Protocol(
+                                    "unexpected QUIC one-shot payload acknowledgement".into(),
+                                ));
+                            }
+                        } else {
+                            if let Some(phantom_one_profile) = phantom_one_profile {
+                                connection
+                                    .negotiate_phantom_one(
+                                        Some(phantom_one_profile),
+                                        timeout_duration,
+                                    )
+                                    .await?;
+                                payload_may_have_been_delivered = true;
+                                connection.send_phantom_one_datagram(payload).await?;
+                            } else {
+                                payload_may_have_been_delivered = true;
+                                connection.send_datagram_wait(payload).await?;
+                            }
+                            let ack =
+                                tokio::time::timeout(timeout_duration, connection.recv_control())
+                                    .await
+                                    .map_err(|_| ShphError::Timeout)??;
+                            if ack != QUIC_PAYLOAD_ACK {
+                                return Err(ShphError::Protocol(
+                                    "unexpected QUIC one-shot payload acknowledgement".into(),
+                                ));
+                            }
+                        }
+                        Ok(state)
+                    }
+                    .await;
+                    endpoint.close(0u32.into(), b"SNAP one-shot complete");
+                    endpoint.wait_idle().await;
+                    Ok((attempt_result, payload_may_have_been_delivered))
+                }) {
+                    Ok(result) => result,
+                    Err(error) => (Err(error), false),
+                }
+            } else {
+                let mut payload_may_have_been_delivered = false;
+                let result = connect_snap_candidate(
+                    plan,
+                    &candidate,
+                    mode,
+                    keystore,
+                    policy,
+                    timeout_duration,
+                    lab.clone(),
+                    profile,
+                    underlay,
+                    None,
+                    roadmap,
+                )
+                .and_then(|(mut session, state)| {
+                    enforce_peer_policy(keystore_path, peer_selector, &state, true)?;
+                    session.activate()?;
+                    if negotiate_envelope_policy {
+                        let mut negotiated = NegotiatedTcp::establish(
+                            session,
+                            &state.transcript_hash_hex,
+                            envelope_config,
+                            shph_transport::MAX_TCP_PAYLOAD_BYTES,
+                            timeout_duration,
+                        )?;
+                        payload_may_have_been_delivered = true;
+                        negotiated.send(payload)?;
+                    } else {
+                        payload_may_have_been_delivered = true;
+                        session.send_frame(payload)?;
+                    }
+                    Ok(state)
+                });
+                (result, payload_may_have_been_delivered)
+            };
+
+            match result {
+                Ok(state) => {
+                    log_snap_audit(
+                        SnapAuditEvent::new(
+                            &audit_context,
+                            &candidate,
+                            round,
+                            attempt,
+                            AttemptOutcome::Connected,
+                            attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_effective_timeout_ms(
+                            timeout_duration.as_millis().min(u64::MAX as u128) as u64,
+                        ),
+                    );
+                    return Ok(state);
+                }
+                Err(error)
+                    if snap_attempt_error_is_retryable(&error, payload_may_have_been_delivered) =>
+                {
+                    log_snap_audit(
+                        SnapAuditEvent::new(
+                            &audit_context,
+                            &candidate,
+                            round,
+                            attempt,
+                            AttemptOutcome::RetryableFailure,
+                            attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_effective_timeout_ms(
+                            timeout_duration.as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_normalized_failure_reason(snap_error_audit_reason(&error)),
+                    );
+                    previous_failed = Some(candidate);
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    log_snap_audit(
+                        SnapAuditEvent::new(
+                            &audit_context,
+                            &candidate,
+                            round,
+                            attempt,
+                            AttemptOutcome::TerminalFailure,
+                            attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_effective_timeout_ms(
+                            timeout_duration.as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_normalized_failure_reason(snap_error_audit_reason(&error)),
+                    );
+                    return Err(error);
+                }
+            }
+            if attempt as usize >= plan.attempt_limit
+                || max_elapsed.is_some_and(|budget| started.elapsed() >= budget)
+            {
+                break;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or(ShphError::Timeout))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4048,6 +5016,7 @@ fn handle_recv_once(
     quic_cert_path: Option<&Path>,
     quic_key_path: Option<&Path>,
     profile: HandshakeProfile,
+    negotiate_envelope_policy: bool,
     roadmap: Option<&RoadmapConfig>,
 ) -> Result<()> {
     if let Some(roadmap) = roadmap {
@@ -4061,7 +5030,15 @@ fn handle_recv_once(
     println!("  Session start: {start_ms}ms");
     println!("  Initial metrics: {:?}", metrics.snapshot());
     let mode = resolve_transport_mode(transport.as_deref(), roadmap)?;
+    validate_envelope_policy_transport(negotiate_envelope_policy, mode)?;
     let lab = quic_lab_config()?;
+    let envelope_config =
+        PhantomOneConfig::for_profile(lab.phantom_one_profile.unwrap_or(ProfileTier::Medium));
+    let lab_for_session = if negotiate_envelope_policy {
+        QuicLabConfig::default()
+    } else {
+        lab.clone()
+    };
     announce_handshake_profile(profile);
     let keystore = KeyStore::load(keystore_path, None)?;
     let policy = peer_policy_for_endpoint(&keystore, bind, false)?;
@@ -4091,26 +5068,35 @@ fn handle_recv_once(
                 bounded_cli_timeout(timeout_secs),
             )
             .await?;
-            if let Some(phantom_one_profile) = phantom_one_profile {
-                connection
-                    .negotiate_phantom_one(
-                        Some(phantom_one_profile),
-                        bounded_cli_timeout(timeout_secs),
-                    )
-                    .await?;
-            }
-            enforce_peer_policy(keystore_path, bind, &connection.handshake, false)?;
-            let payload = if phantom_one_profile.is_some() {
-                connection.recv_phantom_one_datagram().await?
+            let state = connection.handshake.clone();
+            enforce_peer_policy(keystore_path, bind, &state, false)?;
+            let timeout_duration = bounded_cli_timeout(timeout_secs);
+            let payload = if negotiate_envelope_policy {
+                let peer_connection = connection.connection.clone();
+                let mut session =
+                    NegotiatedQuic::establish(connection, envelope_config, 1472, timeout_duration)
+                        .await?;
+                let payload = session.recv().await?;
+                session.send_control(QUIC_PAYLOAD_ACK).await?;
+                let _ = tokio::time::timeout(timeout_duration, peer_connection.closed()).await;
+                payload
             } else {
-                connection.recv_datagram().await?.to_vec()
+                if let Some(phantom_one_profile) = phantom_one_profile {
+                    connection
+                        .negotiate_phantom_one(Some(phantom_one_profile), timeout_duration)
+                        .await?;
+                }
+                let payload = if phantom_one_profile.is_some() {
+                    connection.recv_phantom_one_datagram().await?
+                } else {
+                    connection.recv_datagram().await?.to_vec()
+                };
+                connection.send_control(QUIC_PAYLOAD_ACK).await?;
+                let peer_connection = connection.connection.clone();
+                let _ = tokio::time::timeout(timeout_duration, peer_connection.closed()).await;
+                payload
             };
-            connection.send_control(QUIC_PAYLOAD_ACK).await?;
-            let peer_connection = connection.connection.clone();
-            let _ =
-                tokio::time::timeout(bounded_cli_timeout(timeout_secs), peer_connection.closed())
-                    .await;
-            Ok((connection.handshake, payload))
+            Ok((state, payload))
         })?;
         let (state, payload) = result;
         append_handshake_audit(roadmap, &keystore.identity, bind, &state, "recv", mode)?;
@@ -4131,7 +5117,7 @@ fn handle_recv_once(
             &policy,
             timeout_secs,
             mode,
-            lab,
+            lab_for_session,
             profile,
         )?,
         TransportMode::Quic => accept_secure_session_lab_with_profile(
@@ -4140,7 +5126,7 @@ fn handle_recv_once(
             &policy,
             timeout_secs,
             mode,
-            lab,
+            lab_for_session,
             profile,
         )?,
         TransportMode::OfflineMesh => {
@@ -4172,7 +5158,18 @@ fn handle_recv_once(
     enforce_peer_policy(keystore_path, bind, &state, false)?;
     let keystore = KeyStore::load(keystore_path, None)?;
     append_handshake_audit(roadmap, &keystore.identity, bind, &state, "recv", mode)?;
-    let payload = session.recv_frame()?;
+    let payload = if negotiate_envelope_policy {
+        let mut negotiated = NegotiatedTcp::establish(
+            session,
+            &state.transcript_hash_hex,
+            envelope_config,
+            shph_transport::MAX_TCP_PAYLOAD_BYTES,
+            bounded_cli_timeout(timeout_secs),
+        )?;
+        negotiated.recv()?
+    } else {
+        retry_poll_timeouts_until(bounded_cli_timeout(timeout_secs), || session.recv_frame())?
+    };
     metrics.inc_bytes_recv(payload.len());
     let plaintext = String::from_utf8(payload)
         .map_err(|_| ShphError::Protocol("payload not valid utf8".into()))?;
@@ -4367,6 +5364,51 @@ fn validate_morphology_transport(mode: TransportMode, phantom_one: bool) -> Resu
     Ok(())
 }
 
+fn validate_shroud3_selection(
+    mode: TransportMode,
+    shroud3_adaptive: bool,
+    tun_enabled: bool,
+    phantom_one: bool,
+    snap_enabled: bool,
+) -> Result<()> {
+    if !shroud3_adaptive {
+        return Ok(());
+    }
+    if mode != TransportMode::QuicStandard {
+        return Err(ShphError::Unsupported(
+            "adaptive Shroud 3 requires standards-compliant QUIC".into(),
+        ));
+    }
+    if !tun_enabled {
+        return Err(ShphError::Unsupported(
+            "adaptive Shroud 3 requires native TUN".into(),
+        ));
+    }
+    if phantom_one {
+        return Err(ShphError::Config(
+            "adaptive Shroud 3 cannot be combined with Phantom One".into(),
+        ));
+    }
+    if snap_enabled {
+        return Err(ShphError::Unsupported(
+            "adaptive Shroud 3 is not available with SNAP transport plans".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_shroud3_platform(shroud3_adaptive: bool) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    if shroud3_adaptive {
+        return Err(ShphError::Unsupported(
+            "adaptive Shroud 3 native-TUN integration currently requires Linux".into(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    let _ = shroud3_adaptive;
+    Ok(())
+}
+
 fn set_morphology_env(selection: &MorphologySelection) -> Result<()> {
     std::env::set_var("SHPH_SHROUD_PROFILE", &selection.shroud_profile);
     std::env::set_var(
@@ -4415,6 +5457,22 @@ fn parse_tcp_underlay_for_mode(value: Option<&str>, mode: TransportMode) -> Resu
         ));
     }
     Ok(underlay)
+}
+
+fn session_requires_envelope_policy(config: &Config) -> bool {
+    config
+        .session
+        .as_ref()
+        .is_some_and(|session| session.negotiate_envelope_policy)
+}
+
+fn validate_envelope_policy_transport(enabled: bool, mode: TransportMode) -> Result<()> {
+    if enabled && !matches!(mode, TransportMode::Tcp | TransportMode::QuicStandard) {
+        return Err(ShphError::Unsupported(
+            "envelope-policy negotiation is supported only for one-shot TCP and standards QUIC sessions".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_transport_from_roadmap(cfg: &RoadmapConfig) -> Result<TransportMode> {
@@ -4522,6 +5580,513 @@ fn format_endpoint(host: &str, port: u16) -> String {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
+    }
+}
+
+fn snap_mode_for_adapter(adapter: &str) -> Result<TransportMode> {
+    match adapter {
+        "direct-tcp" | "bridge-onion-tcp" | "bridge-tls" | "bridge-ws" | "shroud-tcp"
+        | "edge-relay" | "mesh-dtn-local" | "mule-usb" => Ok(TransportMode::Tcp),
+        "quic" => Ok(TransportMode::Quic),
+        "quic-standard" => Ok(TransportMode::QuicStandard),
+        "offline-mesh" => Ok(TransportMode::OfflineMesh),
+        "data-mule" => Ok(TransportMode::DataMule),
+        _ => Err(ShphError::Unsupported(format!(
+            "SNAP adapter '{adapter}' has no complete SHPH runtime flow yet"
+        ))),
+    }
+}
+
+fn validate_snap_runtime(plan: &SnapPlan) -> Result<()> {
+    for candidate in &plan.candidates {
+        let local_adapter = matches!(candidate.adapter.as_str(), "mesh-dtn-local" | "mule-usb");
+        if candidate.kind == CandidateKind::Bridge
+            && !local_adapter
+            && candidate.operator_service_contract.is_none()
+        {
+            return Err(ShphError::Config(format!(
+                "SNAP bridge candidate '{}' requires an explicit operator_service_contract",
+                candidate.id()
+            )));
+        }
+        let expected_transport = match candidate.adapter.as_str() {
+            "direct-tcp" => "tcp",
+            "bridge-onion-tcp" | "bridge-tls" | "bridge-ws" | "shroud-tcp" | "edge-relay"
+            | "mesh-dtn-local" | "mule-usb" => "onion-tcp",
+            "quic" => "quic",
+            "quic-standard" => "quic-standard",
+            "offline-mesh" => "offline-mesh",
+            "data-mule" => "data-mule",
+            other => {
+                return Err(ShphError::Unsupported(format!(
+                    "SNAP adapter '{other}' has no complete SHPH runtime flow yet"
+                )))
+            }
+        };
+        if candidate.transport != expected_transport {
+            return Err(ShphError::Unsupported(format!(
+                "SNAP adapter '{}' requires transport '{}', found '{}'",
+                candidate.adapter, expected_transport, candidate.transport
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn snap_primary_mode(plan: &SnapPlan) -> Result<TransportMode> {
+    let candidate = plan
+        .candidates
+        .first()
+        .ok_or_else(|| ShphError::Config("SNAP profile produced no candidates".into()))?;
+    snap_mode_for_adapter(&candidate.adapter)
+}
+
+fn snap_candidate_attempt_timeout(
+    plan: &SnapPlan,
+    candidate: &shph_snap::SnapCandidate,
+    explicit_timeout_cap_secs: Option<u64>,
+    remaining_budget: Option<Duration>,
+) -> Option<Duration> {
+    let mut seconds = plan.effective_candidate_timeout_sec(candidate);
+    if let Some(cap) = explicit_timeout_cap_secs {
+        seconds = seconds.min(cap.max(1) as f64);
+    }
+    if let Some(remaining) = remaining_budget {
+        seconds = seconds.min(remaining.as_secs_f64());
+    }
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(seconds.min(300.0)))
+}
+
+fn snap_candidate_remaining_timeout(deadline: Instant) -> Result<Duration> {
+    snap_remaining_until(deadline, Instant::now()).ok_or(ShphError::Timeout)
+}
+
+fn snap_remaining_until(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+const SNAP_MIN_CANDIDATE_BUDGET: Duration = Duration::from_millis(200);
+
+fn log_snap_audit(event: SnapAuditEvent) {
+    tracing::info!(
+        target: "shph::snap::audit",
+        profile_hash = %event.profile_hash,
+        candidate_id = %event.candidate_id,
+        adapter = %event.adapter,
+        round = event.round_index,
+        attempt = event.attempt_index,
+        outcome = ?event.outcome,
+        elapsed_ms = event.elapsed_ms,
+        schema_version = event.schema_version,
+        event_name = %event.event_name,
+        component = %event.component,
+        profile_name = %event.profile_name,
+        peer_ref = %event.peer_ref,
+        plan_id = %event.plan_id,
+        correlation_id = %event.correlation_id,
+        candidate_source = %event.candidate_source,
+        edge_label = %event.edge_label,
+        shroud_profile = ?event.shroud_profile,
+        round_index = event.round_index,
+        attempt_index = event.attempt_index,
+        effective_timeout_ms = ?event.effective_timeout_ms,
+        result = %event.result,
+        normalized_failure_reason = %event.normalized_failure_reason,
+        detail_code = %event.detail_code,
+        selected_path_type = ?event.selected_path_type,
+        latency_ms = ?event.latency_ms,
+        "SNAP path attempt"
+    );
+}
+
+fn snap_audit_context(plan: &SnapPlan, keystore: &KeyStore) -> Result<SnapAuditContext> {
+    let contact = keystore.contacts.get(&plan.peer_alias).ok_or_else(|| {
+        ShphError::Auth(format!(
+            "SNAP peer alias '{}' is not locally pinned",
+            plan.peer_alias
+        ))
+    })?;
+    let public_key = decode_peer_key(&contact.pubkey_b64, "configured SNAP peer identity")?;
+    let pinned_fingerprint = compute_fingerprint_hex(&public_key);
+    Ok(SnapAuditContext::new(plan, &pinned_fingerprint))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_snap_session(
+    plan: &SnapPlan,
+    keystore: &KeyStore,
+    policy: &shph_core::PeerPolicy,
+    explicit_timeout_cap_secs: Option<u64>,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+    quic_cert_path: Option<&Path>,
+    roadmap: Option<&RoadmapConfig>,
+) -> Result<(SecureSession, shph_core::HandshakeState, TransportMode)> {
+    validate_snap_runtime(plan)?;
+    let audit_context = snap_audit_context(plan, keystore)?;
+    let quic_certificate = if plan
+        .candidates
+        .iter()
+        .any(|candidate| candidate.adapter == "quic-standard")
+    {
+        let certificate_path = quic_cert_path.ok_or_else(|| {
+            ShphError::Config(
+                "--quic-cert or session.quic_cert is required for SNAP quic-standard candidates"
+                    .into(),
+            )
+        })?;
+        Some(read_quic_certificate(certificate_path)?)
+    } else {
+        None
+    };
+    let started = Instant::now();
+    let max_elapsed = (plan.retry_policy.max_elapsed_sec > 0.0)
+        .then(|| Duration::from_secs_f64(plan.retry_policy.max_elapsed_sec));
+    let mut attempt = 0u32;
+    let mut last_error = None;
+
+    for round in 1..=plan.retry_policy.rounds {
+        let mut previous_failed: Option<shph_snap::SnapCandidate> = None;
+        if round > 1 {
+            let jitter = rand::thread_rng().gen_range(0.0..=1.0);
+            let delay =
+                Duration::from_secs_f64(plan.retry_policy.backoff_after_round(round - 1, jitter));
+            if let Some(budget) = max_elapsed {
+                let remaining = budget.saturating_sub(started.elapsed());
+                if remaining < delay {
+                    if let Some(candidate) = previous_failed.as_ref() {
+                        log_snap_audit(SnapAuditEvent::new(
+                            &audit_context,
+                            candidate,
+                            round,
+                            attempt,
+                            AttemptOutcome::BudgetExceeded,
+                            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        ));
+                    }
+                    break;
+                }
+            }
+            thread::sleep(delay);
+        }
+
+        for candidate in plan.candidates_for_round(round) {
+            if attempt as usize >= plan.attempt_limit {
+                break;
+            }
+            if let Some(budget) = max_elapsed {
+                let remaining = budget.saturating_sub(started.elapsed());
+                if remaining < SNAP_MIN_CANDIDATE_BUDGET {
+                    if let Some(previous) = previous_failed.as_ref() {
+                        log_snap_audit(SnapAuditEvent::new(
+                            &audit_context,
+                            previous,
+                            round,
+                            attempt,
+                            AttemptOutcome::BudgetExceeded,
+                            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        ));
+                    }
+                    break;
+                }
+            }
+            if previous_failed
+                .as_ref()
+                .is_some_and(|previous| !plan.candidate_allows_fallback(previous, &candidate))
+            {
+                log_snap_audit(SnapAuditEvent::new(
+                    &audit_context,
+                    &candidate,
+                    round,
+                    attempt,
+                    AttemptOutcome::FallbackDenied,
+                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                ));
+                continue;
+            }
+
+            let remaining_budget =
+                max_elapsed.map(|budget| budget.saturating_sub(started.elapsed()));
+            let Some(candidate_timeout) = snap_candidate_attempt_timeout(
+                plan,
+                &candidate,
+                explicit_timeout_cap_secs,
+                remaining_budget,
+            ) else {
+                if let Some(previous) = previous_failed.as_ref() {
+                    log_snap_audit(SnapAuditEvent::new(
+                        &audit_context,
+                        previous,
+                        round,
+                        attempt,
+                        AttemptOutcome::BudgetExceeded,
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    ));
+                }
+                break;
+            };
+            attempt += 1;
+            let attempt_started = Instant::now();
+            let mode = snap_mode_for_adapter(&candidate.adapter)?;
+            let result = connect_snap_candidate(
+                plan,
+                &candidate,
+                mode,
+                keystore,
+                policy,
+                candidate_timeout,
+                lab.clone(),
+                profile,
+                underlay,
+                quic_certificate.as_deref(),
+                roadmap,
+            );
+            match result {
+                Ok((session, state)) => {
+                    log_snap_audit(
+                        SnapAuditEvent::new(
+                            &audit_context,
+                            &candidate,
+                            round,
+                            attempt,
+                            AttemptOutcome::Connected,
+                            attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_effective_timeout_ms(
+                            candidate_timeout.as_millis().min(u64::MAX as u128) as u64,
+                        ),
+                    );
+                    return Ok((session, state, mode));
+                }
+                Err(error) if snap_error_is_retryable(&error) => {
+                    log_snap_audit(
+                        SnapAuditEvent::new(
+                            &audit_context,
+                            &candidate,
+                            round,
+                            attempt,
+                            AttemptOutcome::RetryableFailure,
+                            attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_effective_timeout_ms(
+                            candidate_timeout.as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_normalized_failure_reason(snap_error_audit_reason(&error)),
+                    );
+                    previous_failed = Some(candidate);
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    log_snap_audit(
+                        SnapAuditEvent::new(
+                            &audit_context,
+                            &candidate,
+                            round,
+                            attempt,
+                            AttemptOutcome::TerminalFailure,
+                            attempt_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_effective_timeout_ms(
+                            candidate_timeout.as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .with_normalized_failure_reason(snap_error_audit_reason(&error)),
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        if attempt as usize >= plan.attempt_limit
+            || max_elapsed.is_some_and(|budget| started.elapsed() >= budget)
+        {
+            break;
+        }
+    }
+
+    Err(last_error.unwrap_or(ShphError::Timeout))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_snap_candidate(
+    plan: &SnapPlan,
+    candidate: &shph_snap::SnapCandidate,
+    mode: TransportMode,
+    keystore: &KeyStore,
+    policy: &shph_core::PeerPolicy,
+    timeout: Duration,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+    quic_certificate: Option<&[u8]>,
+    roadmap: Option<&RoadmapConfig>,
+) -> Result<(SecureSession, shph_core::HandshakeState)> {
+    let candidate_deadline = Instant::now() + timeout;
+    let endpoint = format_endpoint(&candidate.target_host, candidate.target_port);
+    match mode {
+        TransportMode::Tcp if candidate.adapter == "direct-tcp" => {
+            let remaining = snap_candidate_remaining_timeout(candidate_deadline)?;
+            connect_secure_session_lab_with_profile_and_underlay_timeout(
+                &endpoint,
+                &keystore.identity,
+                policy,
+                remaining,
+                mode,
+                lab,
+                profile,
+                underlay,
+            )
+        }
+        TransportMode::Tcp => {
+            let bridge = SnapBridgeConfig {
+                adapter: candidate.adapter.clone(),
+                peer_host: candidate.target_host.clone(),
+                peer_port: candidate.target_port,
+                relay_host: candidate.relay_ip.clone(),
+                relay_port: candidate.relay_port,
+                key_file: candidate.key_file.clone(),
+                route_file: candidate.route_file.clone(),
+                tls_enabled: candidate.tls_enabled.unwrap_or(false),
+                sni: candidate.sni.clone(),
+                tls_ca_file: candidate.tls_ca_file.clone(),
+                tls_cert_sha256: candidate.tls_cert_sha256.clone(),
+                ws_path: candidate.ws_path.clone(),
+                shroud_profile: candidate.shroud_profile.clone(),
+            };
+            let setup_timeout = snap_candidate_remaining_timeout(candidate_deadline)?;
+            let (stream, bridge_lifecycle) = connect_snap_bridge_stream(&bridge, setup_timeout)?;
+            let handshake_timeout = snap_candidate_remaining_timeout(candidate_deadline)?;
+            let (session, state) = connect_secure_session_on_snap_stream(
+                stream,
+                &keystore.identity,
+                policy,
+                handshake_timeout,
+                lab,
+                profile,
+            )?;
+            let session = match bridge_lifecycle {
+                Some(lifecycle) => session.with_snap_bridge_lifecycle(lifecycle)?,
+                None => session,
+            };
+            Ok((session, state))
+        }
+        TransportMode::Quic => {
+            if !underlay.is_direct() {
+                Err(ShphError::Unsupported(
+                    "SNAP QUIC candidates require a direct underlay".into(),
+                ))
+            } else {
+                let remaining = snap_candidate_remaining_timeout(candidate_deadline)?;
+                connect_secure_session_lab_with_profile_and_underlay_timeout(
+                    &endpoint,
+                    &keystore.identity,
+                    policy,
+                    remaining,
+                    mode,
+                    lab,
+                    profile,
+                    &TcpUnderlay::Direct,
+                )
+            }
+        }
+        TransportMode::OfflineMesh => {
+            let cfg = roadmap_offline_mesh_config(roadmap)?;
+            let remaining = snap_candidate_remaining_timeout(candidate_deadline)?;
+            offline_mesh_connect_secure_session_with_profile_timeout(
+                &cfg,
+                &keystore.identity,
+                policy,
+                remaining,
+                profile,
+            )
+        }
+        TransportMode::DataMule => {
+            let cfg = roadmap_data_mule_config(roadmap)?;
+            let peer_node = keystore
+                .contacts
+                .get(&plan.peer_alias)
+                .ok_or_else(|| {
+                    ShphError::Auth(format!(
+                        "SNAP peer alias '{}' is not locally pinned",
+                        plan.peer_alias
+                    ))
+                })?
+                .pubkey_b64
+                .clone();
+            let remaining = snap_candidate_remaining_timeout(candidate_deadline)?;
+            data_mule_connect_secure_session_with_profile_timeout(
+                &cfg,
+                &keystore.identity,
+                &peer_node,
+                policy,
+                remaining,
+                profile,
+            )
+        }
+        TransportMode::QuicStandard => {
+            let certificate = quic_certificate.ok_or_else(|| {
+                ShphError::Config(
+                    "--quic-cert or session.quic_cert is required for SNAP quic-standard candidates"
+                        .into(),
+                )
+            })?;
+            let peer_addr = parse_socket_addr(&endpoint)?;
+            let remaining = snap_candidate_remaining_timeout(candidate_deadline)?;
+            shph_transport::connect_standards_quic_session(
+                peer_addr,
+                candidate.sni.as_deref().unwrap_or("localhost"),
+                certificate,
+                &keystore.identity,
+                policy,
+                profile,
+                remaining,
+            )
+        }
+    }
+}
+
+fn snap_error_is_retryable(error: &ShphError) -> bool {
+    matches!(
+        error,
+        ShphError::Io(_)
+            | ShphError::Timeout
+            | ShphError::Transport(_)
+            | ShphError::ConnectionClosed
+    )
+}
+
+fn snap_attempt_error_is_retryable(
+    error: &ShphError,
+    payload_may_have_been_delivered: bool,
+) -> bool {
+    !payload_may_have_been_delivered && snap_error_is_retryable(error)
+}
+
+fn snap_error_audit_reason(error: &ShphError) -> &'static str {
+    match error {
+        ShphError::Io(_) => "io_error",
+        ShphError::Timeout => "timeout",
+        ShphError::Transport(_) => "transport_error",
+        ShphError::ConnectionClosed => "connection_closed",
+        ShphError::Auth(_) => "authentication_failed",
+        ShphError::Crypto(_) => "cryptographic_failure",
+        ShphError::Protocol(_) => "protocol_failure",
+        ShphError::Handshake(_) => "handshake_failure",
+        ShphError::Config(_) | ShphError::InvalidArgument(_) => "configuration_failure",
+        ShphError::Unsupported(_) => "unsupported_operation",
+        ShphError::PermissionDenied(_) => "permission_denied",
+        ShphError::ResourceExhausted(_) => "resource_exhausted",
+        ShphError::KeyStore(_) => "keystore_failure",
+        ShphError::Obfuscation(_) => "obfuscation_failure",
+        ShphError::Stealth(_) => "profile_failure",
+        ShphError::Serialization(_) => "serialization_failure",
+        ShphError::NotConnected => "not_connected",
+        ShphError::AlreadyConnected => "already_connected",
+        ShphError::Tun(_) => "tun_failure",
+        ShphError::Internal(_) => "internal_failure",
     }
 }
 
@@ -4675,6 +6240,15 @@ fn apply_control_plane(
     interface_name: &str,
     state_config_path: Option<&Path>,
 ) -> Result<ControlPlaneGuard> {
+    apply_control_plane_with_underlay(config, interface_name, state_config_path, None)
+}
+
+fn apply_control_plane_with_underlay(
+    config: &Config,
+    interface_name: &str,
+    state_config_path: Option<&Path>,
+    underlay_override: Option<&TcpUnderlay>,
+) -> Result<ControlPlaneGuard> {
     let Some(control) = &config.control_plane else {
         return Ok(ControlPlaneGuard::default());
     };
@@ -4684,7 +6258,11 @@ fn apply_control_plane(
     // front so a live apply is all-or-nothing rather than leaving the host in a
     // half-applied state. Invalid inputs are rejected before any mutation.
     let plan = build_control_plane_plan(control, interface_name)?;
-    validate_control_plane_underlay(config, &plan)?;
+    if let Some(underlay) = underlay_override {
+        validate_control_plane_underlay_for(underlay, &plan)?;
+    } else {
+        validate_control_plane_underlay(config, &plan)?;
+    }
 
     let mut guard = ControlPlaneGuard {
         dry_run,
@@ -4799,6 +6377,7 @@ impl NativeTunMutationGuard {
                 "dev".into(),
                 interface_name.into(),
             ])?;
+            let link_was_up = tun_link_was_up(&output)?;
             let mtu = output
                 .split_whitespace()
                 .collect::<Vec<_>>()
@@ -4808,6 +6387,11 @@ impl NativeTunMutationGuard {
                 .parse::<usize>()
                 .map_err(|_| ShphError::Internal("native TUN MTU was not numeric".into()))?;
             guard.cleanup_commands = build_tun_mtu_commands(interface_name, mtu)?;
+            if !link_was_up {
+                guard
+                    .cleanup_commands
+                    .push(build_tun_link_state_command(interface_name, false)?);
+            }
         }
 
         #[cfg(target_os = "windows")]
@@ -4965,6 +6549,41 @@ fn configure_native_tun_mtu(interface_name: &str, mtu: usize) -> Result<()> {
     Ok(())
 }
 
+fn configure_native_tun_link_up(interface_name: &str) -> Result<()> {
+    let command = build_tun_link_state_command(interface_name, true)?;
+    if !command.is_empty() {
+        run_shell_command(&command)?;
+        println!("  native TUN link: up");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn tun_link_was_up(output: &str) -> Result<bool> {
+    let flags = output
+        .split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map(|(flags, _)| flags)
+        .ok_or_else(|| ShphError::Internal("unable to determine native TUN link state".into()))?;
+    Ok(flags.split(',').any(|flag| flag == "UP"))
+}
+
+fn build_tun_link_state_command(interface_name: &str, up: bool) -> Result<Vec<String>> {
+    validate_tun_name(interface_name)?;
+    if cfg!(target_os = "linux") {
+        Ok(vec![
+            "ip".into(),
+            "link".into(),
+            "set".into(),
+            "dev".into(),
+            interface_name.into(),
+            if up { "up" } else { "down" }.into(),
+        ])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn native_tun_mtu_for_shroud_profile(shroud_profile: &str) -> Result<usize> {
     let Some(profile) = parse_shroud_profile_name(shroud_profile)? else {
         return Ok(DEFAULT_TUN_MTU_BYTES);
@@ -4977,6 +6596,25 @@ fn native_tun_mtu_for_shroud_profile(shroud_profile: &str) -> Result<usize> {
              maximum profiled payload is {mtu} bytes; use medium/high or disable Shroud"
         )));
     }
+    Ok(mtu)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn shroud3_native_tun_mtu(
+    max_datagram_size: Option<usize>,
+    configured_mtu: usize,
+) -> Result<usize> {
+    let max_datagram_size = max_datagram_size
+        .ok_or_else(|| ShphError::Unsupported("QUIC DATAGRAM is not negotiated".into()))?;
+    let payload_mtu = max_datagram_size
+        .checked_sub(shph_transport::shroud3::SHROUD3_HEADER_BYTES)
+        .ok_or_else(|| {
+            ShphError::Unsupported(
+                "QUIC datagram limit is smaller than the Shroud 3 envelope header".into(),
+            )
+        })?;
+    let mtu = payload_mtu.min(configured_mtu);
+    validate_tun_mtu(mtu)?;
     Ok(mtu)
 }
 
@@ -5179,6 +6817,7 @@ fn apply_nat(interface_name: &str, dry_run: bool) -> Result<NatGuard> {
 fn apply_killswitch(
     config: &Config,
     transport: TransportMode,
+    underlay: &TcpUnderlay,
     dry_run: bool,
 ) -> Result<FirewallGuard> {
     let firewall_transport = match transport {
@@ -5190,7 +6829,17 @@ fn apply_killswitch(
             ))
         }
     };
-    let peers = resolve_killswitch_peers(config)?;
+    let connecting_through_proxy = config
+        .session
+        .as_ref()
+        .is_some_and(|session| session.role == SessionRole::Connect)
+        && !underlay.is_direct();
+    if connecting_through_proxy && transport != TransportMode::Tcp {
+        return Err(ShphError::Unsupported(
+            "SOCKS5 underlay currently supports TCP transport only".into(),
+        ));
+    }
+    let peers = resolve_killswitch_peers(config, underlay)?;
 
     #[cfg(target_os = "linux")]
     {
@@ -5308,22 +6957,31 @@ fn apply_mss_clamp(interface_name: &str, mtu: usize, dry_run: bool) -> Result<Fi
     }
 }
 
-fn resolve_killswitch_peers(config: &Config) -> Result<Vec<SocketAddr>> {
+fn resolve_killswitch_peers(config: &Config, underlay: &TcpUnderlay) -> Result<Vec<SocketAddr>> {
     let endpoint_values = match config.session.as_ref() {
-        Some(session) if session.role == SessionRole::Connect => {
-            let selector = session.peer.as_deref().ok_or_else(|| {
-                ShphError::Config(
-                    "killswitch connect mode requires session.peer to select a peer".into(),
-                )
-            })?;
-            if let Some(peer) = config.peers.iter().find(|peer| {
-                peer.alias == selector || peer.endpoint == selector || peer.pubkey == selector
-            }) {
-                vec![peer.endpoint.clone()]
-            } else {
-                vec![selector.to_string()]
+        Some(session) if session.role == SessionRole::Connect => match underlay {
+            TcpUnderlay::Socks5 { proxy } | TcpUnderlay::Tor { proxy } => vec![proxy.clone()],
+            TcpUnderlay::Direct => {
+                if let Some(transport_peer) = session.transport_peer.as_ref() {
+                    vec![transport_peer.clone()]
+                } else {
+                    let selector = session.peer.as_deref().ok_or_else(|| {
+                        ShphError::Config(
+                            "killswitch connect mode requires session.peer to select a peer".into(),
+                        )
+                    })?;
+                    if let Some(peer) = config.peers.iter().find(|peer| {
+                        peer.alias == selector
+                            || peer.endpoint == selector
+                            || peer.pubkey == selector
+                    }) {
+                        vec![peer.endpoint.clone()]
+                    } else {
+                        vec![selector.to_string()]
+                    }
+                }
             }
-        }
+        },
         _ => config
             .peers
             .iter()
@@ -5351,7 +7009,7 @@ fn resolve_killswitch_peers(config: &Config) -> Result<Vec<SocketAddr>> {
         })?;
         let address = endpoint.host.parse::<IpAddr>().map_err(|_| {
             ShphError::Config(format!(
-                "killswitch requires literal IP peer endpoints; refusing hostname {:?}",
+                "killswitch requires literal IP peer or active proxy endpoints; refusing hostname {:?}",
                 endpoint.host
             ))
         })?;
@@ -5559,21 +7217,76 @@ fn build_control_plane_plan(
 }
 
 fn validate_control_plane_underlay(config: &Config, plan: &ControlPlanePlan) -> Result<()> {
-    let has_default_route = plan.routes.iter().any(|route| {
+    let underlay = config
+        .session
+        .as_ref()
+        .map(|session| TcpUnderlay::parse(session.underlay.as_deref()))
+        .transpose()?
+        .unwrap_or(TcpUnderlay::Direct);
+    validate_control_plane_underlay_for(&underlay, plan)
+}
+
+fn validate_control_plane_underlay_for(
+    underlay: &TcpUnderlay,
+    plan: &ControlPlanePlan,
+) -> Result<()> {
+    let has_any_default_route = plan.routes.iter().any(|route| {
         parse_cidr(route)
             .map(|(_, prefix)| prefix == 0)
             .unwrap_or(false)
     });
-    let socks_underlay = config
-        .session
-        .as_ref()
-        .and_then(|session| session.underlay.as_deref())
-        .is_some_and(|underlay| underlay.starts_with("socks5://"));
+    if !has_any_default_route {
+        return Ok(());
+    }
 
-    if has_default_route && socks_underlay && plan.underlay_bypass_routes.is_empty() {
-        return Err(ShphError::Config(
-            "refusing a default route while a SOCKS5 underlay is configured; add the resolved proxy endpoint to control_plane.underlay_bypass_cidrs before enabling full-tunnel routing".into(),
-        ));
+    let proxy = match underlay {
+        TcpUnderlay::Direct => return Ok(()),
+        TcpUnderlay::Socks5 { proxy } | TcpUnderlay::Tor { proxy } => proxy,
+    };
+    let endpoint = proxy.parse::<std::net::SocketAddr>().map_err(|_| {
+        ShphError::Config(
+            "a full-tunnel SOCKS5 underlay requires a literal proxy IP; a DNS name cannot be safely pinned to a bypass route".into(),
+        )
+    })?;
+    let proxy_ip = endpoint.ip();
+    let proxy_family_default = plan.routes.iter().try_fold(false, |found, route| {
+        let (network, prefix) = parse_cidr(route)?;
+        Ok::<_, ShphError>(found || (prefix == 0 && network.is_ipv4() == proxy_ip.is_ipv4()))
+    })?;
+    if !proxy_family_default {
+        return Ok(());
+    }
+
+    if proxy_ip.is_loopback() {
+        if !plan.underlay_bypass_routes.is_empty() {
+            return Err(ShphError::Config(
+                "a loopback SOCKS5 proxy uses the host's local route; remove unrelated underlay bypass routes".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let host_prefix = if proxy_ip.is_ipv4() { 32 } else { 128 };
+    let expected_bypass = format!("{proxy_ip}/{host_prefix}");
+    let expected_key = canonical_cidr_key(&expected_bypass)?;
+    let actual_keys = plan
+        .underlay_bypass_routes
+        .iter()
+        .map(|route| canonical_cidr_key(route))
+        .collect::<Result<Vec<_>>>()?;
+    if actual_keys.len() != 1 || actual_keys[0] != expected_key {
+        return Err(ShphError::Config(format!(
+            "full-tunnel SOCKS5 routing requires exactly {expected_bypass} in control_plane.underlay_bypass_cidrs; unrelated or missing bypasses are unsafe"
+        )));
+    }
+
+    for route in &plan.routes {
+        let (_, prefix) = parse_cidr(route)?;
+        if prefix >= host_prefix && cidr_contains_ip(route, proxy_ip)? {
+            return Err(ShphError::Config(format!(
+                "control-plane route {route} shadows the exact SOCKS5 underlay bypass {expected_bypass}"
+            )));
+        }
     }
     Ok(())
 }
@@ -5606,6 +7319,29 @@ fn canonical_cidr_key(cidr: &str) -> Result<String> {
         }
     };
     Ok(format!("{network}/{prefix}"))
+}
+
+fn cidr_contains_ip(cidr: &str, candidate: IpAddr) -> Result<bool> {
+    let (network, prefix) = parse_cidr(cidr)?;
+    Ok(match (network, candidate) {
+        (IpAddr::V4(network), IpAddr::V4(candidate)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix))
+            };
+            (u32::from(network) & mask) == (u32::from(candidate) & mask)
+        }
+        (IpAddr::V6(network), IpAddr::V6(candidate)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(prefix))
+            };
+            (u128::from(network) & mask) == (u128::from(candidate) & mask)
+        }
+        _ => false,
+    })
 }
 
 fn validate_underlay_bypass_cidr(cidr: &str) -> Result<()> {
@@ -6156,18 +7892,14 @@ fn build_route_delete_command(cidr: &str, interface_name: &str) -> Result<Vec<St
 fn build_underlay_bypass_route_add_command(cidr: &str) -> Result<Vec<String>> {
     let (ip_addr, _) = parse_cidr(cidr)?;
     validate_underlay_bypass_cidr(cidr)?;
+    let target_ip = ip_addr.to_string();
 
     if cfg!(target_os = "linux") {
         let route_family = if ip_addr.is_ipv6() { "-6" } else { "-4" };
-        let probe = if ip_addr.is_ipv6() {
-            "2606:4700:4700::1111"
-        } else {
-            "1.1.1.1"
-        };
         let script = format!(
             r#"set -eu
 target='{cidr}'
-route="$(ip {route_family} route get {probe})"
+route="$(ip {route_family} route get '{target_ip}')"
 dev="$(printf '%s\n' "$route" | awk '{{for (i = 1; i <= NF; i++) if ($i == "dev") {{print $(i + 1); exit}}}}')"
 via="$(printf '%s\n' "$route" | awk '{{for (i = 1; i <= NF; i++) if ($i == "via") {{print $(i + 1); exit}}}}')"
 if [ -z "$dev" ]; then
@@ -6196,26 +7928,19 @@ fi"#,
 
     if cfg!(target_os = "windows") {
         let family = if ip_addr.is_ipv6() { "IPv6" } else { "IPv4" };
-        let default_prefix = if ip_addr.is_ipv6() {
-            "::/0"
-        } else {
-            "0.0.0.0/0"
-        };
-        let invalid_next_hop = if ip_addr.is_ipv6() { "::" } else { "0.0.0.0" };
         let script = format!(
-            "$prefix = '{cidr}'; \
-             $default = Get-NetRoute -DestinationPrefix '{default_prefix}' -AddressFamily {family} -ErrorAction SilentlyContinue \
-               | Where-Object {{ $_.NextHop -and $_.NextHop -ne '{invalid_next_hop}' }} \
-               | Sort-Object RouteMetric,InterfaceMetric \
+            "$prefix = '{cidr}'; $target = '{target_ip}'; \
+             $selected = Find-NetRoute -RemoteIPAddress $target -ErrorAction Stop \
+               | Where-Object {{ $_.PSObject.Properties.Name -contains 'DestinationPrefix' }} \
                | Select-Object -First 1; \
-             if ($null -eq $default) {{ throw 'unable to determine the active underlay route' }}; \
+             if ($null -eq $selected) {{ throw 'unable to determine the active underlay route to proxy' }}; \
              $existing = @(Get-NetRoute -DestinationPrefix $prefix -AddressFamily {family} -ErrorAction SilentlyContinue); \
              if ($existing.Count -gt 0) {{ \
-               $matching = @($existing | Where-Object {{ $_.InterfaceIndex -eq $default.InterfaceIndex -and $_.NextHop -eq $default.NextHop }}); \
+               $matching = @($existing | Where-Object {{ $_.InterfaceIndex -eq $selected.InterfaceIndex -and $_.NextHop -eq $selected.NextHop }}); \
                if ($matching.Count -gt 0) {{ Write-Output 'SHPH_UNDERLAY_BYPASS_REUSED'; exit 0 }}; \
                throw \"underlay bypass route conflicts with the active underlay: $prefix\" \
              }}; \
-             New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $default.InterfaceIndex -NextHop $default.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null",
+             New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $selected.InterfaceIndex -NextHop $selected.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null",
         );
         return Ok(vec![
             "powershell.exe".into(),
@@ -6450,10 +8175,12 @@ fn run_standards_quic_listen_loop(
     keystore_path: &Path,
     keystore: &KeyStore,
     tun: &TunDevice,
+    configured_tun_mtu: usize,
     bind: &str,
     timeout_secs: u64,
     profile: HandshakeProfile,
     phantom_one_profile: Option<ProfileTier>,
+    shroud3_adaptive: bool,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
     quic_key_path: Option<&Path>,
@@ -6510,6 +8237,11 @@ fn run_standards_quic_listen_loop(
             }
             let state = connection.handshake.clone();
             enforce_peer_policy(keystore_path, bind, &state, false)?;
+            if shroud3_adaptive {
+                let path_mtu = connection.connection.max_datagram_size();
+                let tun_mtu = shroud3_native_tun_mtu(path_mtu, configured_tun_mtu)?;
+                configure_native_tun_mtu(tun.name(), tun_mtu)?;
+            }
             append_handshake_audit(
                 roadmap,
                 &keystore.identity,
@@ -6525,7 +8257,10 @@ fn run_standards_quic_listen_loop(
                 connection,
                 tun_to_quic,
                 quic_to_tun,
-                standards_tun::StandardsTunBridgeConfig::default(),
+                standards_tun::StandardsTunBridgeConfig {
+                    shroud3_adaptive,
+                    ..Default::default()
+                },
             );
             match tokio::select! {
                 result = bridge => result,
@@ -6561,11 +8296,13 @@ fn run_standards_quic_connect_loop(
     keystore_path: &Path,
     keystore: &KeyStore,
     tun: &TunDevice,
+    configured_tun_mtu: usize,
     peer: &str,
     transport_peer: &str,
     timeout_secs: u64,
     profile: HandshakeProfile,
     phantom_one_profile: Option<ProfileTier>,
+    shroud3_adaptive: bool,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
     _quic_key_path: Option<&Path>,
@@ -6607,6 +8344,11 @@ fn run_standards_quic_connect_loop(
         }
         let state = connection.handshake.clone();
         enforce_peer_policy(keystore_path, peer, &state, true)?;
+        if shroud3_adaptive {
+            let path_mtu = connection.connection.max_datagram_size();
+            let tun_mtu = shroud3_native_tun_mtu(path_mtu, configured_tun_mtu)?;
+            configure_native_tun_mtu(tun.name(), tun_mtu)?;
+        }
         append_handshake_audit(
             roadmap,
             &keystore.identity,
@@ -6622,7 +8364,10 @@ fn run_standards_quic_connect_loop(
             connection,
             tun_to_quic,
             quic_to_tun,
-            standards_tun::StandardsTunBridgeConfig::default(),
+            standards_tun::StandardsTunBridgeConfig {
+                shroud3_adaptive,
+                ..Default::default()
+            },
         );
         let bridge_result = tokio::select! {
             result = bridge => result,
@@ -6645,13 +8390,14 @@ fn print_standards_tun_stats(start_ms: u64, stats: &standards_tun::StandardsTunB
     println!("  Transport loop: closed");
     println!("  Session start: {start_ms}ms");
     println!(
-        "  Standards QUIC TUN stats: tx_packets={}, tx_bytes={}, rx_packets={}, rx_bytes={}, oversized_drops={}, invalid_drops={}",
+        "  Standards QUIC TUN stats: tx_packets={}, tx_bytes={}, rx_packets={}, rx_bytes={}, oversized_drops={}, invalid_drops={}, pacing_drops={}",
         stats.tun_to_quic_packets,
         stats.tun_to_quic_bytes,
         stats.quic_to_tun_packets,
         stats.quic_to_tun_bytes,
         stats.dropped_oversized_packets,
         stats.dropped_invalid_datagrams,
+        stats.dropped_pacing_packets,
     );
 }
 
@@ -6659,17 +8405,19 @@ fn print_standards_tun_stats(start_ms: u64, stats: &standards_tun::StandardsTunB
 fn run_listen_loop(
     keystore_path: &Path,
     tun: &TunDevice,
+    configured_tun_mtu: usize,
     bind: &str,
     timeout_secs: u64,
     mode: TransportMode,
     profile: HandshakeProfile,
     phantom_one_profile: Option<ProfileTier>,
+    shroud3_adaptive: bool,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
     quic_key_path: Option<&Path>,
 ) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
-    let _ = phantom_one_profile;
+    let _ = (phantom_one_profile, shroud3_adaptive);
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
@@ -6682,10 +8430,12 @@ fn run_listen_loop(
                 keystore_path,
                 &keystore,
                 tun,
+                configured_tun_mtu,
                 bind,
                 timeout_secs,
                 profile,
                 phantom_one_profile,
+                shroud3_adaptive,
                 roadmap,
                 quic_cert_path,
                 quic_key_path,
@@ -6697,6 +8447,7 @@ fn run_listen_loop(
             let _ = (
                 keystore_path,
                 tun,
+                configured_tun_mtu,
                 bind,
                 timeout_secs,
                 profile,
@@ -6808,36 +8559,42 @@ fn run_listen_loop(
 fn run_connect_loop(
     keystore_path: &Path,
     tun: &TunDevice,
+    configured_tun_mtu: usize,
     peer: &str,
     transport_peer: &str,
     timeout_secs: u64,
+    snap_timeout_cap_secs: Option<u64>,
     mode: TransportMode,
     profile: HandshakeProfile,
     phantom_one_profile: Option<ProfileTier>,
+    shroud3_adaptive: bool,
     roadmap: Option<&RoadmapConfig>,
     quic_cert_path: Option<&Path>,
     quic_key_path: Option<&Path>,
     underlay: &TcpUnderlay,
+    snap_plan: Option<&SnapPlan>,
 ) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
-    let _ = phantom_one_profile;
+    let _ = (phantom_one_profile, shroud3_adaptive);
     let start_ms = phase_a1_now_ms()?;
     let keystore = KeyStore::load(keystore_path, None)?;
     let lab = quic_lab_config()?;
     let policy = peer_policy_for_endpoint(&keystore, peer, true)?;
     announce_handshake_profile(profile);
-    if mode == TransportMode::QuicStandard {
+    if mode == TransportMode::QuicStandard && snap_plan.is_none() {
         #[cfg(target_os = "linux")]
         {
             return run_standards_quic_connect_loop(
                 keystore_path,
                 &keystore,
                 tun,
+                configured_tun_mtu,
                 peer,
                 transport_peer,
                 timeout_secs,
                 profile,
                 phantom_one_profile,
+                shroud3_adaptive,
                 roadmap,
                 quic_cert_path,
                 quic_key_path,
@@ -6849,6 +8606,7 @@ fn run_connect_loop(
             let _ = (
                 keystore_path,
                 tun,
+                configured_tun_mtu,
                 peer,
                 timeout_secs,
                 profile,
@@ -6863,55 +8621,71 @@ fn run_connect_loop(
         }
     }
     let handshake_started = std::time::Instant::now();
-    let (mut session, state) = match mode {
-        TransportMode::Tcp | TransportMode::Quic => {
-            connect_secure_session_lab_with_profile_and_underlay(
-                transport_peer,
-                &keystore.identity,
-                &policy,
-                timeout_secs,
-                mode,
-                lab,
-                profile,
-                underlay,
-            )?
-        }
-        TransportMode::OfflineMesh => {
-            let cfg = roadmap_offline_mesh_config(roadmap)?;
-            offline_mesh_connect_secure_session_with_profile(
-                &cfg,
-                &keystore.identity,
-                &policy,
-                timeout_secs,
-                profile,
-            )?
-        }
-        TransportMode::DataMule => {
-            let cfg = roadmap_data_mule_config(roadmap)?;
-            data_mule_connect_secure_session_with_profile(
-                &cfg,
-                &keystore.identity,
-                peer,
-                &policy,
-                timeout_secs,
-                profile,
-            )?
-        }
-        TransportMode::QuicStandard => {
-            return Err(ShphError::Unsupported(
-                "quic-standard uses the async standards_quic API".into(),
-            ))
-        }
+    let (mut session, state, session_mode) = if let Some(plan) = snap_plan {
+        connect_snap_session(
+            plan,
+            &keystore,
+            &policy,
+            snap_timeout_cap_secs,
+            lab,
+            profile,
+            underlay,
+            quic_cert_path,
+            roadmap,
+        )?
+    } else {
+        let (session, state) = match mode {
+            TransportMode::Tcp | TransportMode::Quic => {
+                connect_secure_session_lab_with_profile_and_underlay(
+                    transport_peer,
+                    &keystore.identity,
+                    &policy,
+                    timeout_secs,
+                    mode,
+                    lab,
+                    profile,
+                    underlay,
+                )?
+            }
+            TransportMode::OfflineMesh => {
+                let cfg = roadmap_offline_mesh_config(roadmap)?;
+                offline_mesh_connect_secure_session_with_profile(
+                    &cfg,
+                    &keystore.identity,
+                    &policy,
+                    timeout_secs,
+                    profile,
+                )?
+            }
+            TransportMode::DataMule => {
+                let cfg = roadmap_data_mule_config(roadmap)?;
+                data_mule_connect_secure_session_with_profile(
+                    &cfg,
+                    &keystore.identity,
+                    peer,
+                    &policy,
+                    timeout_secs,
+                    profile,
+                )?
+            }
+            TransportMode::QuicStandard => {
+                return Err(ShphError::Unsupported(
+                    "quic-standard uses the async standards_quic API".into(),
+                ))
+            }
+        };
+        (session, state, mode)
     };
     let handshake_ms = handshake_started.elapsed().as_millis();
     enforce_peer_policy(keystore_path, peer, &state, true)?;
+    session.activate()?;
     append_handshake_audit(
         roadmap,
         &keystore.identity,
         peer,
         &state,
         "connect-loop",
-        mode,
+        session_mode,
     )?;
     print_handshake_state("connect-loop", peer, &state);
     let session_id = format!("connect-{peer}-{start_ms}");
@@ -7491,24 +9265,29 @@ fn record_data_plane_error(metrics: &MetricsCollector, error: &ShphError) {
 mod tests {
     use super::ticket::JoinTicket;
     use super::{
-        advertised_endpoint, apply_control_plane, build_control_plane_plan,
+        advertised_endpoint, apply_control_plane, apply_killswitch, build_control_plane_plan,
         build_dns_apply_command, build_dns_apply_commands, build_dns_restore_command,
         build_interface_address_add_command, build_interface_address_delete_command,
-        build_route_add_command, build_route_delete_command, build_tun_mtu_commands,
-        build_tun_route_priority_command, build_underlay_bypass_route_add_command,
-        build_underlay_bypass_route_delete_command, cli_exit_code, control_plane_state_path,
-        enforce_peer_policy, handle_host, handle_up, load_control_plane_state,
-        load_or_create_quic_server, morphology_from_ticket, native_tun_mtu_for_shroud_profile,
-        parse_phantom_one_profile, parse_shroud_profile_name, phase_a1_now_ms,
-        read_quic_certificate, read_quic_private_key, read_ticket_source,
+        build_route_add_command, build_route_delete_command, build_tun_link_state_command,
+        build_tun_mtu_commands, build_tun_route_priority_command,
+        build_underlay_bypass_route_add_command, build_underlay_bypass_route_delete_command,
+        cli_exit_code, control_plane_state_path, enforce_peer_policy, handle_host, handle_up,
+        load_control_plane_state, load_or_create_quic_server, morphology_from_ticket,
+        native_tun_mtu_for_shroud_profile, parse_phantom_one_profile, parse_shroud_profile_name,
+        phase_a1_now_ms, read_quic_certificate, read_quic_private_key, read_ticket_source,
         reconnect_delay_with_jitter, render_config_for_display, resolve_killswitch_peers,
-        resolve_morphology, resolve_shroud_profile, run_with_reconnect, save_control_plane_state,
-        transport_mode_to_str, validate_cidr, validate_control_plane_underlay,
+        resolve_morphology, resolve_shroud_profile, retry_poll_timeouts_until, run_with_reconnect,
+        save_control_plane_state, session_requires_envelope_policy, shroud3_native_tun_mtu,
+        snap_attempt_error_is_retryable, snap_candidate_attempt_timeout, snap_error_is_retryable,
+        transport_mode_to_str, tun_link_was_up, validate_cidr, validate_control_plane_underlay,
+        validate_envelope_policy_transport, validate_shroud3_platform, validate_shroud3_selection,
         validate_transport_peer, CliErrorOutput, ControlPlaneGuard, ControlPlanePlan,
         HandshakeState, KeyStore, KeyStoreConfig, MorphologySelection, NativeTunMutationGuard,
         PersistedControlPlaneState, TcpUnderlay, TransportMode, UpOptions, DEFAULT_TUN_MTU_BYTES,
         EXIT_CONFIG, EXIT_PERMISSION, EXIT_TEMPORARY, EXIT_USAGE, MAX_CONTROL_PLANE_STATE_BYTES,
     };
+    #[cfg(target_os = "linux")]
+    use super::{build_linux_killswitch_commands, FirewallTransport};
     #[cfg(target_os = "windows")]
     use super::{build_tun_route_priority_restore_command, build_windows_tun_mtu_restore_commands};
     use shph_config::RoadmapConfig;
@@ -7518,7 +9297,126 @@ mod tests {
     use shph_core::roadmap::{IdentityProviderConfig, TransportAdapterConfig};
     use shph_core::{Result, ShphError};
     use shph_obfuscation::ProfileTier;
+    use shph_snap::{ProfileFormat, SnapProfile};
     use std::fs;
+
+    #[test]
+    fn snap_retry_classification_keeps_identity_and_protocol_failures_terminal() {
+        assert!(snap_error_is_retryable(&ShphError::Timeout));
+        assert!(snap_error_is_retryable(&ShphError::ConnectionClosed));
+        assert!(snap_error_is_retryable(&ShphError::Transport(
+            "connect failed".into()
+        )));
+        assert!(snap_error_is_retryable(&ShphError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "loopback refusal",)
+        )));
+        for error in [
+            ShphError::Auth("wrong peer".into()),
+            ShphError::Protocol("malformed handshake".into()),
+            ShphError::Handshake("invalid signature".into()),
+            ShphError::Crypto("authentication tag mismatch".into()),
+            ShphError::Unsupported("adapter is unavailable".into()),
+        ] {
+            assert!(!snap_error_is_retryable(&error));
+        }
+    }
+
+    #[test]
+    fn snap_attempt_timeout_preserves_fractional_and_remaining_budgets() {
+        let profile = SnapProfile::parse(
+            br#"{"version":1,"peer_alias":"peer1","mode":"direct-only","direct_endpoints":[{"ip":"127.0.0.1","port":7000,"timeout_sec":0.25}]}"#,
+            ProfileFormat::Json,
+        )
+        .unwrap();
+        let plan = profile.plan("127.0.0.1", 7001).unwrap();
+        let candidate = &plan.candidates[0];
+
+        assert_eq!(
+            snap_candidate_attempt_timeout(&plan, candidate, None, None),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(
+            snap_candidate_attempt_timeout(
+                &plan,
+                candidate,
+                None,
+                Some(std::time::Duration::from_millis(125)),
+            ),
+            Some(std::time::Duration::from_millis(125))
+        );
+    }
+
+    #[test]
+    fn snap_candidate_stages_share_one_absolute_budget() {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(2);
+        let after_adapter_setup = started + std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            super::snap_remaining_until(deadline, after_adapter_setup),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(super::snap_remaining_until(deadline, deadline), None);
+    }
+
+    #[test]
+    fn snap_one_shot_does_not_retry_after_payload_may_have_been_delivered() {
+        assert!(snap_attempt_error_is_retryable(&ShphError::Timeout, false));
+        assert!(!snap_attempt_error_is_retryable(&ShphError::Timeout, true));
+        assert!(!snap_attempt_error_is_retryable(
+            &ShphError::Auth("wrong peer".into()),
+            false
+        ));
+    }
+
+    #[test]
+    fn one_shot_receive_retries_poll_timeouts_until_payload_arrives() {
+        let mut polls = 0;
+        let payload = retry_poll_timeouts_until(std::time::Duration::from_secs(1), || {
+            polls += 1;
+            if polls < 3 {
+                Err(ShphError::Timeout)
+            } else {
+                Ok(b"payload".to_vec())
+            }
+        })
+        .expect("receive after transient poll timeouts");
+
+        assert_eq!(payload, b"payload");
+        assert_eq!(polls, 3);
+    }
+
+    fn config_with_underlay(underlay: &str) -> Config {
+        Config {
+            session: Some(SessionConfig {
+                role: SessionRole::Connect,
+                bind: None,
+                peer: Some("198.51.100.10:443".into()),
+                transport_peer: None,
+                snap_profile: None,
+                timeout_secs: Some(5),
+                handshake_profile: None,
+                underlay: Some(underlay.into()),
+                quic_cert: None,
+                quic_key: None,
+                phantom_one: false,
+                shroud3_adaptive: false,
+                negotiate_envelope_policy: false,
+                phantom_one_profile: "medium".into(),
+                reconnect: None,
+                startup_payload: None,
+            }),
+            ..Config::default()
+        }
+    }
+
+    fn default_route_plan(bypasses: &[&str]) -> ControlPlanePlan {
+        ControlPlanePlan {
+            routes: vec!["0.0.0.0/0".into()],
+            underlay_bypass_routes: bypasses.iter().map(|route| (*route).into()).collect(),
+            ..ControlPlanePlan::default()
+        }
+    }
     use std::io;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -7557,6 +9455,7 @@ mod tests {
             Some("medium"),
             false,
             None,
+            false,
             true,
             true,
             None,
@@ -7787,7 +9686,7 @@ mod tests {
             ],
             ..Config::default()
         };
-        let peers = resolve_killswitch_peers(&config).expect("literal peers");
+        let peers = resolve_killswitch_peers(&config, &TcpUnderlay::Direct).expect("literal peers");
         assert_eq!(peers, vec!["198.51.100.10:443".parse().unwrap()]);
 
         let hostname_config = Config {
@@ -7800,7 +9699,7 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(
-            resolve_killswitch_peers(&hostname_config),
+            resolve_killswitch_peers(&hostname_config, &TcpUnderlay::Direct),
             Err(ShphError::Config(message)) if message.contains("literal IP")
         ));
     }
@@ -7827,20 +9726,93 @@ mod tests {
                 bind: None,
                 peer: Some("second".into()),
                 transport_peer: None,
+                snap_profile: None,
                 timeout_secs: None,
                 handshake_profile: None,
                 underlay: None,
                 quic_cert: None,
                 quic_key: None,
                 phantom_one: false,
+                shroud3_adaptive: false,
+                negotiate_envelope_policy: false,
                 phantom_one_profile: "medium".into(),
                 reconnect: None,
                 startup_payload: None,
             }),
             ..Config::default()
         };
-        let peers = resolve_killswitch_peers(&config).expect("selected peer");
+        let peers = resolve_killswitch_peers(&config, &TcpUnderlay::Direct).expect("selected peer");
         assert_eq!(peers, vec!["203.0.113.20:8443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn killswitch_allows_direct_transport_peer_override_only() {
+        let mut config = config_with_underlay("socks5://127.0.0.1:1080");
+        config
+            .session
+            .as_mut()
+            .expect("connect session")
+            .transport_peer = Some("203.0.113.99:9443".into());
+
+        assert_eq!(
+            resolve_killswitch_peers(&config, &TcpUnderlay::Direct).expect("direct endpoint"),
+            vec!["203.0.113.99:9443".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn killswitch_allows_only_the_active_remote_socks_proxy() {
+        let config = config_with_underlay("socks5://203.0.113.30:1080");
+        let underlay =
+            TcpUnderlay::parse(Some("socks5://203.0.113.30:1080")).expect("remote SOCKS proxy");
+
+        let peers = resolve_killswitch_peers(&config, &underlay).expect("proxy allowlist");
+
+        assert_eq!(peers, vec!["203.0.113.30:1080".parse().unwrap()]);
+        #[cfg(target_os = "linux")]
+        {
+            let rules = build_linux_killswitch_commands("shph0", &peers, FirewallTransport::Tcp)
+                .expect("proxy killswitch rules");
+            assert!(rules.iter().any(|rule| {
+                rule.iter().any(|part| part == "203.0.113.30")
+                    && rule.iter().any(|part| part == "1080")
+            }));
+            assert!(!rules
+                .iter()
+                .any(|rule| { rule.iter().any(|part| part == "198.51.100.10") }));
+        }
+    }
+
+    #[test]
+    fn killswitch_allows_loopback_tor_without_resolving_onion_peer() {
+        let mut config = config_with_underlay("tor://127.0.0.1:9050");
+        config.session.as_mut().expect("connect session").peer = Some("service.onion:443".into());
+        let underlay =
+            TcpUnderlay::parse(Some("tor://127.0.0.1:9050")).expect("loopback Tor proxy");
+
+        assert_eq!(
+            resolve_killswitch_peers(&config, &underlay).expect("Tor allowlist"),
+            vec!["127.0.0.1:9050".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn killswitch_rejects_hostname_proxy_and_non_tcp_proxy_transport() {
+        let hostname_config = config_with_underlay("socks5://proxy.example.test:1080");
+        let hostname_underlay = TcpUnderlay::parse(Some("socks5://proxy.example.test:1080"))
+            .expect("hostname SOCKS proxy");
+        assert!(matches!(
+            resolve_killswitch_peers(&hostname_config, &hostname_underlay),
+            Err(ShphError::Config(message)) if message.contains("literal IP")
+        ));
+
+        let config = config_with_underlay("socks5://203.0.113.30:1080");
+        let underlay =
+            TcpUnderlay::parse(Some("socks5://203.0.113.30:1080")).expect("remote SOCKS proxy");
+        assert!(matches!(
+            apply_killswitch(&config, TransportMode::Quic, &underlay, true),
+            Err(ShphError::Unsupported(message)) if message.contains("TCP transport only")
+        ));
     }
 
     #[test]
@@ -7863,6 +9835,7 @@ mod tests {
                 profile: shph_core::HandshakeProfile::SecureDefault,
                 shroud_profile: "medium".into(),
                 phantom_one: false,
+                shroud3_adaptive: false,
                 phantom_one_profile: "medium".into(),
                 quic_cert_path: None,
                 quic_key_path: None,
@@ -7904,6 +9877,7 @@ mod tests {
                 profile: shph_core::HandshakeProfile::SecureDefault,
                 shroud_profile: "medium".into(),
                 phantom_one: false,
+                shroud3_adaptive: false,
                 phantom_one_profile: "medium".into(),
                 quic_cert_path: None,
                 quic_key_path: None,
@@ -7928,6 +9902,7 @@ mod tests {
                 bind: None,
                 peer: Some("127.0.0.1:7231".into()),
                 transport_peer: None,
+                snap_profile: None,
                 timeout_secs: Some(5),
                 startup_payload: None,
                 handshake_profile: None,
@@ -7935,6 +9910,8 @@ mod tests {
                 quic_cert: None,
                 quic_key: None,
                 phantom_one: false,
+                shroud3_adaptive: false,
+                negotiate_envelope_policy: false,
                 phantom_one_profile: "medium".into(),
                 reconnect: Some(ReconnectConfig {
                     enabled: Some(true),
@@ -7954,6 +9931,7 @@ mod tests {
                 profile: shph_core::HandshakeProfile::SecureDefault,
                 shroud_profile: "medium".into(),
                 phantom_one: false,
+                shroud3_adaptive: false,
                 phantom_one_profile: "medium".into(),
                 quic_cert_path: Some(std::path::Path::new("/tmp/server.der")),
                 quic_key_path: Some(std::path::Path::new("/tmp/server.key")),
@@ -7988,6 +9966,82 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_shroud3_selection_is_explicit_and_transport_scoped() {
+        assert!(
+            validate_shroud3_selection(TransportMode::QuicStandard, true, true, false, false,)
+                .is_ok()
+        );
+        assert!(matches!(
+            validate_shroud3_selection(TransportMode::Tcp, true, true, false, false),
+            Err(ShphError::Unsupported(_))
+        ));
+        assert!(matches!(
+            validate_shroud3_selection(TransportMode::QuicStandard, true, false, false, false),
+            Err(ShphError::Unsupported(_))
+        ));
+        assert!(matches!(
+            validate_shroud3_selection(TransportMode::QuicStandard, true, true, true, false),
+            Err(ShphError::Config(_))
+        ));
+        assert!(matches!(
+            validate_shroud3_selection(TransportMode::QuicStandard, true, true, false, true),
+            Err(ShphError::Unsupported(_))
+        ));
+        assert!(validate_shroud3_selection(TransportMode::Tcp, false, false, true, true,).is_ok());
+        if cfg!(target_os = "linux") {
+            assert!(validate_shroud3_platform(true).is_ok());
+        } else {
+            assert!(matches!(
+                validate_shroud3_platform(true),
+                Err(ShphError::Unsupported(_))
+            ));
+        }
+        assert!(validate_shroud3_platform(false).is_ok());
+    }
+
+    #[test]
+    fn adaptive_shroud3_rejection_happens_before_session_startup() {
+        let error = handle_up(
+            std::path::Path::new("/tmp/shph-config.toml"),
+            std::path::Path::new("/tmp/shph-keystore.json"),
+            &Config::default(),
+            UpOptions {
+                transport: TransportMode::Tcp,
+                profile: shph_core::HandshakeProfile::SecureDefault,
+                shroud_profile: "medium".into(),
+                phantom_one: false,
+                shroud3_adaptive: true,
+                phantom_one_profile: "medium".into(),
+                quic_cert_path: None,
+                quic_key_path: None,
+                killswitch: false,
+                killswitch_dry_run: false,
+                mss_clamp: false,
+                tun: true,
+                nat: false,
+                underlay: TcpUnderlay::Direct,
+            },
+        )
+        .expect_err("Shroud 3 must reject non-standards QUIC before setup");
+        let ShphError::Unsupported(message) = error else {
+            panic!("expected an unsupported-platform or transport error");
+        };
+        if cfg!(target_os = "linux") {
+            assert!(message.contains("standards-compliant QUIC"));
+        } else {
+            assert!(message.contains("currently requires Linux"));
+        }
+    }
+
+    #[test]
+    fn adaptive_shroud3_caps_native_tun_mtu_to_the_carrier_budget() {
+        assert_eq!(shroud3_native_tun_mtu(Some(1200), 1360).unwrap(), 1193);
+        assert_eq!(shroud3_native_tun_mtu(Some(1472), 761).unwrap(), 761);
+        assert!(shroud3_native_tun_mtu(Some(582), 1360).is_err());
+        assert!(shroud3_native_tun_mtu(None, 1360).is_err());
+    }
+
+    #[test]
     fn shroud_profile_resolver_supports_disabled_and_intensity_aliases() {
         assert_eq!(parse_shroud_profile_name("off").unwrap(), None);
         assert_eq!(
@@ -8018,6 +10072,24 @@ mod tests {
             parse_shroud_profile_name("tuned-high").unwrap(),
             Some(shph_core::TUNED_HIGH)
         );
+    }
+
+    #[test]
+    fn envelope_policy_opt_in_is_explicit_and_transport_scoped() {
+        let mut config = config_with_underlay("direct");
+        assert!(!session_requires_envelope_policy(&config));
+        config
+            .session
+            .as_mut()
+            .expect("configured session")
+            .negotiate_envelope_policy = true;
+        assert!(session_requires_envelope_policy(&config));
+        assert!(validate_envelope_policy_transport(true, TransportMode::Tcp).is_ok());
+        assert!(validate_envelope_policy_transport(true, TransportMode::QuicStandard).is_ok());
+        assert!(matches!(
+            validate_envelope_policy_transport(true, TransportMode::Quic),
+            Err(ShphError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -8317,6 +10389,30 @@ mod tests {
         }
         assert!(build_tun_mtu_commands("", DEFAULT_TUN_MTU_BYTES).is_err());
         assert!(build_tun_mtu_commands("shph0", 575).is_err());
+    }
+
+    #[test]
+    fn tun_link_state_is_parsed_and_restorable() {
+        assert!(tun_link_was_up(
+            "2: s3srv0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1500 state UNKNOWN"
+        )
+        .expect("parse up link"));
+        assert!(
+            !tun_link_was_up("2: s3srv0: <POINTOPOINT,NOARP> mtu 1500 state DOWN")
+                .expect("parse down link")
+        );
+        assert!(tun_link_was_up("malformed link output").is_err());
+
+        let up = build_tun_link_state_command("shph0", true).expect("link up command");
+        let down = build_tun_link_state_command("shph0", false).expect("link down command");
+        if cfg!(target_os = "linux") {
+            assert_eq!(up, ["ip", "link", "set", "dev", "shph0", "up"]);
+            assert_eq!(down, ["ip", "link", "set", "dev", "shph0", "down"]);
+        } else {
+            assert!(up.is_empty());
+            assert!(down.is_empty());
+        }
+        assert!(build_tun_link_state_command("", true).is_err());
     }
 
     #[test]
@@ -8699,72 +10795,80 @@ mod tests {
     }
 
     #[test]
-    fn default_route_with_socks_underlay_is_rejected() {
-        let config = Config {
-            session: Some(SessionConfig {
-                role: SessionRole::Connect,
-                bind: None,
-                peer: Some("198.51.100.10:443".into()),
-                transport_peer: None,
-                timeout_secs: Some(5),
-                handshake_profile: None,
-                underlay: Some("socks5://127.0.0.1:10808".into()),
-                quic_cert: None,
-                quic_key: None,
-                phantom_one: false,
-                phantom_one_profile: "medium".into(),
-                reconnect: None,
-                startup_payload: None,
-            }),
-            ..Config::default()
-        };
-        let control = ControlPlaneConfig {
-            apply_interface_address: Some(true),
-            interface_cidr: Some("10.250.0.2/30".into()),
+    fn full_tunnel_requires_exact_remote_proxy_bypass() {
+        let config = config_with_underlay("socks5://104.16.230.132:10808");
+        assert!(validate_control_plane_underlay(&config, &default_route_plan(&[])).is_err());
+        assert!(validate_control_plane_underlay(
+            &config,
+            &default_route_plan(&["104.16.230.132/32"])
+        )
+        .is_ok());
+        assert!(
+            validate_control_plane_underlay(&config, &default_route_plan(&["1.1.1.1/32"])).is_err()
+        );
+    }
+
+    #[test]
+    fn full_tunnel_validates_the_effective_cli_underlay_override() {
+        let mut config = config_with_underlay("tor://127.0.0.1:9050");
+        config.control_plane = Some(ControlPlaneConfig {
+            apply_interface_address: Some(false),
+            interface_cidr: None,
             apply_routes: Some(true),
             route_cidrs: Some(vec!["0.0.0.0/0".into()]),
             underlay_bypass_cidrs: None,
             apply_dns: Some(false),
             dns_servers: None,
             dry_run: Some(true),
-        };
-        let plan = build_control_plane_plan(&control, "shph0").expect("plan");
-        assert!(validate_control_plane_underlay(&config, &plan).is_err());
+        });
+        let effective_underlay =
+            TcpUnderlay::parse(Some("socks5://104.16.230.132:10808")).expect("proxy underlay");
+
+        assert!(super::apply_control_plane_with_underlay(
+            &config,
+            "shph0",
+            None,
+            Some(&effective_underlay),
+        )
+        .is_err());
     }
 
     #[test]
-    fn default_route_with_socks_underlay_accepts_explicit_bypass() {
-        let config = Config {
-            session: Some(SessionConfig {
-                role: SessionRole::Connect,
-                bind: None,
-                peer: Some("198.51.100.10:443".into()),
-                transport_peer: None,
-                timeout_secs: Some(5),
-                handshake_profile: None,
-                underlay: Some("socks5://127.0.0.1:10808".into()),
-                quic_cert: None,
-                quic_key: None,
-                phantom_one: false,
-                phantom_one_profile: "medium".into(),
-                reconnect: None,
-                startup_payload: None,
-            }),
-            ..Config::default()
+    fn full_tunnel_normalizes_underlay_and_rejects_dns_proxy_names() {
+        let trimmed = config_with_underlay("  socks5h://104.16.230.132:10808  ");
+        assert!(validate_control_plane_underlay(
+            &trimmed,
+            &default_route_plan(&["104.16.230.132/32"])
+        )
+        .is_ok());
+
+        let hostname = config_with_underlay("socks5h://proxy.example:10808");
+        assert!(validate_control_plane_underlay(
+            &hostname,
+            &default_route_plan(&["203.0.113.7/32"])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn full_tunnel_keeps_loopback_proxy_local_and_rejects_unrelated_bypass() {
+        let config = config_with_underlay("tor://127.0.0.1:9050");
+        assert!(validate_control_plane_underlay(&config, &default_route_plan(&[])).is_ok());
+        assert!(
+            validate_control_plane_underlay(&config, &default_route_plan(&["203.0.113.7/32"]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_proxy_bypass_cannot_be_shadowed_by_a_tun_route() {
+        let config = config_with_underlay("socks5://104.16.230.132:10808");
+        let plan = ControlPlanePlan {
+            routes: vec!["0.0.0.0/0".into(), "104.16.230.132/32".into()],
+            underlay_bypass_routes: vec!["104.16.230.132/32".into()],
+            ..ControlPlanePlan::default()
         };
-        let control = ControlPlaneConfig {
-            apply_interface_address: Some(true),
-            interface_cidr: Some("10.250.0.2/30".into()),
-            apply_routes: Some(true),
-            route_cidrs: Some(vec!["0.0.0.0/0".into()]),
-            underlay_bypass_cidrs: Some(vec!["104.16.230.132/32".into()]),
-            apply_dns: Some(false),
-            dns_servers: None,
-            dry_run: Some(true),
-        };
-        let plan = build_control_plane_plan(&control, "shph0").expect("plan");
-        assert!(validate_control_plane_underlay(&config, &plan).is_ok());
-        assert_eq!(plan.underlay_bypass_routes, vec!["104.16.230.132/32"]);
+        assert!(validate_control_plane_underlay(&config, &plan).is_err());
     }
 
     #[test]

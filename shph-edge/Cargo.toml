@@ -34,7 +34,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["full"] }
 tokio-stream = "0.1"
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.8"
 tracing = "0.1"

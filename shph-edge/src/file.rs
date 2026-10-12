@@ -14,6 +14,18 @@ use std::{
 /// opened handle is then read through a `max_bytes + 1` limit so a file that
 /// grows after the initial metadata check is still rejected.
 pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    read_bounded_file(path, max_bytes, false)
+}
+
+/// Read a private regular file, rejecting group/other access on Unix.
+///
+/// Windows ACLs must be restricted to the edge service identity and
+/// administrators by the operator.
+pub fn read_bounded_private_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    read_bounded_file(path, max_bytes, true)
+}
+
+fn read_bounded_file(path: &Path, max_bytes: u64, require_private: bool) -> io::Result<Vec<u8>> {
     let read_limit = max_bytes.checked_add(1).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -27,6 +39,19 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> io::Result<Vec<
     if !metadata.file_type().is_file() {
         return Err(invalid_input("path must reference a regular file"));
     }
+    #[cfg(unix)]
+    if require_private {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private file permissions must exclude group and other access",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = require_private;
     if metadata.len() > max_bytes {
         return Err(size_limit_error());
     }
@@ -187,6 +212,28 @@ mod tests {
         assert_eq!(
             read_bounded_regular_file(&path, 4).expect("read at limit"),
             b"1234"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_reader_rejects_group_or_other_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new();
+        let path = temp.path("private-key.pem");
+        fs::write(&path, b"private key").expect("write key");
+
+        for mode in [0o644, 0o640] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("set mode");
+            let error = read_bounded_private_file(&path, 1024).expect_err("leaky key mode");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("owner-only mode");
+        assert_eq!(
+            read_bounded_private_file(&path, 1024).expect("owner-only key"),
+            b"private key"
         );
     }
 

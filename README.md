@@ -7,7 +7,7 @@ experimental QUIC-shim, an opt-in standards-compliant QUIC module, and
 Shroud-cell lab paths. The legacy shim is not standards-compliant QUIC or
 anti-censorship guarantees.
 
-## Current Status (2026-09-05)
+## Current Status (2026-10-12)
 
 Workspace version `0.6.7-dev` (prototype pre-release). SHPH is **functional for controlled lab
 environments**, but still **not production-hardened** for hostile-network
@@ -134,7 +134,7 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
     standards-QUIC/native-TUN bridge, requires `SHPH_TUN_NATIVE=1`, and reuses
     stable server material across reconnects. Windows one-shot QUIC is
     supported; Windows native-TUN forwarding remains host-gated.
-- Six standalone fuzzing harnesses cover Shroud-cell framing, TOML
+- Seven standalone fuzzing harnesses cover Shroud-cell framing, TOML
   configuration, audit-record JSON, replay-window state transitions, Shroud2
   datagrams, and Phantom One envelopes under `fuzz/`.
 - Explicit benchmark profiles are available:
@@ -145,6 +145,26 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   `shph-transport` standards-QUIC API. It is disabled by default, records
   bounded public rustls ClientHello metadata, and does not spoof fingerprints
   or claim stealth. See `docs/JA4_OBSERVABILITY.md`.
+- SHPH-native SNAP v1 profile planning is opt-in. Use `shph snap validate`
+  and `shph snap plan` with strict JSON or TOML profiles. Persistent sessions
+  can select `session.snap_profile`; adapter execution keeps SHPH peer pins and
+  authentication. External bridges and relays need operator-owned services,
+  and Python SNAP session interoperability is not included. SNAP remains
+  outside the release profile.
+- Adaptive Shroud 3 is experimental and opt-in for Linux standards-QUIC
+  native-TUN sessions through `host`, `join`, `up`, or
+  `session.shroud3_adaptive`. Both peers must configure it; Shroud 3 uses a
+  distinct `S3` v1 envelope without negotiation or format fallback. The code
+  has authenticated loopback bridge tests, but no native-TUN host
+  interoperability or full-session measurements.
+- Native multi-hop onion routing is an experimental transport API with a
+  separate `shph-onion-relay` process. It carries SHPH sessions through two
+  or three explicitly pinned TLS relays with fixed target allowlists. It has
+  local process-level tests, but no independent protocol review, external
+  service campaign, or native-TUN containment evidence. Neither Shroud 3 nor
+  onion routing is a release-profile, anonymity, or censorship-resistance
+  feature. See `docs/SHROUD_3_IMPLEMENTATION.md` and
+  `docs/ONION_CIRCUIT_DESIGN.md`.
 - `--json` emits structured error objects as well as the existing JSON reports.
   Error objects contain `ok: false`, a stable sysexits-style `code`, a
   human-readable `error`, and an optional remediation `hint`; malformed
@@ -178,8 +198,14 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   leak/packet-path testing, Windows-to-Windows and Linux-to-Linux campaigns,
   UDP/QUIC, PMTU/DNS/IPv6 coverage, and standards-QUIC host validation.
 
-The current development sequence is Shroud lab completion, hardening and
-optimization, release-readiness, then the remaining native Windows TUN gates.
+The next milestone is authenticated TCP/native-TUN lifecycle reliability:
+secret-safe diagnostics, repeatable acceptance on the selected host lane,
+failure recovery, and clean teardown. A separate experimental development scope
+covers Phantom One/Shroud 2 improvements, carrier and probing resistance
+experiments, detectability measurement, and optional onion routing; see
+[`docs/PHANTOM_SHROUD_SCOPE.md`](docs/PHANTOM_SHROUD_SCOPE.md). Existing
+experimental paths retain regression coverage. These workstreams do not close
+the ordered release acceptance checklist in `docs/RELEASE_READINESS.md`.
 
 SHPH inherits core concepts from the Shroud lineage (adaptive framing and profile-driven morphology concepts), reworked for a VPN-first architecture.
 
@@ -348,10 +374,13 @@ shph send-once --peer 198.51.100.10:443 --text "hello" \
 
 This add-on is deliberately explicit and optional. The proxy carries the
 existing SHPH TCP byte stream; it does not terminate SHPH authentication,
-decrypt SHPH payloads, or replace the pinned peer identity. SHPH currently
-supports a local unauthenticated SOCKS5 listener only, so keep that listener
-bound to loopback or otherwise protected. SOCKS5 credentials, QUIC underlay,
-proxy auto-discovery, and a bundled Xray binary are out of scope.
+decrypt SHPH payloads, or replace the pinned peer identity. The generic
+`socks5://` mode does not support credentials. The separate `tor://` mode
+requires a literal loopback SOCKS endpoint and offers fresh per-connection
+SOCKS credentials for proxy-side stream isolation; SHPH does not manage Tor
+circuits or isolation policy. Keep the local SOCKS listener on loopback.
+QUIC-over-SOCKS, proxy auto-discovery, and a bundled Xray binary remain out of
+scope.
 
 See [`docs/REACHABILITY_ADDON.md`](docs/REACHABILITY_ADDON.md) for the
 architecture, operational boundary, and test procedure.

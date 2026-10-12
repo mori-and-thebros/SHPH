@@ -15,6 +15,7 @@ shph-core = { path = "../shph-core" }
 shph-config = { path = "../shph-config" }
 shph-tun = { path = "../shph-tun" }
 shph-transport = { path = "../shph-transport" }
+shph-snap = { path = "../shph-snap" }
 shph-obfuscation = { path = "../shph-obfuscation" }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -31,3 +32,10 @@ toml = { workspace = true }
 libc = { workspace = true }
 windows-sys = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+rcgen = "0.13"
+futures-util = "0.3"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }

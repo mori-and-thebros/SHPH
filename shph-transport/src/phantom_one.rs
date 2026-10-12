@@ -70,6 +70,24 @@ pub struct PhantomOneConfig {
     max_padding: usize,
     /// Enforce this profile's canonical wire-size classes when possible.
     profile_bound: bool,
+    selection: SizeSelection,
+    padding_budget: Option<u64>,
+}
+
+/// Weights correspond to `ProfileTier::base_tiers()`; unused entries must be zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SizeSelection {
+    #[default]
+    FirstFit,
+    Weighted([u16; 7]),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EnvelopeMetrics {
+    pub frames: u64,
+    pub payload_bytes: u64,
+    pub header_bytes: u64,
+    pub padding_bytes: u64,
 }
 
 impl PhantomOneConfig {
@@ -79,6 +97,8 @@ impl PhantomOneConfig {
             min_padding,
             max_padding,
             profile_bound: false,
+            selection: SizeSelection::FirstFit,
+            padding_budget: None,
         };
         config.validate()?;
         Ok(config)
@@ -92,6 +112,8 @@ impl PhantomOneConfig {
             min_padding: 0,
             max_padding: PHANTOM_ONE_MAX_PADDING_BYTES,
             profile_bound: true,
+            selection: SizeSelection::FirstFit,
+            padding_budget: None,
         }
     }
 
@@ -113,7 +135,43 @@ impl PhantomOneConfig {
         self.max_padding
     }
 
+    pub fn with_selection(mut self, selection: SizeSelection) -> Result<Self> {
+        self.selection = selection;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Lifetime tail-padding allowance. Exhaustion returns an error; it never
+    /// silently changes profile or resets at a time-window boundary.
+    pub fn with_padding_budget(mut self, bytes: u64) -> Self {
+        self.padding_budget = Some(bytes);
+        self
+    }
+
+    pub fn selection(self) -> SizeSelection {
+        self.selection
+    }
+
+    pub fn padding_budget(self) -> Option<u64> {
+        self.padding_budget
+    }
+
+    pub fn is_profile_bound(self) -> bool {
+        self.profile_bound
+    }
+
     fn validate(self) -> Result<()> {
+        if let SizeSelection::Weighted(weights) = self.selection {
+            let count = self.profile.base_tiers().len();
+            if !self.profile_bound
+                || weights[..count].iter().all(|weight| *weight == 0)
+                || weights[count..].iter().any(|weight| *weight != 0)
+            {
+                return Err(ShphError::Config(
+                    "invalid Phantom One class weights".into(),
+                ));
+            }
+        }
         if self.min_padding > self.max_padding {
             return Err(ShphError::Config(
                 "Phantom One minimum padding must not exceed maximum padding".into(),
@@ -135,6 +193,8 @@ impl Default for PhantomOneConfig {
             min_padding: 0,
             max_padding: 64,
             profile_bound: false,
+            selection: SizeSelection::FirstFit,
+            padding_budget: None,
         }
     }
 }
@@ -201,6 +261,7 @@ pub struct PhantomOneEncoder {
     next_sequence: Option<u64>,
     config: PhantomOneConfig,
     rng: StdRng,
+    metrics: EnvelopeMetrics,
 }
 
 impl PhantomOneEncoder {
@@ -210,6 +271,7 @@ impl PhantomOneEncoder {
             next_sequence: Some(0),
             config: PhantomOneConfig::default(),
             rng: StdRng::from_entropy(),
+            metrics: EnvelopeMetrics::default(),
         }
     }
 
@@ -236,6 +298,7 @@ impl PhantomOneEncoder {
             next_sequence: Some(0),
             config,
             rng: StdRng::from_entropy(),
+            metrics: EnvelopeMetrics::default(),
         })
     }
 
@@ -254,6 +317,7 @@ impl PhantomOneEncoder {
             next_sequence: Some(0),
             config,
             rng: StdRng::seed_from_u64(seed),
+            metrics: EnvelopeMetrics::default(),
         }
     }
 
@@ -288,11 +352,26 @@ impl PhantomOneEncoder {
         self.next_sequence
     }
 
+    pub fn metrics(&self) -> EnvelopeMetrics {
+        self.metrics
+    }
+
+    fn remaining_padding(&self) -> usize {
+        self.config.padding_budget.map_or(usize::MAX, |budget| {
+            usize::try_from(budget.saturating_sub(self.metrics.padding_bytes)).unwrap_or(usize::MAX)
+        })
+    }
+
     /// Select a canonical target size for a payload on the supplied path MTU.
     pub fn target_size(&mut self, payload_len: usize, path_mtu: usize) -> Result<usize> {
         self.config.validate()?;
         validate_path_mtu(path_mtu)?;
         validate_payload_length(payload_len)?;
+        if self.next_sequence.is_none() {
+            return Err(ShphError::ResourceExhausted(
+                "Phantom One sequence space exhausted".into(),
+            ));
+        }
 
         let minimum = PHANTOM_ONE_HEADER_BYTES
             .checked_add(payload_len)
@@ -305,9 +384,44 @@ impl PhantomOneEncoder {
         }
 
         let maximum_target = minimum
-            .checked_add(self.config.max_padding)
+            .checked_add(self.config.max_padding.min(self.remaining_padding()))
             .ok_or_else(|| protocol("Phantom One target length overflow"))?
             .min(path_mtu);
+
+        if minimum_target > maximum_target {
+            return Err(ShphError::ResourceExhausted(
+                "Phantom One padding budget exhausted".into(),
+            ));
+        }
+
+        if let SizeSelection::Weighted(weights) = self.config.selection {
+            let tiers = self.config.profile.base_tiers();
+            let total: u32 = tiers
+                .iter()
+                .zip(weights)
+                .filter_map(|(tier, weight)| {
+                    (minimum_target..=maximum_target)
+                        .contains(tier)
+                        .then_some(u32::from(weight))
+                })
+                .sum();
+            if total == 0 {
+                return Err(protocol(
+                    "no weighted Phantom One class fits the remaining budget",
+                ));
+            }
+            let mut sample = self.rng.gen_range(0..total);
+            for (&tier, weight) in tiers.iter().zip(weights) {
+                if !(minimum_target..=maximum_target).contains(&tier) {
+                    continue;
+                }
+                if sample < u32::from(weight) {
+                    return Ok(tier);
+                }
+                sample -= u32::from(weight);
+            }
+            unreachable!("positive eligible weight must select a tier");
+        }
 
         for &base_target in self.config.profile.base_tiers() {
             if base_target < minimum_target || base_target > maximum_target {
@@ -318,15 +432,13 @@ impl PhantomOneEncoder {
                 ProfileTier::TunedLow => 3,
                 _ => 0,
             };
-            let jitter = if jitter_bound == 0 {
+            let available_jitter = jitter_bound.min(maximum_target - base_target);
+            let jitter = if available_jitter == 0 {
                 0
             } else {
-                self.rng.gen_range(0..=jitter_bound)
+                self.rng.gen_range(0..=available_jitter)
             };
-            let target = base_target.saturating_add(jitter);
-            if target <= maximum_target && target <= path_mtu {
-                return Ok(target);
-            }
+            return Ok(base_target + jitter);
         }
 
         if self.config.profile_bound {
@@ -416,6 +528,7 @@ impl PhantomOneEncoder {
             || target_len > PHANTOM_ONE_MAX_ENVELOPE_BYTES
             || padding_len < self.config.min_padding
             || padding_len > self.config.max_padding
+            || padding_len > self.remaining_padding()
         {
             return Err(protocol(
                 "Phantom One target is outside configured path-MTU bounds",
@@ -458,6 +571,19 @@ impl PhantomOneEncoder {
         }
 
         self.next_sequence = sequence.checked_add(1);
+        self.metrics.frames = self.metrics.frames.saturating_add(1);
+        self.metrics.payload_bytes = self
+            .metrics
+            .payload_bytes
+            .saturating_add(payload.len() as u64);
+        self.metrics.header_bytes = self
+            .metrics
+            .header_bytes
+            .saturating_add(PHANTOM_ONE_HEADER_BYTES as u64);
+        self.metrics.padding_bytes = self
+            .metrics
+            .padding_bytes
+            .saturating_add(padding_len as u64);
         cleanup.commit();
         Ok(())
     }
@@ -471,6 +597,7 @@ pub struct PhantomOneDecoder {
     config: PhantomOneConfig,
     highest_sequence: Option<u64>,
     seen_bitmap: u64,
+    padding_bytes_used: u64,
 }
 
 impl PhantomOneDecoder {
@@ -481,6 +608,7 @@ impl PhantomOneDecoder {
             config: PhantomOneConfig::default(),
             highest_sequence: None,
             seen_bitmap: 0,
+            padding_bytes_used: 0,
         }
     }
 
@@ -509,6 +637,7 @@ impl PhantomOneDecoder {
             config,
             highest_sequence: None,
             seen_bitmap: 0,
+            padding_bytes_used: 0,
         })
     }
 
@@ -536,7 +665,9 @@ impl PhantomOneDecoder {
     /// Decode and accept one frame, rejecting duplicate or stale sequences.
     pub fn decode(&mut self, datagram: &[u8], path_mtu: usize) -> Result<PhantomOneFrame> {
         let parts = decode_parts(datagram, self.generation, path_mtu, self.config)?;
+        let next_padding_bytes = self.next_padding_bytes(parts.padding_len)?;
         self.accept_sequence(parts.sequence)?;
+        self.padding_bytes_used = next_padding_bytes;
         Ok(parts.to_frame(datagram))
     }
 
@@ -547,11 +678,28 @@ impl PhantomOneDecoder {
     /// transport receive loop.
     pub fn decode_in_place(&mut self, datagram: &mut Vec<u8>, path_mtu: usize) -> Result<()> {
         let parts = decode_parts(datagram, self.generation, path_mtu, self.config)?;
+        let next_padding_bytes = self.next_padding_bytes(parts.padding_len)?;
         self.accept_sequence(parts.sequence)?;
+        self.padding_bytes_used = next_padding_bytes;
         datagram.copy_within(PHANTOM_ONE_HEADER_BYTES..parts.payload_end, 0);
         datagram[parts.payload_len..].zeroize();
         datagram.truncate(parts.payload_len);
         Ok(())
+    }
+
+    fn next_padding_bytes(&self, padding_len: usize) -> Result<u64> {
+        let next = self
+            .padding_bytes_used
+            .checked_add(padding_len as u64)
+            .ok_or_else(|| protocol("Phantom One session padding counter overflow"))?;
+        if self
+            .config
+            .padding_budget
+            .is_some_and(|budget| next > budget)
+        {
+            return Err(protocol("Phantom One session padding budget exceeded"));
+        }
+        Ok(next)
     }
 
     fn accept_sequence(&mut self, sequence: u64) -> Result<()> {
@@ -628,6 +776,8 @@ pub fn decode(
             min_padding: 0,
             max_padding: PHANTOM_ONE_MAX_PADDING_BYTES,
             profile_bound: false,
+            selection: SizeSelection::FirstFit,
+            padding_budget: None,
         },
     )?;
     Ok(parts.to_frame(datagram))
@@ -780,7 +930,7 @@ fn protocol(message: &str) -> ShphError {
 mod tests {
     use super::{
         decode, validate_path_mtu, PhantomOneConfig, PhantomOneDecoder, PhantomOneEncoder,
-        PhantomOneFrameType, PHANTOM_ONE_HEADER_BYTES, PHANTOM_ONE_MAGIC,
+        PhantomOneFrameType, SizeSelection, PHANTOM_ONE_HEADER_BYTES, PHANTOM_ONE_MAGIC,
         PHANTOM_ONE_MAX_ENVELOPE_BYTES, PHANTOM_ONE_MAX_PADDING_BYTES, PHANTOM_ONE_VERSION,
         PROFILE_OFFSET, TARGET_LENGTH_OFFSET,
     };
@@ -1085,6 +1235,73 @@ mod tests {
     }
 
     #[test]
+    fn low_profile_selection_clamps_jitter_at_exact_carrier_and_budget_limits() {
+        let profile = ProfileTier::Low;
+        let target = profile.base_tiers()[0];
+        let padding_budget = target - PHANTOM_ONE_HEADER_BYTES - 1;
+        let config =
+            PhantomOneConfig::for_profile(profile).with_padding_budget(padding_budget as u64);
+
+        for seed in 0..64 {
+            let mut encoder = PhantomOneEncoder::from_seed_with_config(31, seed, config)
+                .expect("budgeted low-profile encoder");
+            assert_eq!(
+                encoder
+                    .target_size(1, target)
+                    .expect("exact canonical limit is usable"),
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_enforces_cumulative_session_padding_budget_before_acceptance() {
+        let raw_config = PhantomOneConfig::new(0, 16).expect("raw frame config");
+        let budget_config = raw_config.with_padding_budget(8);
+        let mut encoder =
+            PhantomOneEncoder::from_seed_with_config(32, 17, raw_config).expect("encoder");
+        let first = encoder
+            .encode_with_target(
+                PhantomOneFrameType::Data,
+                b"a",
+                PHANTOM_ONE_HEADER_BYTES + 1 + 5,
+                128,
+            )
+            .expect("first frame");
+        let over_budget = encoder
+            .encode_with_target(
+                PhantomOneFrameType::Data,
+                b"b",
+                PHANTOM_ONE_HEADER_BYTES + 1 + 4,
+                128,
+            )
+            .expect("second frame");
+
+        let mut decoder = PhantomOneDecoder::with_config(32, budget_config).expect("decoder");
+        assert_eq!(
+            decoder.decode(&first, 128).expect("first decode").payload,
+            b"a"
+        );
+        assert_eq!(decoder.padding_bytes_used, 5);
+        assert_protocol_error(decoder.decode(&over_budget, 128));
+        assert_eq!(decoder.highest_sequence(), Some(0));
+        assert_eq!(decoder.padding_bytes_used, 5);
+
+        let mut in_place_decoder =
+            PhantomOneDecoder::with_config(32, budget_config).expect("in-place decoder");
+        let mut first_in_place = first.clone();
+        in_place_decoder
+            .decode_in_place(&mut first_in_place, 128)
+            .expect("first in-place decode");
+        assert_eq!(first_in_place, b"a");
+        let mut over_budget_in_place = over_budget.clone();
+        assert_protocol_error(in_place_decoder.decode_in_place(&mut over_budget_in_place, 128));
+        assert_eq!(over_budget_in_place, over_budget);
+        assert_eq!(in_place_decoder.highest_sequence(), Some(0));
+        assert_eq!(in_place_decoder.padding_bytes_used, 5);
+    }
+
+    #[test]
     fn replay_free_decode_accepts_every_assigned_profile() {
         let profiles = [
             ProfileTier::Low,
@@ -1240,5 +1457,100 @@ mod tests {
     fn magic_is_version_specific() {
         assert_eq!(&PHANTOM_ONE_MAGIC, b"PH1\0");
         assert_eq!(PHANTOM_ONE_VERSION, 1);
+    }
+
+    #[test]
+    fn weighted_selection_is_seeded_and_matches_configured_frequency() {
+        let config = PhantomOneConfig::for_profile(ProfileTier::Medium)
+            .with_selection(SizeSelection::Weighted([1, 3, 0, 0, 0, 0, 0]))
+            .expect("weighted profile config");
+        let mut first =
+            PhantomOneEncoder::from_seed_with_config(31, 42, config).expect("first encoder");
+        let mut second =
+            PhantomOneEncoder::from_seed_with_config(31, 42, config).expect("second encoder");
+        let mut first_class_count = 0usize;
+        const SAMPLES: usize = 10_000;
+
+        for _ in 0..SAMPLES {
+            let first_size = first.target_size(1, 256).expect("select first target");
+            let second_size = second.target_size(1, 256).expect("select second target");
+            assert_eq!(first_size, second_size, "seeded selection must reproduce");
+            assert!(matches!(first_size, 128 | 256));
+            first_class_count += usize::from(first_size == 128);
+        }
+
+        assert!(
+            (2_200..=2_800).contains(&first_class_count),
+            "first class frequency {first_class_count}/{SAMPLES} must be within 3% of the configured 25%"
+        );
+    }
+
+    #[test]
+    fn weighted_selection_validates_weights_and_requires_profile_binding() {
+        let weighted = SizeSelection::Weighted([1, 0, 0, 0, 0, 0, 0]);
+        assert!(PhantomOneConfig::new(0, 0)
+            .expect("unbound config")
+            .with_selection(weighted)
+            .is_err());
+
+        let profile_config = PhantomOneConfig::for_profile(ProfileTier::Medium);
+        assert!(profile_config
+            .with_selection(SizeSelection::Weighted([0; 7]))
+            .is_err());
+        assert!(profile_config
+            .with_selection(SizeSelection::Weighted([1, 1, 1, 1, 1, 1, 0]))
+            .is_err());
+    }
+
+    #[test]
+    fn weighted_class_and_session_padding_budgets_hold_at_boundaries() {
+        let config = PhantomOneConfig::for_profile(ProfileTier::Medium)
+            .with_selection(SizeSelection::Weighted([1, 0, 0, 0, 0, 0, 0]))
+            .expect("single-class config")
+            .with_padding_budget((128 - PHANTOM_ONE_HEADER_BYTES - 1) as u64);
+        let mut encoder =
+            PhantomOneEncoder::from_seed_with_config(32, 77, config).expect("budgeted encoder");
+        let mut control =
+            PhantomOneEncoder::from_seed_with_config(32, 77, config).expect("control encoder");
+
+        assert!(encoder.target_size(1, 127).is_err());
+        assert_eq!(encoder.next_sequence(), Some(0));
+        assert_eq!(encoder.metrics().frames, 0);
+
+        let encoded = encoder
+            .encode(PhantomOneFrameType::Data, b"x", 128)
+            .expect("canonical class exactly meets carrier limit");
+        let control_encoded = control
+            .encode(PhantomOneFrameType::Data, b"x", 128)
+            .expect("control encoding");
+        assert_eq!(
+            encoded, control_encoded,
+            "rejected selection must not advance RNG"
+        );
+        assert_eq!(encoded.len(), 128);
+        assert_eq!(
+            encoder.metrics().padding_bytes,
+            config.padding_budget().unwrap()
+        );
+
+        let metrics = encoder.metrics();
+        assert!(encoder
+            .encode(PhantomOneFrameType::Data, b"x", 128)
+            .is_err());
+        assert_eq!(encoder.next_sequence(), Some(1));
+        assert_eq!(
+            encoder.metrics(),
+            metrics,
+            "budget rejection must not mutate metrics"
+        );
+        assert!(encoder
+            .encode(
+                PhantomOneFrameType::Data,
+                &[0; 128 - PHANTOM_ONE_HEADER_BYTES + 1],
+                128
+            )
+            .is_err());
+        assert_eq!(encoder.next_sequence(), Some(1));
+        assert_eq!(encoder.metrics(), metrics);
     }
 }

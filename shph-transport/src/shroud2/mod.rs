@@ -12,6 +12,8 @@ use std::collections::{btree_map::Entry, BTreeMap};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
+pub mod workload;
+
 pub const MORPHOLOGY_MAGIC: [u8; 2] = *b"S2";
 pub const MORPHOLOGY_VERSION: u8 = 1;
 pub const MORPHOLOGY_HEADER_BYTES: usize = 7;

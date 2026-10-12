@@ -9,7 +9,7 @@ use shph_edge::{
         MAX_CAPABILITY_TOKEN_FILE_BYTES,
     },
     config::EdgeConfig,
-    file::read_bounded_regular_file,
+    file::{read_bounded_private_file, read_bounded_regular_file},
     frontdoor::FrontDoor,
 };
 use std::{
@@ -48,6 +48,13 @@ enum Command {
         relay_path: String,
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         max_stream_bytes: u64,
+        #[arg(long, default_value_t = 256)]
+        max_capability_verifications_per_second: u64,
+        #[arg(long, default_value_t = shph_edge::config::DEFAULT_HTTP2_IDLE_TIMEOUT_MS)]
+        http2_idle_timeout_ms: u64,
+        /// Normalize denied request status/body; timing equivalence is not implied.
+        #[arg(long)]
+        uniform_fallback: bool,
     },
     Connect {
         #[arg(long, value_enum, default_value_t = CarrierArg::H2)]
@@ -90,6 +97,9 @@ async fn main() -> Result<()> {
             key,
             relay_path,
             max_stream_bytes,
+            max_capability_verifications_per_second,
+            http2_idle_timeout_ms,
+            uniform_fallback,
         } => {
             if cert.is_none() || key.is_none() {
                 anyhow::bail!(
@@ -111,6 +121,8 @@ async fn main() -> Result<()> {
                 },
                 limits: shph_edge::config::Limits {
                     max_stream_bytes,
+                    max_capability_verifications_per_second,
+                    http2_idle_timeout_ms,
                     ..Default::default()
                 },
                 socks: Default::default(),
@@ -130,7 +142,14 @@ async fn main() -> Result<()> {
                     config.limits.max_token_bytes,
                     config.relay_path.clone(),
                 )
-                .context("invalid relay path")?,
+                .context("invalid relay path")?
+                .with_replay_capacity(config.limits.replay_capacity)
+                .context("invalid replay capacity")?
+                .with_max_verifications_per_second(
+                    config.limits.max_capability_verifications_per_second,
+                )
+                .context("invalid capability verification rate")?
+                .with_uniform_fallback(uniform_fallback),
             );
             let result = match carrier {
                 CarrierArg::H2 => {
@@ -162,7 +181,7 @@ async fn main() -> Result<()> {
             relay_path,
         } => {
             let token = String::from_utf8(
-                read_bounded_regular_file(&token_file, MAX_CAPABILITY_TOKEN_FILE_BYTES as u64)
+                read_bounded_private_file(&token_file, MAX_CAPABILITY_TOKEN_FILE_BYTES as u64)
                     .with_context(|| "read capability token")?,
             )
             .context("capability token is not UTF-8")?
@@ -271,4 +290,36 @@ fn hex_decode(value: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(Into::into))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_accepts_an_explicit_http2_idle_timeout() {
+        let cli = Cli::try_parse_from([
+            "shph-edge",
+            "serve",
+            "--listen",
+            "127.0.0.1:8443",
+            "--backend",
+            "127.0.0.1:9000",
+            "--audience",
+            "edge-a",
+            "--public-key-file",
+            "public-key.hex",
+            "--http2-idle-timeout-ms",
+            "12000",
+        ])
+        .expect("valid serve arguments");
+
+        match cli.command {
+            Command::Serve {
+                http2_idle_timeout_ms,
+                ..
+            } => assert_eq!(http2_idle_timeout_ms, 12_000),
+            Command::Connect { .. } => panic!("expected serve command"),
+        }
+    }
 }

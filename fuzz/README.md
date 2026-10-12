@@ -18,10 +18,12 @@ cargo install cargo-fuzz --locked
 - `audit_record`: JSONL ratchet-audit record deserialization.
 - `replay_window`: replay-window state transitions over arbitrary nonce
   sequences.
-- `shroud2_datagram`: bounded Shroud 2 lab-envelope parsing and
-  morphology-size selection.
+- `shroud2_datagram`: bounded Shroud 2 and Shroud 3 lab-envelope parsing and
+  Shroud 2 morphology-size selection.
 - `phantom_one_envelope`: versioned Phantom One envelope parsing, bounded
-  configuration, replay-window behavior, and sequence exhaustion.
+  configuration, replay-window behavior, and bounded envelope-policy offer
+  decoding with mutations of valid offers.
+- `snap_profile`: bounded, strict JSON and TOML SNAP profile parsing.
 
 ## Run
 
@@ -36,6 +38,7 @@ cargo fuzz run audit_record -- -max_total_time=60
 cargo fuzz run replay_window -- -max_total_time=60
 cargo fuzz run shroud2_datagram -- -max_total_time=60
 cargo fuzz run phantom_one_envelope -- -max_total_time=60
+cargo fuzz run snap_profile -- -max_total_time=60
 ```
 
 For a pinned Windows campaign, use the tracked concurrent wrapper after

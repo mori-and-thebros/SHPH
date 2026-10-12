@@ -20,7 +20,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceAliasToLuid;
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0, FWPM_ACTION0,
+    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0,
+    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
     FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_CONDITION_IP_PROTOCOL,
     FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_FILTER0,
     FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
@@ -101,40 +102,48 @@ impl WindowsKillswitchGuard {
             mutex,
             keys: Vec::new(),
         };
-        guard.remove_stale_filters()?;
+        guard.with_transaction(|guard| {
+            guard.remove_stale_filters()?;
+            guard.add_filter(
+                filter_key("block-v4", 0),
+                FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                Vec::new(),
+                FWP_ACTION_BLOCK,
+                FILTER_WEIGHT_BLOCK,
+                "SHPH killswitch block IPv4 connections",
+            )?;
+            guard.add_filter(
+                filter_key("block-v6", 0),
+                FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                Vec::new(),
+                FWP_ACTION_BLOCK,
+                FILTER_WEIGHT_BLOCK,
+                "SHPH killswitch block IPv6 connections",
+            )?;
+            guard.add_loopback(IpAddr::V4([127, 0, 0, 0].into()), 0)?;
+            guard.add_loopback(IpAddr::V6("::1".parse().expect("static IPv6")), 0)?;
 
-        guard.add_filter(
-            filter_key("block-v4", 0),
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            Vec::new(),
-            FWP_ACTION_BLOCK,
-            FILTER_WEIGHT_BLOCK,
-            "SHPH killswitch block IPv4 connections",
-        )?;
-        guard.add_filter(
-            filter_key("block-v6", 0),
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            Vec::new(),
-            FWP_ACTION_BLOCK,
-            FILTER_WEIGHT_BLOCK,
-            "SHPH killswitch block IPv6 connections",
-        )?;
-        guard.add_loopback(IpAddr::V4([127, 0, 0, 0].into()), 0)?;
-        guard.add_loopback(IpAddr::V6("::1".parse().expect("static IPv6")), 0)?;
-
-        for (index, peer) in peers.iter().enumerate() {
-            guard.add_peer(index, *peer, transport)?;
-        }
+            for (index, peer) in peers.iter().enumerate() {
+                guard.add_peer(index, *peer, transport)?;
+            }
+            Ok(())
+        })?;
         Ok(guard)
     }
 
     pub fn allow_interface(&mut self, interface_name: &str) -> Result<()> {
         let luid = interface_luid(interface_name)?;
-        self.remove_key(&filter_key("interface-v4", 0))?;
-        self.remove_key(&filter_key("interface-v6", 0))?;
-        self.add_interface(luid, FWPM_LAYER_ALE_AUTH_CONNECT_V4, "v4")?;
-        self.add_interface(luid, FWPM_LAYER_ALE_AUTH_CONNECT_V6, "v6")?;
-        Ok(())
+        self.with_transaction(|guard| {
+            let v4_key = filter_key("interface-v4", 0);
+            let v6_key = filter_key("interface-v6", 0);
+            guard.remove_key(&v4_key)?;
+            guard.keys.retain(|key| !same_guid(key, &v4_key));
+            guard.remove_key(&v6_key)?;
+            guard.keys.retain(|key| !same_guid(key, &v6_key));
+            guard.add_interface(luid, FWPM_LAYER_ALE_AUTH_CONNECT_V4, "v4")?;
+            guard.add_interface(luid, FWPM_LAYER_ALE_AUTH_CONNECT_V6, "v6")?;
+            Ok(())
+        })
     }
 
     pub fn cleanup(&mut self) -> Result<()> {
@@ -143,18 +152,16 @@ impl WindowsKillswitchGuard {
         }
         let mut first_error = None;
         if !self.engine.is_null() {
-            let pending_keys = std::mem::take(&mut self.keys);
-            let mut remaining_keys = Vec::new();
-            for key in pending_keys {
-                let status = unsafe { FwpmFilterDeleteByKey0(self.engine, &key) };
-                if status != 0 && !is_filter_absent_status(status) {
-                    remaining_keys.push(key);
-                    if first_error.is_none() {
-                        first_error = Some(wfp_error("FwpmFilterDeleteByKey0", status));
+            let pending_keys = self.keys.clone();
+            if !pending_keys.is_empty() {
+                self.with_transaction(|guard| {
+                    for key in &pending_keys {
+                        guard.remove_key(key)?;
                     }
-                }
+                    Ok(())
+                })?;
+                self.keys.clear();
             }
-            self.keys = remaining_keys;
             if self.keys.is_empty() {
                 let status = unsafe { FwpmEngineClose0(self.engine) };
                 if status == 0 {
@@ -193,7 +200,7 @@ impl WindowsKillswitchGuard {
             mutex,
             keys: Vec::new(),
         };
-        guard.remove_stale_filters()?;
+        guard.with_transaction(|guard| guard.remove_stale_filters())?;
         guard.cleanup()
     }
 
@@ -230,7 +237,7 @@ impl WindowsKillswitchGuard {
     }
 
     fn add_loopback(&mut self, address: IpAddr, index: u32) -> Result<()> {
-        let (layer, condition) = match address {
+        match address {
             IpAddr::V4(address) => {
                 let mut mask = FWP_V4_ADDR_AND_MASK {
                     addr: u32::from_be_bytes(address.octets()),
@@ -246,7 +253,14 @@ impl WindowsKillswitchGuard {
                         },
                     },
                 };
-                (FWPM_LAYER_ALE_AUTH_CONNECT_V4, condition)
+                self.add_filter(
+                    filter_key("loopback-v4", index),
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                    vec![condition],
+                    FWP_ACTION_PERMIT,
+                    FILTER_WEIGHT_ALLOW,
+                    "SHPH killswitch loopback",
+                )
             }
             IpAddr::V6(address) => {
                 let mut mask = FWP_V6_ADDR_AND_MASK {
@@ -263,24 +277,54 @@ impl WindowsKillswitchGuard {
                         },
                     },
                 };
-                (FWPM_LAYER_ALE_AUTH_CONNECT_V6, condition)
+                self.add_filter(
+                    filter_key("loopback-v6", index),
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                    vec![condition],
+                    FWP_ACTION_PERMIT,
+                    FILTER_WEIGHT_ALLOW,
+                    "SHPH killswitch loopback",
+                )
             }
-        };
-        self.add_filter(
-            filter_key(
-                if address.is_ipv4() {
-                    "loopback-v4"
+        }
+    }
+
+    fn with_transaction<T>(&mut self, operation: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let status = unsafe { FwpmTransactionBegin0(self.engine, 0) };
+        if status != 0 {
+            return Err(wfp_error("FwpmTransactionBegin0", status));
+        }
+
+        let original_keys = self.keys.clone();
+        match operation(self) {
+            Ok(value) => {
+                let status = unsafe { FwpmTransactionCommit0(self.engine) };
+                if status == 0 {
+                    return Ok(value);
+                }
+
+                self.keys = original_keys;
+                let abort_status = unsafe { FwpmTransactionAbort0(self.engine) };
+                if abort_status == 0 {
+                    Err(wfp_error("FwpmTransactionCommit0", status))
                 } else {
-                    "loopback-v6"
-                },
-                index,
-            ),
-            layer,
-            vec![condition],
-            FWP_ACTION_PERMIT,
-            FILTER_WEIGHT_ALLOW,
-            "SHPH killswitch loopback",
-        )
+                    Err(ShphError::PermissionDenied(format!(
+                        "FwpmTransactionCommit0 failed with status 0x{status:08x}; abort failed with status 0x{abort_status:08x}; administrator elevation is required"
+                    )))
+                }
+            }
+            Err(error) => {
+                self.keys = original_keys;
+                let abort_status = unsafe { FwpmTransactionAbort0(self.engine) };
+                if abort_status == 0 {
+                    Err(error)
+                } else {
+                    Err(ShphError::PermissionDenied(format!(
+                        "{error}; WFP transaction abort failed with status 0x{abort_status:08x}; administrator elevation is required"
+                    )))
+                }
+            }
+        }
     }
 
     fn add_peer(
@@ -289,27 +333,28 @@ impl WindowsKillswitchGuard {
         peer: SocketAddr,
         transport: FirewallTransport,
     ) -> Result<()> {
-        let protocol = transport.protocol_number();
-        let protocol_value = protocol;
-        let port_value = peer.port();
-        let (layer, address_condition) = match peer.ip() {
+        match peer.ip() {
             IpAddr::V4(address) => {
                 let mut mask = FWP_V4_ADDR_AND_MASK {
                     addr: u32::from_be_bytes(address.octets()),
                     mask: u32::MAX,
                 };
-                (
-                    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-                    FWPM_FILTER_CONDITION0 {
-                        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
-                        matchType: 0,
-                        conditionValue: FWP_CONDITION_VALUE0 {
-                            r#type: FWP_V4_ADDR_MASK,
-                            Anonymous: FWP_CONDITION_VALUE0_0 {
-                                v4AddrMask: &mut mask,
-                            },
+                let address_condition = FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    matchType: 0,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_V4_ADDR_MASK,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            v4AddrMask: &mut mask,
                         },
                     },
+                };
+                self.add_peer_filter(
+                    index,
+                    peer,
+                    transport,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                    address_condition,
                 )
             }
             IpAddr::V6(address) => {
@@ -317,21 +362,35 @@ impl WindowsKillswitchGuard {
                     addr: address.octets(),
                     prefixLength: 128,
                 };
-                (
-                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-                    FWPM_FILTER_CONDITION0 {
-                        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
-                        matchType: 0,
-                        conditionValue: FWP_CONDITION_VALUE0 {
-                            r#type: FWP_V6_ADDR_MASK,
-                            Anonymous: FWP_CONDITION_VALUE0_0 {
-                                v6AddrMask: &mut mask,
-                            },
+                let address_condition = FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    matchType: 0,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_V6_ADDR_MASK,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            v6AddrMask: &mut mask,
                         },
                     },
+                };
+                self.add_peer_filter(
+                    index,
+                    peer,
+                    transport,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                    address_condition,
                 )
             }
-        };
+        }
+    }
+
+    fn add_peer_filter(
+        &mut self,
+        index: usize,
+        peer: SocketAddr,
+        transport: FirewallTransport,
+        layer: GUID,
+        address_condition: FWPM_FILTER_CONDITION0,
+    ) -> Result<()> {
         let conditions = vec![
             address_condition,
             FWPM_FILTER_CONDITION0 {
@@ -340,7 +399,7 @@ impl WindowsKillswitchGuard {
                 conditionValue: FWP_CONDITION_VALUE0 {
                     r#type: FWP_UINT8,
                     Anonymous: FWP_CONDITION_VALUE0_0 {
-                        uint8: protocol_value,
+                        uint8: transport.protocol_number(),
                     },
                 },
             },
@@ -349,7 +408,9 @@ impl WindowsKillswitchGuard {
                 matchType: 0,
                 conditionValue: FWP_CONDITION_VALUE0 {
                     r#type: FWP_UINT16,
-                    Anonymous: FWP_CONDITION_VALUE0_0 { uint16: port_value },
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        uint16: peer.port(),
+                    },
                 },
             },
         ];
@@ -436,6 +497,14 @@ impl WindowsKillswitchGuard {
 impl Drop for WindowsKillswitchGuard {
     fn drop(&mut self) {
         let _ = self.cleanup();
+        if !self.engine.is_null() {
+            let _ = unsafe { FwpmEngineClose0(self.engine) };
+            self.engine = null_mut();
+        }
+        if !self.mutex.is_null() {
+            let _ = unsafe { CloseHandle(self.mutex) };
+            self.mutex = null_mut();
+        }
     }
 }
 
@@ -457,6 +526,14 @@ fn acquire_wfp_mutex() -> Result<HANDLE> {
 }
 
 pub fn interface_luid(interface_name: &str) -> Result<u64> {
+    if interface_name.is_empty()
+        || interface_name.contains('\0')
+        || interface_name.chars().any(char::is_control)
+    {
+        return Err(ShphError::InvalidArgument(
+            "Windows interface alias contains invalid characters".into(),
+        ));
+    }
     let mut wide: Vec<u16> = interface_name.encode_utf16().chain(Some(0)).collect();
     let mut luid = NET_LUID_LH::default();
     let status = unsafe { ConvertInterfaceAliasToLuid(wide.as_mut_ptr(), &mut luid) };
@@ -464,6 +541,13 @@ pub fn interface_luid(interface_name: &str) -> Result<u64> {
         return Err(wfp_error("ConvertInterfaceAliasToLuid", status));
     }
     Ok(unsafe { luid.Value })
+}
+
+fn same_guid(left: &GUID, right: &GUID) -> bool {
+    left.data1 == right.data1
+        && left.data2 == right.data2
+        && left.data3 == right.data3
+        && left.data4 == right.data4
 }
 
 fn filter_key(kind: &str, index: u32) -> GUID {
@@ -492,8 +576,16 @@ fn is_filter_absent_status(status: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_filter_absent_status, FWP_E_FILTER_NOT_FOUND, RPC_C_AUTHN_WINNT, WFP_AUTHN_SERVICE,
+        interface_luid, is_filter_absent_status, FWP_E_FILTER_NOT_FOUND, RPC_C_AUTHN_WINNT,
+        WFP_AUTHN_SERVICE,
     };
+
+    #[test]
+    fn interface_alias_rejects_nul_and_control_characters_before_ffi() {
+        for alias in ["", "Ethernet\0suffix", "Ethernet\n"] {
+            assert!(interface_luid(alias).is_err());
+        }
+    }
 
     #[test]
     fn engine_open_uses_supported_rpc_authentication() {

@@ -205,8 +205,12 @@ Operational behavior:
 
 - Envelope paths are confined to sanitized peer and envelope components.
 - File size, scan depth, and scan count are bounded.
-- Each inbox and outbox has an aggregate `max_total_bytes` quota; the default
-  is 4 MiB and the hard cap is 8 MiB.
+- The outbox enforces the aggregate `max_total_bytes` write quota; the default
+  is 4 MiB and the hard cap is 8 MiB. Inbox work is independently bounded by
+  hard scan-entry, scan-byte, per-file, and candidate-memory limits. It checks
+  recipient and configured peer metadata before reading eligible candidates,
+  then processes a bounded snapshot so unauthenticated ciphertext cannot hold
+  later authenticated deliveries behind a spoofed quota claim.
 - Envelopes older than `max_age_ms` are quarantined during scanning; the
   default is 24 hours and the hard cap is 30 days.
 - Payloads above `max_file_bytes` are rejected before AEAD encryption, limiting

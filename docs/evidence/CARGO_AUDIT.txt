@@ -1,24 +1,59 @@
-# Historical capture from August 5, 2026; not a current scan result.
-# The current policy and lockfile status are documented in
-# docs/SUPPLY_CHAIN_SCAN.md. Regenerate this file with:
-# cargo audit --deny warnings
+# Revalidated 2026-09-28 with cargo-audit 0.22.2.
+# RustSec advisory database HEAD: ef03605143a913024f864d2edf476adad5720c93
+# `git ls-remote` matched local and upstream HEAD at 2026-09-28T21:17:17Z.
+# The scans below used --no-fetch after that equality was verified.
+# All four lockfiles passed both blocking policies: warnings and yanked.
+# The 0.22.2 scanner was built in an ignored project-local tools directory.
 
-      Loaded 1173 security advisories (from <local Cargo advisory database>)
-    Scanning Cargo.lock for vulnerabilities (237 crate dependencies)
-Crate:     paste
-Version:   1.0.15
-Warning:   unmaintained
-Title:     paste - no longer maintained
-Date:      2024-10-07
-ID:        RUSTSEC-2024-0436
-URL:       https://rustsec.org/advisories/RUSTSEC-2024-0436
+[root: Cargo.lock]
+Warnings scan: PASS; 1273 advisories loaded, 299 dependencies scanned, no advisory warnings.
+Yanked scan: PASS; 1273 advisories loaded, 299 dependencies scanned, no yanked crates.
 
-Crate:     lru
-Version:   0.12.5
-Warning:   unsound
-Title:     `IterMut` violates Stacked Borrows by invalidating internal pointer
-Date:      2026-01-07
-ID:        RUSTSEC-2026-0002
-URL:       https://rustsec.org/advisories/RUSTSEC-2026-0002
+[benchmark: benchmarks/Cargo.lock]
+Warnings scan: PASS; 1273 advisories loaded, 269 dependencies scanned, no advisory warnings.
+Yanked scan: PASS; 1273 advisories loaded, 269 dependencies scanned, no yanked crates.
 
-warning: 2 allowed warnings found
+[fuzz: fuzz/Cargo.lock]
+Warnings scan: PASS; 1273 advisories loaded, 183 dependencies scanned, no advisory warnings.
+Yanked scan: PASS; 1273 advisories loaded, 183 dependencies scanned, no yanked crates.
+
+[edge: shph-edge/Cargo.lock]
+Warnings scan: PASS; 1273 advisories loaded, 178 dependencies scanned, no advisory warnings.
+Yanked scan: PASS; 1273 advisories loaded, 178 dependencies scanned, no yanked crates.
+
+# The root lockfile's rustls 0.23.43 was updated to 0.23.45 after
+# RUSTSEC-2026-0285 was found; see the release-readiness evidence for the
+# completed locked build and test gates.
+
+# Engineering re-scan on 2026-10-12; this is not clean-candidate release evidence.
+# cargo-audit 0.22.1 used RustSec database HEAD
+# 57dcc0f2192e025138907a495c1ac9a7e1e3e123 (1307 advisories loaded).
+# The initial scan found RUSTSEC-2026-0338 through RUSTSEC-2026-0342 in
+# quinn-proto 0.11.16 / 0.11.17. All four lockfiles now pin quinn-proto 0.11.19
+# with checksum 0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe.
+# Each scan used --no-fetch against the database HEAD above and passed both
+# --deny warnings and --deny yanked:
+# root Cargo.lock: 310 dependencies; benchmarks/Cargo.lock: 275;
+# fuzz/Cargo.lock: 195; shph-edge/Cargo.lock: 178.
+#
+# Registry-backed locked compilation and package validation are BLOCKED:
+# quinn-proto 0.11.19 is not cached, the configured rsproxy download timed out,
+# direct crates.io access timed out, and the WSL index update timed out.
+# Separate source-tag engineering gates passed with a temporary local patch;
+# they are not registry or locked validation. See
+# docs/evidence/QUINN_PROTO_0.11.19_SOURCE_VALIDATION_2026-10-12.md.
+#
+# The current-lock Windows release collector at 2026-10-12T19:55:47Z recorded
+# 15 PASS, 29 FAIL, 5 SKIP, and one dirty-tree WARN. Locked workspace,
+# benchmark, fuzz, and standalone edge build/test/Clippy gates failed because
+# quinn-proto 0.11.19 was not cached; fuzz-smoke builds also failed after DNS
+# resolution for rsproxy.cn failed. The collector skipped packaging to avoid
+# using a stale binary. This dirty engineering run is not clean-candidate
+# release evidence; its report is under the ignored benchmark-runs directory.
+#
+# The guarded full Windows collector at 2026-10-12T20:12:34Z recorded 13 PASS,
+# 29 FAIL, 3 BLOCKED, 4 SKIP, and one dirty-tree WARN. The package and both
+# benchmark smokes were BLOCKED after their current-run MSVC builds failed;
+# stale binaries were not used. The four skips are native two-host TUN, Linux
+# SNAP, Windows SNAP, and operator external-service acceptance. The 29 build
+# and fuzz-smoke failures remain due to the uncached crate and mirror access.

@@ -2,12 +2,14 @@
 
 use libfuzzer_sys::fuzz_target;
 use shph_transport::shroud2::{decode_datagram, MorphologyEngine, MorphologyProfile};
+use shph_transport::shroud3::decode as decode_shroud3;
 
 fuzz_target!(|input: &[u8]| {
     if input.len() > 65_535 {
         return;
     }
     let _ = decode_datagram(input, 65_535);
+    let _ = decode_shroud3(input, 65_535);
 
     if let Some(payload) = input.get(..input.len().min(4_096)) {
         let seed = input

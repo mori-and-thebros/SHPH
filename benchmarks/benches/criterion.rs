@@ -8,7 +8,9 @@ use shph_core::{
 use shph_identity::{IdentityEndpoint, IdentityRecord, VerificationPolicy};
 use shph_obfuscation::{apply_profile, remove_profile, ProfilePadder, ProfileTier};
 use shph_transport::ja4::{Ja4ClientHello, Ja4TlsVersion, Ja4Transport};
-use shph_transport::phantom_one::{PhantomOneDecoder, PhantomOneEncoder, PhantomOneFrameType};
+use shph_transport::phantom_one::{
+    PhantomOneConfig, PhantomOneDecoder, PhantomOneEncoder, PhantomOneFrameType, SizeSelection,
+};
 use shph_transport::shroud2::{
     decode_batched_datagram, decode_datagram, decode_datagram_in_place, encode_batched_datagram,
     encode_datagram, wasserstein_distance, AdaptiveMorphologyConfig, AdaptiveMorphologyEngine,
@@ -338,6 +340,44 @@ fn bench_morphology(c: &mut Criterion) {
 fn bench_phantom_one(c: &mut Criterion) {
     let payload = vec![0x5c; 256];
     let mut group = c.benchmark_group("transport/phantom_one");
+    group.bench_function("target_size_first_fit_payload_1_path_256", |b| {
+        let mut encoder =
+            PhantomOneEncoder::from_seed_with_profile(0x5348_3231, 0x31, ProfileTier::Medium);
+        b.iter(|| {
+            black_box(
+                encoder
+                    .target_size(black_box(1), 256)
+                    .expect("first-fit target"),
+            )
+        })
+    });
+    let weighted_config = PhantomOneConfig::for_profile(ProfileTier::Medium)
+        .with_selection(SizeSelection::Weighted([1, 3, 0, 0, 0, 0, 0]))
+        .expect("weighted selector config");
+    group.bench_function("target_size_weighted_25_75_payload_1_path_256", |b| {
+        let mut encoder =
+            PhantomOneEncoder::from_seed_with_config(0x5348_3231, 0x32, weighted_config)
+                .expect("weighted selector");
+        b.iter(|| {
+            black_box(
+                encoder
+                    .target_size(black_box(1), 256)
+                    .expect("weighted target"),
+            )
+        })
+    });
+    group.bench_function("encode_weighted_25_75_payload_1_path_256", |b| {
+        let mut encoder =
+            PhantomOneEncoder::from_seed_with_config(0x5348_3231, 0x33, weighted_config)
+                .expect("weighted encoder");
+        b.iter(|| {
+            black_box(
+                encoder
+                    .encode(PhantomOneFrameType::Data, black_box(&[0x5c]), 256)
+                    .expect("weighted encode"),
+            )
+        })
+    });
     group.bench_function("encode_decode_authenticated_inner_envelope", |b| {
         let mut encoder = PhantomOneEncoder::from_seed(0x5348_3231, 0x21);
         let mut decoder = PhantomOneDecoder::new(0x5348_3231);

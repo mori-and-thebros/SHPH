@@ -514,8 +514,8 @@ fn open_linux_tun_file(name: &str) -> Result<std::fs::File> {
         *dst = src as libc::c_char;
     }
 
-    // SAFETY: ioctl argument points to a valid IfReq for TUNSETIFF.
-    let res = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };
+    // SAFETY: TUNSETIFF reads and writes a valid IfReq through this pointer.
+    let res = unsafe { libc::ioctl(fd, TUNSETIFF, &mut ifr) };
     if res < 0 {
         return Err(classify_tun_ioctl_error(
             name,

@@ -46,6 +46,25 @@ fn cli_help_contains_main_commands() {
     assert!(join_help_stdout.contains("--ticket-file"));
     assert!(join_help_stdout.contains("--transport-peer"));
     assert!(join_help_stdout.contains("--check"));
+    assert!(join_help_stdout.contains("--shroud3-adaptive"));
+
+    let host_help = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .args(["host", "--help"])
+        .output()
+        .expect("run host help");
+    assert!(host_help.status.success());
+    assert!(String::from_utf8(host_help.stdout)
+        .expect("host help utf8")
+        .contains("--shroud3-adaptive"));
+
+    let up_help = Command::new(env!("CARGO_BIN_EXE_shph"))
+        .args(["up", "--help"])
+        .output()
+        .expect("run up help");
+    assert!(up_help.status.success());
+    assert!(String::from_utf8(up_help.stdout)
+        .expect("up help utf8")
+        .contains("--shroud3-adaptive"));
 
     let doctor_help = Command::new(env!("CARGO_BIN_EXE_shph"))
         .args(["doctor", "--help"])

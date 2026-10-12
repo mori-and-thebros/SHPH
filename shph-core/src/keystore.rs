@@ -41,17 +41,23 @@ pub struct Contact {
     pub sign_pubkey_b64: Option<String>,
 }
 
-#[derive(
-    Debug, Clone, Serialize, Deserialize, Default, zeroize::Zeroize, zeroize::ZeroizeOnDrop,
-)]
+#[derive(Clone, Serialize, Deserialize, Default, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct KeyStoreConfig {
-    /// Reserved for a future encrypted keystore format. It is intentionally
-    /// not serialized because the current format does not encrypt secrets.
+    /// Password for encrypted keystore persistence. Never serialized or
+    /// included in debug output.
     #[serde(skip)]
     pub password: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+impl std::fmt::Debug for KeyStoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyStoreConfig")
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct StoredKeyStore {
     identity_private_b64: String,
     identity_public_b64: String,
@@ -313,9 +319,9 @@ fn decode_exact(value: &str, expected: usize, label: &str) -> Result<Zeroizing<V
 
 /// Atomically write secret bytes to `path` with restrictive permissions.
 ///
-/// Writes to a temp file beside `path`, fsyncs, sets 0600 perms on Unix, then
-/// renames over the target. This avoids a partial/corrupt key file on crash
-/// and keeps the private key from being world/group-readable.
+/// Writes secret bytes to a temp file created with restrictive permissions,
+/// fsyncs, then renames over the target. This avoids partial key files on
+/// crash and prevents group/other access before the first secret byte is written.
 fn atomic_secret_write(path: &Path, data: &[u8]) -> Result<()> {
     let dir = path
         .parent()
@@ -329,7 +335,7 @@ fn atomic_secret_write(path: &Path, data: &[u8]) -> Result<()> {
 
     let (mut tmp, tmp_path) = create_temp_file(&dir, path)?;
     let result = (|| -> Result<()> {
-        restrict_secret_perms(&tmp_path)?;
+        restrict_open_secret_perms(&tmp, &tmp_path)?;
         tmp.write_all(data)?;
         tmp.sync_all()?;
         drop(tmp);
@@ -362,11 +368,22 @@ fn create_temp_file(dir: &Path, target: &Path) -> Result<(File, PathBuf)> {
         .unwrap_or("keystore");
     for attempt in 0..32 {
         let tmp_path = dir.join(format!(".{base}.tmp.{pid}.{nanos}.{attempt}"));
-        match OpenOptions::new()
+        #[cfg(unix)]
+        let creation_result = {
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+            options.open(&tmp_path)
+        };
+        #[cfg(windows)]
+        let creation_result = create_windows_secret_temp_file(&tmp_path);
+        #[cfg(not(any(unix, windows)))]
+        let creation_result = OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&tmp_path)
-        {
+            .open(&tmp_path);
+        match creation_result {
             Ok(file) => return Ok((file, tmp_path)),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(ShphError::Io(err)),
@@ -564,6 +581,24 @@ fn restrict_secret_perms(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn restrict_open_secret_perms(file: &File, _path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = (file, _path);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        restrict_secret_perms(_path)?;
+    }
+    Ok(())
+}
+
 pub fn enforce_owner_only_file_permissions(path: &Path) -> Result<()> {
     restrict_secret_perms(path)
 }
@@ -597,6 +632,11 @@ fn wide_path(path: &Path) -> Result<Vec<u16>> {
             "keystore path contains an embedded NUL".into(),
         ));
     }
+    for unit in &mut wide {
+        if *unit == b'/' as u16 {
+            *unit = b'\\' as u16;
+        }
+    }
 
     // Use the extended-length namespace for absolute paths so Windows
     // security checks remain valid for bounded but nested adapter paths.
@@ -616,6 +656,56 @@ fn wide_path(path: &Path) -> Result<Vec<u16>> {
 
     wide.push(0);
     Ok(wide)
+}
+
+#[cfg(windows)]
+fn create_windows_secret_temp_file(path: &Path) -> io::Result<File> {
+    use std::mem::size_of;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
+
+    let path = wide_path(path)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)\0".encode_utf16().collect();
+    let mut descriptor = std::ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_handle(handle as _) })
 }
 
 #[cfg(windows)]
@@ -783,6 +873,17 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_security_paths_normalize_forward_slashes() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let encoded =
+            wide_path(Path::new("C:/adapter/spool/file.json")).expect("encode extended path");
+        let decoded = std::ffi::OsString::from_wide(&encoded[..encoded.len() - 1]);
+        assert_eq!(decoded, r"\\?\C:\adapter\spool\file.json");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_acl_protected_keystore_roundtrips() {
         let dir =
             std::env::temp_dir().join(format!("shph-keystore-windows-acl-{}", std::process::id()));
@@ -795,6 +896,24 @@ mod tests {
             keystore.identity.public_key_b64(),
             loaded.identity.public_key_b64()
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_temp_keystore_file_is_private_before_write() {
+        let dir =
+            std::env::temp_dir().join(format!("shph-keystore-temp-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut file, temp_path) = create_temp_file(&dir, &dir.join("keystore.json")).unwrap();
+        assert!(std::fs::OpenOptions::new()
+            .read(true)
+            .open(&temp_path)
+            .is_err());
+        file.write_all(b"secret bytes").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&temp_path).unwrap(), b"secret bytes");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -820,6 +939,31 @@ mod tests {
             0o600,
             "keystore must be owner-only (0600), got {mode:o}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_is_owner_only_when_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "shph-ks-temp-perm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("keystore.json");
+        let (file, temp_path) = create_temp_file(&dir, &target).unwrap();
+        let mode = std::fs::metadata(&temp_path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "temp file exposed group/other access: {mode:o}"
+        );
+        drop(file);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1,7 +1,7 @@
 # Phantom One Design (Public Boundary)
 
 Status: prototype, explicit opt-in, versioned wire break. This document
-describes the Phantom One public boundary as of 2026-08-29. It is a
+describes the Phantom One public boundary as of 2026-09-28. It is a
 design and boundary record, not a release announcement, an API stability
 promise, or a security claim.
 
@@ -130,9 +130,11 @@ separate deployable, deliberately outside the SHPH workspace:
   outside that path and method, or without a valid capability, fails closed to
   the fixed fallback responses.
   Bounded concurrent streams, a bounded HTTP/2 connection pool, a connection
-  semaphore, per-stream byte caps, and a bounded backend-connect timeout limit
-  resource use. Pooling reuses the standards HTTP/2/TLS connection only; it
-  does not reuse a capability token.
+  semaphore, an application-idle connection deadline, per-stream byte caps,
+  and a bounded backend-connect timeout limit resource use. The idle deadline
+  refreshes on application stream activity and does not close active streams;
+  its default is 30 seconds. Pooling reuses the standards HTTP/2/TLS connection
+  only; it does not reuse a capability token.
 - The HTTP/3 carrier is **feature-gated and opt-in**. The standalone edge
   crate now contains a standards-library implementation using Quinn, rustls,
   `h3`, and `h3-quinn`, with bounded request/response handling, capability
@@ -162,10 +164,11 @@ keys:
 - Lifetimes are short: the default maximum is 300 seconds, and configuration
   rejects any bound above 3,600 seconds. Clock skew tolerance is bounded
   (default 5 seconds, maximum 300 seconds).
-- Replay suppression uses a bounded nonce cache (default capacity 16,384;
-  configurable between 1 and 1,000,000) that prunes expired entries and evicts
-  oldest-first under pressure. The cache is an in-memory, per-edge mechanism;
-  it is not a distributed revocation system.
+- Replay suppression uses a bounded nonce cache (default capacity 131,072;
+  configurable between 1 and 1,000,000) that prunes expired entries and fails
+  closed when full; it does not evict live nonces. The cache is in-memory and
+  per edge process, so restarts and separate replicas do not share replay
+  state. It is not a distributed revocation system.
 - The standalone edge client accepts either one token or a bounded
   newline-delimited token bundle. Each non-empty line is an independent,
   one-use capability for one logical relay stream. This preserves nonce

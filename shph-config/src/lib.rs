@@ -3,6 +3,7 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -71,12 +72,23 @@ pub enum ObfuscationMode {
     H3,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShadowsocksConfig {
     pub server: String,
     pub method: String,
     pub password: String,
+}
+
+impl fmt::Debug for ShadowsocksConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShadowsocksConfig")
+            .field("server", &self.server)
+            .field("method", &self.method)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +124,7 @@ pub struct ControlPlaneConfig {
     pub dry_run: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     pub role: SessionRole,
@@ -122,6 +134,9 @@ pub struct SessionConfig {
     /// peer-policy selector; this endpoint is used only for connection setup.
     #[serde(default)]
     pub transport_peer: Option<String>,
+    /// Optional versioned SNAP profile path for opt-in outbound path planning.
+    #[serde(default)]
+    pub snap_profile: Option<String>,
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub handshake_profile: Option<HandshakeProfile>,
@@ -138,11 +153,46 @@ pub struct SessionConfig {
     /// Select the separate Phantom One morphology envelope.
     #[serde(default)]
     pub phantom_one: bool,
+    /// Select the experimental adaptive Shroud 3 envelope on persistent
+    /// standards-QUIC native-TUN sessions.
+    #[serde(default)]
+    pub shroud3_adaptive: bool,
+    /// Require the authenticated, versioned envelope-policy exchange for
+    /// supported one-shot application sessions.
+    #[serde(default)]
+    pub negotiate_envelope_policy: bool,
     /// Phantom One profile name. The CLI validates the six supported tiers.
     #[serde(default = "default_phantom_one_profile")]
     pub phantom_one_profile: String,
     pub reconnect: Option<ReconnectConfig>,
     pub startup_payload: Option<String>,
+}
+
+impl fmt::Debug for SessionConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionConfig")
+            .field("role", &self.role)
+            .field("bind", &self.bind)
+            .field("peer", &self.peer)
+            .field("transport_peer", &self.transport_peer)
+            .field(
+                "snap_profile",
+                &self.snap_profile.as_ref().map(|_| "[CONFIGURED]"),
+            )
+            .field("timeout_secs", &self.timeout_secs)
+            .field("handshake_profile", &self.handshake_profile)
+            .field("underlay", &"[REDACTED]")
+            .field("quic_cert", &"[REDACTED]")
+            .field("quic_key", &"[REDACTED]")
+            .field("phantom_one", &self.phantom_one)
+            .field("shroud3_adaptive", &self.shroud3_adaptive)
+            .field("negotiate_envelope_policy", &self.negotiate_envelope_policy)
+            .field("phantom_one_profile", &self.phantom_one_profile)
+            .field("reconnect", &self.reconnect)
+            .field("startup_payload", &"[REDACTED]")
+            .finish()
+    }
 }
 
 fn default_phantom_one_profile() -> String {
@@ -650,6 +700,11 @@ fn validate_control_plane(control: &ControlPlaneConfig) -> Result<()> {
 }
 
 fn validate_session(session: &SessionConfig) -> Result<()> {
+    if session.shroud3_adaptive && session.phantom_one {
+        return Err(ConfigError::Invalid(
+            "session.shroud3_adaptive cannot be combined with session.phantom_one".into(),
+        ));
+    }
     match session.role {
         SessionRole::Listen => {
             if let Some(bind) = &session.bind {
@@ -666,6 +721,9 @@ fn validate_session(session: &SessionConfig) -> Result<()> {
     if let Some(transport_peer) = &session.transport_peer {
         validate_endpoint("session.transport_peer", transport_peer)?;
     }
+    if let Some(profile) = &session.snap_profile {
+        validate_path_text("session.snap_profile", profile)?;
+    }
     if let Some(timeout) = session.timeout_secs {
         if !(1..=3600).contains(&timeout) {
             return Err(ConfigError::Invalid(
@@ -679,12 +737,22 @@ fn validate_session(session: &SessionConfig) -> Result<()> {
             let proxy = value
                 .strip_prefix("socks5://")
                 .or_else(|| value.strip_prefix("socks5h://"))
+                .or_else(|| value.strip_prefix("tor://"))
                 .ok_or_else(|| {
                     ConfigError::Invalid(
-                        "session.underlay must be direct or socks5://host:port".into(),
+                        "session.underlay must be direct, socks5://host:port, or tor://loopback:port".into(),
                     )
                 })?;
             validate_endpoint("session.underlay proxy", proxy)?;
+            if value.starts_with("tor://")
+                && !proxy
+                    .parse::<std::net::SocketAddr>()
+                    .is_ok_and(|address| address.ip().is_loopback() && address.port() != 0)
+            {
+                return Err(ConfigError::Invalid(
+                    "Tor proxy must be a literal loopback address with nonzero port".into(),
+                ));
+            }
         }
     }
     if let Some(cert) = &session.quic_cert {
@@ -878,36 +946,110 @@ fn persist_config_over_windows(tmp: &Path, path: &Path) -> std::io::Result<()> {
     }
     let tmp_w = wide_path(tmp)?;
     let path_w = wide_path(path)?;
-    let result = if path.exists() {
-        unsafe {
-            ReplaceFileW(
-                path_w.as_ptr(),
-                tmp_w.as_ptr(),
-                std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
+    if path.exists() {
+        const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
+        const MAX_REPLACE_RETRIES: u32 = 5;
+
+        // ReplaceFileW documents error 1175 as leaving both files under
+        // their original names, so a bounded retry is safe and preserves the
+        // original config if the replacement continues to fail.
+        for attempt in 0..=MAX_REPLACE_RETRIES {
+            let result = unsafe {
+                ReplaceFileW(
+                    path_w.as_ptr(),
+                    tmp_w.as_ptr(),
+                    std::ptr::null(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            if result != 0 {
+                return Ok(());
+            }
+
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_UNABLE_TO_REMOVE_REPLACED)
+                || attempt == MAX_REPLACE_RETRIES
+            {
+                return Err(error);
+            }
+
+            let backoff_ms = 10_u64 << attempt;
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
         }
-    } else {
-        unsafe {
-            MoveFileExW(
-                tmp_w.as_ptr(),
-                path_w.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        }
+
+        unreachable!("ReplaceFileW retry loop always returns or exits")
+    }
+
+    let result = unsafe {
+        MoveFileExW(
+            tmp_w.as_ptr(),
+            path_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
     };
     if result == 0 {
         return Err(std::io::Error::last_os_error());
     }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, SessionRole, MAX_CONFIG_BYTES};
+    use super::{
+        Config, ObfuscationConfig, ObfuscationMode, SessionConfig, SessionRole, ShadowsocksConfig,
+        MAX_CONFIG_BYTES,
+    };
     use std::fs;
+
+    #[test]
+    fn configuration_debug_redacts_passwords_payloads_and_private_paths() {
+        let config = Config {
+            obfuscation: Some(ObfuscationConfig {
+                mode: ObfuscationMode::Shadowsocks,
+                shadowsocks: Some(ShadowsocksConfig {
+                    server: "proxy.example:443".into(),
+                    method: "chacha20-ietf-poly1305".into(),
+                    password: "secret-shadowsocks-password".into(),
+                }),
+                tls: None,
+            }),
+            session: Some(SessionConfig {
+                role: SessionRole::Connect,
+                bind: None,
+                peer: Some("peer-a".into()),
+                transport_peer: None,
+                snap_profile: Some("/private/snap-local.json".into()),
+                timeout_secs: None,
+                handshake_profile: None,
+                underlay: Some("socks5://user:secret-proxy-password@127.0.0.1:1080".into()),
+                quic_cert: Some("/private/secret-cert.pem".into()),
+                quic_key: Some("/private/secret-key.pem".into()),
+                phantom_one: false,
+                shroud3_adaptive: false,
+                negotiate_envelope_policy: false,
+                phantom_one_profile: "medium".into(),
+                reconnect: None,
+                startup_payload: Some("secret-startup-payload".into()),
+            }),
+            ..Config::default()
+        };
+
+        let debug = format!("{config:#?}");
+        for secret in [
+            "secret-shadowsocks-password",
+            "secret-proxy-password",
+            "secret-cert.pem",
+            "secret-key.pem",
+            "secret-startup-payload",
+            "snap-local.json",
+        ] {
+            assert!(!debug.contains(secret), "debug output leaked {secret}");
+        }
+        assert!(debug.matches("[REDACTED]").count() >= 4);
+    }
 
     #[test]
     fn parse_session_reconnect_and_control_plane() {
@@ -984,6 +1126,54 @@ peer = "127.0.0.1:7000"
         )
         .expect("parse config");
         assert_eq!(cfg.session.unwrap().handshake_profile, None);
+    }
+
+    #[test]
+    fn adaptive_shroud3_session_config_defaults_off_and_rejects_phantom_one() {
+        let old_config = Config::parse(
+            r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[session]
+role = "connect"
+peer = "127.0.0.1:7000"
+"#,
+        )
+        .expect("legacy session config remains valid");
+        assert!(!old_config.session.unwrap().shroud3_adaptive);
+
+        let enabled_config = Config::parse(
+            r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[session]
+role = "connect"
+peer = "127.0.0.1:7000"
+shroud3_adaptive = true
+"#,
+        )
+        .expect("explicit Shroud 3 opt-in");
+        assert!(enabled_config.session.unwrap().shroud3_adaptive);
+
+        let conflict = Config::parse(
+            r#"
+interface_name = "shph0"
+local_endpoint = "0.0.0.0:51820"
+peers = []
+
+[session]
+role = "connect"
+peer = "127.0.0.1:7000"
+phantom_one = true
+shroud3_adaptive = true
+"#,
+        )
+        .expect_err("Phantom One and Shroud 3 are distinct formats");
+        assert!(conflict.to_string().contains("cannot be combined"));
     }
 
     #[test]

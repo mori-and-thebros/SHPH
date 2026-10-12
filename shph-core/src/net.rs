@@ -1,6 +1,7 @@
 //! Network types and transport abstractions.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use std::net::ToSocketAddrs;
 
@@ -77,7 +78,7 @@ pub enum TransportType {
     UdpOverTcp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TunnelConfig {
     pub name: String,
     pub local_addr: String,
@@ -86,6 +87,21 @@ pub struct TunnelConfig {
     pub psk: Option<String>,
     pub tls_ca: Option<String>,
     pub tls_pin: Option<String>,
+}
+
+impl fmt::Debug for TunnelConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TunnelConfig")
+            .field("name", &self.name)
+            .field("local_addr", &self.local_addr)
+            .field("remote_endpoint", &self.remote_endpoint)
+            .field("transport", &self.transport)
+            .field("psk", &"[REDACTED]")
+            .field("tls_ca", &self.tls_ca)
+            .field("tls_pin", &self.tls_pin)
+            .finish()
+    }
 }
 
 #[cfg(test)]

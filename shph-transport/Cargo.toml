@@ -5,19 +5,31 @@ edition = { workspace = true }
 license = { workspace = true }
 description = "Transport abstraction interfaces for SHPH"
 
+[[bin]]
+name = "shph-onion-relay"
+path = "src/bin/shph-onion-relay.rs"
+
 [dependencies]
+clap = { workspace = true }
 shph-core = { path = "../shph-core" }
 shph-obfuscation = { path = "../shph-obfuscation" }
 shph-tun = { path = "../shph-tun" }
 serde_json = { workspace = true }
+serde = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+ring = { workspace = true }
 libc = { workspace = true }
 zeroize = { workspace = true }
 bytes = "1.5"
+futures-util = "0.3"
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = "0.13"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+webpki-roots = "1.0.9"
 tokio = { workspace = true }
 tracing = { workspace = true }
 

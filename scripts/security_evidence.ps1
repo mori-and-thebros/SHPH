@@ -237,6 +237,11 @@ if ($null -eq $cargo) {
     Invoke-CargoGate -Id "metadata" -Arguments (@("metadata", "--format-version", "1", "--no-deps") + $cargoFlags)
     Invoke-CargoGate -Id "core-tests" -Arguments (@("test", "-p", "shph-core", "--lib") + $cargoFlags)
     Invoke-CargoGate -Id "transport-tests" -Arguments (@("test", "-p", "shph-transport", "--lib") + $cargoFlags)
+    Invoke-CargoGate -Id "snap-profile-tests" -Arguments (@("test", "-p", "shph-snap") + $cargoFlags)
+    Invoke-CargoGate -Id "snap-adapter-tests" `
+        -Arguments (@("test", "-p", "shph-transport", "snap_adapter") + $cargoFlags)
+    Invoke-CargoGate -Id "snap-paired-integration-tests" `
+        -Arguments (@("test", "-p", "shph-cli", "--test", "cli_snap") + $cargoFlags)
     Invoke-CargoGate -Id "tun-tests" -Arguments (@("test", "-p", "shph-tun", "--lib") + $cargoFlags)
 
     if ($SkipAudit) {
@@ -272,7 +277,8 @@ if ($SkipFuzz) {
             "audit_record",
             "replay_window",
             "shroud2_datagram",
-            "phantom_one_envelope"
+            "phantom_one_envelope",
+            "snap_profile"
         )
         foreach ($target in $targets) {
             $targetName = "fuzz-$target"

@@ -132,7 +132,7 @@ Ignored raw-capture hashes:
 The captures are local files under ignored `benchmark-runs/`; they are not
 publication artifacts.
 
-## Bottom line
+## Evidence boundary
 
 The current evidence supports: bounded 1,360-byte TUN configuration, Linux
 TCP MSS-clamp planning, local hybrid-handshake cost, and bounded Shroud2 delay

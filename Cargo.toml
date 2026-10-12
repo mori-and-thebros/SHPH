@@ -8,6 +8,7 @@ members = [
   "shph-cli",
   "shph-tui",
   "shph-identity",
+  "shph-snap",
 ]
 resolver = "2"
 

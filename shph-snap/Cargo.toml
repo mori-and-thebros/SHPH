@@ -1,0 +1,15 @@
+[package]
+name = "shph-snap"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "SHPH opt-in SNAP path profiles and deterministic candidate planner"
+
+[dependencies]
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }

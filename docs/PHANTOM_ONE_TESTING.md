@@ -1,6 +1,6 @@
 # Phantom One Testing and Evidence Boundaries
 
-Status: prototype testing plan, 2026-08-29. This document scopes authorized
+Status: prototype test and evidence boundary, reviewed 2026-09-28. This document scopes authorized
 testing for Phantom One and defines what current and future evidence may
 and may not claim. It complements `docs/PHANTOM_ONE_DESIGN.md` and follows the
 evidence discipline of `docs/SECURITY_EVIDENCE.md`, `docs/TESTING.md`, and
@@ -27,10 +27,11 @@ All Phantom One testing is **lab-only and authorized-only**:
 | Component | State | Evidence class |
 | --- | --- | --- |
 | Phantom One envelope (`shph_transport::phantom_one`) | Exported opt-in lab module; unit tests cover round-trip, bounds, malformed/truncated/non-canonical rejection, replay-window behavior, and sequence exhaustion | S0 (source boundary) + S1 (focused unit tests) |
+| Envelope-policy agreement (`shph_transport::envelope_policy`) | Transcript-bound TCP and standards-QUIC offer/ack exchange; explicit CLI opt-in for one-shot send/receive, with persistent TUN and unsupported transports rejected | S0 + S1 API tests and loopback process tests for baseline and negotiated TCP/standards-QUIC; no timeout/replay/downgrade matrix or peer interoperability campaign |
 | Edge relay (`shph-edge/`) | Standalone prototype, **not a workspace member**; unit tests cover capability signature/expiry/audience/replay rejection, replay-cache bounds, front-door fallback decisions, configurable-path validation, bounded token bundles, log redaction, config validation, and bounded no-reparse file inputs | S0 + S1 within its own manifest; Linux and Windows format, Clippy, compile/test gates |
 | HTTP/2 carrier | TLS-required loopback-capable prototype with bounded connection/stream pooling; no recorded live-TLS multiplexing or two-host run | S0 + S1 for validation and lifecycle boundaries |
 | HTTP/3 carrier | Feature-gated opt-in Quinn/rustls + h3/h3-quinn relay path with bounded requests, capability checks, replay protection, and shutdown handling | S0 + S1 compile/unit evidence; no live two-host HTTP/3 evidence |
-| Fuzz target (`fuzz/fuzz_targets/phantom_one_envelope.rs`) | Registered in `fuzz/Cargo.toml`; exercises the **real** `shph_transport::phantom_one` decode, encoder, and stateful-decoder paths with arbitrary bytes and bounded path MTU | S2-eligible once a bounded run is recorded; see below |
+| Fuzz target (`fuzz/fuzz_targets/phantom_one_envelope.rs`) | Registered in `fuzz/Cargo.toml`; exercises the **real** `shph_transport::phantom_one` decode, encoder, and stateful-decoder paths plus bounded `EnvelopeOffer` decoding and mutated policy offers | S2-eligible once a bounded run is recorded; see below |
 
 There is currently **no S3 or S4 evidence** for any Phantom One component: no
 two-host run, no hostile-network or impairment campaign, no independent
@@ -44,6 +45,53 @@ adaptive Shroud2 rows, and an in-memory `edge_opaque_relay` row. These are
 implementation and allocation regression signals only; they do not upgrade
 the Phantom One or edge components to host, network, or censorship-resistance
 evidence.
+
+### D4 — offline detectability and flow-blocking simulation
+
+The evaluator remains offline and does not collect packets or read PCAPs. The
+bounded `scripts/pcap_to_trace_csv.py` helper converts authorized classic
+Ethernet PCAP 2.4 captures to packet summaries with a SHA-256 provenance
+record. It supports IPv4/IPv6 TCP and UDP, requires explicit observation and
+group metadata, and omits endpoint addresses, ports, payloads, and absolute
+timestamps from the CSV. It rejects truncated captures, selected fragments,
+ambiguous loopback direction, and inputs outside its resource limits. PCAPNG,
+other link types, and authorized representative captures remain unsupported or
+unavailable; inspect every provenance file before sharing results.
+
+Convert separate control/target and baseline/candidate captures into separate
+new output directories, use unique capture IDs, then pass their CSV files to
+the evaluator. It enforces shared file and row limits across all inputs:
+
+```bash
+python3 scripts/pcap_to_trace_csv.py owned-capture.pcap \
+  --output-dir target/d4/capture-01 \
+  --observer-address 192.0.2.10 --port 443 \
+  --candidate baseline-v1 --label target \
+  --site-id site-01 --host-id host-01 --day-id day-01 \
+  --capture-id capture-01
+python3 scripts/traffic_detectability.py \
+  target/d4/capture-01/traces.csv target/d4/capture-02/traces.csv \
+  target/d4/capture-03/traces.csv --seed 7 > target/d4/report.json
+```
+
+For a synthetic-only pipeline smoke test, generate a deterministic input and
+run the held-out classifier/block-decision pipeline with:
+
+```bash
+python3 scripts/generate_synthetic_traces.py target/shph-d4-synthetic.csv --groups 180 --seed 7
+python3 scripts/traffic_detectability.py target/shph-d4-synthetic.csv --seed 7 > target/shph-d4-simulation.json
+```
+
+The generator creates a deliberately distinctive synthetic baseline and a
+synthetic variant sampled from the same toy distribution as its controls. The
+simulator groups train/calibration/test splits by site/host/day, calibrates a
+flow-level deny threshold at predeclared false-positive budgets, and reports
+held-out target-block and collateral-control-block rates. It does not drop
+packets, alter routes, model a real censor, or produce evidence about real
+traffic. Synthetic output is a pipeline smoke test only. For D4 evidence, use
+sanitized, authorized captures with documented provenance and retain the
+sample warnings and group-bootstrap intervals; see
+`docs/PHANTOM_SHROUD_SCOPE.md`.
 
 ## Test layers and commands
 
@@ -59,7 +107,31 @@ Edge prototype tests (separate manifest, not the workspace):
 
 ```bash
 cargo test --manifest-path shph-edge/Cargo.toml
+cargo test --manifest-path shph-edge/Cargo.toml http2_idle_deadline
 ```
+
+### Bounded one-shot loopback observation
+
+`scripts/benchmark_one_shot_loopback.py` runs real sender and receiver CLI
+processes against `127.0.0.1`, verifies the exact received payload, and records
+process wall time for baseline and negotiated modes. It supports TCP and
+standards QUIC, bounds iterations, payload size, and command timeouts, and
+removes temporary identities and certificates on exit. For example:
+
+```bash
+cargo build --locked -p shph-cli
+python3 scripts/benchmark_one_shot_loopback.py \
+  --binary target/debug/shph --transport tcp --mode both --iterations 3 \
+  --payload-bytes 256 --output target/loopback-tcp.json
+python3 scripts/benchmark_one_shot_loopback.py \
+  --binary target/debug/shph --transport quic-standard --mode both --iterations 3 \
+  --payload-bytes 256 --output target/loopback-quic.json
+```
+
+The measurement includes process startup and orchestration. The runner does not
+capture packets or measure carrier-only latency, wire overhead, goodput, CPU,
+memory, impairment, or multiple workload classes. Its manifest is a local
+engineering observation, not P5 acceptance, S3 evidence, or a release result.
 
 The CI workflow also runs the edge manifest's format, Clippy, and test gates on
 a Windows runner so the platform-specific no-reparse file-open path is compiled
@@ -105,8 +177,12 @@ Coverage intent for the S1 layer:
 
 The `phantom_one_envelope` fuzz target is registered in `fuzz/Cargo.toml` and
 exercises the real `shph_transport::phantom_one` decode, encoder, and stateful
-decoder with arbitrary bytes and bounded path MTU, covering malformed,
-truncated, non-canonical, oversized, replay, and sequence-exhaustion inputs.
+decoder with arbitrary bytes and bounded path MTU. It also decodes arbitrary
+policy offers and mutates fields in a valid offer before decoding it. Coverage
+includes malformed, truncated, non-canonical, oversized, and replay-related
+inputs. It does not reach the sequence-exhaustion boundary; that boundary is
+covered by the focused Phantom One unit test. The harness does not establish
+or fuzz a live authenticated policy exchange.
 The CI fuzz-smoke job runs one iteration per target including
 `phantom_one_envelope`; the pinned Windows campaign wrapper includes all six
 registered targets as well.

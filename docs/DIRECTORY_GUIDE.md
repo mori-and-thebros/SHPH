@@ -12,11 +12,17 @@ This file maps the repository layout and the main public validation artifacts.
 - `shph-config/`: config model and parser.
 - `shph-core/`: handshake, framing, transport negotiation primitives.
 - `shph-obfuscation/`: protocol-shaping extension surface.
-- `shph-transport/`: transport enum and socket/parsing support.
+- `shph-transport/`: transport APIs; `src/shroud3.rs` contains the opt-in
+  adaptive Shroud 3 envelope, and `src/onion.rs` plus
+  `src/bin/shph-onion-relay.rs` contain the experimental multihop circuit and
+  operator relay process.
 - `shph-edge/`: standalone owned-domain Phantom One HTTP/2 relay prototype;
   separate manifest and lockfile, outside the workspace release profile.
 - `shph-identity/`: isolated experimental signed identity records,
   provider-independent local discovery.
+- `shph-snap/`: strict SNAP profile parsing, deterministic path planning,
+  bounded retry policy, and sanitized audit context; it does not own SHPH
+  session authentication or transport execution.
 - `shph-tun/`: TUN abstraction crate.
 - `shph-tui/`: optional terminal UI shell.
 - `fuzz/`: standalone cargo-fuzz targets for parser and replay robustness.
@@ -63,10 +69,15 @@ This file maps the repository layout and the main public validation artifacts.
 - `docs/evidence/WINDOWS_NATIVE_VALIDATION_2026-08-09_POST_LOADER.md`: historical
   post-loader Windows validation record.
 - `docs/SHROUD2_BENCHMARK_RESULTS_2026-08-04.md`: versioned Shroud 2.0 morphology evidence.
+- `docs/SHROUD_3_IMPLEMENTATION.md`: opt-in Shroud 3 API and support boundaries.
+- `docs/ONION_CIRCUIT_DESIGN.md`: onion circuit design, current prototype shape,
+  and independent-review gate.
 - `docs/MORPHOLOGY_PERFORMANCE.md`: adaptive morphology, reusable-buffer
   tuning, owned-edge relay measurement, and explicit performance boundaries.
 - `docs/PHANTOM_ONE_DESIGN.md`: versioned Phantom One boundary, edge separation, and
   explicit non-claims.
+- `docs/PHANTOM_SHROUD_SCOPE.md`: consolidated implementation scope for morphology,
+  carrier/probing experiments, detectability measurement, and optional onion routing.
 - `docs/PHANTOM_ONE_OPERATOR.md`: opt-in TCP operator workflow and edge-prototype
   limitations.
 - `docs/PHANTOM_ONE_TESTING.md`: Phantom One testing and evidence taxonomy.
@@ -78,6 +89,10 @@ This file maps the repository layout and the main public validation artifacts.
   profile comparison, and operator-skip evidence for Phase D.
 - `docs/SUPPORT_MATRIX.md`: authoritative release profile, support levels, and
   non-claims boundary.
+- `docs/SNAP_PROFILES.md`: SNAP profile selection, validation, and operator
+  service declarations.
+- `docs/SNAP_ACCEPTANCE_EVIDENCE.md`: strict Linux, Windows, and operator
+  service evidence bundle format for the SNAP release gates.
 - `docs/RELEASE_READINESS.md`: binding release gates and evidence package
   requirements.
 - `docs/OPERATOR_CAMPAIGNS.md`: bounded reconnect, crash, DNS, IPv6, PMTU, and

@@ -4,7 +4,8 @@ use ring::{
     signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey},
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -207,12 +208,27 @@ impl CapabilityVerifier {
         })
     }
 
+    pub(crate) fn replay_retention_secs(&self) -> u64 {
+        self.max_lifetime
+            .as_secs()
+            .saturating_add(self.clock_skew.as_secs().saturating_mul(2))
+            .saturating_add(1)
+    }
+
     pub fn verify(
         &self,
         token: &str,
         now: u64,
         replay: &mut ReplayCache,
     ) -> Result<CapabilityClaims, CapabilityError> {
+        replay.consume(self.verify_for_replay(token, now)?, now)
+    }
+
+    pub(crate) fn verify_for_replay(
+        &self,
+        token: &str,
+        now: u64,
+    ) -> Result<VerifiedCapability, CapabilityError> {
         if token.len() > MAX_TOKEN_LEN {
             return Err(CapabilityError::Malformed);
         }
@@ -256,11 +272,21 @@ impl CapabilityVerifier {
         if lifetime > self.max_lifetime.as_secs() {
             return Err(CapabilityError::LifetimeTooLong);
         }
-        if !replay.insert(claims.nonce, claims.expires_at, now) {
-            return Err(CapabilityError::Replay);
-        }
-        Ok(claims)
+        let replay_expires_at = claims.expires_at.saturating_add(self.clock_skew.as_secs());
+        let valid_from = claims.issued_at.saturating_sub(self.clock_skew.as_secs());
+        Ok(VerifiedCapability {
+            claims,
+            valid_from,
+            replay_expires_at,
+        })
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct VerifiedCapability {
+    claims: CapabilityClaims,
+    valid_from: u64,
+    replay_expires_at: u64,
 }
 
 fn signing_input(payload: &[u8]) -> Vec<u8> {
@@ -274,36 +300,58 @@ fn signing_input(payload: &[u8]) -> Vec<u8> {
 pub struct ReplayCache {
     capacity: usize,
     entries: HashMap<[u8; NONCE_LEN], u64>,
-    order: VecDeque<([u8; NONCE_LEN], u64)>,
+    expirations: BinaryHeap<Reverse<(u64, [u8; NONCE_LEN])>>,
 }
 
 impl ReplayCache {
     pub fn new(capacity: usize) -> Result<Self, CapabilityError> {
-        if capacity == 0 {
+        if capacity == 0 || capacity > 1_000_000 {
             return Err(CapabilityError::Malformed);
         }
         Ok(Self {
             capacity,
             entries: HashMap::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
+            expirations: BinaryHeap::with_capacity(capacity),
         })
     }
 
     pub fn insert(&mut self, nonce: [u8; NONCE_LEN], expires_at: u64, now: u64) -> bool {
-        self.prune(now);
-        if self.entries.contains_key(&nonce) {
+        if self
+            .entries
+            .get(&nonce)
+            .is_some_and(|existing_expiry| *existing_expiry > now)
+        {
             return false;
         }
-        while self.entries.len() >= self.capacity {
-            if let Some((old_nonce, _)) = self.order.pop_front() {
-                self.entries.remove(&old_nonce);
-            } else {
-                break;
-            }
+        self.prune(now);
+        if expires_at <= now || self.entries.contains_key(&nonce) {
+            return false;
+        }
+        // Never evict a live nonce: doing so makes a consumed capability
+        // usable again. Capacity pressure must fail closed.
+        if self.entries.len() >= self.capacity {
+            return false;
         }
         self.entries.insert(nonce, expires_at);
-        self.order.push_back((nonce, expires_at));
+        self.expirations.push(Reverse((expires_at, nonce)));
         true
+    }
+
+    pub(crate) fn consume(
+        &mut self,
+        verified: VerifiedCapability,
+        now: u64,
+    ) -> Result<CapabilityClaims, CapabilityError> {
+        if now < verified.valid_from {
+            return Err(CapabilityError::NotYetValid);
+        }
+        if verified.replay_expires_at <= now {
+            return Err(CapabilityError::Expired);
+        }
+        if !self.insert(verified.claims.nonce, verified.replay_expires_at, now) {
+            return Err(CapabilityError::Replay);
+        }
+        Ok(verified.claims)
     }
 
     pub fn len(&self) -> usize {
@@ -315,12 +363,14 @@ impl ReplayCache {
     }
 
     fn prune(&mut self, now: u64) {
-        while let Some((nonce, expires_at)) = self.order.front().copied() {
+        while let Some(Reverse((expires_at, nonce))) = self.expirations.peek().copied() {
             if expires_at > now {
                 break;
             }
-            self.order.pop_front();
-            self.entries.remove(&nonce);
+            self.expirations.pop();
+            if self.entries.get(&nonce) == Some(&expires_at) {
+                self.entries.remove(&nonce);
+            }
         }
     }
 }
@@ -350,6 +400,36 @@ mod tests {
 
     fn claims(nonce: u8) -> CapabilityClaims {
         CapabilityClaims::new("edge-a", 100, 120, [nonce; NONCE_LEN])
+    }
+
+    #[test]
+    fn deferred_replay_commit_rechecks_the_complete_skew_window() {
+        let (issuer, _) = CapabilityIssuer::generate(Duration::from_secs(300)).expect("issuer");
+        let verifier = CapabilityVerifier::new(
+            issuer.public_key(),
+            "edge-a",
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .expect("verifier");
+        let token = issuer
+            .issue(&CapabilityClaims::new("edge-a", 100, 160, [9; NONCE_LEN]))
+            .expect("token");
+        let mut replay = ReplayCache::new(2).expect("cache");
+
+        let verified = verifier
+            .verify_for_replay(&token, 95)
+            .expect("valid at lower skew bound");
+        assert_eq!(
+            replay.consume(verified, 94),
+            Err(CapabilityError::NotYetValid)
+        );
+
+        let verified = verifier
+            .verify_for_replay(&token, 100)
+            .expect("valid before nominal expiry");
+        assert_eq!(replay.consume(verified, 165), Err(CapabilityError::Expired));
+        assert!(replay.is_empty());
     }
 
     #[test]
@@ -392,10 +472,58 @@ mod tests {
         assert!(cache.insert([1; 16], 10, 0));
         assert!(cache.insert([2; 16], 11, 0));
         assert!(!cache.insert([1; 16], 10, 0));
-        assert!(cache.insert([3; 16], 12, 0));
+        assert!(!cache.insert([3; 16], 12, 0));
         assert_eq!(cache.len(), 2);
-        assert!(cache.insert([1; 16], 10, 12));
+        assert!(!cache.insert([1; 16], 10, 0));
+        assert!(!cache.insert([1; 16], 10, 12));
+        assert!(cache.insert([3; 16], 20, 12));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn repeated_replays_at_capacity_do_not_grow_expiry_index() {
+        let capacity = 4096;
+        let mut cache = ReplayCache::new(capacity).expect("cache");
+        for value in 0..capacity {
+            let nonce = (value as u128).to_be_bytes();
+            assert!(cache.insert(nonce, 120, 0));
+        }
+        let expiry_count = cache.expirations.len();
+
+        for _ in 0..capacity {
+            assert!(!cache.insert([0; NONCE_LEN], 120, 0));
+        }
+
+        assert_eq!(cache.len(), capacity);
+        assert_eq!(cache.expirations.len(), expiry_count);
+    }
+
+    #[test]
+    fn replay_cache_prunes_out_of_order_expiration_and_preserves_live_entries() {
+        let mut cache = ReplayCache::new(2).unwrap();
+        assert!(cache.insert([1; 16], 100, 0));
+        assert!(cache.insert([2; 16], 10, 0));
+        assert!(cache.insert([3; 16], 50, 11));
+        assert!(!cache.insert([1; 16], 100, 11));
+    }
+
+    #[test]
+    fn skew_does_not_allow_replay_after_nominal_expiration() {
+        let (issuer, _) = issuer_verifier();
+        let verifier = CapabilityVerifier::new(
+            issuer.public_key(),
+            "edge-a",
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let token = issuer.issue(&claims(1)).unwrap();
+        let mut cache = ReplayCache::new(2).unwrap();
+        verifier.verify(&token, 119, &mut cache).unwrap();
+        assert_eq!(
+            verifier.verify(&token, 121, &mut cache),
+            Err(CapabilityError::Replay)
+        );
     }
 
     #[test]

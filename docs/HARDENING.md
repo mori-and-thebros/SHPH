@@ -861,3 +861,33 @@ File: `shph-transport/src/lib.rs`.
 - **Deferred global bucketing.** Shroud's existing fixed-size cell behavior is
   retained. Global bucketed sizes for unshrouded TCP/QUIC remain deferred until
   a versioned authenticated length envelope can preserve interoperability.
+
+## Increment 32 — private temporary keys and bounded inbox processing
+
+Date: 2026-09-28
+
+Files: `shph-core/src/keystore.rs`, `shph-transport/src/lib.rs`,
+`scripts/edge_active_probe.py`, and `scripts/benchmark_criterion.ps1`.
+
+- **Keystore temporary-file creation.** Unix temp files receive mode `0600`
+  when created. Windows temp files receive the protected owner-only DACL in
+  `CreateFileW` security attributes before secret bytes are written. Windows
+  compile and runtime checks remain host-gated.
+- **Data-Mule inbox availability.** The receive path no longer lets
+  unauthenticated sender/recipient metadata consume the receiver's configured
+  inbox quota and block later deliveries. Inbox enumeration remains bounded
+  by hard entry, byte, depth, per-file, and candidate-memory caps. A candidate
+  snapshot avoids rescanning the remaining files after each invalid AEAD
+  envelope; the outbox aggregate quota remains enforced.
+- **Probe preflight bounds.** Token files are opened nonblocking where
+  supported and must be regular files. The configured runtime deadline now
+  covers setup, including HTTP/2 capability detection.
+- **Benchmark environment cleanup.** The Windows Criterion wrapper restores
+  the prior `CARGO_TARGET_DIR` value after the benchmark process exits.
+- **Fuzz evidence scope.** The Phantom One fuzz target no longer claims to
+  exercise sequence exhaustion; the boundary remains covered by its focused
+  unit test.
+
+The Windows path still requires a native Windows compile/runtime run. The
+available GNU cross-target attempt stopped in the `ring` C build because the
+MinGW compiler could not be launched; this is not Windows validation evidence.

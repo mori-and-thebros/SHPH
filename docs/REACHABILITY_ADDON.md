@@ -1,9 +1,8 @@
 # Optional Reachability Add-on
 
 SHPH supports an explicit, opt-in SOCKS5 underlay for outbound TCP
-connections. The intended use is a locally running Xray-compatible client (or
-another SOCKS5 implementation) when the direct route to an SHPH host is not
-usable.
+connections, including an operator-managed Tor SOCKS endpoint. The intended use
+is a locally running proxy when the direct route to an SHPH host is not usable.
 
 This is a route adapter, not a replacement transport. SHPH still performs the
 same authenticated, end-to-end handshake and encrypted framing after the
@@ -48,7 +47,17 @@ shph connect --peer 198.51.100.10:443 \
 shph send-once --peer 198.51.100.10:443 \
   --text 'underlay smoke test' \
   --underlay socks5://127.0.0.1:10808
+
+shph connect --peer relay.example.onion:443 \
+  --underlay tor://127.0.0.1:9050
 ```
+
+The `tor://` underlay accepts only a literal loopback SOCKS endpoint. It offers
+SOCKS5 username/password authentication with fresh random credentials for each
+connection, supporting proxy-side auth-based stream isolation. SHPH does not
+manage Tor circuits or isolation policy. Peer hostnames, including `.onion`
+names, are sent to the proxy as SOCKS domain targets rather than resolved by
+SHPH locally.
 
 For a temporary or changing relay endpoint, keep the ticket in an
 owner-only file instead of copying a long command-line value:
@@ -93,6 +102,9 @@ timeout_secs = 10
 underlay = "socks5://127.0.0.1:10808"
 ```
 
+Use `underlay = "tor://127.0.0.1:9050"` to select an operator-managed Tor
+SOCKS listener instead. Omitting `underlay` continues to select direct TCP.
+
 The `--underlay` command-line value takes precedence over the session value.
 If neither is present, SHPH uses direct TCP.
 
@@ -125,9 +137,16 @@ operating system.
 ## Deliberate limits
 
 - Only outbound TCP supports this add-on.
-- The SHPH SOCKS5 client offers the no-auth method only.
-- Proxy credentials, proxy auto-discovery, QUIC-over-SOCKS, and a bundled Xray
-  runtime are not implemented.
+- The generic `socks5://` underlay offers no-auth only. The Tor-specific
+  `tor://` mode requires a loopback proxy and offers fresh SOCKS auth
+  credentials per connection; user-configurable proxy credentials,
+  auto-discovery, QUIC-over-SOCKS, and a bundled Tor/Xray runtime are not
+  implemented.
+- Tor underlay selection alone does not establish native-TUN routing or
+  containment through Tor. Do not claim full VPN operation through Tor without
+  separate route-containment validation.
+- SOCKS setup is bounded by the TCP handshake deadline, but the synchronous
+  connect API does not expose cancellation during proxy setup.
 - The SOCKS5 listener must not be treated as a public SHPH service endpoint.
 - The proxy can still observe connection timing, destination metadata
   available to it, and traffic volume. This feature does not claim to defeat
@@ -167,6 +186,11 @@ SOCKS5 listener that verifies:
 - a domain-form `CONNECT` request;
 - the requested destination and port; and
 - consumption of a successful SOCKS5 bound-address response.
+
+Tor-specific fake-proxy tests also verify fresh auth credentials across
+connections, `.onion` domain forwarding, timeout behavior, and failure closure
+without a direct peer connection. A live Tor campaign remains separate and is
+recorded as `SKIP` when no authorized Tor endpoint is available.
 
 To validate a real deployment, run the SHPH host and local SOCKS5 listener in
 the same controlled environment, then compare:

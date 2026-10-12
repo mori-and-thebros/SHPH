@@ -1,1 +1,12 @@
-*.sh text eol=lf
+* text=auto eol=lf
+*.ps1 text eol=crlf
+
+# Local maintainer and confidential files are not part of source archives.
+/AGENTS.md export-ignore
+/.github/RELEASE_DRAFT_v0.6.8-dev.md export-ignore
+/.github/RELEASE_PREFLIGHT_v0.6.8-dev.md export-ignore
+/internal/** export-ignore
+/docs/CRYPTO_FUNDING_BOOTSTRAP.md export-ignore
+/docs/FUNDING_SPRINT_BOARD.md export-ignore
+/docs/IDENTITY_DISCOVERY_BENCHMARKS_2026-08-14.md export-ignore
+/docs/IDENTITY_DISCOVERY_DESIGN.md export-ignore

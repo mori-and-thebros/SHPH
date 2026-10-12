@@ -9,6 +9,122 @@ experimental transports are not release blockers because they are explicitly
 outside that profile; they are also not allowed to appear as production
 capabilities.
 
+## Next milestone: TCP/native-TUN lifecycle reliability
+
+Complete the following in order for the TCP/native-TUN release milestone.
+The separately scoped experimental program in
+[PHANTOM_SHROUD_SCOPE.md](PHANTOM_SHROUD_SCOPE.md) may proceed alongside it;
+experimental progress does not close these gates or broaden release claims.
+Existing experimental functionality keeps its regression checks; fixes needed
+for shared-code correctness remain in scope.
+
+1. **Secret-safe diagnostics.** Redact session keys and keystore passwords in
+   debug formatting, including nested handshake state. Verify compact and
+   pretty formatting with regression tests. Keep raw private-key storage types
+   free of `Debug` implementations.
+2. **Local lifecycle baseline.** Run the core tests, CLI control-plane tests,
+   and bounded repeated-session reliability suite below on the candidate.
+   Resolve failures before privileged acceptance. These tests do not close
+   native packet-forwarding gates.
+3. **Repeat the selected native lane.** Start with the previously evidenced
+   Windows-to-Linux direct-TCP IPv4 configuration. Record both hosts, runtime
+   hashes, configuration, candidate revision, and exact commands. Repeat
+   authenticated forwarding, peer restart/reconnect, and normal shutdown on
+   three fresh sessions. Capture adapter, route, DNS, process, and firewall
+   state before and after each session; require no unexplained residue.
+4. **Failure and containment acceptance.** On dedicated hosts, record startup
+   failure rollback, Ctrl+C teardown, and forced termination separately.
+   Observe packet behavior during peer outage and forced termination with
+   the killswitch enabled, then verify explicit cleanup. Policy presence alone
+   cannot pass the packet-leak gate. Follow the host procedures in gate groups
+   3 and 4 and record unavailable capabilities as `SKIP`.
+5. **Candidate evidence.** Close every required gate for the selected release
+   profile with clean-tree provenance. Update the support matrix only for
+   behavior observed in that campaign. Other host pairings, DNS/IPv6, and
+   alternate transports require separate evidence before expanding claims.
+
+Local starting commands (no native interface or firewall setup):
+
+```text
+cargo test -p shph-core --locked
+cargo test -p shph-cli --test cli_control_plane --locked
+cargo test -p shph-cli --test cli_reliability --locked -- --test-threads=1
+```
+
+The milestone remains open until the required host results and release gates
+pass. A green local suite or historical campaign does not complete it.
+
+## SHPH-native SNAP acceptance lane
+
+SNAP v1 is opt-in and remains outside the release profile until this lane is
+closed. Its planner and adapter code must not be described as release-supported
+based on parsing or loopback evidence alone. The local starting checks are:
+
+```text
+cargo test -p shph-snap --locked
+cargo test -p shph-transport snap_adapter --locked
+cargo test -p shph-cli --test cli_snap --locked
+```
+
+The paired SHPH tests must cover each selected adapter, pinned-peer
+authentication and wrong-peer rejection, adapter setup failure, allowed and
+forbidden fallback, reconnect, and shutdown. Candidate ordering and attempt and
+elapsed-time budgets must remain bounded. Python SNAP may be used as the
+behavioral reference; Python SierraNode session interoperability is not part
+of this lane.
+
+Before SNAP enters a release profile, capture adapter-specific acceptance on
+each claimed platform. Exercise TUN forwarding, route and DNS behavior, and
+killswitch containment wherever the adapter is used with those controls. Run
+external bridges and relays only on operator-owned or explicitly authorized
+services with their declared service contracts. Record unavailable Linux,
+Windows, carrier, or service evidence as `SKIP`; it does not close this lane.
+The release-readiness collector records separate required rows for
+`snap-linux-adapter-acceptance`, `snap-windows-adapter-acceptance`, and
+`snap-external-service-acceptance`; each needs its own evidence. The broader
+`native-tun-two-host` gate remains separate.
+Supply those manifests and their hashed artifacts with
+`-SnapEvidenceDirectory <path>`; their exact schema and adapter coverage are
+defined in [`SNAP_ACCEPTANCE_EVIDENCE.md`](SNAP_ACCEPTANCE_EVIDENCE.md). If a
+manifest is absent, the collector records `SKIP`. Malformed or source-mismatched
+evidence records `FAIL`. Hash and schema validation does not replace review of
+the underlying host results or operator service contracts.
+The current support level and evidence boundary are listed in
+[`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md).
+
+## Experimental Shroud 3 and onion prototype checks
+
+These checks exercise opt-in research surfaces outside the release profile;
+their success does not make either surface release-supported:
+
+```text
+cargo test -p shph-transport shroud3 --locked
+cargo test -p shph-transport onion --locked
+cargo test -p shph-transport --test onion_process --locked
+cargo build -p shph-transport --bin shph-onion-relay --release --locked
+```
+
+The relay process test uses three loopback relay processes and an SHPH
+destination. Focused onion tests also cover circuit exhaustion, malformed
+setup, a stalled destination, lifetime closure, and shutdown with an incomplete
+TLS setup. This is process-level local evidence only. Independent protocol
+review, authorized external relay operation, full-session measurements, and
+native-TUN route/DNS/killswitch containment remain separate gates. Shroud 3
+has an explicit Linux `host`/`join`/`up` opt-in for standards-QUIC native-TUN
+sessions; both peers must select it. Its authenticated loopback bridge-framing
+test does not open a host TUN or establish two-host interoperability. It is not
+part of the default release behavior.
+
+On Linux systems that permit user/network namespaces and expose `/dev/net/tun`,
+[`validate_shroud3_tun_namespace.sh`](../scripts/validate_shroud3_tun_namespace.sh)
+adds a real packet-path check for the experimental Shroud 3 bridge. It starts
+two pinned SHPH peers in separate nested network namespaces, carries a UDP
+echo through both TUN devices over a namespace-local veth underlay, and checks
+graceful shutdown cleanup. Its addresses and routes are confined to those
+temporary namespaces. Even a `PASS` is local one-kernel evidence; it does not
+replace the selected native two-host release lane or close Shroud 3 host,
+containment, interoperability, or performance gates.
+
 ## Gate status
 
 Every gate must be recorded as one of:
@@ -114,6 +230,11 @@ Use the collector to record the result without hiding failures:
 ```powershell
 pwsh -File .\scripts\release_readiness.ps1 -AllowDirty
 ```
+
+The collector packages only after the current platform's release-build gate
+passes, and runs benchmark smoke profiles only after the matching benchmark
+build passes. It uses the explicit Windows MSVC output paths. Existing binaries
+left in `target/` by earlier runs do not count as current-run evidence.
 
 On a Windows host with only Windows PowerShell 5.1 installed, use:
 

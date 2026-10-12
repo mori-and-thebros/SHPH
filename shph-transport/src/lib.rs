@@ -4,9 +4,15 @@
 //! UDP datagram shim for phased adoption, and an opt-in standards-compliant
 //! QUIC transport backed by Quinn.
 
+pub mod cover;
+pub mod envelope_policy;
 pub mod ja4;
+pub mod onion;
+pub mod pacing;
 pub mod phantom_one;
 pub mod shroud2;
+pub mod shroud3;
+pub mod snap_adapter;
 pub mod standards_quic;
 #[cfg(target_os = "linux")]
 pub mod standards_tun;
@@ -44,7 +50,8 @@ const MAX_QUIC_FRAME_BYTES: usize = 16 * 1024;
 const MAX_QUIC_HELLO_BYTES: usize = 12 * 1024;
 const SHROUD_AEAD_OVERHEAD: usize = 12 + 16;
 const MAX_QUIC_PAYLOAD_BYTES: usize = MAX_QUIC_FRAME_BYTES - 4 - SHROUD_AEAD_OVERHEAD;
-const MAX_TCP_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - SHROUD_AEAD_OVERHEAD;
+/// Maximum plaintext bytes carried by one authenticated TCP frame.
+pub const MAX_TCP_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - SHROUD_AEAD_OVERHEAD;
 const PHANTOM_ONE_TCP_PATH_MTU: usize = MAX_TCP_PAYLOAD_BYTES;
 const SHROUD_LENGTH_PREFIX: usize = 2;
 const QUIC_HANDSHAKE_ATTEMPTS: usize = 3;
@@ -57,6 +64,7 @@ const MAX_CONCURRENT_TCP_HANDSHAKES: usize = 16;
 const MAX_DNS_RESOLVER_WORKERS: usize = 4;
 const MAX_DNS_RESOLVER_QUEUE: usize = 32;
 const MAX_RESOLVED_ADDRESSES: usize = 32;
+const SOCKS_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 struct ZeroizeOnDrop<'a> {
     buffer: &'a mut Vec<u8>,
@@ -119,7 +127,14 @@ pub enum TransportMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TcpUnderlay {
     Direct,
-    Socks5 { proxy: String },
+    Socks5 {
+        proxy: String,
+    },
+    /// Operator-managed Tor SOCKS endpoint. Fresh authentication credentials
+    /// request per-connection isolation; only a literal loopback proxy is allowed.
+    Tor {
+        proxy: String,
+    },
 }
 
 impl TcpUnderlay {
@@ -133,9 +148,10 @@ impl TcpUnderlay {
         let proxy = value
             .strip_prefix("socks5://")
             .or_else(|| value.strip_prefix("socks5h://"))
+            .or_else(|| value.strip_prefix("tor://"))
             .ok_or_else(|| {
                 ShphError::InvalidArgument(
-                    "underlay must be direct, socks5://host:port, or socks5h://host:port".into(),
+                    "underlay must be direct, socks5://host:port, socks5h://host:port, or tor://loopback:port".into(),
                 )
             })?
             .trim();
@@ -158,6 +174,20 @@ impl TcpUnderlay {
                 "SOCKS5 proxy port must be non-zero".into(),
             ));
         }
+        if value.starts_with("tor://") {
+            if !endpoint
+                .host
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+            {
+                return Err(ShphError::InvalidArgument(
+                    "Tor proxy must be a literal loopback address".into(),
+                ));
+            }
+            return Ok(Self::Tor {
+                proxy: format_socket_endpoint(&endpoint.host, endpoint.port),
+            });
+        }
         Ok(Self::Socks5 {
             proxy: format_socket_endpoint(&endpoint.host, endpoint.port),
         })
@@ -171,6 +201,7 @@ impl TcpUnderlay {
         match self {
             Self::Direct => "direct",
             Self::Socks5 { .. } => "socks5",
+            Self::Tor { .. } => "tor",
         }
     }
 
@@ -178,6 +209,7 @@ impl TcpUnderlay {
         match self {
             Self::Direct => None,
             Self::Socks5 { proxy } => Some(format!("socks5://{proxy}")),
+            Self::Tor { proxy } => Some(format!("tor://{proxy}")),
         }
     }
 }
@@ -207,11 +239,13 @@ impl TransportMode {
 
 pub struct SecureSession {
     inner: SecureSessionInner,
+    transcript_hash_hex: String,
 }
 
 enum SecureSessionInner {
     Tcp(Box<SecureTcpSession>),
     Quic(Box<ExperimentalQuicSession>),
+    QuicStandard(Box<standards_quic::BlockingStandardsQuicSession>),
     OfflineMesh(OfflineMeshSession),
     DataMule(DataMuleSession),
 }
@@ -223,6 +257,7 @@ pub struct SecureSender {
 enum SecureSenderInner {
     Tcp(Box<SecureTcpSender>),
     Quic(Box<ExperimentalQuicSender>),
+    QuicStandard(standards_quic::BlockingStandardsQuicSender),
     OfflineMesh(Box<OfflineMeshSender>),
     DataMule(Box<DataMuleSender>),
 }
@@ -245,6 +280,7 @@ pub struct QuicLabConfig {
 enum SecureReceiverInner {
     Tcp(SecureTcpReceiver),
     Quic(ExperimentalQuicReceiver),
+    QuicStandard(standards_quic::BlockingStandardsQuicReceiver),
     OfflineMesh(OfflineMeshReceiver),
     DataMule(DataMuleReceiver),
 }
@@ -359,30 +395,6 @@ fn now_unix_ms() -> Result<u64> {
 fn data_mule_envelope_expired(created_at_unix_ms: u64, now_unix_ms: u64, max_age_ms: u64) -> bool {
     now_unix_ms.saturating_sub(created_at_unix_ms) > max_age_ms
         || created_at_unix_ms.saturating_sub(now_unix_ms) > max_age_ms
-}
-
-fn trim_data_mule_candidates_to_quota(
-    candidates: &mut Vec<DataMuleCandidate>,
-    max_total_bytes: u64,
-) {
-    let mut total = candidates
-        .iter()
-        .map(|candidate| candidate.file_bytes)
-        .sum::<u64>();
-    if total <= max_total_bytes {
-        return;
-    }
-
-    candidates
-        .sort_by_key(|candidate| (candidate.created_at_unix_ms, candidate.envelope_id.clone()));
-    while total > max_total_bytes {
-        let Some(_) = candidates.first() else {
-            break;
-        };
-        let candidate = candidates.remove(0);
-        total = total.saturating_sub(candidate.file_bytes);
-        quarantine_file(&candidate.path);
-    }
 }
 
 fn data_mule_spool_usage(
@@ -621,6 +633,11 @@ fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
             "file adapter path contains an embedded NUL",
         ));
     }
+    for unit in &mut value {
+        if *unit == b'/' as u16 {
+            *unit = b'\\' as u16;
+        }
+    }
 
     // Win32 file APIs otherwise apply the legacy MAX_PATH limit. The
     // filesystem adapter deliberately uses bounded but nested paths, so
@@ -641,6 +658,20 @@ fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
 
     value.push(0);
     Ok(value)
+}
+
+#[cfg(all(test, windows))]
+mod windows_extended_path_tests {
+    use super::windows_extended_path;
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::Path};
+
+    #[test]
+    fn drive_paths_normalize_forward_slashes_for_extended_namespace() {
+        let encoded = windows_extended_path(Path::new("C:/adapter/spool/file.json"))
+            .expect("encode extended path");
+        let decoded = OsString::from_wide(&encoded[..encoded.len() - 1]);
+        assert_eq!(decoded, r"\\?\C:\adapter\spool\file.json");
+    }
 }
 
 #[cfg(windows)]
@@ -894,7 +925,14 @@ fn parse_socket_addr(addr: &str, deadline: Instant) -> Result<SocketAddr> {
 }
 
 fn tcp_handshake_deadline(timeout_secs: u64) -> Instant {
-    Instant::now() + Duration::from_secs(timeout_secs.max(1).min(TCP_HANDSHAKE_DEADLINE.as_secs()))
+    tcp_handshake_deadline_after(Duration::from_secs(timeout_secs.max(1)))
+}
+
+fn tcp_handshake_deadline_after(timeout: Duration) -> Instant {
+    Instant::now()
+        + timeout
+            .max(Duration::from_millis(1))
+            .min(TCP_HANDSHAKE_DEADLINE)
 }
 
 fn connect_tcp_with_deadline(peer: &str, deadline: Instant) -> Result<TcpStream> {
@@ -922,32 +960,134 @@ fn connect_tcp_via_underlay(
     underlay: &TcpUnderlay,
     deadline: Instant,
 ) -> Result<TcpStream> {
+    connect_tcp_via_underlay_inner(peer, underlay, deadline, None)
+}
+
+fn connect_tcp_via_underlay_inner(
+    peer: &str,
+    underlay: &TcpUnderlay,
+    deadline: Instant,
+    cancellation: Option<&dyn Fn() -> bool>,
+) -> Result<TcpStream> {
+    check_setup_cancellation(cancellation)?;
     match underlay {
         TcpUnderlay::Direct => connect_tcp_with_deadline(peer, deadline),
         TcpUnderlay::Socks5 { proxy } => {
             let mut stream = connect_tcp_with_deadline(proxy, deadline)?;
             refresh_deadline_timeout(&stream, deadline)?;
-            socks5_connect(&mut stream, peer, deadline)?;
+            match cancellation {
+                Some(cancelled) => socks5_connect_authenticated_with_cancel(
+                    &mut stream,
+                    peer,
+                    deadline,
+                    None,
+                    Some(cancelled),
+                )?,
+                None => socks5_connect(&mut stream, peer, deadline)?,
+            }
+            refresh_deadline_timeout(&stream, deadline)?;
+            Ok(stream)
+        }
+        TcpUnderlay::Tor { proxy } => {
+            // Validate public enum construction too, not just parsed CLI input.
+            let address: SocketAddr = proxy.parse().map_err(|_| {
+                ShphError::Config("Tor proxy must be a literal loopback socket".into())
+            })?;
+            if !address.ip().is_loopback() || address.port() == 0 {
+                return Err(ShphError::Config(
+                    "Tor proxy must be a literal loopback socket".into(),
+                ));
+            }
+            let mut stream = connect_tcp_with_deadline(proxy, deadline)?;
+            let username = Zeroizing::new(rand::random::<[u8; 16]>());
+            let password = Zeroizing::new(rand::random::<[u8; 16]>());
+            match cancellation {
+                Some(cancelled) => socks5_connect_authenticated_with_cancel(
+                    &mut stream,
+                    peer,
+                    deadline,
+                    Some((&username[..], &password[..])),
+                    Some(cancelled),
+                )?,
+                None => socks5_connect_authenticated(
+                    &mut stream,
+                    peer,
+                    deadline,
+                    Some((&username[..], &password[..])),
+                )?,
+            }
             refresh_deadline_timeout(&stream, deadline)?;
             Ok(stream)
         }
     }
 }
 
+fn check_setup_cancellation(cancellation: Option<&dyn Fn() -> bool>) -> Result<()> {
+    if cancellation.is_some_and(|cancelled| cancelled()) {
+        Err(ShphError::Transport("SOCKS5 setup cancelled".into()))
+    } else {
+        Ok(())
+    }
+}
+
 fn socks5_connect(stream: &mut TcpStream, peer: &str, deadline: Instant) -> Result<()> {
+    socks5_connect_authenticated(stream, peer, deadline, None)
+}
+
+fn socks5_connect_authenticated(
+    stream: &mut TcpStream,
+    peer: &str,
+    deadline: Instant,
+    authentication: Option<(&[u8], &[u8])>,
+) -> Result<()> {
+    socks5_connect_authenticated_with_cancel(stream, peer, deadline, authentication, None)
+}
+
+fn socks5_connect_authenticated_with_cancel(
+    stream: &mut TcpStream,
+    peer: &str,
+    deadline: Instant,
+    authentication: Option<(&[u8], &[u8])>,
+    cancellation: Option<&dyn Fn() -> bool>,
+) -> Result<()> {
     const SOCKS5_VERSION: u8 = 5;
     const SOCKS5_NO_AUTH: u8 = 0;
     const SOCKS5_CONNECT: u8 = 1;
     const SOCKS5_RESERVED: u8 = 0;
     const SOCKS5_SUCCESS: u8 = 0;
 
-    write_tcp_all_or_closed_with_deadline(stream, &[SOCKS5_VERSION, 1, SOCKS5_NO_AUTH], deadline)?;
-    let mut method_response = [0u8; 2];
-    read_exact_or_closed_with_deadline(stream, &mut method_response, deadline)?;
-    if method_response != [SOCKS5_VERSION, SOCKS5_NO_AUTH] {
-        return Err(ShphError::Transport(
-            "SOCKS5 proxy does not support unauthenticated CONNECT".into(),
+    let method = if authentication.is_some() {
+        2
+    } else {
+        SOCKS5_NO_AUTH
+    };
+    if authentication.is_some_and(|(user, password)| {
+        user.is_empty() || password.is_empty() || user.len() > 255 || password.len() > 255
+    }) {
+        return Err(ShphError::Config(
+            "SOCKS authentication values must be 1..255 bytes".into(),
         ));
+    }
+    write_socks5_bytes(stream, &[SOCKS5_VERSION, 1, method], deadline, cancellation)?;
+    let mut method_response = [0u8; 2];
+    read_socks5_bytes(stream, &mut method_response, deadline, cancellation)?;
+    if method_response != [SOCKS5_VERSION, method] {
+        return Err(ShphError::Transport(
+            "SOCKS5 proxy rejected the required authentication method".into(),
+        ));
+    }
+    if let Some((user, password)) = authentication {
+        let mut auth = Zeroizing::new(Vec::with_capacity(user.len() + password.len() + 3));
+        auth.extend_from_slice(&[1, user.len() as u8]);
+        auth.extend_from_slice(user);
+        auth.push(password.len() as u8);
+        auth.extend_from_slice(password);
+        write_socks5_bytes(stream, &auth, deadline, cancellation)?;
+        let mut response = [0; 2];
+        read_socks5_bytes(stream, &mut response, deadline, cancellation)?;
+        if response != [1, 0] {
+            return Err(ShphError::Auth("SOCKS authentication failed".into()));
+        }
     }
 
     let endpoint = Endpoint::parse(peer)
@@ -985,10 +1125,10 @@ fn socks5_connect(stream: &mut TcpStream, peer: &str, deadline: Instant) -> Resu
         }
     }
     request.extend_from_slice(&endpoint.port.to_be_bytes());
-    write_tcp_all_or_closed_with_deadline(stream, &request, deadline)?;
+    write_socks5_bytes(stream, &request, deadline, cancellation)?;
 
     let mut response_header = [0u8; 4];
-    read_exact_or_closed_with_deadline(stream, &mut response_header, deadline)?;
+    read_socks5_bytes(stream, &mut response_header, deadline, cancellation)?;
     if response_header[0] != SOCKS5_VERSION {
         return Err(ShphError::Protocol(
             "SOCKS5 proxy returned an invalid version".into(),
@@ -1008,17 +1148,17 @@ fn socks5_connect(stream: &mut TcpStream, peer: &str, deadline: Instant) -> Resu
     match response_header[3] {
         1 => {
             let mut address = [0u8; 4];
-            read_exact_or_closed_with_deadline(stream, &mut address, deadline)?;
+            read_socks5_bytes(stream, &mut address, deadline, cancellation)?;
         }
         3 => {
             let mut length = [0u8; 1];
-            read_exact_or_closed_with_deadline(stream, &mut length, deadline)?;
+            read_socks5_bytes(stream, &mut length, deadline, cancellation)?;
             let mut address = vec![0u8; length[0] as usize];
-            read_exact_or_closed_with_deadline(stream, &mut address, deadline)?;
+            read_socks5_bytes(stream, &mut address, deadline, cancellation)?;
         }
         4 => {
             let mut address = [0u8; 16];
-            read_exact_or_closed_with_deadline(stream, &mut address, deadline)?;
+            read_socks5_bytes(stream, &mut address, deadline, cancellation)?;
         }
         value => {
             return Err(ShphError::Protocol(format!(
@@ -1027,8 +1167,36 @@ fn socks5_connect(stream: &mut TcpStream, peer: &str, deadline: Instant) -> Resu
         }
     }
     let mut port = [0u8; 2];
-    read_exact_or_closed_with_deadline(stream, &mut port, deadline)?;
-    Ok(())
+    read_socks5_bytes(stream, &mut port, deadline, cancellation)?;
+    check_setup_cancellation(cancellation)
+}
+
+fn write_socks5_bytes(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    deadline: Instant,
+    cancellation: Option<&dyn Fn() -> bool>,
+) -> Result<()> {
+    match cancellation {
+        Some(cancelled) => {
+            write_tcp_all_or_closed_with_deadline_and_cancel(stream, payload, deadline, cancelled)
+        }
+        None => write_tcp_all_or_closed_with_deadline(stream, payload, deadline),
+    }
+}
+
+fn read_socks5_bytes(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    cancellation: Option<&dyn Fn() -> bool>,
+) -> Result<()> {
+    match cancellation {
+        Some(cancelled) => {
+            read_exact_or_closed_with_deadline_and_cancel(stream, buffer, deadline, cancelled)
+        }
+        None => read_exact_or_closed_with_deadline(stream, buffer, deadline),
+    }
 }
 
 fn bounded_quic_timeout_secs(timeout_secs: u64) -> u64 {
@@ -1238,10 +1406,26 @@ pub fn offline_mesh_connect_secure_session_with_profile(
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
+    offline_mesh_connect_secure_session_with_profile_timeout(
+        cfg,
+        local_identity,
+        policy,
+        Duration::from_secs(timeout_secs.max(1)),
+        profile,
+    )
+}
+
+pub fn offline_mesh_connect_secure_session_with_profile_timeout(
+    cfg: &OfflineMeshConfig,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout: Duration,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
     let material = build_hello_with_profile(local_identity, profile)?;
     let mut writer = OfflineMeshWriteState::new(cfg, &cfg.node_id, &cfg.peer_id);
     let mut reader = OfflineMeshReadState::new(cfg, &cfg.node_id, &cfg.peer_id);
-    let timeout = Duration::from_secs(timeout_secs.max(1));
+    let timeout = timeout.max(Duration::from_millis(1));
 
     writer.send_payload(&serialize_hello_with_padding(&material.local_hello)?)?;
     let peer_hello = reader.receive_verified_hello(timeout, local_identity, &material, policy)?;
@@ -1259,6 +1443,7 @@ pub fn offline_mesh_connect_secure_session_with_profile(
             state.session_keys.send_key,
             state.session_keys.recv_key,
         )),
+        transcript_hash_hex: state.transcript_hash_hex.clone(),
     };
     Ok((session, state))
 }
@@ -1311,6 +1496,7 @@ pub fn offline_mesh_accept_secure_session_with_profile(
             state.session_keys.send_key,
             state.session_keys.recv_key,
         )),
+        transcript_hash_hex: state.transcript_hash_hex.clone(),
     };
     Ok((session, state))
 }
@@ -1425,11 +1611,29 @@ pub fn data_mule_connect_secure_session_with_profile(
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(SecureSession, HandshakeState)> {
+    data_mule_connect_secure_session_with_profile_timeout(
+        cfg,
+        local_identity,
+        peer_node,
+        policy,
+        Duration::from_secs(timeout_secs.max(1)),
+        profile,
+    )
+}
+
+pub fn data_mule_connect_secure_session_with_profile_timeout(
+    cfg: &DataMuleConfig,
+    local_identity: &IdentityKeyPair,
+    peer_node: &str,
+    policy: &PeerPolicy,
+    timeout: Duration,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
     let material = build_hello_with_profile(local_identity, profile)?;
     let local_node = local_identity.public_key_b64();
     let mut writer = DataMuleWriteState::new(cfg, &local_node, peer_node);
     let mut reader = DataMuleReadState::new(cfg, &local_node, Some(peer_node));
-    let timeout = Duration::from_secs(timeout_secs.max(1));
+    let timeout = timeout.max(Duration::from_millis(1));
 
     writer.send_payload(&serialize_hello_with_padding(&material.local_hello)?)?;
     let (peer_hello, _) =
@@ -1448,6 +1652,7 @@ pub fn data_mule_connect_secure_session_with_profile(
             state.session_keys.send_key,
             state.session_keys.recv_key,
         )),
+        transcript_hash_hex: state.transcript_hash_hex.clone(),
     };
 
     Ok((session, state))
@@ -1504,6 +1709,7 @@ pub fn data_mule_accept_secure_session_with_profile(
             state.session_keys.send_key,
             state.session_keys.recv_key,
         )),
+        transcript_hash_hex: state.transcript_hash_hex.clone(),
     };
     Ok((session, state))
 }
@@ -1553,6 +1759,29 @@ pub fn connect_secure_session_with_profile_and_underlay(
     profile: HandshakeProfile,
     underlay: &TcpUnderlay,
 ) -> Result<(SecureSession, HandshakeState)> {
+    connect_secure_session_with_profile_and_underlay_inner(
+        peer,
+        local_identity,
+        policy,
+        Duration::from_secs(timeout_secs.max(1)),
+        mode,
+        profile,
+        underlay,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_secure_session_with_profile_and_underlay_inner(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout: Duration,
+    mode: TransportMode,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+    cancellation: Option<&dyn Fn() -> bool>,
+) -> Result<(SecureSession, HandshakeState)> {
     if !underlay.is_direct() && mode != TransportMode::Tcp {
         return Err(ShphError::InvalidArgument(
             "SOCKS5 underlay currently supports TCP transport only".into(),
@@ -1560,13 +1789,14 @@ pub fn connect_secure_session_with_profile_and_underlay(
     }
     match mode {
         TransportMode::Tcp => {
-            let (stream, state) = tcp_connect_and_handshake_with_profile_and_underlay(
+            let (stream, state) = tcp_connect_and_handshake_with_profile_and_underlay_inner(
                 peer,
                 local_identity,
                 policy,
-                timeout_secs,
+                timeout,
                 profile,
                 underlay,
+                cancellation,
             )?;
             Ok((
                 SecureSession {
@@ -1575,16 +1805,17 @@ pub fn connect_secure_session_with_profile_and_underlay(
                         state.session_keys.send_key,
                         state.session_keys.recv_key,
                     ))),
+                    transcript_hash_hex: state.transcript_hash_hex.clone(),
                 },
                 state,
             ))
         }
         TransportMode::Quic => {
-            let (socket, peer_addr, state) = quic_handshake_client_with_profile(
+            let (socket, peer_addr, state) = quic_handshake_client_with_profile_timeout(
                 peer,
                 local_identity,
                 policy,
-                timeout_secs,
+                timeout,
                 profile,
             )?;
             Ok((
@@ -1595,6 +1826,7 @@ pub fn connect_secure_session_with_profile_and_underlay(
                         state.session_keys.send_key,
                         state.session_keys.recv_key,
                     ))),
+                    transcript_hash_hex: state.transcript_hash_hex.clone(),
                 },
                 state,
             ))
@@ -1648,6 +1880,36 @@ pub fn connect_secure_session_lab_with_profile(
     )
 }
 
+/// Connect a standards-QUIC data session through the synchronous
+/// `SecureSession` interface. The returned session remains gated until the
+/// caller completes its local peer-policy checks and calls `activate`.
+pub fn connect_standards_quic_session(
+    peer_addr: SocketAddr,
+    server_name: &str,
+    server_certificate_der: &[u8],
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    profile: HandshakeProfile,
+    handshake_timeout: Duration,
+) -> Result<(SecureSession, HandshakeState)> {
+    let (session, state) = standards_quic::BlockingStandardsQuicSession::connect(
+        peer_addr,
+        server_name.to_owned(),
+        server_certificate_der.to_vec(),
+        local_identity.clone(),
+        policy.clone(),
+        profile,
+        handshake_timeout,
+    )?;
+    Ok((
+        SecureSession {
+            inner: SecureSessionInner::QuicStandard(Box::new(session)),
+            transcript_hash_hex: state.transcript_hash_hex.clone(),
+        },
+        state,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn connect_secure_session_lab_with_profile_and_underlay(
     peer: &str,
@@ -1659,15 +1921,96 @@ pub fn connect_secure_session_lab_with_profile_and_underlay(
     profile: HandshakeProfile,
     underlay: &TcpUnderlay,
 ) -> Result<(SecureSession, HandshakeState)> {
-    validate_lab_profiles(mode, lab.shroud_profile, lab.phantom_one_profile)?;
-    let (mut session, state) = connect_secure_session_with_profile_and_underlay(
+    connect_secure_session_lab_with_profile_and_underlay_timeout(
         peer,
         local_identity,
         policy,
-        timeout_secs,
+        Duration::from_secs(timeout_secs.max(1)),
+        mode,
+        lab,
+        profile,
+        underlay,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn connect_secure_session_lab_with_profile_and_underlay_timeout(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout: Duration,
+    mode: TransportMode,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+) -> Result<(SecureSession, HandshakeState)> {
+    connect_secure_session_lab_with_profile_and_underlay_inner(
+        peer,
+        local_identity,
+        policy,
+        timeout,
+        mode,
+        lab,
+        profile,
+        underlay,
+        None,
+    )
+}
+
+/// Connect a session while polling `cancelled` during SOCKS5 setup.
+///
+/// SOCKS exchange I/O checks cancellation at bounded intervals while honoring
+/// the existing absolute handshake deadline. Resolving a non-literal SOCKS
+/// proxy and connecting its TCP socket remain deadline-bounded blocking calls.
+/// Direct TCP connect and the subsequent SHPH handshake are also only
+/// deadline-bounded; the CLI uses this variant only for SOCKS underlays.
+#[allow(clippy::too_many_arguments)]
+pub fn connect_secure_session_lab_with_profile_and_underlay_with_cancel(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout_secs: u64,
+    mode: TransportMode,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(SecureSession, HandshakeState)> {
+    connect_secure_session_lab_with_profile_and_underlay_inner(
+        peer,
+        local_identity,
+        policy,
+        Duration::from_secs(timeout_secs.max(1)),
+        mode,
+        lab,
+        profile,
+        underlay,
+        Some(cancelled),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_secure_session_lab_with_profile_and_underlay_inner(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout: Duration,
+    mode: TransportMode,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+    cancellation: Option<&dyn Fn() -> bool>,
+) -> Result<(SecureSession, HandshakeState)> {
+    validate_lab_profiles(mode, lab.shroud_profile, lab.phantom_one_profile)?;
+    let (mut session, state) = connect_secure_session_with_profile_and_underlay_inner(
+        peer,
+        local_identity,
+        policy,
+        timeout,
         mode,
         profile,
         underlay,
+        cancellation,
     )?;
     if let Some(shroud_profile) = lab.shroud_profile {
         session = match mode {
@@ -1728,6 +2071,7 @@ pub fn accept_secure_session_with_profile(
                         state.session_keys.send_key,
                         state.session_keys.recv_key,
                     ))),
+                    transcript_hash_hex: state.transcript_hash_hex.clone(),
                 },
                 state,
             ))
@@ -1748,6 +2092,7 @@ pub fn accept_secure_session_with_profile(
                         state.session_keys.send_key,
                         state.session_keys.recv_key,
                     ))),
+                    transcript_hash_hex: state.transcript_hash_hex.clone(),
                 },
                 state,
             ))
@@ -1835,6 +2180,25 @@ fn validate_lab_profiles(
 }
 
 impl SecureSession {
+    /// Keep a SNAP TLS bridge relay alive for this authenticated TCP session.
+    pub fn with_snap_bridge_lifecycle(
+        mut self,
+        lifecycle: snap_adapter::SnapBridgeLifecycle,
+    ) -> Result<Self> {
+        match &mut self.inner {
+            SecureSessionInner::Tcp(session) => {
+                session._snap_bridge_lifecycle = Some(Arc::new(lifecycle));
+                Ok(self)
+            }
+            SecureSessionInner::Quic(_)
+            | SecureSessionInner::QuicStandard(_)
+            | SecureSessionInner::OfflineMesh(_)
+            | SecureSessionInner::DataMule(_) => Err(ShphError::Unsupported(
+                "SNAP TLS bridge lifecycle requires an authenticated TCP session".into(),
+            )),
+        }
+    }
+
     fn with_quic_profile(mut self, profile: ShroudProfile) -> Result<Self> {
         if let SecureSessionInner::Quic(session) = &mut self.inner {
             if profile.is_tuned() {
@@ -1901,7 +2265,7 @@ impl SecureSession {
                     PhantomOneConfig::for_profile(profile),
                 )?);
             }
-            SecureSessionInner::Quic(_) => {
+            SecureSessionInner::Quic(_) | SecureSessionInner::QuicStandard(_) => {
                 return Err(ShphError::Unsupported(
                     "Phantom One is currently available on authenticated TCP only".into(),
                 ));
@@ -1914,10 +2278,24 @@ impl SecureSession {
         }
         Ok(self)
     }
+
+    /// Activate a session adapter after local peer-policy checks have passed.
+    /// Adapters that do not gate asynchronous setup are already active.
+    pub fn activate(&mut self) -> Result<()> {
+        match &mut self.inner {
+            SecureSessionInner::QuicStandard(session) => session.activate(),
+            SecureSessionInner::Tcp(_)
+            | SecureSessionInner::Quic(_)
+            | SecureSessionInner::OfflineMesh(_)
+            | SecureSessionInner::DataMule(_) => Ok(()),
+        }
+    }
+
     pub fn send_frame(&mut self, payload: &[u8]) -> Result<()> {
         match &mut self.inner {
             SecureSessionInner::Tcp(session) => session.send_frame(payload),
             SecureSessionInner::Quic(session) => session.send_frame(payload),
+            SecureSessionInner::QuicStandard(session) => session.send_frame(payload),
             SecureSessionInner::OfflineMesh(session) => session.send_frame(payload),
             SecureSessionInner::DataMule(session) => session.send_frame(payload),
         }
@@ -1927,6 +2305,7 @@ impl SecureSession {
         match &mut self.inner {
             SecureSessionInner::Tcp(session) => session.recv_frame(),
             SecureSessionInner::Quic(session) => session.recv_frame(),
+            SecureSessionInner::QuicStandard(session) => session.recv_frame(),
             SecureSessionInner::OfflineMesh(session) => session.recv_frame(),
             SecureSessionInner::DataMule(session) => session.recv_frame(),
         }
@@ -1953,6 +2332,17 @@ impl SecureSession {
                     },
                     SecureReceiver {
                         inner: SecureReceiverInner::Quic(receiver),
+                    },
+                ))
+            }
+            SecureSessionInner::QuicStandard(session) => {
+                let (sender, receiver) = (*session).into_split()?;
+                Ok((
+                    SecureSender {
+                        inner: SecureSenderInner::QuicStandard(sender),
+                    },
+                    SecureReceiver {
+                        inner: SecureReceiverInner::QuicStandard(receiver),
                     },
                 ))
             }
@@ -1987,6 +2377,7 @@ impl SecureSender {
         match &mut self.inner {
             SecureSenderInner::Tcp(sender) => sender.send_frame(payload),
             SecureSenderInner::Quic(sender) => sender.send_frame(payload),
+            SecureSenderInner::QuicStandard(sender) => sender.send_frame(payload),
             SecureSenderInner::OfflineMesh(sender) => sender.send_frame(payload),
             SecureSenderInner::DataMule(sender) => sender.send_frame(payload),
         }
@@ -2005,6 +2396,7 @@ impl SecureReceiver {
                 .socket
                 .set_read_timeout(Some(timeout))
                 .map_err(map_io_error),
+            SecureReceiverInner::QuicStandard(receiver) => receiver.set_poll_timeout(timeout),
             SecureReceiverInner::OfflineMesh(receiver) => {
                 receiver.timeout = timeout;
                 Ok(())
@@ -2020,6 +2412,7 @@ impl SecureReceiver {
         match &mut self.inner {
             SecureReceiverInner::Tcp(receiver) => receiver.recv_frame(),
             SecureReceiverInner::Quic(receiver) => receiver.recv_frame(),
+            SecureReceiverInner::QuicStandard(receiver) => receiver.recv_frame(),
             SecureReceiverInner::OfflineMesh(receiver) => receiver.recv_frame(),
             SecureReceiverInner::DataMule(receiver) => receiver.recv_frame(),
         }
@@ -2066,8 +2459,58 @@ pub fn tcp_handshake_client_with_profile_and_underlay(
     profile: HandshakeProfile,
     underlay: &TcpUnderlay,
 ) -> Result<HandshakeState> {
+    tcp_handshake_client_with_profile_and_underlay_inner(
+        peer,
+        local_identity,
+        policy,
+        timeout_secs,
+        profile,
+        underlay,
+        None,
+    )
+}
+
+/// Perform a client handshake while polling `cancelled` during SOCKS5 setup.
+///
+/// The callback is not polled during the subsequent SHPH handshake, DNS
+/// resolution, or the initial TCP connect; those operations remain bounded by
+/// the aggregate handshake deadline.
+pub fn tcp_handshake_client_with_profile_and_underlay_with_cancel(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<HandshakeState> {
+    tcp_handshake_client_with_profile_and_underlay_inner(
+        peer,
+        local_identity,
+        policy,
+        timeout_secs,
+        profile,
+        underlay,
+        Some(cancelled),
+    )
+}
+
+fn tcp_handshake_client_with_profile_and_underlay_inner(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout_secs: u64,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+    cancellation: Option<&dyn Fn() -> bool>,
+) -> Result<HandshakeState> {
     let deadline = tcp_handshake_deadline(timeout_secs);
-    let mut stream = connect_tcp_via_underlay(peer, underlay, deadline)?;
+    let mut stream = match cancellation {
+        Some(cancelled) => {
+            connect_tcp_via_underlay_inner(peer, underlay, deadline, Some(cancelled))?
+        }
+        None => connect_tcp_via_underlay(peer, underlay, deadline)?,
+    };
     refresh_deadline_timeout(&stream, deadline)?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello_with_deadline(&mut stream, &material.local_hello, deadline)?;
@@ -2146,8 +2589,43 @@ pub fn tcp_connect_and_handshake_with_profile_and_underlay(
     profile: HandshakeProfile,
     underlay: &TcpUnderlay,
 ) -> Result<(TcpStream, HandshakeState)> {
-    let deadline = tcp_handshake_deadline(timeout_secs);
-    let mut stream = connect_tcp_via_underlay(peer, underlay, deadline)?;
+    tcp_connect_and_handshake_with_profile_and_underlay_inner(
+        peer,
+        local_identity,
+        policy,
+        Duration::from_secs(timeout_secs.max(1)),
+        profile,
+        underlay,
+        None,
+    )
+}
+
+fn tcp_connect_and_handshake_with_profile_and_underlay_inner(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout: Duration,
+    profile: HandshakeProfile,
+    underlay: &TcpUnderlay,
+    cancellation: Option<&dyn Fn() -> bool>,
+) -> Result<(TcpStream, HandshakeState)> {
+    let deadline = tcp_handshake_deadline_after(timeout);
+    let stream = match cancellation {
+        Some(cancelled) => {
+            connect_tcp_via_underlay_inner(peer, underlay, deadline, Some(cancelled))?
+        }
+        None => connect_tcp_via_underlay(peer, underlay, deadline)?,
+    };
+    tcp_handshake_on_connected_stream(stream, local_identity, policy, profile, deadline)
+}
+
+fn tcp_handshake_on_connected_stream(
+    mut stream: TcpStream,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    profile: HandshakeProfile,
+    deadline: Instant,
+) -> Result<(TcpStream, HandshakeState)> {
     refresh_deadline_timeout(&stream, deadline)?;
     let mut material = build_hello_with_profile(local_identity, profile)?;
     write_tcp_hello_with_deadline(&mut stream, &material.local_hello, deadline)?;
@@ -2160,6 +2638,67 @@ pub fn tcp_connect_and_handshake_with_profile_and_underlay(
     let state = verify_and_derive(local_identity, &material, &peer_hello, true, policy)?;
     clear_deadline_timeout(&stream)?;
     Ok((stream, state))
+}
+
+/// Authenticate a pre-established TCP stream with the standard SHPH handshake.
+///
+/// SNAP adapters use this to carry the same pinned-peer session over an
+/// operator-configured bridge. The bridge never replaces or terminates the
+/// SHPH identity handshake.
+pub fn connect_secure_session_on_snap_stream(
+    stream: TcpStream,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout: Duration,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
+    validate_lab_profiles(
+        TransportMode::Tcp,
+        lab.shroud_profile,
+        lab.phantom_one_profile,
+    )?;
+    let deadline = tcp_handshake_deadline_after(timeout);
+    let (stream, state) =
+        tcp_handshake_on_connected_stream(stream, local_identity, policy, profile, deadline)?;
+    let mut session = SecureSession {
+        inner: SecureSessionInner::Tcp(Box::new(SecureTcpSession::new(
+            stream,
+            state.session_keys.send_key,
+            state.session_keys.recv_key,
+        ))),
+        transcript_hash_hex: state.transcript_hash_hex.clone(),
+    };
+    if let Some(shroud_profile) = lab.shroud_profile {
+        session = session.with_tcp_profile(ProfileTier::from_shroud_profile(shroud_profile))?;
+    }
+    if let Some(phantom_one_profile) = lab.phantom_one_profile {
+        session = session.with_phantom_one_generation_and_profile(
+            phantom_one_generation_from_transcript(&state.transcript_hash_hex)?,
+            phantom_one_profile,
+        )?;
+    }
+    Ok((session, state))
+}
+
+/// Connect an authenticated SHPH TCP session through a fixed, pinned onion
+/// path. The route remains fail-closed and does not retry the destination
+/// directly. This path is experimental and requires operator-managed relays.
+pub fn connect_secure_session_onion(
+    path: onion::OnionPath,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout: Duration,
+    lab: QuicLabConfig,
+    profile: HandshakeProfile,
+) -> Result<(SecureSession, HandshakeState)> {
+    validate_lab_profiles(
+        TransportMode::Tcp,
+        lab.shroud_profile,
+        lab.phantom_one_profile,
+    )?;
+    let stream = onion::connect_onion_bridge(path, timeout)?;
+    connect_secure_session_on_snap_stream(stream, local_identity, policy, timeout, lab, profile)
 }
 
 /// Per-peer-address connection-rate limiter for the unauthenticated entry path.
@@ -2754,6 +3293,40 @@ fn read_exact_or_closed_with_deadline(
     Ok(())
 }
 
+fn read_exact_or_closed_with_deadline_and_cancel(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        check_setup_cancellation(Some(cancelled))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ShphError::Timeout);
+        }
+        stream.set_read_timeout(Some(remaining.min(SOCKS_CANCEL_POLL_INTERVAL)))?;
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => return Err(ShphError::ConnectionClosed),
+            Ok(read) => filled += read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                check_setup_cancellation(Some(cancelled))?;
+                if Instant::now() >= deadline {
+                    return Err(ShphError::Timeout);
+                }
+            }
+            Err(error) => return Err(map_io_error(error)),
+        }
+    }
+    check_setup_cancellation(Some(cancelled))
+}
+
 fn refresh_deadline_timeout(stream: &TcpStream, deadline: Instant) -> Result<()> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -2811,6 +3384,7 @@ pub struct SecureTcpSession {
     phantom_one_encoder: Option<PhantomOneEncoder>,
     phantom_one_decoder: Option<PhantomOneDecoder>,
     frame_reader: TcpFrameReader,
+    _snap_bridge_lifecycle: Option<Arc<snap_adapter::SnapBridgeLifecycle>>,
 }
 
 impl SecureTcpSession {
@@ -2825,6 +3399,7 @@ impl SecureTcpSession {
             phantom_one_encoder: None,
             phantom_one_decoder: None,
             frame_reader: TcpFrameReader::default(),
+            _snap_bridge_lifecycle: None,
         }
     }
 
@@ -2863,6 +3438,7 @@ impl SecureTcpSession {
 
     pub fn into_split(self) -> Result<(SecureTcpSender, SecureTcpReceiver)> {
         let recv_stream = self.stream.try_clone().map_err(map_io_error)?;
+        let snap_bridge_lifecycle = self._snap_bridge_lifecycle;
         let sender = SecureTcpSender {
             stream: self.stream,
             send_cipher: self.send_cipher,
@@ -2870,6 +3446,7 @@ impl SecureTcpSession {
             padding_padder: self.padding_padder,
             padding_buffer: self.padding_buffer,
             phantom_one_encoder: self.phantom_one_encoder,
+            _snap_bridge_lifecycle: snap_bridge_lifecycle.clone(),
         };
         let receiver = SecureTcpReceiver {
             stream: recv_stream,
@@ -2877,6 +3454,7 @@ impl SecureTcpSession {
             padding_profile: self.padding_profile,
             phantom_one_decoder: self.phantom_one_decoder,
             frame_reader: self.frame_reader,
+            _snap_bridge_lifecycle: snap_bridge_lifecycle,
         };
         Ok((sender, receiver))
     }
@@ -2889,6 +3467,7 @@ pub struct SecureTcpSender {
     padding_padder: Option<ProfilePadder>,
     padding_buffer: Vec<u8>,
     phantom_one_encoder: Option<PhantomOneEncoder>,
+    _snap_bridge_lifecycle: Option<Arc<snap_adapter::SnapBridgeLifecycle>>,
 }
 
 impl SecureTcpSender {
@@ -2911,6 +3490,7 @@ pub struct SecureTcpReceiver {
     padding_profile: Option<ProfileTier>,
     phantom_one_decoder: Option<PhantomOneDecoder>,
     frame_reader: TcpFrameReader,
+    _snap_bridge_lifecycle: Option<Arc<snap_adapter::SnapBridgeLifecycle>>,
 }
 
 impl SecureTcpReceiver {
@@ -3034,15 +3614,33 @@ pub fn quic_handshake_client_with_profile(
     timeout_secs: u64,
     profile: HandshakeProfile,
 ) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
-    let timeout_secs = bounded_quic_timeout_secs(timeout_secs);
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    quic_handshake_client_with_profile_timeout(
+        peer,
+        local_identity,
+        policy,
+        Duration::from_secs(bounded_quic_timeout_secs(timeout_secs)),
+        profile,
+    )
+}
+
+pub fn quic_handshake_client_with_profile_timeout(
+    peer: &str,
+    local_identity: &IdentityKeyPair,
+    policy: &PeerPolicy,
+    timeout: Duration,
+    profile: HandshakeProfile,
+) -> Result<(UdpSocket, SocketAddr, HandshakeState)> {
+    let timeout = timeout
+        .max(Duration::from_millis(1))
+        .min(Duration::from_secs(MAX_QUIC_IDLE_TIMEOUT_SECS));
+    let deadline = Instant::now() + timeout;
     let peer_addr = parse_socket_addr(peer, deadline)?;
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| ShphError::Transport(e.to_string()))?;
     socket
-        .set_read_timeout(Some(Duration::from_secs(timeout_secs)))
+        .set_read_timeout(Some(timeout))
         .map_err(ShphError::Io)?;
     socket
-        .set_write_timeout(Some(Duration::from_secs(timeout_secs)))
+        .set_write_timeout(Some(timeout))
         .map_err(ShphError::Io)?;
 
     let material = build_hello_with_profile(local_identity, profile)?;
@@ -3882,6 +4480,40 @@ fn write_tcp_all_or_closed_with_deadline(
     Ok(())
 }
 
+fn write_tcp_all_or_closed_with_deadline_and_cancel(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    let mut written = 0;
+    while written < payload.len() {
+        check_setup_cancellation(Some(cancelled))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ShphError::Timeout);
+        }
+        stream.set_write_timeout(Some(remaining.min(SOCKS_CANCEL_POLL_INTERVAL)))?;
+        match stream.write(&payload[written..]) {
+            Ok(0) => return Err(ShphError::ConnectionClosed),
+            Ok(count) => written += count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                check_setup_cancellation(Some(cancelled))?;
+                if Instant::now() >= deadline {
+                    return Err(ShphError::Timeout);
+                }
+            }
+            Err(error) => return Err(map_io_error(error)),
+        }
+    }
+    check_setup_cancellation(Some(cancelled))
+}
+
 struct OfflineMeshSession {
     send_state: OfflineMeshWriteState,
     recv_state: OfflineMeshReadState,
@@ -4553,12 +5185,12 @@ struct DataMuleReadState {
     inbox_dir: String,
     local_node: String,
     peer_filter: Option<String>,
+    pending_candidates: VecDeque<DataMuleCandidate>,
     poll_interval: Duration,
     seen_envelopes: HashSet<String>,
     seen_order: VecDeque<String>,
     max_seen: usize,
     max_file_bytes: u64,
-    max_total_bytes: u64,
     max_age_ms: u64,
 }
 
@@ -4569,6 +5201,7 @@ impl DataMuleReadState {
             inbox_dir: cfg.inbox_dir.clone(),
             local_node: local_node.to_string(),
             peer_filter: peer_filter.map(std::string::ToString::to_string),
+            pending_candidates: VecDeque::new(),
             poll_interval: Duration::from_millis(
                 cfg.poll_interval_ms.clamp(1, MAX_ADAPTER_POLL_INTERVAL_MS),
             ),
@@ -4576,9 +5209,6 @@ impl DataMuleReadState {
             seen_order: VecDeque::new(),
             max_seen: 1024,
             max_file_bytes,
-            max_total_bytes: cfg
-                .max_total_bytes
-                .clamp(max_file_bytes, MAX_DATA_MULE_TOTAL_BYTES),
             max_age_ms: cfg.max_age_ms.clamp(1, MAX_DATA_MULE_AGE_MS),
         }
     }
@@ -4640,6 +5270,8 @@ impl DataMuleReadState {
         self.commit_envelope(&frame)?;
         if self.peer_filter.is_none() {
             self.peer_filter = Some(peer_node.clone());
+            self.pending_candidates
+                .retain(|candidate| candidate.from_node == peer_node);
         }
         Ok((peer_hello, peer_node))
     }
@@ -4699,32 +5331,42 @@ impl DataMuleReadState {
     }
 
     fn poll_envelope(&mut self) -> Result<Option<DataMuleEnvelopeFrame>> {
-        let root = Path::new(&self.inbox_dir);
-        let mut candidates = Vec::new();
-        let now = now_unix_ms()?;
-        let mut scan = DataMuleScanContext::new(self.max_file_bytes, self.max_age_ms, now);
-        collect_shph_files(root, &mut candidates, 0, &mut scan)?;
-        trim_data_mule_candidates_to_quota(&mut candidates, self.max_total_bytes);
-
-        candidates.retain(|candidate: &DataMuleCandidate| {
-            candidate.to_node == self.local_node
-                && self
-                    .peer_filter
-                    .as_ref()
-                    .is_none_or(|peer| peer == &candidate.from_node)
-                && !self.seen_envelopes.contains(&format!(
-                    "{}\0{}",
-                    candidate.from_node, candidate.envelope_id
-                ))
-        });
-
-        if candidates.is_empty() {
-            return Ok(None);
+        if self.pending_candidates.is_empty() {
+            let inbox_root = Path::new(&self.inbox_dir);
+            ensure_no_reparse_components(inbox_root).map_err(ShphError::Io)?;
+            let inbox_metadata = match fs::symlink_metadata(inbox_root) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(ShphError::Io(error)),
+            };
+            if !inbox_metadata.is_dir() {
+                return Err(ShphError::Protocol(
+                    "data-mule inbox root is not a directory".into(),
+                ));
+            }
+            let recipient_inbox = inbox_root.join(safe_path_component(&self.local_node));
+            let mut candidates = Vec::new();
+            let now = now_unix_ms()?;
+            let mut scan = DataMuleScanContext::new(self.max_file_bytes, self.max_age_ms, now);
+            collect_shph_files(&recipient_inbox, &mut candidates, 0, &mut scan)?;
+            candidates.retain(|candidate: &DataMuleCandidate| {
+                candidate.to_node == self.local_node
+                    && self
+                        .peer_filter
+                        .as_ref()
+                        .is_none_or(|peer| peer == &candidate.from_node)
+                    && !self.seen_envelopes.contains(&format!(
+                        "{}\0{}",
+                        candidate.from_node, candidate.envelope_id
+                    ))
+            });
+            candidates.sort_by_key(|candidate| {
+                (candidate.created_at_unix_ms, candidate.envelope_id.clone())
+            });
+            self.pending_candidates = candidates.into();
         }
 
-        candidates
-            .sort_by_key(|candidate| (candidate.created_at_unix_ms, candidate.envelope_id.clone()));
-        for candidate in candidates {
+        while let Some(candidate) = self.pending_candidates.pop_front() {
             let Some(claimed) = claim_file(&candidate.path).map_err(ShphError::Io)? else {
                 continue;
             };
@@ -4929,7 +5571,8 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -5181,6 +5824,262 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         super::socks5_connect(&mut stream, "example.test:443", deadline).expect("SOCKS5 CONNECT");
         proxy.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn tor_underlay_uses_fresh_auth_and_forwards_onion_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Tor SOCKS listener");
+        let proxy_address = listener.local_addr().expect("Tor SOCKS address");
+        let proxy = thread::spawn(move || {
+            let mut credentials = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept Tor SOCKS client");
+                let mut greeting = [0u8; 3];
+                stream.read_exact(&mut greeting).expect("read Tor greeting");
+                assert_eq!(greeting, [5, 1, 2]);
+                stream
+                    .write_all(&[5, 2])
+                    .expect("select username/password auth");
+
+                let mut auth_header = [0u8; 2];
+                stream
+                    .read_exact(&mut auth_header)
+                    .expect("read SOCKS auth header");
+                assert_eq!(auth_header, [1, 16]);
+                let mut username = vec![0u8; auth_header[1] as usize];
+                stream
+                    .read_exact(&mut username)
+                    .expect("read SOCKS username");
+                let mut password_len = [0u8; 1];
+                stream
+                    .read_exact(&mut password_len)
+                    .expect("read SOCKS password length");
+                assert_eq!(password_len[0], 16);
+                let mut password = vec![0u8; password_len[0] as usize];
+                stream
+                    .read_exact(&mut password)
+                    .expect("read SOCKS password");
+                stream.write_all(&[1, 0]).expect("accept SOCKS auth");
+                credentials.push((username, password));
+
+                let mut request_header = [0u8; 4];
+                stream
+                    .read_exact(&mut request_header)
+                    .expect("read onion CONNECT header");
+                assert_eq!(request_header, [5, 1, 0, 3]);
+                let mut hostname_len = [0u8; 1];
+                stream
+                    .read_exact(&mut hostname_len)
+                    .expect("read onion hostname length");
+                let mut hostname = vec![0u8; hostname_len[0] as usize];
+                stream
+                    .read_exact(&mut hostname)
+                    .expect("read onion hostname");
+                assert_eq!(hostname, b"service-test.onion");
+                let mut port = [0u8; 2];
+                stream
+                    .read_exact(&mut port)
+                    .expect("read onion destination port");
+                assert_eq!(u16::from_be_bytes(port), 443);
+                stream
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                    .expect("write SOCKS success response");
+            }
+            credentials
+        });
+
+        let underlay = TcpUnderlay::Tor {
+            proxy: proxy_address.to_string(),
+        };
+        for _ in 0..2 {
+            let stream = super::connect_tcp_via_underlay(
+                "service-test.onion:443",
+                &underlay,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("connect through Tor SOCKS");
+            drop(stream);
+        }
+        let credentials = proxy.join().expect("Tor SOCKS thread");
+        assert_eq!(credentials.len(), 2);
+        assert_ne!(credentials[0], credentials[1]);
+    }
+
+    #[test]
+    fn tor_underlay_failure_closes_and_never_connects_directly() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").expect("bind Tor SOCKS listener");
+        let proxy_address = proxy_listener.local_addr().expect("Tor SOCKS address");
+        let peer_listener = TcpListener::bind("127.0.0.1:0").expect("bind peer sentinel");
+        peer_listener
+            .set_nonblocking(true)
+            .expect("set peer sentinel nonblocking");
+        let proxy = thread::spawn(move || {
+            let (mut stream, _) = proxy_listener.accept().expect("accept Tor SOCKS client");
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).expect("read Tor greeting");
+            assert_eq!(greeting, [5, 1, 2]);
+            stream
+                .write_all(&[5, 0])
+                .expect("reject required username/password auth");
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                result => panic!("expected client close, got {result:?}"),
+            }
+        });
+
+        let underlay = TcpUnderlay::Tor {
+            proxy: proxy_address.to_string(),
+        };
+        let result = super::connect_tcp_via_underlay(
+            &peer_listener
+                .local_addr()
+                .expect("peer sentinel address")
+                .to_string(),
+            &underlay,
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(matches!(result, Err(ShphError::Transport(_))));
+        proxy.join().expect("Tor SOCKS thread");
+        assert!(matches!(
+            peer_listener.accept(),
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn tor_underlay_proxy_setup_obeys_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled Tor SOCKS listener");
+        let proxy_address = listener.local_addr().expect("Tor SOCKS address");
+        let proxy = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept Tor SOCKS client");
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).expect("read Tor greeting");
+            assert_eq!(greeting, [5, 1, 2]);
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                result => panic!("expected client close, got {result:?}"),
+            }
+        });
+
+        let underlay = TcpUnderlay::Tor {
+            proxy: proxy_address.to_string(),
+        };
+        let started = Instant::now();
+        let result = super::connect_tcp_via_underlay(
+            "service-test.onion:443",
+            &underlay,
+            started + Duration::from_millis(250),
+        );
+        assert!(matches!(result, Err(ShphError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        proxy.join().expect("stalled Tor SOCKS thread");
+    }
+
+    #[test]
+    fn tor_underlay_setup_honors_preexisting_cancellation() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").expect("bind Tor SOCKS listener");
+        proxy_listener
+            .set_nonblocking(true)
+            .expect("set Tor listener nonblocking");
+        let proxy_address = proxy_listener.local_addr().expect("Tor SOCKS address");
+        let underlay = TcpUnderlay::Tor {
+            proxy: proxy_address.to_string(),
+        };
+        let cancellation = AtomicBool::new(true);
+        let cancelled = || cancellation.load(Ordering::Acquire);
+
+        let result = super::connect_tcp_via_underlay_inner(
+            "service-test.onion:443",
+            &underlay,
+            Instant::now() + Duration::from_secs(2),
+            Some(&cancelled),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ShphError::Transport(message)) if message == "SOCKS5 setup cancelled"
+        ));
+        assert!(matches!(
+            proxy_listener.accept(),
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn tor_underlay_setup_cancellation_closes_proxy_without_direct_fallback() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").expect("bind Tor SOCKS listener");
+        let proxy_address = proxy_listener.local_addr().expect("Tor SOCKS address");
+        let peer_listener = TcpListener::bind("127.0.0.1:0").expect("bind peer sentinel");
+        peer_listener
+            .set_nonblocking(true)
+            .expect("set peer sentinel nonblocking");
+        let (stalled_sender, stalled_receiver) = mpsc::channel();
+        let proxy = thread::spawn(move || {
+            let (mut stream, _) = proxy_listener.accept().expect("accept Tor SOCKS client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set mock read timeout");
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).expect("read Tor greeting");
+            assert_eq!(greeting, [5, 1, 2]);
+            stream
+                .write_all(&[5, 2])
+                .expect("select username/password auth");
+            let mut authentication = [0u8; 35];
+            stream
+                .read_exact(&mut authentication)
+                .expect("read SOCKS auth");
+            assert_eq!(&authentication[..2], &[1, 16]);
+            assert_eq!(authentication[18], 16);
+            stalled_sender.send(()).expect("notify stalled setup");
+
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                result => panic!("expected client close after cancellation, got {result:?}"),
+            }
+        });
+
+        let underlay = TcpUnderlay::Tor {
+            proxy: proxy_address.to_string(),
+        };
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let connector_cancellation = Arc::clone(&cancellation);
+        let peer = peer_listener
+            .local_addr()
+            .expect("peer sentinel address")
+            .to_string();
+        let connector = thread::spawn(move || {
+            let cancelled = || connector_cancellation.load(Ordering::Acquire);
+            super::connect_tcp_via_underlay_inner(
+                &peer,
+                &underlay,
+                Instant::now() + Duration::from_secs(5),
+                Some(&cancelled),
+            )
+        });
+
+        stalled_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy reached stalled authentication response");
+        let cancellation_started = Instant::now();
+        cancellation.store(true, Ordering::Release);
+        let result = connector.join().expect("connector thread");
+        assert!(matches!(
+            result,
+            Err(ShphError::Transport(message)) if message == "SOCKS5 setup cancelled"
+        ));
+        assert!(cancellation_started.elapsed() < Duration::from_secs(1));
+        proxy.join().expect("Tor SOCKS mock thread");
+        assert!(matches!(
+            peer_listener.accept(),
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
@@ -6396,8 +7295,10 @@ mod tests {
             TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
-        let bad = root.join("a.shph");
-        let good = root.join("b.shph");
+        let recipient_inbox = root.join(super::safe_path_component("local"));
+        fs::create_dir_all(&recipient_inbox).unwrap();
+        let bad = recipient_inbox.join("a.shph");
+        let good = recipient_inbox.join("b.shph");
         let now = super::now_unix_ms().unwrap();
         let bad_envelope = serde_json::json!({
             "envelope_id": "a",
@@ -6437,6 +7338,190 @@ mod tests {
     }
 
     #[test]
+    fn data_mule_quota_ignores_other_peers_without_quarantining_them() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-peer-quota-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let recipient_inbox = root.join(super::safe_path_component("local"));
+        fs::create_dir_all(&recipient_inbox).unwrap();
+        let now = super::now_unix_ms().unwrap();
+        let legitimate = recipient_inbox.join("legitimate.shph");
+        let unrelated = recipient_inbox.join("unrelated.shph");
+        let legitimate_bytes = serde_json::to_vec(&serde_json::json!({
+            "envelope_id": "legitimate",
+            "created_at_unix_ms": now.saturating_sub(1_000),
+            "from_node": "peer",
+            "to_node": "local",
+            "ciphertext_b64": "AQ==",
+            "nonce_b64": "AQ=="
+        }))
+        .unwrap();
+        let unrelated_bytes = serde_json::to_vec(&serde_json::json!({
+            "envelope_id": "unrelated",
+            "created_at_unix_ms": now.saturating_sub(500),
+            "from_node": "other-peer",
+            "to_node": "local",
+            "ciphertext_b64": "AQ==",
+            "nonce_b64": "AQ=="
+        }))
+        .unwrap();
+        let quota = legitimate_bytes.len() as u64;
+        fs::write(&legitimate, legitimate_bytes).unwrap();
+        fs::write(&unrelated, unrelated_bytes).unwrap();
+
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.join("out").to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 256,
+            max_total_bytes: quota,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
+        };
+        let mut state = super::DataMuleReadState::new(&cfg, "local", Some("peer"));
+        let frame = state
+            .poll_envelope()
+            .expect("scan")
+            .expect("eligible message remains deliverable");
+
+        assert_eq!(frame.envelope.envelope_id, "legitimate");
+        assert!(unrelated.exists());
+        assert!(!unrelated.with_extension("rejected").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_ignores_unrelated_recipient_spool_above_scan_budget() {
+        let root = test_root("shph-mule-recipient-scan-budget");
+        let unrelated_inbox = root.join(super::safe_path_component("unrelated-recipient"));
+        let recipient_inbox = root.join(super::safe_path_component("local"));
+        fs::create_dir_all(&unrelated_inbox).unwrap();
+        fs::create_dir_all(&recipient_inbox).unwrap();
+
+        let now = super::now_unix_ms().unwrap();
+        let large_bytes = serde_json::to_vec(&serde_json::json!({
+            "envelope_id": "unrelated-entry",
+            "created_at_unix_ms": now,
+            "from_node": "peer",
+            "to_node": "unrelated-recipient",
+            "ciphertext_b64": "A".repeat(250_000),
+            "nonce_b64": "AA=="
+        }))
+        .unwrap();
+        let max_file_bytes = 256 * 1024;
+        assert!(large_bytes.len() <= max_file_bytes);
+        let unrelated_count = super::MAX_QUEUE_SCAN_BYTES / large_bytes.len() as u64 + 1;
+        assert!(unrelated_count * large_bytes.len() as u64 > super::MAX_QUEUE_SCAN_BYTES);
+        for index in 0..unrelated_count {
+            fs::write(
+                unrelated_inbox.join(format!("unrelated-{index}.shph")),
+                &large_bytes,
+            )
+            .unwrap();
+        }
+
+        let local_bytes = serde_json::to_vec(&serde_json::json!({
+            "envelope_id": "local-delivery",
+            "created_at_unix_ms": now,
+            "from_node": "peer",
+            "to_node": "local",
+            "ciphertext_b64": "AQ==",
+            "nonce_b64": "AQ=="
+        }))
+        .unwrap();
+        fs::write(recipient_inbox.join("local-delivery.shph"), local_bytes).unwrap();
+
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.join("out").to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: max_file_bytes as u64,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
+        };
+        let mut state = super::DataMuleReadState::new(&cfg, "local", Some("peer"));
+        let frame = state
+            .poll_envelope()
+            .expect("scan local recipient inbox")
+            .expect("local delivery remains available");
+
+        assert_eq!(frame.envelope.envelope_id, "local-delivery");
+        assert_eq!(
+            fs::read_dir(&unrelated_inbox).unwrap().count() as u64,
+            unrelated_count
+        );
+        assert!(unrelated_inbox.read_dir().unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("rejected")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_spoofed_over_quota_entry_does_not_block_authenticated_delivery() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-over-quota-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let recipient_inbox = root.join(super::safe_path_component("local"));
+        fs::create_dir_all(&recipient_inbox).unwrap();
+        let now = super::now_unix_ms().unwrap();
+        let spoofed = recipient_inbox.join("spoofed.shph");
+        let authenticated = recipient_inbox.join("authenticated.shph");
+        let spoofed_bytes = serde_json::to_vec(&serde_json::json!({
+            "envelope_id": "a-spoofed",
+            "created_at_unix_ms": now.saturating_sub(1),
+            "from_node": "peer",
+            "to_node": "local",
+            "ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(b"forged"),
+            "nonce_b64": "AAAAAAAAAAA="
+        }))
+        .unwrap();
+        let mut sender = SendCipher::new([0x74; 32]);
+        let ciphertext = sender.encrypt(b"authenticated delivery").unwrap();
+        let authenticated_bytes = serde_json::to_vec(&serde_json::json!({
+            "envelope_id": "b-authenticated",
+            "created_at_unix_ms": now,
+            "from_node": "peer",
+            "to_node": "local",
+            "ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(ciphertext),
+            "nonce_b64": "AAAAAAAAAAA="
+        }))
+        .unwrap();
+        assert!(spoofed_bytes.len() <= 256);
+        assert!(authenticated_bytes.len() <= 256);
+        assert!(spoofed_bytes.len() + authenticated_bytes.len() > 256);
+        fs::write(&spoofed, spoofed_bytes).unwrap();
+        fs::write(&authenticated, authenticated_bytes).unwrap();
+
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.join("out").to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 256,
+            max_total_bytes: 256,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
+        };
+        let mut state = super::DataMuleReadState::new(&cfg, "local", Some("peer"));
+        let mut receiver = ReceiveCipher::new([0x74; 32]);
+
+        assert_eq!(
+            state
+                .receive_decrypted_frame(&mut receiver, Duration::from_secs(1))
+                .unwrap(),
+            b"authenticated delivery"
+        );
+        assert!(spoofed.with_extension("rejected").exists());
+        assert!(!authenticated.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn data_mule_scan_quarantines_expired_files() {
         let root = std::env::temp_dir().join(format!(
             "shph-mule-expiry-{}-{}",
@@ -6444,7 +7529,9 @@ mod tests {
             TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
-        let stale = root.join("stale.shph");
+        let recipient_inbox = root.join(super::safe_path_component("local"));
+        fs::create_dir_all(&recipient_inbox).unwrap();
+        let stale = recipient_inbox.join("stale.shph");
         let now = super::now_unix_ms().unwrap();
         let envelope = serde_json::json!({
             "envelope_id": "stale",
@@ -6467,7 +7554,7 @@ mod tests {
         let mut state = DataMuleReadState::new(&cfg, "local", Some("peer"));
         assert!(state.poll_envelope().expect("scan").is_none());
         assert!(!stale.exists());
-        assert!(root.join("stale.rejected").exists());
+        assert!(recipient_inbox.join("stale.rejected").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6479,7 +7566,9 @@ mod tests {
             TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
-        let future = root.join("future.shph");
+        let recipient_inbox = root.join(super::safe_path_component("local"));
+        fs::create_dir_all(&recipient_inbox).unwrap();
+        let future = recipient_inbox.join("future.shph");
         let now = super::now_unix_ms().unwrap();
         let envelope = serde_json::json!({
             "envelope_id": "future",
@@ -6502,7 +7591,7 @@ mod tests {
         let mut state = DataMuleReadState::new(&cfg, "local", Some("peer"));
         assert!(state.poll_envelope().expect("scan").is_none());
         assert!(!future.exists());
-        assert!(root.join("future.rejected").exists());
+        assert!(recipient_inbox.join("future.rejected").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6670,6 +7759,54 @@ mod tests {
             &PeerPolicy::single(PeerPin::for_identity(&peer)),
         );
         assert!(matches!(result, Err(shph_core::ShphError::Auth(_))));
+
+        let local_dir = root.join(super::safe_path_component(&local.public_key_b64()));
+        let names: Vec<String> = fs::read_dir(local_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.contains(".rejected")));
+        assert!(names.iter().all(|name| !name.contains(".processing")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_mule_pinned_sender_with_wrong_signed_hello_is_terminal() {
+        let root = std::env::temp_dir().join(format!(
+            "shph-mule-pinned-identity-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let cfg = DataMuleConfig {
+            inbox_dir: root.to_string_lossy().into_owned(),
+            outbox_dir: root.to_string_lossy().into_owned(),
+            poll_interval_ms: 1,
+            max_file_bytes: 64 * 1024,
+            max_total_bytes: 8 * 1024 * 1024,
+            max_age_ms: MAX_DATA_MULE_AGE_MS,
+        };
+        let local = IdentityKeyPair::generate().unwrap();
+        let pinned = IdentityKeyPair::generate().unwrap();
+        let wrong = IdentityKeyPair::generate().unwrap();
+        let local_material =
+            super::build_hello_with_profile(&local, HandshakeProfile::SecureDefault).unwrap();
+        let wrong_material =
+            super::build_hello_with_profile(&wrong, HandshakeProfile::SecureDefault).unwrap();
+        let pinned_node = pinned.public_key_b64();
+        let mut writer = DataMuleWriteState::new(&cfg, &pinned_node, &local.public_key_b64());
+        writer
+            .send_payload(&serde_json::to_vec(&wrong_material.local_hello).unwrap())
+            .unwrap();
+
+        let mut reader = DataMuleReadState::new(&cfg, &local.public_key_b64(), Some(&pinned_node));
+        let result = reader.receive_verified_hello(
+            Duration::from_millis(100),
+            &local,
+            &local_material,
+            &PeerPolicy::single(PeerPin::for_identity(&pinned)),
+        );
+        assert!(matches!(result, Err(ShphError::Auth(_))));
 
         let local_dir = root.join(super::safe_path_component(&local.public_key_b64()));
         let names: Vec<String> = fs::read_dir(local_dir)

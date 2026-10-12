@@ -21,7 +21,8 @@ $targets = @(
     "audit_record",
     "replay_window",
     "shroud2_datagram",
-    "phantom_one_envelope"
+    "phantom_one_envelope",
+    "snap_profile"
 )
 
 $resolvedOutput = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {

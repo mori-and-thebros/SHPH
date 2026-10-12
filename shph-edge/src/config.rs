@@ -6,6 +6,8 @@ use thiserror::Error;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 pub const DEFAULT_RELAY_PATH: &str = "/phantom-one/v1";
 pub const MAX_RELAY_PATH_BYTES: usize = 128;
+pub const DEFAULT_REPLAY_CAPACITY: usize = 128 * 1024;
+pub const DEFAULT_HTTP2_IDLE_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +51,8 @@ pub struct Limits {
     pub max_connections: usize,
     #[serde(default = "default_replay_capacity")]
     pub replay_capacity: usize,
+    #[serde(default = "default_max_capability_verifications_per_second")]
+    pub max_capability_verifications_per_second: u64,
     #[serde(default = "default_max_lifetime")]
     pub max_capability_lifetime_secs: u64,
     #[serde(default = "default_clock_skew")]
@@ -59,6 +63,8 @@ pub struct Limits {
     pub backend_idle_timeout_ms: u64,
     #[serde(default = "default_tls_handshake_timeout")]
     pub tls_handshake_timeout_ms: u64,
+    #[serde(default = "default_http2_idle_timeout")]
+    pub http2_idle_timeout_ms: u64,
     #[serde(default = "default_max_streams_per_connection")]
     pub max_streams_per_connection: u32,
     #[serde(default = "default_max_http2_connections")]
@@ -72,11 +78,14 @@ impl Default for Limits {
             max_stream_bytes: default_max_body(),
             max_connections: default_max_connections(),
             replay_capacity: default_replay_capacity(),
+            max_capability_verifications_per_second:
+                default_max_capability_verifications_per_second(),
             max_capability_lifetime_secs: default_max_lifetime(),
             clock_skew_secs: default_clock_skew(),
             backend_connect_timeout_ms: default_connect_timeout(),
             backend_idle_timeout_ms: default_idle_timeout(),
             tls_handshake_timeout_ms: default_tls_handshake_timeout(),
+            http2_idle_timeout_ms: default_http2_idle_timeout(),
             max_streams_per_connection: default_max_streams_per_connection(),
             max_http2_connections: default_max_http2_connections(),
         }
@@ -93,7 +102,10 @@ fn default_max_connections() -> usize {
     1024
 }
 fn default_replay_capacity() -> usize {
-    16 * 1024
+    DEFAULT_REPLAY_CAPACITY
+}
+fn default_max_capability_verifications_per_second() -> u64 {
+    256
 }
 fn default_max_lifetime() -> u64 {
     300
@@ -110,6 +122,9 @@ fn default_idle_timeout() -> u64 {
 fn default_tls_handshake_timeout() -> u64 {
     5000
 }
+fn default_http2_idle_timeout() -> u64 {
+    DEFAULT_HTTP2_IDLE_TIMEOUT_MS
+}
 fn default_max_streams_per_connection() -> u32 {
     128
 }
@@ -119,16 +134,26 @@ fn default_max_http2_connections() -> usize {
 
 impl Limits {
     pub fn validate(&self) -> Result<(), EdgeConfigError> {
+        let replay_retention_secs = self
+            .max_capability_lifetime_secs
+            .saturating_add(self.clock_skew_secs.saturating_mul(2))
+            .saturating_add(1);
+        let minimum_replay_capacity = self
+            .max_capability_verifications_per_second
+            .saturating_mul(replay_retention_secs);
         if !(64..=4096).contains(&self.max_token_bytes)
             || self.max_stream_bytes == 0
             || self.max_stream_bytes > 1024 * 1024 * 1024
             || !(1..=100_000).contains(&self.max_connections)
             || !(1..=1_000_000).contains(&self.replay_capacity)
+            || !(1..=100_000).contains(&self.max_capability_verifications_per_second)
             || !(1..=3600).contains(&self.max_capability_lifetime_secs)
             || self.clock_skew_secs > 300
+            || (self.replay_capacity as u64) < minimum_replay_capacity
             || !(100..=60_000).contains(&self.backend_connect_timeout_ms)
             || !(100..=600_000).contains(&self.backend_idle_timeout_ms)
             || !(100..=60_000).contains(&self.tls_handshake_timeout_ms)
+            || !(100..=600_000).contains(&self.http2_idle_timeout_ms)
             || !(1..=1024).contains(&self.max_streams_per_connection)
             || !(1..=64).contains(&self.max_http2_connections)
         {
@@ -231,6 +256,10 @@ impl EdgeConfig {
     pub fn tls_handshake_timeout(&self) -> Duration {
         Duration::from_millis(self.limits.tls_handshake_timeout_ms)
     }
+
+    pub fn http2_idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.limits.http2_idle_timeout_ms)
+    }
 }
 
 fn default_relay_path() -> String {
@@ -293,6 +322,20 @@ mod tests {
     }
 
     #[test]
+    fn replay_capacity_covers_the_configured_rate_and_token_retention() {
+        let limits = Limits::default();
+        let required = limits.max_capability_verifications_per_second
+            * (limits.max_capability_lifetime_secs + 2 * limits.clock_skew_secs + 1);
+        assert!(limits.replay_capacity as u64 >= required);
+
+        let undersized = Limits {
+            replay_capacity: 16 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(undersized.validate(), Err(EdgeConfigError::InvalidLimits));
+    }
+
+    #[test]
     fn timeout_and_stream_limits_are_bounded() {
         for invalid in [
             Limits {
@@ -305,6 +348,14 @@ mod tests {
             },
             Limits {
                 tls_handshake_timeout_ms: 99,
+                ..Default::default()
+            },
+            Limits {
+                http2_idle_timeout_ms: 99,
+                ..Default::default()
+            },
+            Limits {
+                http2_idle_timeout_ms: 600_001,
                 ..Default::default()
             },
             Limits {
@@ -321,6 +372,14 @@ mod tests {
             },
             Limits {
                 max_http2_connections: 65,
+                ..Default::default()
+            },
+            Limits {
+                max_capability_verifications_per_second: 0,
+                ..Default::default()
+            },
+            Limits {
+                max_capability_verifications_per_second: 100_001,
                 ..Default::default()
             },
         ] {
