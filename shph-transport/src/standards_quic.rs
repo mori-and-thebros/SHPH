@@ -1441,7 +1441,7 @@ impl StandardsQuicConnection {
         &self,
         morphology: &mut crate::shroud3::AdaptiveShroud3,
         payload: &[u8],
-        observation: crate::shroud2::workload::WorkloadObservation,
+        observation: crate::shroud3::Shroud3Observation,
         pacer: &crate::pacing::DatagramPacer,
         enqueued_at: std::time::Instant,
         cancel: tokio::sync::watch::Receiver<bool>,
@@ -2294,14 +2294,12 @@ mod tests {
     async fn shroud3_adaptation_round_trips_over_authenticated_quic_and_rejects_s2() {
         let (client, client_connection, server_connection) =
             established_pair(HandshakeProfile::SecureDefault).await;
-        let mut morphology =
-            crate::shroud3::AdaptiveShroud3::new(crate::shroud2::workload::WorkloadConfig {
-                minimum_dwell: Duration::ZERO,
-                use_arrivals: false,
-                use_queue_age: false,
-                ..Default::default()
-            })
-            .expect("Shroud 3 engine");
+        let mut morphology = crate::shroud3::AdaptiveShroud3::new(crate::shroud3::Shroud3Config {
+            minimum_dwell: Duration::ZERO,
+            transition_confirmations: 1,
+            ..Default::default()
+        })
+        .expect("Shroud 3 engine");
         let pacer = crate::pacing::DatagramPacer::new(4, Duration::from_secs(2)).expect("pacer");
         let application_payload = b"adaptive Shroud 3 over authenticated QUIC";
         for index in 0..3 {
@@ -2310,7 +2308,7 @@ mod tests {
                 .send_shroud3_adaptive_datagram_paced(
                     &mut morphology,
                     application_payload,
-                    crate::shroud2::workload::WorkloadObservation {
+                    crate::shroud3::Shroud3Observation {
                         observed_at: Duration::from_millis(index),
                         queue_age: Duration::ZERO,
                     },

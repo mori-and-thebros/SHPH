@@ -153,10 +153,13 @@ claims. See `docs/SUPPORT_MATRIX.md` and `docs/RELEASE_READINESS.md`.
   outside the release profile.
 - Adaptive Shroud 3 is experimental and opt-in for Linux standards-QUIC
   native-TUN sessions through `host`, `join`, `up`, or
-  `session.shroud3_adaptive`. Both peers must configure it; Shroud 3 uses a
-  distinct `S3` v1 envelope without negotiation or format fallback. The code
-  has authenticated loopback bridge tests, but no native-TUN host
-  interoperability or full-session measurements.
+  `session.shroud3_adaptive`. Both peers must configure it; Shroud 3 has its
+  own bounded workload, size, padding, and pacing engine in the distinct `S3`
+  v1 envelope, without negotiation or format fallback. Synthetic in-memory
+  comparisons and authenticated loopback bridge tests do not establish
+  carrier-visible behavior, classifier improvement, native two-host
+  interoperability, or full-session costs. No traffic-resistance claim is
+  made.
 - Native multi-hop onion routing is an experimental transport API with a
   separate `shph-onion-relay` process. It carries SHPH sessions through two
   or three explicitly pinned TLS relays with fixed target allowlists. It has

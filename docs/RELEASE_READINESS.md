@@ -115,6 +115,22 @@ sessions; both peers must select it. Its authenticated loopback bridge-framing
 test does not open a host TUN or establish two-host interoperability. It is not
 part of the default release behavior.
 
+The current Shroud 3 implementation has an independent bounded workload and
+joint size/delay engine; it does not reuse Shroud 2's encoder or size classes.
+The local benchmark compares synthetic Shroud 2 and Shroud 3 workloads and has
+a separate benchmark-only cover-policy arm. Those runs measure in-memory
+envelopes, not carrier packet captures. No authorized representative captures
+are available, so capture fitting and held-out passive-classifier effectiveness
+are **BLOCKED**. Active-probe evaluation for the `shph-edge` front door is a
+separate evidence lane; loopback probes do not close an owned-host campaign.
+
+The local HTTP/2 regression test compares identical denial status, content
+type, and body for missing, invalid, expired, and replayed capabilities. It
+also confirms the connection remains usable and that the backend sees only the
+authorized first use. The updated operator probe summarizes the replay denial
+response and timing. No run of that operator probe against a live edge was
+recorded for this change; live service and owned-host campaigns remain open.
+
 On Linux systems that permit user/network namespaces and expose `/dev/net/tun`,
 [`validate_shroud3_tun_namespace.sh`](../scripts/validate_shroud3_tun_namespace.sh)
 adds a real packet-path check for the experimental Shroud 3 bridge. It starts

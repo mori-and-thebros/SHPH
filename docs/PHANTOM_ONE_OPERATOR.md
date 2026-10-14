@@ -95,10 +95,12 @@ shph send-once --peer 127.0.0.1:7000 --text 'authorized test' --transport tcp --
 
 ## Local active-probe baseline
 
-`scripts/edge_active_probe.py` records bounded HTTP/2 response status, body
-length/hash, timing, incomplete TLS-handshake behavior, and TCP connection
-churn for an operator-owned edge. Install a `curl` build with HTTP/2 support,
-then expose the owned service locally or through an SSH tunnel:
+`scripts/edge_active_probe.py` records bounded per-case HTTP/2 status, body
+length/hash, first-byte and total timing, incomplete TLS and HTTP/2 frame
+behavior, malformed HTTP/2 handling, and TCP connection churn for an
+operator-owned edge. Its summary groups outcomes, statuses, body sizes,
+content hashes, and timing ranges by probe. Install a `curl` build with HTTP/2
+support, then expose the owned service locally or through an SSH tunnel:
 
 ```text
 python3 scripts/edge_active_probe.py \
@@ -114,12 +116,16 @@ The harness pins connections to `127.0.0.1`; it does not resolve or probe a
 remote address. Optional expired-token and invalid-signature cases use
 operator-supplied token files. `--probe-replay` additionally requires
 `--allow-token-consumption`; the first request uses a valid capability and may
-reach the configured backend. Response bodies are never printed, and the
-authorized probe discards response bodies rather than storing them. The report
-does not prove indistinguishability or backend isolation: monitor the owned
-backend separately, and treat cache-capacity and live-host campaigns as
-additional gates. The probe disables ambient curl configuration and proxy
-environment routing before making its loopback-pinned requests.
+reach the configured backend. The first-use response body is discarded. The
+replay denial body is summarized by status, size, hash, and timing; raw bodies
+are not printed or included in the report. A local HTTP/2 test compares denial
+responses for missing, invalid, expired, and replayed capabilities, checks
+that the connection stays usable, and confirms only the authorized first use
+reaches the backend. The script still requires an operator backend counter for
+a service campaign. Its report does not prove indistinguishability: cache
+capacity and live-host campaigns remain separate gates. The probe disables
+ambient curl configuration and proxy environment routing before making its
+loopback-pinned requests.
 
 ## Edge prototype
 

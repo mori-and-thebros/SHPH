@@ -1,12 +1,21 @@
-# Adaptive Shroud 3 Linux CLI/TUN and Lab API
+# Shroud 3 Morphology Engine
 
 Status: **experimental implementation; not release validated**.
 
-Shroud 3 is a distinct, opt-in envelope for adaptive morphology over an already
-authenticated standards-QUIC connection. It reuses the bounded caller-driven
-workload policy introduced with Shroud 2, while changing the wire marker to
-`S3` version `1`. Shroud 2 remains unchanged and remains the default when no
+Shroud 3 is an opt-in morphology engine for datagrams inside an already
+authenticated standards-QUIC connection. It has its own configuration,
+workload state, rolling observation window, size selection, padding, pacing
+delay, and metrics. It does not call the Shroud 2 encoder or reuse Shroud 2
+size classes. Shroud 2 remains unchanged and remains the default when no
 morphology API is selected.
+
+The engine selects among interactive, bursty, sustained, and queue-pressure
+states using payload lengths, caller-supplied arrival times, burst density,
+and queue age. Each state has a bounded weighted profile that samples a target
+size and pacing delay together. The production constructor uses OS-seeded
+randomness. Default profiles are engineering parameters; they have not been
+fit to representative captures. This implementation has no measured passive
+classifier results and makes no claim of improved traffic resistance.
 
 ## Rust API
 
@@ -15,12 +24,12 @@ session-relative monotonic clock and queue-age observations used by the
 application scheduler:
 
 ```rust,ignore
-let mut morphology = AdaptiveShroud3::new(WorkloadConfig::default())?;
+let mut morphology = AdaptiveShroud3::new(Shroud3Config::default())?;
 connection
     .send_shroud3_adaptive_datagram_paced(
         &mut morphology,
         payload,
-        WorkloadObservation {
+        Shroud3Observation {
             observed_at: session_elapsed,
             queue_age: enqueue_age,
         },
@@ -32,12 +41,17 @@ connection
 let payload = peer_connection.recv_shroud3_datagram().await?;
 ```
 
-The sender uses OS-seeded randomness by default. `from_seed` is for deterministic
-tests and reproducible lab work; it is not suitable for emitting production
-padding. The API does not infer application identity, inspect payload content,
+The sender and benchmark use OS-seeded randomness. `from_seed` is compiled
+only for unit tests; ordinary and benchmark builds expose only the OS-seeded
+constructor. The API does not infer application identity, inspect payload
+content,
 or create a hidden observation clock. Callers must configure both peers to use
 the Shroud 3 decoder. A Shroud 2 frame, unknown version, invalid length, or
 invalid workload observation is rejected. There is no implicit format downgrade.
+
+The engine keeps a fixed 16-observation window. Padding is limited to 4,096
+bytes, path datagrams to the 16-bit framing limit, and shaping delay to 100 ms.
+The per-session configuration applies lower limits by default.
 
 ## CLI and saved session configuration
 
@@ -81,6 +95,12 @@ startup, even if `--no-tun` was omitted.
   bridge framing, pacing, and authenticated QUIC code paths. The loopback test
   does not open a host TUN or establish two-host interoperability, full-session
   performance, traffic-analysis resistance, or release support.
+- The benchmark suite compares synthetic Shroud 2 and Shroud 3 workloads and
+  includes a separate benchmark-only cover-policy arm using Phantom One
+  keepalive framing. That composition is not a production Shroud 3 cover path.
+  In-memory envelope sizes are not carrier captures; QUIC packet headers,
+  packet timing, CPU cost under network load, and classifier outcomes require
+  separate measurement.
 - `scripts/validate_shroud3_tun_namespace.sh` exercises one UDP echo packet
   through two real TUN devices in separate nested network namespaces over a
   veth underlay, then checks process and control-plane cleanup. Its WSL2 result

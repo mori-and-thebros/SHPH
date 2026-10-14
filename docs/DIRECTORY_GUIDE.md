@@ -12,8 +12,8 @@ This file maps the repository layout and the main public validation artifacts.
 - `shph-config/`: config model and parser.
 - `shph-core/`: handshake, framing, transport negotiation primitives.
 - `shph-obfuscation/`: protocol-shaping extension surface.
-- `shph-transport/`: transport APIs; `src/shroud3.rs` contains the opt-in
-  adaptive Shroud 3 envelope, and `src/onion.rs` plus
+- `shph-transport/`: transport APIs; `src/shroud3.rs` contains the independent
+  opt-in Shroud 3 morphology engine, and `src/onion.rs` plus
   `src/bin/shph-onion-relay.rs` contain the experimental multihop circuit and
   operator relay process.
 - `shph-edge/`: standalone owned-domain Phantom One HTTP/2 relay prototype;

@@ -154,7 +154,7 @@ async fn shroud3_tun_to_quic_loop(
     let pacer = crate::pacing::DatagramPacer::new(64, std::time::Duration::from_secs(1))?;
     let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
     let mut morphology =
-        crate::shroud3::AdaptiveShroud3::new(crate::shroud2::workload::WorkloadConfig::default())?;
+        crate::shroud3::AdaptiveShroud3::new(crate::shroud3::Shroud3Config::default())?;
 
     loop {
         tokio::select! {
@@ -167,7 +167,7 @@ async fn shroud3_tun_to_quic_loop(
                             return Ok(stats);
                         }
                         let enqueued_at = std::time::Instant::now();
-                        let observation = crate::shroud2::workload::WorkloadObservation {
+                        let observation = crate::shroud3::Shroud3Observation {
                             observed_at: session_started.elapsed(),
                             // TUN reads are handed directly to the bounded pacer;
                             // there is no application queue before this timestamp.
@@ -244,7 +244,7 @@ fn encode_shroud3_tun_datagram(
     morphology: &mut crate::shroud3::AdaptiveShroud3,
     packet: &[u8],
     path_mtu: usize,
-    observation: crate::shroud2::workload::WorkloadObservation,
+    observation: crate::shroud3::Shroud3Observation,
 ) -> Result<Option<Zeroizing<Vec<u8>>>> {
     if packet.len() > shph_tun::MAX_TUN_PACKET_BYTES
         || packet
@@ -567,8 +567,7 @@ mod tests {
         decode_shroud3_tun_datagram, encode_shroud3_tun_datagram, is_invalid_tun_datagram,
         is_oversized_tun_datagram, StandardsTunBridgeConfig, StandardsTunBridgeStats,
     };
-    use crate::shroud2::workload::{WorkloadConfig, WorkloadObservation};
-    use crate::shroud3::AdaptiveShroud3;
+    use crate::shroud3::{AdaptiveShroud3, Shroud3Config, Shroud3Observation};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -641,11 +640,10 @@ mod tests {
 
     fn shroud3_engine() -> AdaptiveShroud3 {
         AdaptiveShroud3::from_seed(
-            WorkloadConfig {
+            Shroud3Config {
                 minimum_dwell: Duration::ZERO,
-                use_arrivals: false,
-                use_queue_age: false,
-                ..WorkloadConfig::default()
+                transition_confirmations: 1,
+                ..Shroud3Config::default()
             },
             0x5348_5244,
         )
@@ -660,7 +658,7 @@ mod tests {
             &mut morphology,
             &packet,
             1472,
-            WorkloadObservation {
+            Shroud3Observation {
                 observed_at: Duration::from_millis(1),
                 queue_age: Duration::ZERO,
             },
@@ -679,7 +677,7 @@ mod tests {
             .encode(
                 b"not an IP packet",
                 1472,
-                WorkloadObservation {
+                Shroud3Observation {
                     observed_at: Duration::from_millis(2),
                     queue_age: Duration::ZERO,
                 },
@@ -693,7 +691,7 @@ mod tests {
             &mut morphology,
             &vec![0u8; shph_tun::MAX_TUN_PACKET_BYTES + 1],
             1472,
-            WorkloadObservation {
+            Shroud3Observation {
                 observed_at: Duration::from_millis(3),
                 queue_age: Duration::ZERO,
             },
@@ -762,7 +760,7 @@ mod tests {
             &mut morphology,
             &packet,
             path_mtu,
-            WorkloadObservation {
+            Shroud3Observation {
                 observed_at: Duration::from_millis(1),
                 queue_age: Duration::ZERO,
             },

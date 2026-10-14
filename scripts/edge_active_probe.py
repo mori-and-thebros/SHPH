@@ -17,6 +17,7 @@ import re
 import shutil
 import stat
 import socket
+import ssl
 import subprocess
 import tempfile
 import time
@@ -39,6 +40,7 @@ HTTP2_WRITE_OUT = (
     "%{time_appconnect}\\t%{time_starttransfer}\\t%{time_total}\\t"
     "%{size_download}"
 )
+HTTP2_CLIENT_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 
 class ProbeError(Exception):
@@ -315,6 +317,58 @@ def _partial_tls_probe(
     }
 
 
+def _http2_framing_probe(
+    *,
+    host: str,
+    port: int,
+    ca_file: Path,
+    timeout_seconds: float,
+    deadline: float,
+    case: str,
+    frame_bytes: bytes,
+) -> dict[str, object]:
+    started = time.monotonic()
+    received = bytearray()
+    remaining = min(timeout_seconds, 3.0, max(0.001, deadline - started))
+    outcome = "connected"
+    try:
+        context = ssl.create_default_context(cafile=str(ca_file))
+        context.set_alpn_protocols(["h2"])
+        with socket.create_connection(("127.0.0.1", port), timeout=remaining) as raw:
+            raw.settimeout(remaining)
+            with context.wrap_socket(raw, server_hostname=host) as stream:
+                if stream.selected_alpn_protocol() != "h2":
+                    outcome = "wrong_alpn"
+                else:
+                    stream.sendall(HTTP2_CLIENT_PREFACE + frame_bytes)
+                    stream.shutdown(socket.SHUT_WR)
+                    while len(received) < 512 and time.monotonic() < deadline:
+                        try:
+                            chunk = stream.recv(512 - len(received))
+                        except TimeoutError:
+                            outcome = "timeout"
+                            break
+                        if not chunk:
+                            outcome = "closed"
+                            break
+                        received.extend(chunk)
+                    else:
+                        outcome = "response_limit" if len(received) >= 512 else "timeout"
+                    if received and outcome == "connected":
+                        outcome = "response"
+    except (OSError, ssl.SSLError) as error:
+        outcome = "connect_or_tls_error"
+        error_kind = type(error).__name__
+    return {
+        "probe": case,
+        "outcome": outcome,
+        "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+        "response_bytes": len(received),
+        "response_sha256": hashlib.sha256(received).hexdigest(),
+        **({"error": error_kind} if outcome == "connect_or_tls_error" else {}),
+    }
+
+
 def _connection_churn(
     port: int, count: int, timeout_seconds: float, deadline: float
 ) -> dict[str, object]:
@@ -343,6 +397,54 @@ def _connection_churn(
             "max": round(ordered[-1], 3) if ordered else None,
         },
     }
+
+
+def summarize_probe_observations(samples: Sequence[dict[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for sample in samples:
+        grouped.setdefault(str(sample.get("probe", "unknown")), []).append(sample)
+
+    summaries: list[dict[str, object]] = []
+    for probe, rows in sorted(grouped.items()):
+        statuses: dict[str, int] = {}
+        response_sizes: dict[str, int] = {}
+        response_hashes: dict[str, int] = {}
+        outcomes: dict[str, int] = {}
+        for row in rows:
+            for field, destination in (
+                ("status", statuses),
+                ("response_bytes", response_sizes),
+                ("response_sha256", response_hashes),
+                ("outcome", outcomes),
+            ):
+                value = row.get(field)
+                if value is not None:
+                    key = str(value)
+                    destination[key] = destination.get(key, 0) + 1
+
+        timing: dict[str, dict[str, float]] = {}
+        for field in ("first_byte_ms", "total_ms", "elapsed_ms"):
+            values = sorted(
+                float(row[field]) for row in rows if isinstance(row.get(field), (int, float))
+            )
+            if values:
+                timing[field] = {
+                    "min": round(values[0], 3),
+                    "median": round(values[len(values) // 2], 3),
+                    "max": round(values[-1], 3),
+                }
+        summaries.append(
+            {
+                "probe": probe,
+                "samples": len(rows),
+                "outcomes": outcomes,
+                "statuses": statuses,
+                "response_sizes": response_sizes,
+                "response_hashes": response_hashes,
+                "timing_ms": timing,
+            }
+        )
+    return summaries
 
 
 def run_probes(args: argparse.Namespace) -> dict[str, object]:
@@ -438,6 +540,7 @@ def run_probes(args: argparse.Namespace) -> dict[str, object]:
             break
 
     replay_results = None
+    replay_samples: list[dict[str, object]] = []
     if args.probe_replay and not truncated:
         assert valid_token is not None
         remaining = deadline - time.monotonic()
@@ -468,18 +571,46 @@ def run_probes(args: argparse.Namespace) -> dict[str, object]:
                     headers=authorized_headers,
                     ca_file=args.ca_file,
                     timeout_seconds=min(float(args.timeout_seconds), remaining),
-                    capture_response=False,
                 )
+                replay_samples.append({"probe": "replayed_capability", **second})
             replay_results = {"first_use": first, "replay": second}
         else:
             truncated = True
 
     remaining = deadline - time.monotonic()
     partial_tls = None
+    partial_http2 = None
+    malformed_http2 = None
     if remaining >= 0.25:
         partial_tls = _partial_tls_probe(
             port, min(args.timeout_seconds, remaining), deadline
         )
+        remaining = deadline - time.monotonic()
+        if remaining >= 0.25:
+            partial_http2 = _http2_framing_probe(
+                host=host,
+                port=port,
+                ca_file=args.ca_file,
+                timeout_seconds=min(args.timeout_seconds, remaining),
+                deadline=deadline,
+                case="partial_http2_frame",
+                frame_bytes=bytes.fromhex("000010010400000001") + b"\xff",
+            )
+        else:
+            truncated = True
+        remaining = deadline - time.monotonic()
+        if remaining >= 0.25:
+            malformed_http2 = _http2_framing_probe(
+                host=host,
+                port=port,
+                ca_file=args.ca_file,
+                timeout_seconds=min(args.timeout_seconds, remaining),
+                deadline=deadline,
+                case="malformed_http2_settings_stream",
+                frame_bytes=bytes.fromhex("000000040000000001"),
+            )
+        else:
+            truncated = True
     else:
         truncated = True
     remaining = deadline - time.monotonic()
@@ -510,7 +641,12 @@ def run_probes(args: argparse.Namespace) -> dict[str, object]:
             "max_response_bytes": MAX_RESPONSE_BYTES,
         },
         "probes": samples,
+        "observable_distributions": summarize_probe_observations(
+            [*samples, *replay_samples]
+        ),
         "partial_tls_handshake": partial_tls,
+        "partial_http2_frame": partial_http2,
+        "malformed_http2_settings": malformed_http2,
         "connection_churn": churn,
         "authorized_replay_probe": replay_results,
         "skipped_probes": [

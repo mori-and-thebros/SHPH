@@ -103,6 +103,133 @@ class CapabilityHelpersTests(unittest.TestCase):
 
 
 class ProbeBoundsTests(unittest.TestCase):
+    def test_authorized_replay_probe_captures_denial_response_for_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ca_file = root / "ca.pem"
+            valid_token = root / "valid.token"
+            expired_token = root / "expired.token"
+            ca_file.write_bytes(b"ca")
+            valid_token.write_text("phantom-one.1.payload.signature", encoding="ascii")
+            expired_token.write_text("phantom-one.1.payload.expired", encoding="ascii")
+            args = mock.Mock(
+                endpoint="https://edge.example:443",
+                relay_path=probe.DEFAULT_RELAY_PATH,
+                ca_file=ca_file,
+                valid_token_file=valid_token,
+                expired_token_file=expired_token,
+                probe_replay=True,
+                allow_token_consumption=True,
+                curl_bin="curl",
+                timeout_seconds=1,
+                max_runtime=30,
+                repeat=1,
+                churn=1,
+            )
+
+            def fake_curl_probe(**kwargs):
+                if kwargs.get("capture_response", True):
+                    return {
+                        "outcome": "response",
+                        "status": 401,
+                        "response_bytes": 12,
+                        "response_sha256": "same-denial-body",
+                        "first_byte_ms": 2.0,
+                        "total_ms": 3.0,
+                    }
+                return {
+                    "outcome": "response",
+                    "status": 200,
+                    "response_bytes": None,
+                    "response_sha256": None,
+                    "first_byte_ms": 2.0,
+                    "total_ms": 3.0,
+                }
+
+            with (
+                mock.patch.object(probe.shutil, "which", return_value="curl"),
+                mock.patch.object(probe, "curl_supports_http2", return_value=True),
+                mock.patch.object(probe, "_curl_probe", side_effect=fake_curl_probe) as curl_probe,
+                mock.patch.object(probe, "_partial_tls_probe", return_value={"outcome": "closed"}),
+                mock.patch.object(
+                    probe, "_http2_framing_probe", return_value={"outcome": "closed"}
+                ),
+                mock.patch.object(probe, "_connection_churn", return_value={"connected": 1}),
+            ):
+                report = probe.run_probes(args)
+
+        self.assertFalse(curl_probe.call_args_list[-2].kwargs["capture_response"])
+        self.assertTrue(curl_probe.call_args_list[-1].kwargs.get("capture_response", True))
+        replay = report["authorized_replay_probe"]["replay"]
+        self.assertEqual(replay["status"], 401)
+        self.assertEqual(replay["response_bytes"], 12)
+        self.assertEqual(replay["response_sha256"], "same-denial-body")
+        replay_summary = next(
+            row
+            for row in report["observable_distributions"]
+            if row["probe"] == "replayed_capability"
+        )
+        self.assertEqual(replay_summary["statuses"], {"401": 1})
+        self.assertEqual(replay_summary["response_sizes"], {"12": 1})
+        self.assertEqual(replay_summary["response_hashes"], {"same-denial-body": 1})
+
+    def test_probe_summary_compares_observable_content_size_and_timing(self):
+        summary = probe.summarize_probe_observations(
+            [
+                {
+                    "probe": "missing_capability",
+                    "outcome": "response",
+                    "status": 401,
+                    "response_bytes": 12,
+                    "response_sha256": "same-body",
+                    "first_byte_ms": 2.0,
+                    "total_ms": 3.0,
+                },
+                {
+                    "probe": "missing_capability",
+                    "outcome": "response",
+                    "status": 401,
+                    "response_bytes": 12,
+                    "response_sha256": "same-body",
+                    "first_byte_ms": 4.0,
+                    "total_ms": 5.0,
+                },
+                {
+                    "probe": "invalid_signature",
+                    "outcome": "response",
+                    "status": 401,
+                    "response_bytes": 12,
+                    "response_sha256": "same-body",
+                    "first_byte_ms": 3.0,
+                    "total_ms": 4.0,
+                },
+                {
+                    "probe": "replayed_capability",
+                    "outcome": "response",
+                    "status": 401,
+                    "response_bytes": 12,
+                    "response_sha256": "same-body",
+                    "first_byte_ms": 5.0,
+                    "total_ms": 6.0,
+                },
+            ]
+        )
+
+        self.assertEqual(
+            [row["probe"] for row in summary],
+            ["invalid_signature", "missing_capability", "replayed_capability"],
+        )
+        missing = summary[1]
+        self.assertEqual(missing["samples"], 2)
+        self.assertEqual(missing["statuses"], {"401": 2})
+        self.assertEqual(missing["response_sizes"], {"12": 2})
+        self.assertEqual(missing["response_hashes"], {"same-body": 2})
+        self.assertEqual(missing["timing_ms"]["first_byte_ms"]["median"], 4.0)
+        replay = summary[2]
+        self.assertEqual(replay["statuses"], {"401": 1})
+        self.assertEqual(replay["response_sizes"], {"12": 1})
+        self.assertEqual(replay["response_hashes"], {"same-body": 1})
+
     def test_curl_requires_http2_and_in_transfer_size_limit_support(self):
         with mock.patch.object(probe.subprocess, "run") as run:
             run.return_value.returncode = 0

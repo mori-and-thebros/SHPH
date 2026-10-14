@@ -13,14 +13,20 @@ or independent-review evidence.
   Local paired adapter tests do not establish external bridge/relay acceptance
   or Python SierraNode session interoperability.
 
-- Added an adaptive `S3` v1 QUIC datagram envelope with caller-supplied
-  workload observations, bounded pacing, strict Shroud 2 separation, and a
-  deterministic test constructor reserved for tests/labs. Native Linux TUN
+- Replaced the Shroud 3 wrapper with an independent `S3` v1 morphology engine:
+  its own bounded workload state, joint size/delay profiles, padding, pacing,
+  and metrics. Added synthetic Shroud 2/Shroud 3 workload comparisons and a
+  benchmark-only, separately scheduled cover-policy arm. No profiles are
+  capture-fitted, and no traffic-resistance claim is made. Native Linux TUN
   links are activated before route setup and their prior down state is restored
   on cleanup.
 - Added nested TLS 1.3 onion paths over two or three explicitly pinned relays,
   a standalone `shph-onion-relay` process with numeric target allowlists and
   bounded per-circuit resources, and local authenticated SHPH loopback tests.
+- Extended the `shph-edge` active-probe report to include replay-denial
+  response distributions. Added a local HTTP/2 regression test for missing,
+  invalid, expired, and replayed capabilities, connection reuse, and backend
+  exclusion; this is not a live service campaign.
 - Added an isolated Linux namespace probe for a real adaptive Shroud 3 TUN
   packet round trip and graceful control-plane cleanup; it is not two-host
   release evidence.

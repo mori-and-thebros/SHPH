@@ -10,16 +10,19 @@ use shph_identity::{
     MAX_ENDPOINTS, MAX_RECORD_BYTES,
 };
 use shph_obfuscation::ProfileTier;
+use shph_transport::cover::{CoverPolicy, CoverScheduler};
 use shph_transport::phantom_one::{
     PhantomOneConfig, PhantomOneDecoder, PhantomOneEncoder, PhantomOneFrameType,
     PHANTOM_ONE_HEADER_BYTES,
 };
+use shph_transport::shroud2::workload::{WorkloadConfig, WorkloadMorphology};
 use shph_transport::shroud2::{
     decode_batched_datagram, decode_datagram, encode_batched_datagram, encode_datagram,
     wasserstein_distance, AdaptiveMorphologyConfig, AdaptiveMorphologyEngine, EmpiricalHistogram,
     MorphologyBatchPolicy, MorphologyBatchPushResult, MorphologyBatcher, MorphologyEngine,
     MorphologyProfile,
 };
+use shph_transport::shroud3::{AdaptiveShroud3, Shroud3Config, Shroud3Observation};
 use shph_transport::{
     quic_handshake_client_with_profile, quic_handshake_server_on_socket_with_profile,
 };
@@ -234,6 +237,7 @@ fn main() {
         bench_shroud_profiles(options);
         bench_shroud2_morphology(options);
         bench_shroud2_distribution_stability(options);
+        bench_shroud3_comparison(options);
         bench_shroud2_delay(options);
         bench_shroud2_long_session(options);
         bench_shroud2_impairment(options);
@@ -2314,6 +2318,320 @@ fn morphology_distribution_cases() -> [(&'static str, MorphologyProfile, &'stati
             0x4449_5354_5442_554c,
         ),
     ]
+}
+
+fn bench_shroud3_comparison(options: Options) {
+    let sample_count = options.frames.clamp(
+        MORPHOLOGY_STABILITY_MIN_SAMPLES,
+        MORPHOLOGY_STABILITY_MAX_SAMPLES,
+    );
+    for workload in [
+        "interactive",
+        "burst-idle",
+        "sustained",
+        "mixed-bidirectional",
+    ] {
+        for arm in ["shroud2", "shroud3", "shroud3-cover"] {
+            bench_morphology_comparison_case(options, workload, arm, sample_count);
+        }
+    }
+}
+
+fn bench_morphology_comparison_case(
+    options: Options,
+    workload: &str,
+    arm: &str,
+    sample_count: usize,
+) {
+    let path_mtu = EVIDENCE_MORPHOLOGY_PATH_MTU;
+    let workload_config = WorkloadConfig {
+        minimum_dwell: Duration::ZERO,
+        burst_gap: Duration::from_millis(5),
+        burst_threshold: 4,
+        use_arrivals: true,
+        use_queue_age: true,
+        ..WorkloadConfig::default()
+    };
+    let mut shroud2 = [
+        WorkloadMorphology::from_seed(workload_config, 0x5348_5232_0001)
+            .expect("Shroud 2 direction 0"),
+        WorkloadMorphology::from_seed(workload_config, 0x5348_5232_0002)
+            .expect("Shroud 2 direction 1"),
+    ];
+    let shroud3_config = Shroud3Config {
+        minimum_dwell: Duration::ZERO,
+        transition_confirmations: 1,
+        ..Shroud3Config::default()
+    };
+    let mut shroud3 = [
+        AdaptiveShroud3::new(shroud3_config.clone()).expect("Shroud 3 direction 0"),
+        AdaptiveShroud3::new(shroud3_config).expect("Shroud 3 direction 1"),
+    ];
+    let cover_policy = CoverPolicy {
+        interval_ms: 100,
+        idle_timeout_ms: 500,
+        maximum_bytes: 64 * 1024 * 1024,
+        overhead_percent: 100,
+    };
+    let mut cover_schedulers = [
+        CoverScheduler::new(Some(cover_policy)).expect("cover scheduler 0"),
+        CoverScheduler::new(Some(cover_policy)).expect("cover scheduler 1"),
+    ];
+    let mut cover_encoders = [
+        PhantomOneEncoder::from_seed(1, 0x434f_5645_5201),
+        PhantomOneEncoder::from_seed(1, 0x434f_5645_5202),
+    ];
+    let mut cover_decoders = [PhantomOneDecoder::new(1), PhantomOneDecoder::new(1)];
+
+    let mut samples_ns = Vec::with_capacity(sample_count);
+    let mut delay_samples_ns = Vec::with_capacity(sample_count);
+    let mut inter_arrival_samples_ns = Vec::with_capacity(sample_count);
+    let mut wire_sizes = Vec::with_capacity(sample_count + sample_count / 8);
+    let mut direction_sizes = [Vec::new(), Vec::new()];
+    let mut direction_gaps_ns = [Vec::new(), Vec::new()];
+    let mut last_observation = [None, None];
+    let mut last_data_at = [None, None];
+    let mut direction_wire_bytes = [0usize; 2];
+    let mut direction_data_frames = [0usize; 2];
+    let mut direction_cover_frames = [0usize; 2];
+    let mut maximum_burst = [0u32; 2];
+    let mut raw_bytes = 0usize;
+    let mut wire_bytes = 0usize;
+    let start = begin_measurement();
+
+    for packet in 0..sample_count {
+        let (direction, payload_bytes, observed_at) =
+            morphology_comparison_observation(workload, packet);
+        if let Some(previous) = last_observation[direction] {
+            let gap = observed_at.saturating_sub(previous).as_nanos();
+            inter_arrival_samples_ns.push(gap);
+            direction_gaps_ns[direction].push(gap);
+        }
+
+        if arm == "shroud3-cover" {
+            if let Some(last_data) = last_data_at[direction] {
+                let cover_at =
+                    last_data + Duration::from_millis(u64::from(cover_policy.interval_ms));
+                if cover_at < observed_at
+                    && observed_at.saturating_sub(last_data)
+                        < Duration::from_millis(u64::from(cover_policy.idle_timeout_ms))
+                {
+                    let target = cover_encoders[direction]
+                        .target_size(1, path_mtu)
+                        .expect("cover target size");
+                    let reserved_bytes = target.saturating_add(WIRE_AEAD_OVERHEAD);
+                    if cover_schedulers[direction]
+                        .reserve(cover_at, reserved_bytes, false, false, false)
+                        .expect("cover budget reservation")
+                    {
+                        let cover = cover_encoders[direction]
+                            .encode_with_target(
+                                PhantomOneFrameType::Keepalive,
+                                &[0],
+                                target,
+                                path_mtu,
+                            )
+                            .expect("cover frame encoding");
+                        let decoded = cover_decoders[direction]
+                            .decode(&cover, path_mtu)
+                            .expect("cover frame decoding");
+                        assert_eq!(decoded.frame_type, PhantomOneFrameType::Keepalive);
+                        assert_eq!(decoded.payload, [0]);
+                        wire_bytes = wire_bytes.saturating_add(cover.len());
+                        direction_wire_bytes[direction] =
+                            direction_wire_bytes[direction].saturating_add(cover.len());
+                        direction_cover_frames[direction] += 1;
+                        wire_sizes.push(cover.len());
+                        direction_sizes[direction].push(cover.len());
+                        black_box(cover);
+                    }
+                }
+            }
+        }
+
+        let payload = vec![0x5a; payload_bytes];
+        let sample_start = Instant::now();
+        let (datagram, shaping_delay) = if arm == "shroud2" {
+            let encoded = shroud2[direction]
+                .encode(&payload, path_mtu, observed_at, Duration::ZERO)
+                .expect("Shroud 2 workload encode");
+            let delay = shroud2[direction].next_delay();
+            let decoded = decode_datagram(&encoded, path_mtu).expect("Shroud 2 decode");
+            assert_eq!(decoded, payload);
+            (encoded, delay)
+        } else {
+            let encoded = shroud3[direction]
+                .encode(
+                    &payload,
+                    path_mtu,
+                    Shroud3Observation {
+                        observed_at,
+                        queue_age: Duration::ZERO,
+                    },
+                )
+                .expect("Shroud 3 workload encode");
+            let delay = shroud3[direction].next_delay();
+            let decoded =
+                shph_transport::shroud3::decode(&encoded, path_mtu).expect("Shroud 3 decode");
+            assert_eq!(decoded, payload);
+            (encoded, delay)
+        };
+        samples_ns.push(sample_start.elapsed().as_nanos());
+        delay_samples_ns.push(shaping_delay.as_nanos());
+        raw_bytes = raw_bytes.saturating_add(payload.len());
+        wire_bytes = wire_bytes.saturating_add(datagram.len());
+        direction_wire_bytes[direction] =
+            direction_wire_bytes[direction].saturating_add(datagram.len());
+        direction_data_frames[direction] += 1;
+        wire_sizes.push(datagram.len());
+        direction_sizes[direction].push(datagram.len());
+        last_observation[direction] = Some(observed_at);
+        last_data_at[direction] = Some(observed_at);
+        if arm == "shroud2" {
+            maximum_burst[direction] =
+                maximum_burst[direction].max(shroud2[direction].metrics().burst_length);
+        } else {
+            if arm == "shroud3-cover" {
+                cover_schedulers[direction]
+                    .record_payload(observed_at, payload.len())
+                    .expect("cover scheduler data observation");
+            }
+            maximum_burst[direction] =
+                maximum_burst[direction].max(shroud3[direction].metrics().burst_length);
+        }
+        black_box(datagram);
+    }
+
+    let runtime = finish_measurement(start);
+    let size_stats = distribution_stats(&wire_sizes);
+    let direction_size_summaries = direction_sizes.each_ref().map(|sizes| {
+        if sizes.is_empty() {
+            "none".to_string()
+        } else {
+            let stats = distribution_stats(sizes);
+            format!(
+                "{}:{}:{}:{}:{}",
+                stats.min_bytes,
+                stats.p50_bytes,
+                stats.p95_bytes,
+                stats.max_bytes,
+                stats.mean_bytes
+            )
+        }
+    });
+    let direction_gap_summaries = direction_gaps_ns.each_ref().map(|gaps| {
+        if gaps.is_empty() {
+            "none".to_string()
+        } else {
+            let stats = stats_from_samples(gaps);
+            format!("{}:{}", stats.p50_ns, stats.p95_ns)
+        }
+    });
+    let delay_stats = stats_from_samples(&delay_samples_ns);
+    let arrival_stats = if inter_arrival_samples_ns.is_empty() {
+        None
+    } else {
+        Some(stats_from_samples(&inter_arrival_samples_ns))
+    };
+    let carrier_frames = wire_sizes.len();
+    let wire_metrics =
+        aggregate_wire_metrics(raw_bytes, wire_bytes, carrier_frames, runtime.elapsed_ns);
+    let average_payload = raw_bytes / sample_count;
+    let scenario = format!("{arm}_{workload}");
+    let scenario_notes = format!(
+        "workload={workload};arm={arm};data_frames={sample_count};cover_frames={};path_mtu={path_mtu};inner_envelope_bytes_only;no_quic_packet_capture_or_ip_headers;wire_min={};wire_p50={};wire_p95={};wire_max={};wire_mean={:.3};distinct_sizes={};size_entropy_bits={:.6};shape_delay_min_ns={};shape_delay_p50_ns={};shape_delay_p95_ns={};shape_delay_max_ns={};input_gap_p50_ns={};input_gap_p95_ns={};direction0_frames={};direction0_inner_bytes={};direction0_size_min_p50_p95_max_mean={};direction0_gap_p50_p95_ns={};direction0_max_burst={};direction1_frames={};direction1_inner_bytes={};direction1_size_min_p50_p95_max_mean={};direction1_gap_p50_p95_ns={};direction1_max_burst={};synthetic_workload_not_classifier_evidence{}",
+        direction_cover_frames.iter().sum::<usize>(),
+        size_stats.min_bytes,
+        size_stats.p50_bytes,
+        size_stats.p95_bytes,
+        size_stats.max_bytes,
+        size_stats.mean_bytes,
+        size_stats.distinct_sizes,
+        size_stats.entropy_bits,
+        delay_stats.min_ns,
+        delay_stats.p50_ns,
+        delay_stats.p95_ns,
+        delay_stats.max_ns,
+        arrival_stats.map_or_else(|| "-".to_string(), |stats| stats.p50_ns.to_string()),
+        arrival_stats.map_or_else(|| "-".to_string(), |stats| stats.p95_ns.to_string()),
+        direction_data_frames[0] + direction_cover_frames[0],
+        direction_wire_bytes[0],
+        direction_size_summaries[0],
+        direction_gap_summaries[0],
+        maximum_burst[0],
+        direction_data_frames[1] + direction_cover_frames[1],
+        direction_wire_bytes[1],
+        direction_size_summaries[1],
+        direction_gap_summaries[1],
+        maximum_burst[1],
+        if arm == "shroud3-cover" {
+            ";cover_arm=benchmark-only-Phantom-One-keepalive-plus-CoverScheduler;not-a-production-Shroud3-cover-path"
+        } else {
+            ""
+        },
+    );
+
+    let name = match arm {
+        "shroud2" => "shroud2_workload_morphology",
+        "shroud3" => "shroud3_morphology",
+        _ => "shroud3_cover_experiment",
+    };
+    emit_latency_with_wire(
+        name,
+        options,
+        &scenario,
+        average_payload,
+        &samples_ns,
+        runtime,
+        wire_metrics,
+        &scenario_notes,
+    );
+    let seconds = runtime.elapsed_ns as f64 / 1_000_000_000.0;
+    emit_rate_with_wire(
+        options,
+        &format!("{scenario}_cost"),
+        average_payload,
+        runtime,
+        raw_bytes as f64 / seconds / 1_000_000.0,
+        wire_bytes as f64 / seconds / 1_000_000.0,
+        wire_metrics,
+        &scenario_notes,
+    );
+}
+
+fn morphology_comparison_observation(workload: &str, packet: usize) -> (usize, usize, Duration) {
+    match workload {
+        "interactive" => (
+            0,
+            32 + (packet.wrapping_mul(37) % 384),
+            Duration::from_millis(packet as u64 * 30),
+        ),
+        "burst-idle" => (
+            0,
+            64 + (packet.wrapping_mul(97) % 900),
+            Duration::from_millis(((packet / 8) * 250 + (packet % 8) * 2) as u64),
+        ),
+        "sustained" => (
+            0,
+            1_000 + (packet.wrapping_mul(17) % 400),
+            Duration::from_millis(packet as u64 * 20),
+        ),
+        "mixed-bidirectional" => {
+            let direction = packet % 2;
+            let sequence = packet / 2;
+            let (payload, gap) = if direction == 0 {
+                (32 + (sequence.wrapping_mul(37) % 384), 30)
+            } else {
+                (1_000 + (sequence.wrapping_mul(17) % 400), 20)
+            };
+            (
+                direction,
+                payload,
+                Duration::from_millis(sequence as u64 * gap),
+            )
+        }
+        _ => unreachable!("benchmark workload is enumerated by the caller"),
+    }
 }
 
 fn bench_shroud2_delay(options: Options) {

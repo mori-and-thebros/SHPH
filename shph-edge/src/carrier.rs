@@ -2574,6 +2574,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn h2_denial_responses_match_and_replays_never_reach_backend() {
+        use crate::capability::{unix_now, CapabilityClaims};
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backend listener");
+        let backend_address = backend_listener.local_addr().expect("backend address");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("edge listener");
+        let address = listener.local_addr().expect("edge address");
+        let client_stream = TcpStream::connect(address).await.expect("client stream");
+        let (server_stream, _) = listener.accept().await.expect("server stream");
+        let (issuer, _) = CapabilityIssuer::generate(Duration::from_secs(300)).expect("issuer");
+        let verifier = crate::capability::CapabilityVerifier::new(
+            issuer.public_key(),
+            "edge-a",
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .expect("verifier");
+        let front_door = Arc::new(FrontDoor::new(verifier, 4096));
+        let config = Arc::new(EdgeConfig {
+            listen: address,
+            backend: backend_address.to_string(),
+            audience: "edge-a".into(),
+            public_key: String::new(),
+            relay_path: DEFAULT_RELAY_PATH.into(),
+            tls: Default::default(),
+            limits: Default::default(),
+            socks: Default::default(),
+        });
+        let replay = front_door.replay_cache();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            serve_http2_io(
+                TokioIo::new(server_stream),
+                config,
+                front_door,
+                replay,
+                server_shutdown,
+            )
+            .await
+        });
+
+        let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+        builder.timer(TokioTimer::new());
+        let (mut sender, connection) = timeout(
+            Duration::from_secs(2),
+            builder.handshake::<_, Full<Bytes>>(TokioIo::new(client_stream)),
+        )
+        .await
+        .expect("client handshake timeout")
+        .expect("client handshake");
+        let client_task = tokio::spawn(connection);
+
+        let now = unix_now().expect("clock");
+        let expired = issuer
+            .issue(&CapabilityClaims::new(
+                "edge-a",
+                now - 120,
+                now - 60,
+                [0x31; 16],
+            ))
+            .expect("expired capability");
+        let mut invalid = signed_capability_headers(&issuer, [0x32; 16]);
+        let token = invalid
+            .get(CAPABILITY_HEADER)
+            .expect("signed capability")
+            .to_str()
+            .expect("ASCII capability")
+            .to_owned();
+        let mut token_parts = token.split('.').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(token_parts.len(), 4);
+        let replacement = if token_parts[3].starts_with('A') {
+            'B'
+        } else {
+            'A'
+        };
+        token_parts[3].replace_range(0..1, &replacement.to_string());
+        invalid.insert(
+            CAPABILITY_HEADER,
+            token_parts.join(".").parse().expect("tampered header"),
+        );
+
+        let cases = [
+            ("missing", None),
+            ("invalid-signature", Some(invalid)),
+            (
+                "expired",
+                Some({
+                    let mut headers = http::HeaderMap::new();
+                    headers.insert(CAPABILITY_HEADER, expired.parse().expect("expired header"));
+                    headers
+                }),
+            ),
+        ];
+        let case_count = cases.len();
+        let mut response_times = Vec::with_capacity(case_count + 2);
+        let mut denial_shapes = Vec::with_capacity(case_count + 1);
+        for (name, capability_headers) in cases {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(format!("https://edge.example{DEFAULT_RELAY_PATH}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream");
+            if let Some(headers) = capability_headers {
+                if let Some(value) = headers.get(CAPABILITY_HEADER) {
+                    request = request.header(CAPABILITY_HEADER, value);
+                }
+            }
+            let started = std::time::Instant::now();
+            let response = timeout(
+                Duration::from_secs(2),
+                sender.send_request(request.body(Full::new(Bytes::new())).expect("request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name} probe response timeout"))
+            .unwrap_or_else(|_| panic!("{name} probe response failed"));
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .unwrap_or_else(|_| panic!("{name} fallback body"))
+                .to_bytes();
+            response_times.push(started.elapsed());
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{name} status");
+            assert_eq!(headers[header::CONTENT_TYPE], "text/plain; charset=utf-8");
+            assert_eq!(body.as_ref(), b"unauthorized\n", "{name} body");
+            assert!(!sender.is_closed(), "{name} closed the HTTP/2 connection");
+            denial_shapes.push((status, headers[header::CONTENT_TYPE].clone(), body.to_vec()));
+        }
+
+        assert_eq!(response_times.len(), case_count);
+
+        let (stop_backend_sender, mut stop_backend_receiver) =
+            tokio::sync::oneshot::channel::<()>();
+        let backend_task = tokio::spawn(async move {
+            let mut accepted_connections = 0usize;
+            loop {
+                tokio::select! {
+                    _ = &mut stop_backend_receiver => break,
+                    accepted = backend_listener.accept() => {
+                        let (mut backend, _) = accepted.expect("backend accept");
+                        accepted_connections += 1;
+                        if accepted_connections == 1 {
+                            let mut request = Vec::new();
+                            timeout(Duration::from_secs(2), backend.read_to_end(&mut request))
+                                .await
+                                .expect("authorized request body timeout")
+                                .expect("authorized request body");
+                            assert!(request.is_empty());
+                            backend
+                                .write_all(b"authorized backend response")
+                                .await
+                                .expect("backend response");
+                        }
+                        backend.shutdown().await.expect("backend shutdown");
+                    }
+                }
+            }
+            accepted_connections
+        });
+
+        let valid_headers = signed_capability_headers(&issuer, [0x33; 16]);
+        let valid_token = valid_headers
+            .get(CAPABILITY_HEADER)
+            .expect("valid capability")
+            .clone();
+        let first_request = Request::builder()
+            .method("POST")
+            .uri(format!("https://edge.example{DEFAULT_RELAY_PATH}"))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(CAPABILITY_HEADER, valid_token.clone())
+            .body(Full::new(Bytes::new()))
+            .expect("authorized request");
+        let first_response = timeout(Duration::from_secs(2), sender.send_request(first_request))
+            .await
+            .expect("authorized response timeout")
+            .expect("authorized response");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = first_response
+            .into_body()
+            .collect()
+            .await
+            .expect("authorized response body")
+            .to_bytes();
+        assert_eq!(first_body.as_ref(), b"authorized backend response");
+        assert!(
+            !sender.is_closed(),
+            "valid capability closed the HTTP/2 connection"
+        );
+
+        let replay_request = Request::builder()
+            .method("POST")
+            .uri(format!("https://edge.example{DEFAULT_RELAY_PATH}"))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(CAPABILITY_HEADER, valid_token)
+            .body(Full::new(Bytes::new()))
+            .expect("replay request");
+        let replay_started = std::time::Instant::now();
+        let replay_response = timeout(Duration::from_secs(2), sender.send_request(replay_request))
+            .await
+            .expect("replay response timeout")
+            .expect("replay response");
+        let replay_status = replay_response.status();
+        let replay_headers = replay_response.headers().clone();
+        let replay_body = replay_response
+            .into_body()
+            .collect()
+            .await
+            .expect("replay response body")
+            .to_bytes();
+        response_times.push(replay_started.elapsed());
+        assert_eq!(replay_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            replay_headers[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(replay_body.as_ref(), b"unauthorized\n");
+        assert!(
+            !sender.is_closed(),
+            "replayed capability closed the HTTP/2 connection"
+        );
+        denial_shapes.push((
+            replay_status,
+            replay_headers[header::CONTENT_TYPE].clone(),
+            replay_body.to_vec(),
+        ));
+        assert!(denial_shapes.windows(2).all(|pair| pair[0] == pair[1]));
+
+        let _ = stop_backend_sender.send(());
+        let accepted_connections = timeout(Duration::from_secs(2), backend_task)
+            .await
+            .expect("backend observer shutdown timeout")
+            .expect("backend observer task");
+        assert_eq!(accepted_connections, 1, "replay reached the backend");
+        assert_eq!(response_times.len(), case_count + 1);
+        shutdown.cancel();
+        drop(sender);
+        client_task.abort();
+        timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server shutdown timeout")
+            .expect("server task")
+            .expect("server connection");
+    }
+
+    #[tokio::test]
     async fn armed_pool_notification_observes_a_released_stream_slot() {
         let slots = Arc::new(Semaphore::new(1));
         let permit = slots.clone().acquire_owned().await.expect("slot");
