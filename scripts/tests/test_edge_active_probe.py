@@ -1,7 +1,11 @@
 import io
 import os
+import socket
+import ssl
 import sys
+import threading
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -10,6 +14,27 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import edge_active_probe as probe
+
+
+def start_loopback_listener(handler):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.settimeout(2.0)
+    errors = []
+
+    def run():
+        try:
+            handler(listener)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return listener.getsockname()[1], thread, errors
 
 
 class EndpointValidationTests(unittest.TestCase):
@@ -103,6 +128,105 @@ class CapabilityHelpersTests(unittest.TestCase):
 
 
 class ProbeBoundsTests(unittest.TestCase):
+    def test_partial_tls_probe_sends_truncated_client_hello_to_loopback(self):
+        received = bytearray()
+
+        def serve(listener):
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(1.0)
+                while True:
+                    chunk = connection.recv(512)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+
+        port, server, errors = start_loopback_listener(serve)
+        report = probe._partial_tls_probe(port, 0.5, time.monotonic() + 2.0)
+        server.join(2.0)
+
+        self.assertFalse(server.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(received, b"\x16\x03\x03\x00\x40\x01\x00\x00\x3c\x03\x03" + b"\x00" * 10)
+        self.assertEqual(report["outcome"], "closed")
+        self.assertEqual(report["response_bytes"], 0)
+        self.assertLess(report["elapsed_ms"], 1000)
+
+    def test_http2_framing_probe_sends_malformed_frame_over_loopback_tls(self):
+        fixture_dir = Path(__file__).resolve().parents[2] / "shph-edge" / "tests" / "fixtures"
+        ca_file = fixture_dir / "test-only-edge-probe-ca.pem"
+        cert_file = fixture_dir / "test-only-edge-probe-cert.pem"
+        key_file = fixture_dir / "test-only-edge-probe-key.pem"
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+        server_context.set_alpn_protocols(["h2"])
+        selected_alpn = []
+        received = bytearray()
+
+        def serve(listener):
+            raw, _ = listener.accept()
+            with raw:
+                with server_context.wrap_socket(raw, server_side=True) as connection:
+                    selected_alpn.append(connection.selected_alpn_protocol())
+                    connection.settimeout(1.0)
+                    while True:
+                        try:
+                            chunk = connection.recv(512)
+                        except (OSError, ssl.SSLError):
+                            break
+                        if not chunk:
+                            break
+                        received.extend(chunk)
+
+        port, server, errors = start_loopback_listener(serve)
+        frame = b"\x00\x40\x01\x04\x00\x00\x00\x00\x00"
+        report = probe._http2_framing_probe(
+            host="edge-probe.test",
+            port=port,
+            ca_file=ca_file,
+            timeout_seconds=1.0,
+            deadline=time.monotonic() + 3.0,
+            case="oversized_settings",
+            frame_bytes=frame,
+        )
+        server.join(2.0)
+
+        self.assertFalse(server.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(selected_alpn, ["h2"])
+        self.assertEqual(received, probe.HTTP2_CLIENT_PREFACE + frame)
+        self.assertIn(
+            report["outcome"], {"closed", "connect_or_tls_error", "response_limit"}, report
+        )
+        if report["outcome"] == "response_limit":
+            self.assertEqual(report["response_bytes"], 512)
+        self.assertLessEqual(report["response_bytes"], 512)
+        self.assertLess(report["elapsed_ms"], 2000)
+
+    def test_connection_churn_probe_counts_owned_loopback_connections(self):
+        attempts = 4
+
+        def serve(listener):
+            for _ in range(attempts):
+                connection, _ = listener.accept()
+                connection.close()
+
+        port, server, errors = start_loopback_listener(serve)
+        report = probe._connection_churn(
+            port,
+            attempts,
+            timeout_seconds=0.5,
+            deadline=time.monotonic() + 3.0,
+        )
+        server.join(2.0)
+
+        self.assertFalse(server.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(report["requested"], attempts)
+        self.assertEqual(report["attempted"], attempts)
+        self.assertEqual(report["connected"], attempts)
+        self.assertEqual(report["failures"], {})
+
     def test_authorized_replay_probe_captures_denial_response_for_comparison(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -24,9 +24,10 @@ or independent-review evidence.
   a standalone `shph-onion-relay` process with numeric target allowlists and
   bounded per-circuit resources, and local authenticated SHPH loopback tests.
 - Extended the `shph-edge` active-probe report to include replay-denial
-  response distributions. Added a local HTTP/2 regression test for missing,
-  invalid, expired, and replayed capabilities, connection reuse, and backend
-  exclusion; this is not a live service campaign.
+  response distributions. Added loopback tests for missing, invalid, expired,
+  and replayed capabilities; partial TLS and HTTP/2 inputs; the connection
+  limit; bounded connection churn; recovery; and backend exclusion. These are
+  local regressions, not a live service campaign.
 - Added an isolated Linux namespace probe for a real adaptive Shroud 3 TUN
   packet round trip and graceful control-plane cleanup; it is not two-host
   release evidence.

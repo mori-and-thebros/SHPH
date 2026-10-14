@@ -642,6 +642,16 @@ pub async fn serve_http2_until(
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let listener = TcpListener::bind(config.listen).await?;
+    serve_http2_listener(listener, config, front_door, tls_acceptor, shutdown).await
+}
+
+async fn serve_http2_listener(
+    listener: TcpListener,
+    config: Arc<EdgeConfig>,
+    front_door: Arc<FrontDoor>,
+    tls_acceptor: TlsAcceptor,
+    shutdown: CancellationToken,
+) -> Result<(), CarrierError> {
     let replay = front_door.replay_cache();
     let active = Arc::new(tokio::sync::Semaphore::new(config.limits.max_connections));
     let mut tasks = JoinSet::new();
@@ -2159,6 +2169,53 @@ mod tests {
         headers
     }
 
+    fn active_probe_test_tls() -> (TlsAcceptor, TlsConnector) {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let ca_path = fixture_dir.join("test-only-edge-probe-ca.pem");
+        let cert_path = fixture_dir.join("test-only-edge-probe-cert.pem");
+        let key_path = fixture_dir.join("test-only-edge-probe-key.pem");
+        let certificates = load_certs(&ca_path).expect("test CA certificate");
+        let mut roots = RootCertStore::empty();
+        for certificate in certificates {
+            roots.add(certificate).expect("test root certificate");
+        }
+
+        let mut server = load_server_tls(&cert_path, &key_path).expect("test server TLS");
+        server.alpn_protocols = vec![b"h2".to_vec()];
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("test TLS protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"h2".to_vec()];
+
+        (
+            TlsAcceptor::from(Arc::new(server)),
+            TlsConnector::from(Arc::new(client)),
+        )
+    }
+
+    async fn connect_active_probe_test_tls(
+        address: SocketAddr,
+        connector: &TlsConnector,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let stream = timeout(Duration::from_secs(2), TcpStream::connect(address))
+            .await
+            .expect("test TCP connect timeout")
+            .expect("test TCP connect");
+        timeout(
+            Duration::from_secs(2),
+            connector.connect(
+                ServerName::try_from("edge-probe.test").expect("test server name"),
+                stream,
+            ),
+        )
+        .await
+        .expect("test TLS handshake timeout")
+        .expect("test TLS handshake")
+    }
+
     fn spawn_frontdoor_decision(
         front_door: Arc<FrontDoor>,
         replay: Arc<tokio::sync::Mutex<ReplayCache>>,
@@ -2823,6 +2880,240 @@ mod tests {
             .expect("server shutdown timeout")
             .expect("server task")
             .expect("server connection");
+    }
+
+    #[tokio::test]
+    async fn h2_partial_and_oversized_frames_close_without_backend_access() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backend listener");
+        let backend_address = backend_listener.local_addr().expect("backend address");
+        let (issuer, _) = CapabilityIssuer::generate(Duration::from_secs(300)).expect("issuer");
+        let verifier = crate::capability::CapabilityVerifier::new(
+            issuer.public_key(),
+            "edge-a",
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .expect("verifier");
+        let front_door = Arc::new(FrontDoor::new(verifier, 4096));
+        let config = Arc::new(EdgeConfig {
+            listen: "127.0.0.1:0".parse().expect("listen address"),
+            backend: backend_address.to_string(),
+            audience: "edge-a".into(),
+            public_key: String::new(),
+            relay_path: DEFAULT_RELAY_PATH.into(),
+            tls: Default::default(),
+            limits: Default::default(),
+            socks: Default::default(),
+        });
+        let replay = front_door.replay_cache();
+        let client_preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let cases: [(&str, &[u8]); 2] = [
+            ("partial-frame-header", &[0x00, 0x00, 0x06, 0x04]),
+            (
+                "oversized-settings-frame",
+                &[0x00, 0x40, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00],
+            ),
+        ];
+
+        for (name, frame) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("edge listener");
+            let address = listener.local_addr().expect("edge address");
+            let client = TcpStream::connect(address).await.expect("client stream");
+            let (server_stream, _) = listener.accept().await.expect("server stream");
+            let shutdown = CancellationToken::new();
+            let server_task = tokio::spawn(serve_http2_io(
+                TokioIo::new(server_stream),
+                config.clone(),
+                front_door.clone(),
+                replay.clone(),
+                shutdown,
+            ));
+
+            let mut client = client;
+            client
+                .write_all(client_preface)
+                .await
+                .expect("client preface");
+            client.write_all(frame).await.expect("probe frame");
+            client.shutdown().await.expect("probe half-close");
+
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+                .await
+                .unwrap_or_else(|_| panic!("{name} probe connection did not close"))
+                .expect("read probe response");
+            assert!(
+                response.len() <= 512,
+                "{name} response exceeded the probe bound"
+            );
+            let _server_result = timeout(Duration::from_secs(2), server_task)
+                .await
+                .unwrap_or_else(|_| panic!("{name} server task did not finish"))
+                .expect("server task join");
+            assert!(
+                timeout(Duration::from_millis(50), backend_listener.accept())
+                    .await
+                    .is_err(),
+                "{name} reached the backend"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_front_door_bounds_partial_handshakes_connections_and_churn() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backend listener");
+        let backend_address = backend_listener.local_addr().expect("backend address");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("edge listener");
+        let address = listener.local_addr().expect("edge address");
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let config = Arc::new(EdgeConfig {
+            listen: address,
+            backend: backend_address.to_string(),
+            audience: "edge-a".into(),
+            public_key: String::new(),
+            relay_path: DEFAULT_RELAY_PATH.into(),
+            tls: crate::config::TlsConfig {
+                cert: Some(fixture_dir.join("test-only-edge-probe-cert.pem")),
+                key: Some(fixture_dir.join("test-only-edge-probe-key.pem")),
+                ca: None,
+                server_name: "edge-probe.test".into(),
+            },
+            limits: crate::config::Limits {
+                max_connections: 1,
+                replay_capacity: 4096,
+                max_capability_verifications_per_second: 1,
+                tls_handshake_timeout_ms: 200,
+                http2_idle_timeout_ms: 5_000,
+                ..Default::default()
+            },
+            socks: Default::default(),
+        });
+        config.validate().expect("test edge config");
+
+        let (issuer, _) = CapabilityIssuer::generate(Duration::from_secs(300)).expect("issuer");
+        let verifier = crate::capability::CapabilityVerifier::new(
+            issuer.public_key(),
+            "edge-a",
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .expect("verifier");
+        let front_door = Arc::new(FrontDoor::new(verifier, 4096));
+        let (tls_acceptor, tls_connector) = active_probe_test_tls();
+        let shutdown = CancellationToken::new();
+        let server_task = tokio::spawn(serve_http2_listener(
+            listener,
+            config,
+            front_door,
+            tls_acceptor,
+            shutdown.clone(),
+        ));
+
+        let mut partial_tls = TcpStream::connect(address)
+            .await
+            .expect("partial TLS connect");
+        partial_tls
+            .write_all(&[0x16, 0x03, 0x03, 0x00, 0x40, 0x01])
+            .await
+            .expect("partial TLS client hello");
+        let mut partial_response = Vec::new();
+        timeout(
+            Duration::from_secs(2),
+            partial_tls.read_to_end(&mut partial_response),
+        )
+        .await
+        .expect("partial TLS probe exceeded the handshake deadline")
+        .expect("partial TLS response read");
+        assert!(partial_response.len() <= 512);
+
+        let held_connection = connect_active_probe_test_tls(address, &tls_connector).await;
+        assert_eq!(
+            held_connection.get_ref().1.alpn_protocol(),
+            Some(b"h2".as_slice())
+        );
+        let mut over_limit = TcpStream::connect(address)
+            .await
+            .expect("over-limit connect");
+        let mut over_limit_response = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            over_limit.read_to_end(&mut over_limit_response),
+        )
+        .await
+        .expect("connection-limit rejection timeout")
+        .expect("connection-limit response read");
+        assert!(over_limit_response.is_empty());
+        drop(held_connection);
+
+        for attempt in 0..8 {
+            let mut stream = TcpStream::connect(address)
+                .await
+                .unwrap_or_else(|_| panic!("connection churn attempt {attempt} connect"));
+            stream
+                .shutdown()
+                .await
+                .unwrap_or_else(|_| panic!("connection churn attempt {attempt} shutdown"));
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+                .await
+                .unwrap_or_else(|_| panic!("connection churn attempt {attempt} did not close"))
+                .unwrap_or_else(|_| panic!("connection churn attempt {attempt} read"));
+            assert!(response.len() <= 512);
+        }
+
+        let tls = connect_active_probe_test_tls(address, &tls_connector).await;
+        let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+        builder.timer(TokioTimer::new());
+        let (mut sender, connection) = timeout(
+            Duration::from_secs(2),
+            builder.handshake::<_, Full<Bytes>>(TokioIo::new(tls)),
+        )
+        .await
+        .expect("post-churn HTTP/2 handshake timeout")
+        .expect("post-churn HTTP/2 handshake");
+        let client_task = tokio::spawn(connection);
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("https://edge-probe.test{DEFAULT_RELAY_PATH}"))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Full::new(Bytes::new()))
+            .expect("post-churn request");
+        let response = timeout(Duration::from_secs(2), sender.send_request(request))
+            .await
+            .expect("post-churn response timeout")
+            .expect("post-churn response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response_body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("post-churn response body")
+            .to_bytes();
+        assert_eq!(response_body.as_ref(), b"unauthorized\n");
+        assert!(!sender.is_closed(), "denial closed the HTTP/2 connection");
+        drop(sender);
+        client_task.abort();
+        assert!(
+            timeout(Duration::from_millis(50), backend_listener.accept())
+                .await
+                .is_err(),
+            "unauthorized probes reached the backend"
+        );
+
+        shutdown.cancel();
+        timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("edge server shutdown timeout")
+            .expect("edge server task")
+            .expect("edge server result");
     }
 
     #[tokio::test]
