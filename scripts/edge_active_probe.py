@@ -34,6 +34,7 @@ MAX_RUNTIME_SECONDS = 120
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_TOKEN_BYTES = 4096
 MAX_CA_FILE_BYTES = 1024 * 1024
+MAX_TLS_HANDSHAKE_BYTES = 1024 * 1024
 DEFAULT_RELAY_PATH = "/phantom-one/v1"
 HTTP2_WRITE_OUT = (
     "%{http_code}\\t%{http_version}\\t%{time_connect}\\t"
@@ -329,6 +330,7 @@ def _http2_framing_probe(
 ) -> dict[str, object]:
     started = time.monotonic()
     received = bytearray()
+    handshake_wire_bytes = 0
     remaining = min(timeout_seconds, 3.0, max(0.001, deadline - started))
     outcome = "connected"
     try:
@@ -336,37 +338,122 @@ def _http2_framing_probe(
         context.set_alpn_protocols(["h2"])
         with socket.create_connection(("127.0.0.1", port), timeout=remaining) as raw:
             raw.settimeout(remaining)
-            with context.wrap_socket(raw, server_hostname=host) as stream:
-                if stream.selected_alpn_protocol() != "h2":
-                    outcome = "wrong_alpn"
-                else:
-                    stream.sendall(HTTP2_CLIENT_PREFACE + frame_bytes)
-                    stream.shutdown(socket.SHUT_WR)
-                    while len(received) < 512 and time.monotonic() < deadline:
-                        try:
-                            chunk = stream.recv(512 - len(received))
-                        except TimeoutError:
-                            outcome = "timeout"
-                            break
-                        if not chunk:
-                            outcome = "closed"
-                            break
-                        received.extend(chunk)
+            # Keep the raw socket for the bounded wire capture after the
+            # client half-closes its write side.
+            incoming = ssl.MemoryBIO()
+            outgoing = ssl.MemoryBIO()
+            stream = context.wrap_bio(
+                incoming, outgoing, server_side=False, server_hostname=host
+            )
+
+            def flush_tls_output() -> None:
+                while outgoing.pending:
+                    raw.sendall(outgoing.read())
+
+            def receive_tls_input() -> None:
+                nonlocal handshake_wire_bytes
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                raw.settimeout(min(timeout_seconds, 3.0, remaining))
+                chunk = raw.recv(16 * 1024)
+                if not chunk:
+                    raise ssl.SSLEOFError("TLS peer closed during handshake")
+                if handshake_wire_bytes + len(chunk) > MAX_TLS_HANDSHAKE_BYTES:
+                    raise ssl.SSLError("TLS peer exceeded the probe handshake byte limit")
+                handshake_wire_bytes += len(chunk)
+                incoming.write(chunk)
+
+            while True:
+                try:
+                    stream.do_handshake()
+                    break
+                except ssl.SSLWantReadError:
+                    flush_tls_output()
+                    receive_tls_input()
+                except ssl.SSLWantWriteError:
+                    flush_tls_output()
+            flush_tls_output()
+
+            if stream.selected_alpn_protocol() != "h2":
+                outcome = "wrong_alpn"
+            else:
+                pending = memoryview(HTTP2_CLIENT_PREFACE + frame_bytes)
+                while pending:
+                    try:
+                        written = stream.write(pending)
+                    except ssl.SSLWantReadError:
+                        flush_tls_output()
+                        receive_tls_input()
+                    except ssl.SSLWantWriteError:
+                        flush_tls_output()
                     else:
-                        outcome = "response_limit" if len(received) >= 512 else "timeout"
-                    if received and outcome == "connected":
-                        outcome = "response"
+                        if written <= 0:
+                            raise ssl.SSLError("TLS probe write made no progress")
+                        pending = pending[written:]
+                        flush_tls_output()
+                raw.shutdown(socket.SHUT_WR)
+                while len(received) < 512:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        outcome = "timeout"
+                        break
+                    raw.settimeout(min(timeout_seconds, 3.0, remaining))
+                    try:
+                        chunk = raw.recv(512 - len(received))
+                    except TimeoutError:
+                        outcome = "timeout"
+                        break
+                    if not chunk:
+                        outcome = "closed"
+                        break
+                    received.extend(chunk)
+                else:
+                    outcome = "wire_limit" if len(received) >= 512 else "timeout"
+                if received and outcome == "connected":
+                    outcome = "wire_data"
+    except TimeoutError:
+        outcome = "timeout"
     except (OSError, ssl.SSLError) as error:
         outcome = "connect_or_tls_error"
         error_kind = type(error).__name__
+    tls_records = _tls_record_headers(received)
+    parsed_wire_bytes = sum(
+        5 + int(record["captured_payload_bytes"]) for record in tls_records
+    )
     return {
         "probe": case,
         "outcome": outcome,
         "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
-        "response_bytes": len(received),
-        "response_sha256": hashlib.sha256(received).hexdigest(),
+        "tls_handshake_wire_bytes": handshake_wire_bytes,
+        "tls_wire_bytes": len(received),
+        "tls_records": tls_records,
+        "tls_unparsed_wire_bytes": len(received) - parsed_wire_bytes,
         **({"error": error_kind} if outcome == "connect_or_tls_error" else {}),
     }
+
+
+def _tls_record_headers(wire_bytes: bytes | bytearray) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    offset = 0
+    while len(wire_bytes) - offset >= 5:
+        payload_length = int.from_bytes(wire_bytes[offset + 3 : offset + 5], "big")
+        captured_length = min(payload_length, len(wire_bytes) - offset - 5)
+        complete = captured_length == payload_length
+        records.append(
+            {
+                "content_type": wire_bytes[offset],
+                "legacy_version": wire_bytes[offset + 1 : offset + 3].hex(),
+                "declared_payload_bytes": payload_length,
+                "captured_payload_bytes": captured_length,
+                "complete": complete,
+            }
+        )
+        if not complete:
+            offset = len(wire_bytes)
+            break
+        offset += 5 + payload_length
+    return records
 
 
 def _connection_churn(

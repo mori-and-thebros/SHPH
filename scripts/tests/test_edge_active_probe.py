@@ -196,12 +196,45 @@ class ProbeBoundsTests(unittest.TestCase):
         self.assertEqual(selected_alpn, ["h2"])
         self.assertEqual(received, probe.HTTP2_CLIENT_PREFACE + frame)
         self.assertIn(
-            report["outcome"], {"closed", "connect_or_tls_error", "response_limit"}, report
+            report["outcome"],
+            {"closed", "connect_or_tls_error", "timeout", "wire_data", "wire_limit"},
+            report,
         )
-        if report["outcome"] == "response_limit":
-            self.assertEqual(report["response_bytes"], 512)
-        self.assertLessEqual(report["response_bytes"], 512)
+        self.assertGreater(report["tls_handshake_wire_bytes"], 0)
+        self.assertLessEqual(
+            report["tls_handshake_wire_bytes"], probe.MAX_TLS_HANDSHAKE_BYTES
+        )
+        self.assertLessEqual(report["tls_wire_bytes"], 512)
+        self.assertEqual(
+            report["tls_wire_bytes"],
+            sum(5 + record["captured_payload_bytes"] for record in report["tls_records"])
+            + report["tls_unparsed_wire_bytes"],
+        )
+        self.assertNotIn("response_sha256", report)
         self.assertLess(report["elapsed_ms"], 2000)
+
+    def test_tls_record_headers_report_bounded_visible_lengths(self):
+        wire = b"\x17\x03\x03\x00\x03abc\x15\x03\x03\x00\x04xy"
+
+        self.assertEqual(
+            probe._tls_record_headers(wire),
+            [
+                {
+                    "content_type": 23,
+                    "legacy_version": "0303",
+                    "declared_payload_bytes": 3,
+                    "captured_payload_bytes": 3,
+                    "complete": True,
+                },
+                {
+                    "content_type": 21,
+                    "legacy_version": "0303",
+                    "declared_payload_bytes": 4,
+                    "captured_payload_bytes": 2,
+                    "complete": False,
+                },
+            ],
+        )
 
     def test_connection_churn_probe_counts_owned_loopback_connections(self):
         attempts = 4

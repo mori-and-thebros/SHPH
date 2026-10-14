@@ -693,6 +693,7 @@ fn validate_payload_for_path(payload_len: usize, path_mtu: usize) -> Result<usiz
 
 /// Decode one Shroud 3 envelope into its application payload.
 pub fn decode(datagram: &[u8], path_mtu: usize) -> Result<Vec<u8>> {
+    validate_datagram_bounds(datagram.len(), path_mtu)?;
     let mut decoded = datagram.to_vec();
     match decode_in_place(&mut decoded, path_mtu) {
         Ok(()) => Ok(decoded),
@@ -714,14 +715,7 @@ pub fn decode_in_place(datagram: &mut Vec<u8>, path_mtu: usize) -> Result<()> {
 }
 
 fn decode_inner(datagram: &mut Vec<u8>, path_mtu: usize) -> Result<()> {
-    if !(SHROUD3_HEADER_BYTES..=MAX_SHROUD3_DATAGRAM_BYTES).contains(&path_mtu)
-        || datagram.len() < SHROUD3_HEADER_BYTES
-        || datagram.len() > path_mtu
-    {
-        return Err(ShphError::Protocol(
-            "Shroud 3 datagram length is outside the negotiated limit".into(),
-        ));
-    }
+    validate_datagram_bounds(datagram.len(), path_mtu)?;
     if datagram[..2] != SHROUD3_MAGIC || datagram[2] != SHROUD3_VERSION {
         return Err(ShphError::Protocol(
             "Shroud 3 envelope version mismatch".into(),
@@ -748,6 +742,18 @@ fn decode_inner(datagram: &mut Vec<u8>, path_mtu: usize) -> Result<()> {
     datagram.copy_within(SHROUD3_HEADER_BYTES..payload_end, 0);
     datagram[payload_len..].zeroize();
     datagram.truncate(payload_len);
+    Ok(())
+}
+
+fn validate_datagram_bounds(datagram_len: usize, path_mtu: usize) -> Result<()> {
+    if !(SHROUD3_HEADER_BYTES..=MAX_SHROUD3_DATAGRAM_BYTES).contains(&path_mtu)
+        || datagram_len < SHROUD3_HEADER_BYTES
+        || datagram_len > path_mtu
+    {
+        return Err(ShphError::Protocol(
+            "Shroud 3 datagram length is outside the negotiated limit".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1024,5 +1030,12 @@ mod tests {
         excessive_padding[5..7].copy_from_slice(&declared_len.to_be_bytes());
         assert!(decode_in_place(&mut excessive_padding, 8_192).is_err());
         assert!(excessive_padding.is_empty());
+    }
+
+    #[test]
+    fn decoder_rejects_oversized_input_and_invalid_path_limit() {
+        let oversized = vec![0u8; MAX_SHROUD3_DATAGRAM_BYTES + 1];
+        assert!(decode(&oversized, MAX_SHROUD3_DATAGRAM_BYTES).is_err());
+        assert!(decode(&oversized, usize::MAX).is_err());
     }
 }

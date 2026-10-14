@@ -19,15 +19,17 @@ or independent-review evidence.
   benchmark-only, separately scheduled cover-policy arm. No profiles are
   capture-fitted, and no traffic-resistance claim is made. Native Linux TUN
   links are activated before route setup and their prior down state is restored
-  on cleanup.
+  on cleanup. The decoder checks datagram bounds before making its bounded copy.
 - Added nested TLS 1.3 onion paths over two or three explicitly pinned relays,
   a standalone `shph-onion-relay` process with numeric target allowlists and
   bounded per-circuit resources, and local authenticated SHPH loopback tests.
 - Extended the `shph-edge` active-probe report to include replay-denial
   response distributions. Added loopback tests for missing, invalid, expired,
   and replayed capabilities; partial TLS and HTTP/2 inputs; the connection
-  limit; bounded connection churn; recovery; and backend exclusion. These are
-  local regressions, not a live service campaign.
+  limit; bounded connection churn; recovery; and backend exclusion. Malformed
+  HTTP/2 probes report bounded TLS wire bytes and record lengths separately
+  from decrypted HTTP response bodies. These are local regressions, not a live
+  service campaign.
 - Added an isolated Linux namespace probe for a real adaptive Shroud 3 TUN
   packet round trip and graceful control-plane cleanup; it is not two-host
   release evidence.

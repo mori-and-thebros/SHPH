@@ -51,7 +51,10 @@ invalid workload observation is rejected. There is no implicit format downgrade.
 
 The engine keeps a fixed 16-observation window. Padding is limited to 4,096
 bytes, path datagrams to the 16-bit framing limit, and shaping delay to 100 ms.
-The per-session configuration applies lower limits by default.
+The per-session configuration applies lower limits by default. The copying
+decoder checks the negotiated path and datagram lengths before allocating its
+copy; accepted datagrams are capped at 65,535 bytes. The in-place decoder
+validates the same bounds and wipes rejected input.
 
 ## CLI and saved session configuration
 
